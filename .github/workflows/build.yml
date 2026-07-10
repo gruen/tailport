@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          out="tailport-${{ matrix.goos }}-${{ matrix.goarch }}"
+          go build -trimpath -ldflags="-s -w" -o "dist/$out" ./cmd/tailport
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailport-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/tailport-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
