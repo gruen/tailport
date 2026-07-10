@@ -1,5 +1,5 @@
-// Package config loads tailport's YAML config: the list of ports to hide
-// from the default (filtered) view.
+// Package config loads and persists tailport's YAML config: a per-port
+// registry of labels and favorites that drives the default (filtered) view.
 package config
 
 import (
@@ -9,19 +9,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PortMeta holds user-set metadata for a single port: a custom label
+// and/or favorite status. An entry existing in the registry (regardless
+// of its field values) means the port is "known" and should stay visible
+// in the default view even when nothing's currently listening on it.
+type PortMeta struct {
+	Label    string `yaml:"label,omitempty"`
+	Favorite bool   `yaml:"favorite,omitempty"`
+}
+
+// Config is the persisted per-port registry.
 type Config struct {
-	ExcludePorts []int `yaml:"exclude_ports"`
+	Ports map[int]PortMeta `yaml:"ports"`
 }
 
-var defaultExcludePorts = []int{
-	22,    // sshd
-	631,   // cups
-	5353,  // mdns/avahi
-	41641, // tailscale's own wireguard listener
-}
-
+// Default returns an empty registry: no ports are pre-known.
 func Default() Config {
-	return Config{ExcludePorts: append([]int(nil), defaultExcludePorts...)}
+	return Config{Ports: map[int]PortMeta{}}
 }
 
 // Path returns the config file location, honoring XDG_CONFIG_HOME.
@@ -54,16 +58,29 @@ func Load() (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.Ports == nil {
+		cfg.Ports = map[int]PortMeta{}
+	}
 	return cfg, nil
 }
 
-func (c Config) Excludes(port int) bool {
-	for _, p := range c.ExcludePorts {
-		if p == port {
-			return true
-		}
+// Save writes the config to disk at Path(), creating the parent directory
+// if needed. Called immediately after any registry mutation (label set,
+// favorite toggled, port remembered) so changes survive restarts without
+// requiring a clean exit.
+func (c Config) Save() error {
+	path, err := Path()
+	if err != nil {
+		return err
 	}
-	return false
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 // WriteDefault writes the default config to disk if no config exists yet.
@@ -75,12 +92,5 @@ func WriteDefault() error {
 	if _, err := os.Stat(path); err == nil {
 		return nil // already exists, don't clobber
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := yaml.Marshal(Default())
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o644)
+	return Default().Save()
 }
