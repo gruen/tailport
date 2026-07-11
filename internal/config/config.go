@@ -21,6 +21,10 @@ type PortMeta struct {
 	// (toggled on) until explicitly unlocked. It never blocks toggling
 	// off, labeling, or favoriting.
 	Locked bool `yaml:"locked,omitempty"`
+	// LastProcess is the most recent process name seen listening on this port.
+	// It's remembered so a favorite that goes down can still show what used to
+	// run there ("was mailpit") instead of an anonymous "?".
+	LastProcess string `yaml:"last_process,omitempty"`
 }
 
 // Config is the persisted per-port registry, plus display preferences.

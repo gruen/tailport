@@ -32,6 +32,9 @@ var (
 	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	// wasStyle renders a remembered-but-gone process name ("was mailpit") as a
+	// muted italic, so it reads as a memory rather than a live label.
+	wasStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Italic(true)
 	// publicStyle marks a port funnelled to the public internet -- deliberately
 	// a hot magenta ● (ASCII mode), distinct from the green ◉ tailnet-serve and
 	// amber ▲ dangling markers, so "this is on the public internet" reads at a glance.
@@ -210,11 +213,18 @@ func (i portItem) Title() string {
 	if i.meta.Favorite {
 		star = favStyle.Render("★") + " "
 	}
+	// Name precedence: an explicit user label wins; else the live process name
+	// while something's listening; else the remembered last process ("was
+	// mailpit", italic) so a down favorite still says what used to run there;
+	// else "?".
 	name := i.meta.Label
-	if name == "" {
+	switch {
+	case name != "":
+	case i.port.Process != "":
 		name = i.port.Process
-	}
-	if name == "" {
+	case i.meta.LastProcess != "":
+		name = wasStyle.Render("was " + i.meta.LastProcess)
+	default:
 		name = "?"
 	}
 	return fmt.Sprintf("%s%s :%d  %s%s", marker, lock, i.port.Number, star, name)
@@ -641,6 +651,31 @@ func (m *model) saveConfig() tea.Cmd {
 	return nil
 }
 
+// rememberProcesses records the currently-listening process name of each
+// FAVORITE port into its registry entry (meta.LastProcess), so a favorite that
+// later goes down can still show "was <name>" rather than an anonymous "?".
+// Only favorites persist in the view when down, so only they need it; scoping
+// here also keeps the write rare. Returns true if any entry changed, so the
+// caller can persist just once and not re-write config on a steady state.
+func (m *model) rememberProcesses() bool {
+	changed := false
+	for _, p := range m.allPorts {
+		if p.Process == "" {
+			continue
+		}
+		meta, ok := m.cfg.Ports[p.Number]
+		if !ok || !meta.Favorite {
+			continue
+		}
+		if meta.LastProcess != p.Process {
+			meta.LastProcess = p.Process
+			m.cfg.Ports[p.Number] = meta
+			changed = true
+		}
+	}
+	return changed
+}
+
 // cleanupDangling turns off every serve mapping in ports, one at a time.
 // It reports the ports it could not tear down (if any) as a single error.
 func cleanupDangling(ports []int) tea.Cmd {
@@ -853,7 +888,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allPorts = msg.ports
 		m.active = msg.active
 		m.funnel = msg.funnel
-		return m, m.rebuildItems()
+		// Remember the live process names of favorites BEFORE rebuilding, so a
+		// favorite that later goes down can show "was <name>". Persist only when
+		// something actually changed, so a steady state never re-writes config.
+		changed := m.rememberProcesses()
+		cmd := m.rebuildItems()
+		if changed {
+			return m, tea.Batch(cmd, m.saveConfig())
+		}
+		return m, cmd
 
 	case fqdnMsg:
 		if msg.fqdn != "" {

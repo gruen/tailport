@@ -55,7 +55,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	cfg := Default()
-	cfg.Ports[3000] = PortMeta{Label: "dev server", Favorite: true}
+	cfg.Ports[3000] = PortMeta{Label: "dev server", Favorite: true, LastProcess: "vite"}
 	cfg.Ports[9000] = PortMeta{Favorite: false}
 
 	if err := cfg.Save(); err != nil {
@@ -71,8 +71,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if len(got.Ports) != 3 {
 		t.Fatalf("Load() got %d ports, want 3: %v", len(got.Ports), got.Ports)
 	}
-	if meta := got.Ports[3000]; meta.Label != "dev server" || !meta.Favorite {
-		t.Errorf("Load() port 3000 = %+v, want Label=\"dev server\" Favorite=true", meta)
+	if meta := got.Ports[3000]; meta.Label != "dev server" || !meta.Favorite || meta.LastProcess != "vite" {
+		t.Errorf("Load() port 3000 = %+v, want Label=\"dev server\" Favorite=true LastProcess=vite", meta)
 	}
 	if meta, ok := got.Ports[9000]; !ok || meta.Favorite {
 		t.Errorf("Load() port 9000 = %+v (ok=%v), want present, Favorite=false", meta, ok)

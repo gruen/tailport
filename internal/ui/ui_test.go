@@ -1511,6 +1511,74 @@ func TestMarkerGlyph(t *testing.T) {
 	}
 }
 
+// TestWasName covers znrg: the Title name precedence -- label > live process >
+// remembered "was <name>" (italic) > "?".
+func TestWasName(t *testing.T) {
+	cases := []struct {
+		name      string
+		label     string
+		process   string // live process (listening) when non-empty
+		listening bool
+		last      string // meta.LastProcess
+		wantSub   string
+		wantNoSub string
+	}{
+		{"label wins", "My Mail", "mailpit", true, "mailpit", "My Mail", "was"},
+		{"live process", "", "mailpit", true, "postfix", "mailpit", "was"},
+		{"down remembers", "", "", false, "mailpit", "was mailpit", ""},
+		{"down, nothing known", "", "", false, "", "?", "was"},
+		{"label beats remembered when down", "My Mail", "", false, "mailpit", "My Mail", "was"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			it := portItem{
+				port:      portscan.Port{Number: 8025, Process: c.process},
+				listening: c.listening,
+				meta:      config.PortMeta{Label: c.label, Favorite: true, LastProcess: c.last},
+			}
+			got := stripANSI(it.Title())
+			if !strings.Contains(got, c.wantSub) {
+				t.Errorf("Title = %q, want to contain %q", got, c.wantSub)
+			}
+			if c.wantNoSub != "" && strings.Contains(got, c.wantNoSub) {
+				t.Errorf("Title = %q, should not contain %q", got, c.wantNoSub)
+			}
+		})
+	}
+}
+
+// TestRememberProcesses covers the capture side: favorite listening ports get
+// their process recorded (returning changed), non-favorite / non-listening
+// ports are left alone, and a steady state reports no change.
+func TestRememberProcesses(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{
+		8025: {Favorite: true}, // favorite, will be captured
+		3000: {},               // registered but not favorite -> skip
+	}})
+	m.allPorts = []portscan.Port{
+		{Number: 8025, Process: "mailpit"},
+		{Number: 3000, Process: "node"},
+		{Number: 9999, Process: "stray"}, // not registered -> skip
+	}
+
+	if !m.rememberProcesses() {
+		t.Fatal("rememberProcesses should report a change on first capture")
+	}
+	if got := m.cfg.Ports[8025].LastProcess; got != "mailpit" {
+		t.Errorf("favorite :8025 LastProcess = %q, want mailpit", got)
+	}
+	if got := m.cfg.Ports[3000].LastProcess; got != "" {
+		t.Errorf("non-favorite :3000 LastProcess = %q, want empty (not remembered)", got)
+	}
+	if _, ok := m.cfg.Ports[9999]; ok {
+		t.Errorf("unregistered :9999 should not gain a registry entry")
+	}
+	// Steady state: same ports, nothing new -> no change, no re-write.
+	if m.rememberProcesses() {
+		t.Error("rememberProcesses should report no change when nothing moved")
+	}
+}
+
 // TestResolveEmoji covers the markers-mode resolution: emoji/ascii force it,
 // auto (or empty) defers to the terminal heuristic (UTF-8 locale + sane TERM).
 func TestResolveEmoji(t *testing.T) {
