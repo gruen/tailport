@@ -117,6 +117,27 @@ func TestFunnelPublicPortsExcludedFromActive(t *testing.T) {
 	}
 }
 
+// TestStatusParsers covers e40f's dedupe: activePortsFrom and parseFunnel,
+// which Status() runs on a SINGLE serve-status fetch, agree on one config --
+// serve reports the local :8080, funnel reports {local 3000 -> public 443},
+// and the funnel's public :443 is not mistaken for a served local port.
+func TestStatusParsers(t *testing.T) {
+	active, err := activePortsFrom([]byte(funnelConfigJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(active, []int{8080}) {
+		t.Errorf("activePortsFrom = %v, want [8080] (funnel :443 excluded)", active)
+	}
+	funnel, err := parseFunnel([]byte(funnelConfigJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(funnel, map[int]int{3000: 443}) {
+		t.Errorf("parseFunnel = %v, want {3000:443}", funnel)
+	}
+}
+
 // TestPublicURL covers the URL shown in the funnel confirm: :443 is implicit,
 // the other ingress ports are explicit.
 func TestPublicURL(t *testing.T) {

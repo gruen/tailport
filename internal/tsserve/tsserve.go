@@ -38,6 +38,12 @@ func ActivePorts() ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
+	return activePortsFrom(out)
+}
+
+// activePortsFrom parses the served (tailnet) local ports out of a ServeConfig
+// JSON blob. Split from ActivePorts so Status can reuse a single fetch.
+func activePortsFrom(out []byte) ([]int, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parsing serve status: %w", err)
@@ -60,6 +66,24 @@ func ActivePorts() ([]int, error) {
 	}
 	sort.Ints(ports)
 	return ports, nil
+}
+
+// Status fetches the ServeConfig ONCE and returns both the tailnet-serve
+// local ports and the funnel (local->public) map. A refresh should prefer this
+// over calling ActivePorts + FunnelStatus separately, which would run
+// `tailscale serve status --json` twice for the same data (e40f).
+func Status() (active []int, funnel map[int]int, err error) {
+	out, err := statusJSON()
+	if err != nil {
+		return nil, nil, err
+	}
+	if active, err = activePortsFrom(out); err != nil {
+		return nil, nil, err
+	}
+	if funnel, err = parseFunnel(out); err != nil {
+		return nil, nil, err
+	}
+	return active, funnel, nil
 }
 
 // statusJSON fetches the current ServeConfig as JSON. Serve status carries

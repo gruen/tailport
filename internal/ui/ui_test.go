@@ -456,6 +456,54 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestAutoRefresh covers e40f: the periodic tick reschedules itself and polls
+// only when idle; a periodic poll's error fades silently while a manual/toggle
+// refresh error still toasts; and the FQDN arrives via its own cached message.
+func TestAutoRefresh(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// Idle tick -> reschedules and polls (non-nil cmd), no state change.
+	m := New(config.Config{})
+	res, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Error("an idle refreshTickMsg should return a cmd (poll + reschedule)")
+	}
+	_ = res.(model)
+
+	// Tick while a toggle is in flight -> still reschedules, but must not clear
+	// pending / stomp the op.
+	m = New(config.Config{})
+	m.pending = 8080
+	res, cmd = m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Error("a tick during an in-flight toggle should still reschedule")
+	}
+	if got := res.(model); got.pending != 8080 {
+		t.Errorf("a tick must not disturb an in-flight toggle; pending = %d", got.pending)
+	}
+
+	// A periodic-poll error fades silently (no toast).
+	m = New(config.Config{})
+	m = mustUpdate(t, m, refreshMsg{auto: true, err: fmt.Errorf("tailscaled down")})
+	if m.flash != "" {
+		t.Errorf("an auto-refresh error must not raise a toast; got %q", m.flash)
+	}
+
+	// A manual/toggle refresh error still toasts.
+	m = New(config.Config{})
+	m = mustUpdate(t, m, refreshMsg{err: fmt.Errorf("tailscaled down")})
+	if m.flash == "" || m.flashLevel != flashError {
+		t.Errorf("a non-auto refresh error should toast; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+
+	// FQDN arrives via its own message and is cached.
+	m = New(config.Config{})
+	m = mustUpdate(t, m, fqdnMsg{fqdn: "host.example.ts.net"})
+	if m.fqdn != "host.example.ts.net" {
+		t.Errorf("fqdnMsg should set m.fqdn; got %q", m.fqdn)
+	}
+}
+
 // TestAddPortAlreadyFavorited covers 7ac3: 'n' on an already-favorited port
 // is a no-op with an info toast; 'n' on a new port favorites it silently.
 func TestAddPortAlreadyFavorited(t *testing.T) {

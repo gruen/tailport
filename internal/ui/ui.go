@@ -208,9 +208,18 @@ type refreshMsg struct {
 	ports  []portscan.Port
 	active map[int]bool
 	funnel map[int]int
-	fqdn   string
-	err    error
+	// auto marks a periodic-poll refresh (e40f), whose errors fade silently
+	// instead of raising a red toast every interval.
+	auto bool
+	err  error
 }
+
+// fqdnMsg carries the node's MagicDNS name, fetched once at startup and cached
+// (it's static for the session), keeping the heaviest call out of the poll.
+type fqdnMsg struct{ fqdn string }
+
+// refreshTickMsg fires on the periodic auto-refresh timer (e40f).
+type refreshTickMsg struct{}
 
 type toggleDoneMsg struct {
 	port int
@@ -378,8 +387,21 @@ func Run(cfg config.Config) error {
 	return err
 }
 
+// refreshInterval is how often the TUI re-reads serve/funnel state so changes
+// made outside the app (e.g. `tailscale serve` on the CLI) surface on their own
+// (e40f). The poll is cheap after the Status dedupe + FQDN cache: ss + one
+// serve-status call.
+const refreshInterval = 3 * time.Second
+
 func (m model) Init() tea.Cmd {
-	return refresh
+	// FQDN is fetched once (it's static for the session; see fetchFQDN); the
+	// periodic tick then only re-reads the cheap serve/funnel state.
+	return tea.Batch(refresh, fetchFQDN, refreshTick())
+}
+
+// refreshTick schedules the next auto-refresh.
+func refreshTick() tea.Cmd {
+	return tea.Tick(refreshInterval, func(time.Time) tea.Msg { return refreshTickMsg{} })
 }
 
 func refresh() tea.Msg {
@@ -387,7 +409,8 @@ func refresh() tea.Msg {
 	if err != nil {
 		return refreshMsg{err: err}
 	}
-	activeList, err := tsserve.ActivePorts()
+	// One serve-status fetch reconciles both serve and funnel (e40f dedupe).
+	activeList, funnel, err := tsserve.Status()
 	if err != nil {
 		return refreshMsg{err: err}
 	}
@@ -395,14 +418,24 @@ func refresh() tea.Msg {
 	for _, p := range activeList {
 		active[p] = true
 	}
-	funnel, err := tsserve.FunnelStatus()
-	if err != nil {
-		return refreshMsg{err: err}
-	}
-	// FQDN is best-effort: a failure here shouldn't blank the whole view, it
-	// only degrades the public URL to a hostless form, so the error is dropped.
+	return refreshMsg{ports: ports, active: active, funnel: funnel}
+}
+
+// autoRefresh is the periodic-poll variant: same read as refresh, but its
+// result is flagged so a transient poll failure fades silently instead of
+// nagging with a red toast every interval.
+func autoRefresh() tea.Msg {
+	msg, _ := refresh().(refreshMsg)
+	msg.auto = true
+	return msg
+}
+
+// fetchFQDN reads the node's MagicDNS name once; it's static for the session,
+// so it's kept out of the periodic poll (the heaviest call -- it walks the
+// netmap). Best-effort: an empty result just degrades public URLs to hostless.
+func fetchFQDN() tea.Msg {
 	fqdn, _ := tsserve.FQDN()
-	return refreshMsg{ports: ports, active: active, funnel: funnel, fqdn: fqdn}
+	return fqdnMsg{fqdn: fqdn}
 }
 
 func toggle(port int, turnOn bool) tea.Cmd {
@@ -697,15 +730,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshMsg:
 		if msg.err != nil {
+			if msg.auto {
+				return m, nil // periodic poll: fail silently, don't nag
+			}
 			return m, m.setErr(msg.err.Error())
 		}
 		m.allPorts = msg.ports
 		m.active = msg.active
 		m.funnel = msg.funnel
+		return m, m.rebuildItems()
+
+	case fqdnMsg:
 		if msg.fqdn != "" {
 			m.fqdn = msg.fqdn
 		}
-		return m, m.rebuildItems()
+		return m, nil
+
+	case refreshTickMsg:
+		// Always reschedule; poll only when idle so an auto-refresh never
+		// stomps an in-flight toggle/cleanup. State reconciliation reuses the
+		// same path as manual 'r', so it preserves selection.
+		if m.pending != 0 || m.cleaning != 0 {
+			return m, refreshTick()
+		}
+		return m, tea.Batch(autoRefresh, refreshTick())
 
 	case toggleDoneMsg:
 		m.pending = 0
