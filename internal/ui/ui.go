@@ -1121,8 +1121,13 @@ func (m model) renderViewIndicator() string {
 }
 
 // statusText is the human-readable status shown at the bottom: the current
-// operation while one is in flight, otherwise how many ports are exposed
-// right now (replacing the old opaque "[ready]").
+// operation while one is in flight, otherwise a multi-state breakdown of what
+// this machine is doing -- how many ports are listening locally, how many
+// tailport serves on the tailnet, and how many are funnelled to the public
+// internet. The single word "exposed" (which conflated serve forwards with
+// tailnet reachability) is qualified to "exposed on tailnet"; "public" is the
+// funnel count, real since yt69. It abbreviates on narrow terminals rather
+// than overflowing the line.
 func (m model) statusText() string {
 	switch {
 	case m.pending != 0:
@@ -1130,23 +1135,33 @@ func (m model) statusText() string {
 	case m.cleaning != 0:
 		return fmt.Sprintf("cleaning %d stale forward(s)...", m.cleaning)
 	}
-	n := 0
+
+	listening := len(m.allPorts)
+	tailnet := 0
 	for _, on := range m.active {
 		if on {
-			n++
+			tailnet++
 		}
 	}
-	where := ""
+	public := len(m.funnel)
+
+	full := fmt.Sprintf("%d listening · %d exposed on tailnet · %d public", listening, tailnet, public)
+	withHost := full
 	if m.host != "" {
-		where = " on " + m.host
+		withHost = full + " — " + m.host
 	}
-	switch n {
-	case 0:
-		return "no ports exposed" + where
-	case 1:
-		return "1 port exposed" + where
+	// Widest form that fits, degrading host -> shorter labels -> initials.
+	switch {
+	case m.width <= 0 || lipgloss.Width(withHost) <= m.width:
+		return withHost
+	case lipgloss.Width(full) <= m.width:
+		return full
 	default:
-		return fmt.Sprintf("%d ports exposed%s", n, where)
+		medium := fmt.Sprintf("%d listening · %d tailnet · %d public", listening, tailnet, public)
+		if lipgloss.Width(medium) <= m.width {
+			return medium
+		}
+		return fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 	}
 }
 

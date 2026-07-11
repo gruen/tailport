@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
@@ -217,6 +218,56 @@ func TestUpdateToggleKeys(t *testing.T) {
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if got := res.(model); got.pending != 0 {
 		t.Errorf("enter should not toggle; pending = %d, want 0", got.pending)
+	}
+}
+
+// TestStatusText covers k4ph's multi-state breakdown: listening (portscan
+// total), exposed on tailnet (served count), and public (funnel count), with
+// in-flight operation messages taking precedence and narrow terminals
+// degrading gracefully.
+func TestStatusText(t *testing.T) {
+	base := model{
+		host:     "host",
+		width:    120,
+		allPorts: []portscan.Port{{Number: 22}, {Number: 3000}, {Number: 8080}, {Number: 9000}, {Number: 5000}},
+		active:   map[int]bool{8080: true, 3000: true},
+		funnel:   map[int]int{9000: 443},
+	}
+
+	got := base.statusText()
+	for _, want := range []string{"5 listening", "2 exposed on tailnet", "1 public", "host"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("statusText = %q, want it to contain %q", got, want)
+		}
+	}
+
+	// Zero of everything reads cleanly, not "no ports".
+	empty := model{host: "host", width: 120}
+	if got := empty.statusText(); !strings.Contains(got, "0 listening · 0 exposed on tailnet · 0 public") {
+		t.Errorf("empty statusText = %q", got)
+	}
+
+	// In-flight operations take precedence over the breakdown.
+	pending := base
+	pending.pending = 8080
+	if got := pending.statusText(); got != "toggling :8080..." {
+		t.Errorf("pending statusText = %q, want the toggling message", got)
+	}
+	cleaning := base
+	cleaning.cleaning = 2
+	if got := cleaning.statusText(); !strings.Contains(got, "cleaning 2 stale") {
+		t.Errorf("cleaning statusText = %q", got)
+	}
+
+	// A narrow terminal abbreviates instead of overflowing.
+	narrow := base
+	narrow.width = 18
+	got = narrow.statusText()
+	if lipgloss.Width(got) > narrow.width {
+		t.Errorf("narrow statusText %q width %d exceeds %d", got, lipgloss.Width(got), narrow.width)
+	}
+	if !strings.Contains(got, "5") { // still conveys the listening count
+		t.Errorf("narrow statusText = %q, expected to keep the counts", got)
 	}
 }
 
