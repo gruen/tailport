@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,9 +24,54 @@ import (
 var (
 	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	favStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 )
+
+// keyMap describes every keybinding the TUI responds to, for the bubbles/help
+// legend. It satisfies help.KeyMap. Most bindings carry static help text;
+// ShowAll's Desc is refreshed on each render to reflect the current filter
+// mode (see model.renderLegend).
+type keyMap struct {
+	Toggle     key.Binding
+	NewPort    key.Binding
+	Label      key.Binding
+	Favorite   key.Binding
+	Unfavorite key.Binding
+	Lock       key.Binding
+	ShowAll    key.Binding
+	Refresh    key.Binding
+	Quit       key.Binding
+}
+
+// ShortHelp and FullHelp return the same flat list: the legend doesn't
+// distinguish a "short" vs "full" mode, it always shows every binding and
+// relies on width-based wrapping (see wrapBindings) instead of truncation.
+func (k keyMap) ShortHelp() []key.Binding {
+	return []key.Binding{
+		k.Toggle, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
+		k.Lock, k.ShowAll, k.Refresh, k.Quit,
+	}
+}
+
+func (k keyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{k.ShortHelp()}
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		Toggle:     key.NewBinding(key.WithKeys("enter", " "), key.WithHelp("enter", "toggle")),
+		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new port")),
+		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
+		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
+		Unfavorite: key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "unfavorite")),
+		Lock:       key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "lock/unlock")),
+		ShowAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
+		Refresh:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	}
+}
 
 type portItem struct {
 	port   portscan.Port
@@ -38,6 +85,10 @@ func (i portItem) Title() string {
 	if i.active {
 		marker = activeStyle.Render("●")
 	}
+	lock := ""
+	if i.meta.Locked {
+		lock = " " + lockStyle.Render("🔒")
+	}
 	star := ""
 	if i.meta.Favorite {
 		star = favStyle.Render("★") + " "
@@ -49,7 +100,7 @@ func (i portItem) Title() string {
 	if name == "" {
 		name = "?"
 	}
-	return fmt.Sprintf("%s :%d  %s%s", marker, i.port.Number, star, name)
+	return fmt.Sprintf("%s%s :%d  %s%s", marker, lock, i.port.Number, star, name)
 }
 
 func (i portItem) Description() string {
@@ -88,6 +139,8 @@ const (
 
 type model struct {
 	list    list.Model
+	help    help.Model
+	keys    keyMap
 	cfg     config.Config
 	host    string
 	showAll bool
@@ -133,7 +186,9 @@ func New(cfg config.Config) model {
 		cfg.Ports = map[int]config.PortMeta{}
 	}
 
-	return model{list: l, cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li}
+	h := help.New()
+
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li}
 }
 
 func Run(cfg config.Config) error {
@@ -192,7 +247,14 @@ func (m *model) remember(port int) {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.list.SetSize(msg.Width, msg.Height-2)
+		m.help.Width = msg.Width
+		legendLines := 1
+		if legend := m.renderLegend(); legend != "" {
+			legendLines = strings.Count(legend, "\n") + 1
+		}
+		// Reserve one row for the blank line separating the list from the
+		// legend, plus one more for the status line below it.
+		m.list.SetSize(msg.Width, msg.Height-legendLines-2)
 		return m, nil
 
 	case refreshMsg:
@@ -236,6 +298,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 					turnOn := !m.active[port]
+					if turnOn && m.cfg.Ports[port].Locked {
+						m.err = fmt.Errorf("port :%d is locked -- press x to unlock", port)
+						return m, nil
+					}
 					if turnOn {
 						m.remember(port)
 					}
@@ -323,7 +389,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if meta, ok := m.cfg.Ports[sel.port.Number]; ok {
 				meta.Favorite = false
-				if meta.Label == "" {
+				if meta.Label == "" && !meta.Locked {
 					delete(m.cfg.Ports, sel.port.Number)
 				} else {
 					m.cfg.Ports[sel.port.Number] = meta
@@ -334,6 +400,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildItems()
 			}
 			return m, nil
+		case "x":
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			if m.cfg.Ports == nil {
+				m.cfg.Ports = map[int]config.PortMeta{}
+			}
+			// Unlike "u", unlocking never deletes the registry entry: once
+			// a port has been locked (or explicitly unlocked), it stays
+			// "known" and visible in the default view, same as a port
+			// that's been toggled on at least once (see remember).
+			meta := m.cfg.Ports[sel.port.Number]
+			meta.Locked = !meta.Locked
+			m.cfg.Ports[sel.port.Number] = meta
+			if err := m.cfg.Save(); err != nil {
+				m.err = err
+			}
+			m.rebuildItems()
+			return m, nil
 		case "enter", " ":
 			if m.pending != 0 {
 				return m, nil // a toggle is already in flight
@@ -343,6 +429,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			turnOn := !sel.active
+			if turnOn && sel.meta.Locked {
+				m.err = fmt.Errorf("port :%d is locked -- press x to unlock", sel.port.Number)
+				return m, nil
+			}
 			if turnOn {
 				m.remember(sel.port.Number)
 			}
@@ -427,6 +517,65 @@ func (m *model) setItems(items []list.Item) {
 	}
 }
 
+// renderLegend renders the keybinding legend, wrapping onto additional
+// lines as needed to fit m.help.Width rather than truncating with an
+// ellipsis (bubbles/help's own ShortHelpView/FullHelpView only truncate,
+// they don't wrap, so the packing is done by hand in wrapBindings).
+func (m model) renderLegend() string {
+	keys := m.keys
+	filter := "filtered"
+	if m.showAll {
+		filter = "all ports"
+	}
+	keys.ShowAll.SetHelp("a", filter)
+	return wrapBindings(m.help.Styles, keys.ShortHelp(), m.help.Width, m.help.ShortSeparator)
+}
+
+// wrapBindings greedily packs "key desc" items onto lines, starting a new
+// line whenever the next item would overflow width (a width <= 0 means
+// unbounded, matching bubbles/help's own convention). This is what gives
+// the legend a stacked, multi-line layout in narrow terminals instead of
+// bubbles/help's default single-line-plus-ellipsis truncation.
+func wrapBindings(styles help.Styles, bindings []key.Binding, width int, sep string) string {
+	if len(bindings) == 0 {
+		return ""
+	}
+	renderedSep := styles.ShortSeparator.Inline(true).Render(sep)
+	sepWidth := lipgloss.Width(renderedSep)
+
+	var lines []string
+	var cur strings.Builder
+	curWidth := 0
+	for _, kb := range bindings {
+		if !kb.Enabled() {
+			continue
+		}
+		item := styles.ShortKey.Inline(true).Render(kb.Help().Key) + " " + styles.ShortDesc.Inline(true).Render(kb.Help().Desc)
+		itemWidth := lipgloss.Width(item)
+
+		addWidth := itemWidth
+		if curWidth > 0 {
+			addWidth += sepWidth
+		}
+		if width > 0 && curWidth > 0 && curWidth+addWidth > width {
+			lines = append(lines, cur.String())
+			cur.Reset()
+			curWidth = 0
+		}
+
+		if curWidth > 0 {
+			cur.WriteString(renderedSep)
+			curWidth += sepWidth
+		}
+		cur.WriteString(item)
+		curWidth += itemWidth
+	}
+	if cur.Len() > 0 {
+		lines = append(lines, cur.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m model) View() string {
 	var b string
 	if m.err != nil {
@@ -443,14 +592,13 @@ func (m model) View() string {
 		return b
 	}
 
-	filter := "filtered"
-	if m.showAll {
-		filter = "all ports"
-	}
 	status := "ready"
 	if m.pending != 0 {
 		status = fmt.Sprintf("toggling :%d...", m.pending)
 	}
-	b += "\n" + helpStyle.Render(fmt.Sprintf("enter: toggle  n: new port  l: label  f: favorite  u: unfavorite  a: %s  r: refresh  q: quit  [%s]", filter, status))
+	if legend := m.renderLegend(); legend != "" {
+		b += "\n" + legend
+	}
+	b += "\n" + helpStyle.Render(fmt.Sprintf("[%s]", status))
 	return b
 }

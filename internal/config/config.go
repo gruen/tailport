@@ -9,13 +9,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// PortMeta holds user-set metadata for a single port: a custom label
-// and/or favorite status. An entry existing in the registry (regardless
-// of its field values) means the port is "known" and should stay visible
-// in the default view even when nothing's currently listening on it.
+// PortMeta holds user-set metadata for a single port: a custom label,
+// favorite status, and/or lock state. An entry existing in the registry
+// (regardless of its field values) means the port is "known" and should
+// stay visible in the default view even when nothing's currently
+// listening on it.
 type PortMeta struct {
 	Label    string `yaml:"label,omitempty"`
 	Favorite bool   `yaml:"favorite,omitempty"`
+	// Locked blocks the port from being exposed via tailscale serve
+	// (toggled on) until explicitly unlocked. It never blocks toggling
+	// off, labeling, or favoriting.
+	Locked bool `yaml:"locked,omitempty"`
 }
 
 // Config is the persisted per-port registry.
@@ -23,9 +28,12 @@ type Config struct {
 	Ports map[int]PortMeta `yaml:"ports"`
 }
 
-// Default returns an empty registry: no ports are pre-known.
+// Default returns a registry seeded with port 22 (SSH) locked, so a
+// fresh install doesn't accidentally expose it via tailscale serve
+// before the user has looked at the tool. All other ports start
+// unregistered.
 func Default() Config {
-	return Config{Ports: map[int]PortMeta{}}
+	return Config{Ports: map[int]PortMeta{22: {Locked: true}}}
 }
 
 // Path returns the config file location, honoring XDG_CONFIG_HOME.
