@@ -220,17 +220,28 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 }
 
-// TestEmptyStateMessage covers the contextual empty-view text: it names the
-// current view so a blank list explains itself instead of showing "No items."
+// TestEmptyStateMessage covers the contextual empty-view text: both views
+// must lead with what tailport is and the commands that power it (ss/lsof,
+// tailscale serve), then name the current view.
 func TestEmptyStateMessage(t *testing.T) {
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
 
-	m.showAllPorts = false
-	if msg := m.emptyStateMessage(); !strings.Contains(msg, "Favorites") {
-		t.Errorf("favorites empty-state should mention Favorites; got %q", msg)
-	}
-	m.showAllPorts = true
-	if msg := m.emptyStateMessage(); !strings.Contains(msg, "listening") {
-		t.Errorf("all-ports empty-state should mention listening; got %q", msg)
+	for _, all := range []bool{false, true} {
+		m.showAllPorts = all
+		msg := m.emptyStateMessage()
+		// Leads with the tool + its underlying commands, in both views.
+		for _, want := range []string{"tailport", "tailscale serve", "ss", "lsof"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("showAllPorts=%v: empty-state should mention %q; got %q", all, want, msg)
+			}
+		}
+		// Then the view-specific hint.
+		wantView := "Favorites"
+		if all {
+			wantView = "listening"
+		}
+		if !strings.Contains(msg, wantView) {
+			t.Errorf("showAllPorts=%v: empty-state should mention %q; got %q", all, wantView, msg)
+		}
 	}
 }

@@ -32,6 +32,11 @@ var (
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
 	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
+	// The two segments of the Favorites|All-ports view indicator: the active
+	// view is a filled green chip, the inactive one is dim.
+	viewActiveStyle   = lipgloss.NewStyle().Background(lipgloss.Color("42")).Foreground(lipgloss.Color("233")).Bold(true)
+	viewInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
 // keyMap describes every keybinding the TUI responds to, for the bubbles/help
@@ -177,6 +182,10 @@ type model struct {
 	// it's open the overlay replaces the whole view and swallows every key
 	// except the ?/esc/q that dismiss it.
 	showHelp bool
+	// height is the terminal height from the last WindowSizeMsg, used to pin
+	// the bottom bar (view indicator, status, shortcuts) to the last rows of
+	// the viewport regardless of how short the body is.
+	height int
 
 	allPorts []portscan.Port
 	active   map[int]bool
@@ -357,12 +366,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.help.Width = msg.Width
+		m.height = msg.Height
 		legendLines := 1
 		if legend := m.renderLegend(); legend != "" {
 			legendLines = strings.Count(legend, "\n") + 1
 		}
-		// Reserve one row for the blank line separating the list from the
-		// legend, plus one more for the status line below it.
+		// Reserve the bottom bar: one blank separator, the view-indicator/
+		// status line, and the wrapped shortcuts legend. View then pads the
+		// gap so the bar lands on the last rows (see renderBottom).
 		m.list.SetSize(msg.Width, msg.Height-legendLines-2)
 		return m, nil
 
@@ -732,11 +743,9 @@ func selectIndexForPort(numbers []int, target int) int {
 // they don't wrap, so the packing is done by hand in wrapBindings).
 func (m model) renderLegend() string {
 	keys := m.keys
-	view := "favorites"
-	if m.showAllPorts {
-		view = "all ports"
-	}
-	keys.ShowAll.SetHelp("a", view)
+	// The active view is shown by the segmented indicator (renderViewIndicator),
+	// so "a" is just labeled with its action.
+	keys.ShowAll.SetHelp("a", "switch view")
 	// "clean stale" only makes sense when there's something stale to clean;
 	// wrapBindings skips disabled bindings, so it drops out otherwise.
 	keys.Clean.SetEnabled(m.hasDangling())
@@ -842,22 +851,114 @@ func (m model) helpView() string {
 // bare "No items." -- most important on a fresh install, where the default
 // Favorites view is empty until the user favorites something.
 func (m model) emptyStateMessage() string {
-	if m.showAllPorts {
-		return "No TCP ports are listening on this machine right now.\n\n" +
-			"Start a local server (a dev server, database, and so on), then\n" +
-			"press r to refresh. Press ? for help."
+	// Lead with what the tool is and the commands that power it -- an empty
+	// view is often a user's first screen, so it should explain tailport
+	// before it explains why this particular list is empty.
+	//
+	// Each line is assembled from single-line styled spans and joined with
+	// "\n" OUTSIDE any Render call: passing a multi-line string to Render
+	// would block-pad the shorter lines with background spaces.
+	k := helpKeyStyle.Render
+	t := helpTextStyle.Render
+
+	lines := []string{
+		t("tailport exposes your machine's listening TCP ports to your tailnet."),
+		t("It discovers them with ") + k("ss") + t(" (Linux) / ") + k("lsof") + t(" (macOS), and turns"),
+		t("each one on or off with ") + k("tailscale serve --http=<port>") + t(" -- tailnet-only,"),
+		t("plain HTTP, same port in and out, never ") + k("tailscale funnel") + t("."),
+		"",
 	}
-	return "No favorite ports yet -- this is your Favorites view.\n\n" +
-		"Favorites (" + favStyle.Render("★") + ") are a shortlist you curate: they stay here across\n" +
-		"restarts even when the process isn't running.\n\n" +
-		"Press " + helpKeyStyle.Render("a") + " to switch to All ports (everything listening now),\n" +
-		"then " + helpKeyStyle.Render("f") + " to favorite one. Press " + helpKeyStyle.Render("?") + " for help."
+	if m.showAllPorts {
+		lines = append(lines,
+			t("Nothing is listening on this machine right now. Start a local"),
+			t("server, then press ")+k("r")+t(" to refresh. Press ")+k("?")+t(" for help."),
+		)
+		return helpTitleStyle.Render("All ports") + "\n\n" + strings.Join(lines, "\n")
+	}
+	lines = append(lines,
+		t("This is your Favorites view, and you haven't favorited anything yet."),
+		t("Favorites (")+favStyle.Render("★")+t(") are a shortlist that persists across restarts,"),
+		t("even when the process isn't running. Press ")+k("a")+t(" for All ports, then ")+k("f"),
+		t("to favorite one. Press ")+k("?")+t(" for help."),
+	)
+	return helpTitleStyle.Render("Favorites") + "\n\n" + strings.Join(lines, "\n")
 }
 
-// renderEmptyState renders the title plus emptyStateMessage in place of the
-// list body when the current view has no items.
+// renderEmptyState renders the empty-view explanation in place of the list
+// body when the current view has no items.
 func (m model) renderEmptyState() string {
-	return helpTitleStyle.Render("tailport") + "\n\n" + helpTextStyle.Render(m.emptyStateMessage())
+	return m.emptyStateMessage()
+}
+
+// renderViewIndicator renders the Favorites | All-ports segmented control,
+// with the active view as a filled chip so it's unmistakable which one "a"
+// is currently showing.
+func (m model) renderViewIndicator() string {
+	fav, all := " Favorites ", " All ports "
+	if m.showAllPorts {
+		return viewInactiveStyle.Render(fav) + viewActiveStyle.Render(all)
+	}
+	return viewActiveStyle.Render(fav) + viewInactiveStyle.Render(all)
+}
+
+// statusText is the human-readable status shown at the bottom: the current
+// operation while one is in flight, otherwise how many ports are exposed
+// right now (replacing the old opaque "[ready]").
+func (m model) statusText() string {
+	switch {
+	case m.pending != 0:
+		return fmt.Sprintf("toggling :%d...", m.pending)
+	case m.cleaning != 0:
+		return fmt.Sprintf("cleaning %d stale forward(s)...", m.cleaning)
+	}
+	n := 0
+	for _, on := range m.active {
+		if on {
+			n++
+		}
+	}
+	where := ""
+	if m.host != "" {
+		where = " on " + m.host
+	}
+	switch n {
+	case 0:
+		return "no ports exposed" + where
+	case 1:
+		return "1 port exposed" + where
+	default:
+		return fmt.Sprintf("%d ports exposed%s", n, where)
+	}
+}
+
+// renderBottom builds the bottom bar. In a modal entry mode it's the prompt
+// for that flow; otherwise it's the view indicator + status on one line, with
+// the shortcuts legend on the last row(s). View pins whatever this returns to
+// the bottom of the viewport.
+func (m model) renderBottom() string {
+	switch m.mode {
+	case entryAddPort:
+		return helpStyle.Render("expose port: ") + m.portInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
+	case entryLabel:
+		return helpStyle.Render(fmt.Sprintf("label :%d: ", m.labelPort)) + m.labelInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
+	case entryConfirmClean:
+		targets := make([]string, len(m.cleanTargets))
+		for i, p := range m.cleanTargets {
+			targets[i] = strconv.Itoa(p)
+		}
+		return helpStyle.Render(fmt.Sprintf("tear down forwards on :%s? ", strings.Join(targets, ", :"))) + helpStyle.Render("(y: confirm, any other key: cancel)")
+	case entryConfirm22:
+		action := "expose :22 (SSH) via tailscale serve"
+		if !m.confirmTurnOn {
+			action = "stop serving :22 (SSH) -- this can drop your live session"
+		}
+		return warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
+	}
+	bar := m.renderViewIndicator() + "   " + helpStyle.Render(m.statusText())
+	if legend := m.renderLegend(); legend != "" {
+		bar += "\n" + legend
+	}
+	return bar
 }
 
 func (m model) View() string {
@@ -865,54 +966,28 @@ func (m model) View() string {
 		return m.helpView()
 	}
 
-	var b string
+	// Body: the list, or -- when the current view itself is empty (no
+	// favorites, or nothing listening), as opposed to a "/" filter that
+	// matched nothing (Items() still populated) -- a contextual explanation
+	// instead of bubbles/list's bare "No items.".
+	var body string
 	if m.err != nil {
-		b += errStyle.Render("error: "+m.err.Error()) + "\n"
+		body += errStyle.Render("error: "+m.err.Error()) + "\n"
 	}
-	// An empty Items() means the current view itself has nothing (no
-	// favorites, or nothing listening) -- as opposed to a "/" filter that
-	// matched nothing, where Items() is still populated. In the former case
-	// bubbles/list would just print a bare "No items."; render a contextual
-	// explanation of what the view is and how to get somewhere instead.
 	if len(m.list.Items()) == 0 && m.list.FilterState() != list.Filtering {
-		b += m.renderEmptyState()
+		body += m.renderEmptyState()
 	} else {
-		b += m.list.View()
+		body += m.list.View()
 	}
 
-	switch m.mode {
-	case entryAddPort:
-		b += "\n" + helpStyle.Render("expose port: ") + m.portInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
-		return b
-	case entryLabel:
-		b += "\n" + helpStyle.Render(fmt.Sprintf("label :%d: ", m.labelPort)) + m.labelInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
-		return b
-	case entryConfirmClean:
-		targets := make([]string, len(m.cleanTargets))
-		for i, p := range m.cleanTargets {
-			targets[i] = strconv.Itoa(p)
-		}
-		b += "\n" + helpStyle.Render(fmt.Sprintf("tear down forwards on :%s? ", strings.Join(targets, ", :"))) + helpStyle.Render("(y: confirm, any other key: cancel)")
-		return b
-	case entryConfirm22:
-		action := "expose :22 (SSH) via tailscale serve"
-		if !m.confirmTurnOn {
-			action = "stop serving :22 (SSH) -- this can drop your live session"
-		}
-		b += "\n" + warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
-		return b
+	// Pin the bottom bar (shortcuts, view indicator, status -- or a modal
+	// prompt) to the last rows of the viewport by padding the gap. Before the
+	// first WindowSizeMsg (m.height == 0) this falls back to a single blank
+	// separator line.
+	bottom := m.renderBottom()
+	gap := m.height - lipgloss.Height(body) - lipgloss.Height(bottom)
+	if gap < 1 {
+		gap = 1
 	}
-
-	status := "ready"
-	if m.pending != 0 {
-		status = fmt.Sprintf("toggling :%d...", m.pending)
-	}
-	if m.cleaning != 0 {
-		status = fmt.Sprintf("cleaning %d stale forwards...", m.cleaning)
-	}
-	if legend := m.renderLegend(); legend != "" {
-		b += "\n" + legend
-	}
-	b += "\n" + helpStyle.Render(fmt.Sprintf("[%s]", status))
-	return b
+	return body + strings.Repeat("\n", gap) + bottom
 }
