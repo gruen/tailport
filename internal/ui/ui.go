@@ -1506,9 +1506,8 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 			if half > 0 {
 				rel = float64(x-cx) / float64(half)
 			}
-			br := eggShade(rel, float64(frame))
-			ch := eggChars[int(br*float64(len(eggChars)-1)+0.5)]
-			st := lipgloss.NewStyle().Foreground(eggRampColor(br)).Bold(true)
+			ch, col := eggCell(x, y, h, rel, float64(frame))
+			st := lipgloss.NewStyle().Foreground(col).Bold(true)
 			b.WriteString(st.Render(string(ch)))
 		}
 		out[y] = b.String()
@@ -1520,43 +1519,106 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 // picks the glyph, gold hue reinforces it (eggRampColor).
 var eggChars = []rune{'░', '▒', '▓', '█'}
 
-// eggShade returns the brightness in [0,1] at a normalised horizontal position
-// rel in [-1,1] (left edge .. right edge of the row). The look is a key light
-// from the upper-left plus a specular glint that EASES back and forth over a
-// small left-of-centre arc -- the frames-32..36 motion picked from the study,
-// so the highlight breathes in place instead of orbiting the egg. The light
-// azimuth ITSELF sways a hair on the same breath, so the shadow-side terminator
-// drifts too and the right side isn't dead static. One shared cosine drives
-// both, giving zero velocity at each extreme (ease-in-out) and keeping the
-// highlight and shadow coherent (light leans left -> shadow deepens right).
-func eggShade(rel, frame float64) float64 {
+// eggCell returns the glyph and colour for one cell of the egg, at a
+// normalised horizontal position rel in [-1,1] (left edge .. right edge of the
+// row), for row y of rows total. The look composes three parts:
+//
+//   - Body: a broad gold gradient whose midtones carry well to the right (a
+//     "chrome" body), lit from just left of centre.
+//   - Glint: a specular highlight that EASES back and forth over a small
+//     left-of-centre arc (the frames-32..36 motion picked from the study), so
+//     it breathes in place rather than orbiting. Both body and glint use the
+//     same shared cosine breath (ease-in-out: zero velocity at each extreme).
+//   - Shimmer: a facing-weighted micro-sparkle -- a subtle metallic flake plus
+//     rare bright "pops" -- densest over the belly (where the shell faces the
+//     viewer) and fading to nothing at the silhouette, so the jewelling sits on
+//     the 3D curve instead of sprinkling flat.
+func eggCell(x, y, rows int, rel, frame float64) (rune, lipgloss.Color) {
 	if rel < -1 {
 		rel = -1
 	} else if rel > 1 {
 		rel = 1
 	}
 	const (
-		omega    = 0.28  // ~2.2s per full back-and-forth at 100ms/frame
-		lightMid = -0.5  // key light, upper-left
-		lightAmp = 0.077 // shadow terminator sway: a whisper (~a 4-frame-worth
-		//                    of travel), so the dark side breathes without the
-		//                    high-contrast shadow reading as too fast/aggressive
-		gMid = -0.9215 // midpoint of the frame 32..36 glint arc
-		gAmp = 0.2725  // half its span
+		omega    = 0.28    // ~2.2s per full breath at 100ms/frame
+		fillAmp  = 0.40    // body midtone strength (carries right)
+		fillAz   = -0.2    // body lit just left of centre
+		ambient  = 0.16    // shadow-side floor
+		gMid     = -0.9215 // midpoint of the frame 32..36 glint arc
+		gAmp     = 0.2725  // half its span
+		glintAmp = 0.62    // specular strength
+		shimAmp  = 0.28    // subtle flake brightness
+		popThr   = 0.66    // subtle: rare bright pops
 	)
 	breath := math.Cos(frame * omega)
 	lon := math.Asin(rel) // -pi/2 .. pi/2 across the row
-	lightAz := lightMid + lightAmp*breath
-	base := math.Max(0, math.Cos(lon-lightAz))
+	fill := fillAmp * math.Max(0, math.Cos(lon-fillAz))
 	g := gMid + gAmp*breath
 	glint := math.Exp(-math.Pow((lon-g)/0.33, 2))
-	br := 0.16 + 0.5*base + 0.72*glint
-	if br < 0 {
-		br = 0
-	} else if br > 1 {
-		br = 1
+	br := eggClamp01(ambient + fill + glintAmp*glint)
+
+	// Facing-weighted micro-shimmer: flake lifts the body a touch, a rare pop
+	// flashes a near-white diamond. Both scale with how much the cell faces the
+	// viewer, so they crowd the belly and vanish at the rim.
+	nz := eggFacing(rel, y, rows)
+	ph := eggCellPhase(x, y)
+	br = eggClamp01(br + eggTwinkle(frame, ph, 0.7, 3)*nz*shimAmp)
+	if eggTwinkle(frame, ph+2.0, 0.5, 12)*nz > popThr {
+		return '█', lipgloss.Color("#fffbec") // diamond pop
 	}
-	return br
+
+	idx := int(br*float64(len(eggChars)-1) + 0.5)
+	if idx < 0 {
+		idx = 0
+	} else if idx > len(eggChars)-1 {
+		idx = len(eggChars) - 1
+	}
+	return eggChars[idx], eggRampColor(br)
+}
+
+func eggClamp01(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+// eggFacing approximates how much a cell's surface faces the viewer -- 1 at the
+// belly centre, easing to 0 at the silhouette -- from its horizontal (rel) and
+// vertical (row y of rows) position on the egg. Used to weight the shimmer onto
+// the 3D curve.
+func eggFacing(rel float64, y, rows int) float64 {
+	nx := rel
+	ny := 0.0
+	if rows > 1 {
+		ny = (0.5 - float64(y)/float64(rows-1)) * 2 * 0.85
+	}
+	v := 1 - nx*nx - ny*ny*0.7
+	if v < 0 {
+		return 0
+	}
+	return math.Sqrt(v)
+}
+
+// eggTwinkle is a sharp positive lobe: sin(...) rectified and raised to a power,
+// so higher sharp -> rarer, briefer flashes. Drives the shimmer flake and pops.
+func eggTwinkle(frame, phase, speed, sharp float64) float64 {
+	s := math.Sin(frame*speed + phase)
+	if s < 0 {
+		return 0
+	}
+	return math.Pow(s, sharp)
+}
+
+// eggCellPhase is a deterministic per-cell phase in [0,2π) so each cell twinkles
+// on its own offset (no visible seams or waves), stable across frames.
+func eggCellPhase(x, y int) float64 {
+	s := uint32(x)*374761393 + uint32(y)*668265263
+	s = (s ^ (s >> 13)) * 1274126177
+	return float64(s%6283) / 1000
 }
 
 // eggRampColor maps brightness in [0,1] to a gold gradient: deep bronze in
