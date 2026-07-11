@@ -185,6 +185,34 @@ above — no daemon, no config beyond the YAML file, and nothing is installed
 or modified system-wide other than the `serve` mappings you toggle
 yourself.
 
+## Troubleshooting
+
+### "exposed, nothing listening" (a dangling forward)
+
+A row marked `▲` / `🪹` means the `serve` mapping is up but no local process
+holds the port. Two common cases:
+
+- **The app just isn't running** (it died, or hasn't started). Start it, or
+  un-expose the port — `space` on the row, or `C` to clear all stale forwards.
+  The mapping deliberately outlives the app so you can restart it freely, so
+  tailport won't tear it down for you.
+- **The app can't start with "address already in use."** When you serve
+  `:8025`, tailscaled binds your **tailnet IP** on `:8025`. If your app then
+  tries to bind `0.0.0.0:8025` (all interfaces), that collides and the app
+  fails to start — so the forward dangles. The mapping meant to expose the app
+  is what's blocking it.
+
+  The fix is to bind the app to **loopback**, which is what `serve` proxies to
+  anyway:
+
+  ```sh
+  mailpit --listen 127.0.0.1:8025      # e.g. — bind 127.0.0.1, not 0.0.0.0
+  ```
+
+  This both resolves the collision and keeps the app off your LAN — it's
+  reachable only over the tailnet, through `serve`. If you genuinely need the
+  app on `0.0.0.0:<port>`, un-expose the port first (`space`, or `C`).
+
 ## Development
 
 Build and test locally with the standard Go toolchain:

@@ -1511,6 +1511,31 @@ func TestMarkerGlyph(t *testing.T) {
 	}
 }
 
+// TestDanglingDescription covers km8x: a served-but-not-listening row explains
+// itself -- names the loopback target and the un-expose key -- while healthy and
+// not-exposed rows keep their plain descriptions.
+func TestDanglingDescription(t *testing.T) {
+	dangling := portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"}
+	got := stripANSI(dangling.Description())
+	for _, want := range []string{"127.0.0.1:8025", "loopback", "space"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("dangling description %q should mention %q", got, want)
+		}
+	}
+
+	// Healthy serve: the tailnet URL, no scary hint.
+	healthy := portItem{port: portscan.Port{Number: 8025}, active: true, listening: true, host: "host"}
+	if got := stripANSI(healthy.Description()); got != "http://host:8025" {
+		t.Errorf("healthy description = %q, want the tailnet URL", got)
+	}
+
+	// Not exposed: unchanged.
+	idle := portItem{port: portscan.Port{Number: 8025}}
+	if got := idle.Description(); got != "not exposed" {
+		t.Errorf("idle description = %q, want %q", got, "not exposed")
+	}
+}
+
 // TestWasName covers znrg: the Title name precedence -- label > live process >
 // remembered "was <name>" (italic) > "?".
 func TestWasName(t *testing.T) {

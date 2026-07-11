@@ -238,7 +238,14 @@ func (i portItem) Description() string {
 	}
 	if i.active {
 		if !i.listening {
-			return warnStyle.Render("exposed, nothing listening")
+			// Dangling forward: served, but nothing is on the loopback target.
+			// The usual cause is the app binding 0.0.0.0:<port>, which collides
+			// with tailscaled's tailnet-IP serve listener on the same port -- so
+			// point at the fix (bind loopback) and the un-expose key (space acts
+			// on this row; C batch-cleans all stale). Full story in ? help / README.
+			return warnStyle.Render(fmt.Sprintf(
+				"nothing on 127.0.0.1:%d — bind app to loopback, or space to un-expose",
+				i.port.Number))
 		}
 		return fmt.Sprintf("http://%s:%d", i.host, i.port.Number)
 	}
@@ -1959,6 +1966,14 @@ func (m model) helpView() string {
 	b.WriteString(warnStyle.Render(
 		"Toggling port :22 (SSH) asks for a y/n confirmation first, in both\n" +
 			"directions — turning serve off for :22 can drop your live SSH session."))
+	b.WriteString("\n\n")
+	b.WriteString(helpTextStyle.Render(
+		"A served port showing \"nothing listening\" is a dangling forward: the\n" +
+			"serve mapping is up but no local process holds it. If your app won't\n" +
+			"start with \"address already in use\", it's binding 0.0.0.0:<port>, which\n" +
+			"collides with tailscale's serve listener on that port — bind it to\n" +
+			"127.0.0.1:<port> instead (what serve proxies to, and not exposed on your\n" +
+			"LAN). Or un-expose the port first: space on the row, or C to clear all."))
 	b.WriteString("\n\n")
 	for _, line := range configSaveLines(m.configPath) {
 		b.WriteString(helpTextStyle.Render(line) + "\n")
