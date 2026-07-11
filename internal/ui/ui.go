@@ -33,6 +33,10 @@ var (
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
 	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 
+	// logoStyle draws the persistent cyan "tailport" wordmark pinned to the
+	// top-left of every view (list and empty-state alike); see renderHeader.
+	logoStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
+
 	// The two segments of the Favorites|All-ports view indicator: the active
 	// view is a filled green chip, the inactive one is dim.
 	viewActiveStyle   = lipgloss.NewStyle().Background(lipgloss.Color("42")).Foreground(lipgloss.Color("233")).Bold(true)
@@ -182,9 +186,11 @@ type model struct {
 	// it's open the overlay replaces the whole view and swallows every key
 	// except the ?/esc/q that dismiss it.
 	showHelp bool
-	// height is the terminal height from the last WindowSizeMsg, used to pin
-	// the bottom bar (view indicator, status, shortcuts) to the last rows of
-	// the viewport regardless of how short the body is.
+	// width and height are the terminal dimensions from the last
+	// WindowSizeMsg. height pins the bottom bar (status, shortcuts) to the
+	// last rows of the viewport regardless of how short the body is; width
+	// right-justifies the view toggle in the top header (see renderHeader).
+	width  int
 	height int
 
 	allPorts []portscan.Port
@@ -207,7 +213,10 @@ func New(cfg config.Config) model {
 	host, _ := os.Hostname()
 
 	l := list.New(nil, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "tailport"
+	// The "tailport" wordmark now lives in View()'s persistent header
+	// (renderHeader), drawn above both the list and the empty state, so the
+	// list's own built-in title is turned off to avoid rendering it twice.
+	l.SetShowTitle(false)
 	l.SetShowHelp(false)
 
 	ti := textinput.New()
@@ -366,15 +375,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.help.Width = msg.Width
+		m.width = msg.Width
 		m.height = msg.Height
 		legendLines := 1
 		if legend := m.renderLegend(); legend != "" {
 			legendLines = strings.Count(legend, "\n") + 1
 		}
-		// Reserve the bottom bar: one blank separator, the view-indicator/
-		// status line, and the wrapped shortcuts legend. View then pads the
-		// gap so the bar lands on the last rows (see renderBottom).
-		m.list.SetSize(msg.Width, msg.Height-legendLines-2)
+		// Reserve the persistent top header (one row) plus the bottom bar: one
+		// blank separator, the status line, and the wrapped shortcuts legend.
+		// View then pads the gap so the bar lands on the last rows (see
+		// renderHeader / renderBottom).
+		headerLines := lipgloss.Height(m.renderHeader())
+		m.list.SetSize(msg.Width, msg.Height-headerLines-legendLines-2)
 		return m, nil
 
 	case refreshMsg:
@@ -890,6 +902,22 @@ func (m model) renderEmptyState() string {
 	return m.emptyStateMessage()
 }
 
+// renderHeader draws the persistent top header: the cyan "tailport" wordmark
+// pinned top-left and the Favorites|All-ports toggle right-aligned on the same
+// row, spanning the terminal width. View() draws it above both the list body
+// and the empty state, so the logo never disappears when a view is empty or
+// when switching views. Before the first WindowSizeMsg (width == 0) the two
+// fall back to a single-space separation.
+func (m model) renderHeader() string {
+	logo := logoStyle.Render("tailport")
+	toggle := m.renderViewIndicator()
+	gap := m.width - lipgloss.Width(logo) - lipgloss.Width(toggle)
+	if gap < 1 {
+		gap = 1 // too narrow to justify; keep at least a space (may wrap)
+	}
+	return logo + strings.Repeat(" ", gap) + toggle
+}
+
 // renderViewIndicator renders the Favorites | All-ports segmented control,
 // with the active view as a filled chip so it's unmistakable which one "a"
 // is currently showing.
@@ -932,9 +960,10 @@ func (m model) statusText() string {
 }
 
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
-// for that flow; otherwise it's the view indicator + status on one line, with
-// the shortcuts legend on the last row(s). View pins whatever this returns to
-// the bottom of the viewport.
+// for that flow; otherwise it's the status line, with the shortcuts legend on
+// the last row(s). The Favorites|All-ports toggle lives in the top header
+// (renderHeader), not here. View pins whatever this returns to the bottom of
+// the viewport.
 func (m model) renderBottom() string {
 	switch m.mode {
 	case entryAddPort:
@@ -954,7 +983,7 @@ func (m model) renderBottom() string {
 		}
 		return warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
 	}
-	bar := m.renderViewIndicator() + "   " + helpStyle.Render(m.statusText())
+	bar := helpStyle.Render(m.statusText())
 	if legend := m.renderLegend(); legend != "" {
 		bar += "\n" + legend
 	}
@@ -965,6 +994,10 @@ func (m model) View() string {
 	if m.showHelp {
 		return m.helpView()
 	}
+
+	// Persistent top header (logo + view toggle), drawn above both the list
+	// and the empty state so the wordmark never disappears.
+	header := m.renderHeader()
 
 	// Body: the list, or -- when the current view itself is empty (no
 	// favorites, or nothing listening), as opposed to a "/" filter that
@@ -980,14 +1013,13 @@ func (m model) View() string {
 		body += m.list.View()
 	}
 
-	// Pin the bottom bar (shortcuts, view indicator, status -- or a modal
-	// prompt) to the last rows of the viewport by padding the gap. Before the
-	// first WindowSizeMsg (m.height == 0) this falls back to a single blank
-	// separator line.
+	// Pin the bottom bar (shortcuts, status -- or a modal prompt) to the last
+	// rows of the viewport by padding the gap. Before the first WindowSizeMsg
+	// (m.height == 0) this falls back to a single blank separator line.
 	bottom := m.renderBottom()
-	gap := m.height - lipgloss.Height(body) - lipgloss.Height(bottom)
+	gap := m.height - lipgloss.Height(header) - lipgloss.Height(body) - lipgloss.Height(bottom)
 	if gap < 1 {
 		gap = 1
 	}
-	return body + strings.Repeat("\n", gap) + bottom
+	return header + "\n" + body + strings.Repeat("\n", gap) + bottom
 }

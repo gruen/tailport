@@ -220,6 +220,37 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 }
 
+// TestHeader covers ttny: the cyan "tailport" wordmark and the Favorites|All
+// toggle live in one persistent top header, drawn above both the list and the
+// empty state -- so the logo survives an empty view -- and the toggle no
+// longer appears in the bottom bar.
+func TestHeader(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.width = 80
+	m.height = 24
+
+	header := m.renderHeader()
+	if !strings.Contains(header, "tailport") {
+		t.Errorf("header should contain the logo; got %q", header)
+	}
+	for _, seg := range []string{"Favorites", "All ports"} {
+		if !strings.Contains(header, seg) {
+			t.Errorf("header should contain view toggle segment %q; got %q", seg, header)
+		}
+	}
+
+	// Empty favorites view (fresh config): the whole View still leads with the
+	// logo, even though the body is the empty-state message, not the list.
+	if got := m.View(); !strings.Contains(got, "tailport") {
+		t.Error("empty-state View should still contain the persistent logo")
+	}
+
+	// The toggle moved to the header, so the bottom bar must not duplicate it.
+	if bottom := m.renderBottom(); strings.Contains(bottom, "Favorites") || strings.Contains(bottom, "All ports") {
+		t.Errorf("bottom bar should not contain the view toggle; got %q", bottom)
+	}
+}
+
 // TestEmptyStateMessage covers the contextual empty-view text: both views
 // must lead with what tailport is and the commands that power it (ss/lsof,
 // tailscale serve), then name the current view.
