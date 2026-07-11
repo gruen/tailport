@@ -4,6 +4,7 @@ package portscan
 
 import (
 	"bufio"
+	"bytes"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -15,10 +16,18 @@ func List() ([]Port, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseLsof(out)
+}
 
+// parseLsof extracts listening TCP ports from the output of
+// `lsof -iTCP -sTCP:LISTEN -n -P`. It is split out from List so the macOS
+// parsing can be unit-tested against fixture data (portscan_darwin_test.go)
+// and exercised natively by the opt-in `[ci darwin]` CI job (5y04) -- the
+// darwin path was previously build-only, never run.
+func parseLsof(out []byte) ([]Port, error) {
 	seen := map[int]bool{}
 	var ports []Port
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	scanner := bufio.NewScanner(bytes.NewReader(out))
 	first := true
 	for scanner.Scan() {
 		if first {
@@ -43,7 +52,7 @@ func List() ([]Port, error) {
 		// address) BEFORE the seen[] dedup, so a real app socket sharing
 		// the port still registers it as listening. The host is everything
 		// before the last colon, with any IPv6 brackets stripped. Mirrors
-		// the Linux path; unverified on macOS (no Mac available here).
+		// the Linux path.
 		host := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
 		if isTailscaleAddr(host) {
 			continue

@@ -1,0 +1,38 @@
+name: darwin-tests
+
+# Opt-in macOS job: exercises the `lsof` port-discovery path (internal/portscan)
+# on a native Apple-Silicon runner. macOS minutes are pricey, so it runs ONLY
+# when explicitly asked -- either a pushed commit whose message contains the
+# literal token `[ci darwin]`, or a manual run from the Actions tab
+# (workflow_dispatch). A normal push does NOT start it.
+#
+# Note: the `[ci darwin]` gate reads github.event.head_commit.message, which is
+# populated on PUSH events (not pull_request). Trigger it on a branch push or
+# via manual dispatch.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  darwin:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci darwin]') }}
+    runs-on: macos-14 # Apple Silicon / arm64 -- matches the darwin/arm64 fleet target
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        # Runs natively on macOS, so the darwin-tagged tests in
+        # internal/portscan (parseLsof fixtures + the real-lsof List() smoke
+        # test) actually execute -- the whole reason this job exists.
+        run: go test ./...

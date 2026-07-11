@@ -170,6 +170,38 @@ above — no daemon, no config beyond the YAML file, and nothing is installed
 or modified system-wide other than the `serve` mappings you toggle
 yourself.
 
+## Development
+
+Build and test locally with the standard Go toolchain:
+
+```sh
+go build ./...
+go vet ./...
+go test ./...
+```
+
+### CI and the macOS `lsof` path
+
+Port discovery is OS-specific: Linux uses `ss`, macOS uses `lsof` (see
+[How it works](#how-it-works)). The default CI runs on Linux, so the macOS
+`lsof` code path in `internal/portscan` is built when cross-compiling but is
+**not executed** there.
+
+To keep pricey macOS runner minutes opt-in, the macOS-specific tests run on a
+native Apple-Silicon runner only when you ask for them, via
+[`darwin-tests.yml`](.github/workflows/darwin-tests.yml):
+
+- **Include `[ci darwin]` in a commit message** and push — the macOS job runs
+  `go build/vet/test` on `macos-14`, so the darwin-tagged tests in
+  `internal/portscan` (the `parseLsof` fixtures and the real-`lsof` `List()`
+  smoke test) actually execute.
+- Or trigger it manually from the repository's **Actions** tab
+  (`workflow_dispatch`).
+
+A push **without** the `[ci darwin]` token does not start the macOS job. The
+token is read from the pushed commit message, so use a branch push or manual
+dispatch (it is not evaluated for pull-request events).
+
 ## License
 
 [MIT](./LICENSE)

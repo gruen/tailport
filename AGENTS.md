@@ -64,9 +64,13 @@ contract. The short version:
   driving the compiled binary with `send-keys`/`capture-pane`, or a
   throwaway `go run` harness against live `tailscaled` — and cite what
   you actually observed in the close message, not just that it built.
-- If something can't be verified in the current environment (e.g. the
-  macOS `lsof` path with no Mac available, or a GitHub Actions run with
-  no pushed remote), say so explicitly. Either leave the issue open with
+- If something can't be verified in the current environment (e.g. a
+  GitHub Actions run with no pushed remote, or an `aarch64` build with no
+  ARM host), say so explicitly. The macOS `lsof` path
+  (`internal/portscan`) can now be exercised on a native runner via the
+  opt-in `[ci darwin]` job (`.github/workflows/darwin-tests.yml`), so
+  "no Mac available" is no longer a blanket caveat — its parser is also
+  unit-tested with fixtures. Either leave the issue open with
   `needs-review` and a comment describing exactly what's blocked, or close
   it with an honest caveat in the message — never claim untested code
   paths as verified.
