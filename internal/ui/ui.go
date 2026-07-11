@@ -1322,12 +1322,16 @@ func (m model) statusText() string {
 	}
 	public := len(m.funnel)
 
-	full := fmt.Sprintf("%d listening · %d exposed on tailnet · %d public", listening, tailnet, public)
+	// The public count is m.funnel -- ports exposed publicly via `tailscale
+	// funnel`, not an independent public bind -- so it's labelled "public
+	// (funnel)" to name the mechanism (67zk) and pair with "exposed on
+	// tailnet".
+	full := fmt.Sprintf("%d listening · %d exposed on tailnet · %d public (funnel)", listening, tailnet, public)
 	// The host rides the "listening" segment ("N listening on <host>") rather
 	// than a trailing "— <host>" (20w6); the other segments are unchanged.
 	withHost := full
 	if m.host != "" {
-		withHost = fmt.Sprintf("%d listening on %s · %d exposed on tailnet · %d public", listening, m.host, tailnet, public)
+		withHost = fmt.Sprintf("%d listening on %s · %d exposed on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
 	}
 	// Widest form that fits, degrading host -> shorter labels -> initials.
 	switch {
@@ -1336,7 +1340,9 @@ func (m model) statusText() string {
 	case lipgloss.Width(full) <= m.width:
 		return full
 	default:
-		medium := fmt.Sprintf("%d listening · %d tailnet · %d public", listening, tailnet, public)
+		// Medium drops the host and shortens labels; "funnel" stands in for
+		// "public (funnel)" for compactness while staying precise.
+		medium := fmt.Sprintf("%d listening · %d tailnet · %d funnel", listening, tailnet, public)
 		if lipgloss.Width(medium) <= m.width {
 			return medium
 		}

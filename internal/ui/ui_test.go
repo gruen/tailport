@@ -570,8 +570,9 @@ func TestStatusText(t *testing.T) {
 	}
 
 	got := base.statusText()
-	// The host attaches to the listening segment (20w6), not a trailing "— host".
-	for _, want := range []string{"5 listening on host", "2 exposed on tailnet", "1 public"} {
+	// Host on the listening segment (20w6), funnel count labelled "public
+	// (funnel)" (67zk), no trailing "— host".
+	for _, want := range []string{"5 listening on host", "2 exposed on tailnet", "1 public (funnel)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("statusText = %q, want it to contain %q", got, want)
 		}
@@ -582,7 +583,7 @@ func TestStatusText(t *testing.T) {
 
 	// Zero of everything reads cleanly, not "no ports"; no host -> no "on".
 	empty := model{host: "", width: 120}
-	if got := empty.statusText(); got != "0 listening · 0 exposed on tailnet · 0 public" {
+	if got := empty.statusText(); got != "0 listening · 0 exposed on tailnet · 0 public (funnel)" {
 		t.Errorf("empty (no host) statusText = %q", got)
 	}
 
