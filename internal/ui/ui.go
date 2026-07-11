@@ -414,8 +414,12 @@ func refreshTick() tea.Cmd {
 }
 
 const (
-	eggURL      = "https://michaelgruen.com/"
-	eggDomain   = "michaelgruen.com"
+	eggURL        = "https://michaelgruen.com/"
+	eggDomain     = "michaelgruen.com"
+	eggRepoURL    = "https://github.com/gruen/tailport"
+	eggRepoDomain = "github.com/gruen/tailport"
+	// Both links are hardcoded (from the origin remote) -- the app never shells
+	// out to git; it only shells to tailscale/ss/lsof (zero extra deps).
 	eggInterval = 100 * time.Millisecond // ~10fps: responsive over SSH, no flood
 )
 
@@ -515,10 +519,10 @@ func copyCmd(url string) tea.Cmd {
 	}
 }
 
-// copyEggLink copies the Easter-egg site link via the same vetted clip/OSC 52
-// path as copyURL, and toasts -- without closing the overlay (28mv).
-func (m *model) copyEggLink() tea.Cmd {
-	return tea.Batch(copyCmd(eggURL), m.setFlash("copied "+eggDomain, flashInfo))
+// eggCopy copies one of the Easter-egg links via the same vetted clip/OSC 52
+// path as copyURL, and toasts -- without closing the overlay (28mv/2b4r).
+func (m *model) eggCopy(url, domain string) tea.Cmd {
+	return tea.Batch(copyCmd(url), m.setFlash("copied "+domain, flashInfo))
 }
 
 // setFlash shows a transient toast at the given severity and returns the
@@ -833,7 +837,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c":
 				return m, tea.Quit
 			case "c":
-				return m, m.copyEggLink()
+				return m, m.eggCopy(eggURL, eggDomain)
+			case "g":
+				return m, m.eggCopy(eggRepoURL, eggRepoDomain)
 			}
 			return m, nil
 		}
@@ -1486,7 +1492,8 @@ func (m model) eggView() string {
 		cred(1, "· The LLM Agent Fleet ·"),
 		cred(2, "Claude Opus 4.8 · Sonnet 5 · Haiku 4.5 · Fable 5"),
 		cred(3, eggURL),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("c: copy link   esc / q: back"),
+		cred(4, eggRepoURL),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("c: copy site · g: copy repo · esc / q: back"),
 	)
 	if m.flash != "" {
 		lines = append(lines, activeStyle.Render(m.flash))

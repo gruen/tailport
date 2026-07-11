@@ -504,6 +504,19 @@ func TestEasterEgg(t *testing.T) {
 		t.Errorf("'c' should copy the link and toast; flash=%q cmd=%v", m.flash, cmd != nil)
 	}
 
+	// 'g' copies the GitHub repo link (2b4r), toasts, and stays open.
+	if eggRepoURL != "https://github.com/gruen/tailport" {
+		t.Errorf("egg repo link = %q, want the GitHub repo", eggRepoURL)
+	}
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(model)
+	if !m.showEgg {
+		t.Error("'g' must not close the egg")
+	}
+	if cmd == nil || !strings.Contains(m.flash, eggRepoDomain) {
+		t.Errorf("'g' should copy the repo link and toast; flash=%q cmd=%v", m.flash, cmd != nil)
+	}
+
 	// esc closes; a subsequent tick must NOT reschedule (no ticker leak).
 	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEsc})
 	if m.showEgg {
@@ -519,13 +532,22 @@ func TestEasterEgg(t *testing.T) {
 		t.Error("pressing E again should close the egg")
 	}
 
-	// Hidden: the egg is not advertised in the help overlay or the legend.
+	// 'g' is inert outside the egg overlay (only handled under showEgg).
+	m4 := New(config.Config{})
+	m4.active = map[int]bool{}
+	m4.rebuildItems()
+	m4 = mustUpdate(t, m4, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m4.showEgg || strings.Contains(m4.flash, eggRepoDomain) {
+		t.Errorf("'g' outside the egg must do nothing; showEgg=%v flash=%q", m4.showEgg, m4.flash)
+	}
+
+	// Hidden: neither link is advertised in the help overlay or the legend.
 	m3 := New(config.Config{})
 	m3.help.Width = 200
-	if strings.Contains(m3.helpView(), eggDomain) {
+	if strings.Contains(m3.helpView(), eggDomain) || strings.Contains(m3.helpView(), eggRepoDomain) {
 		t.Error("the egg must not be documented in the help overlay")
 	}
-	if strings.Contains(m3.renderLegend(), eggDomain) {
+	if strings.Contains(m3.renderLegend(), eggDomain) || strings.Contains(m3.renderLegend(), eggRepoDomain) {
 		t.Error("the egg must not appear in the bottom legend")
 	}
 }
