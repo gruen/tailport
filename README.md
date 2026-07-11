@@ -87,46 +87,70 @@ are currently exposed on your tailnet.
 | --- | --- |
 | `enter` / `space` | Toggle `tailscale serve` on/off for the selected port |
 | `n` | Open a text-input to type a port number (even one nothing is listening on yet) and toggle it on |
-| `a` | Toggle between the filtered view and showing every listening port |
+| `l` | Label the selected port with custom text (prefilled with its resolved process name) |
+| `f` | Favorite the selected port, pinning it to the default view |
+| `u` | Unfavorite the selected port |
+| `a` | Toggle between the default view and showing every listening port |
 | `r` | Refresh the port list and serve status |
 | `q` / `ctrl+c` | Quit |
 
 An exposed port shows a filled marker (●) and the `http://<hostname>:<port>`
 URL it's reachable at from other tailnet devices; an unexposed one shows a
-hollow marker (○).
+hollow marker (○). A favorited port additionally shows a star (★). The name
+shown next to a port is its custom label if you've set one, otherwise its
+resolved process name — or `?` if that can't be determined, which happens
+when the port belongs to a process owned by a different user (most
+commonly `root`) than the one running tailport.
 
-### Filtered view
+### Default view and the port registry
 
-By default tailport hides a short list of ports that are almost never what
-you want to expose (sshd, cups, avahi/mDNS, and Tailscale's own WireGuard
-listener). Press `a` to see every listening port, including those. The
-exclude list only affects the default view — it doesn't stop you from
-exposing an excluded port via `n`, and any port already exposed is always
-shown regardless of the filter.
+tailport doesn't show every listening port by default — that gets noisy
+fast (sshd, mDNS, Docker, browsers holding sockets open, etc.). Instead it
+shows the union of:
+
+- ports currently exposed via `tailscale serve`, and
+- ports in the **registry**: anything you've ever toggled on, labeled, or
+  favorited.
+
+A port earns a place in the registry the moment you interact with it —
+toggling it on (via `enter`/`space` or `n`), labeling it (`l`), or
+favoriting it (`f`) all add it. Once a port is in the registry it keeps
+showing up, marked inactive, even after you toggle it off — and that
+persists across restarts, not just for the current session. `u` on a port
+that has no label reverses this: it's dropped from the registry and
+disappears from the default view (unless it's currently active).
+
+Press `a` to bypass the registry entirely and see every port currently
+listening on the machine, whether known to tailport or not — useful for
+finding something new to expose, label, or favorite.
 
 ## Configuration
 
-On first run, tailport writes a default config to:
+On first run, tailport writes an empty registry (`ports: {}`) to:
 
 ```
 $XDG_CONFIG_HOME/tailport/config.yaml
 ```
 
 or, if `XDG_CONFIG_HOME` isn't set, `~/.config/tailport/config.yaml`. It
-won't overwrite an existing file. The only setting today is the filtered
-view's exclude list:
+won't overwrite an existing file. This is the port registry described
+above — labels and favorites, keyed by port number — and it's rewritten
+automatically every time you toggle, label, or favorite/unfavorite a port
+from within the app. You generally shouldn't need to hand-edit it, but the
+format is plain YAML if you want to:
 
 ```yaml
-exclude_ports:
-    - 22
-    - 631
-    - 5353
-    - 41641
+ports:
+    3000:
+        label: dev server
+        favorite: true
+    9000: {}
 ```
 
-That's `22` (sshd), `631` (cups), `5353` (mdns/avahi), and `41641`
-(Tailscale's own WireGuard listener). Edit this list to hide (or stop
-hiding) other ports from the default view.
+An entry can have a `label`, be marked `favorite`, or both. An empty entry
+(`{}`, as for `9000` above) means "keep this in the default view" without
+a custom label or favorite status — the state left behind by toggling a
+port on without labeling or favoriting it.
 
 ## How it works
 
@@ -137,6 +161,9 @@ hiding) other ports from the default view.
 - Toggling on: `tailscale serve --bg --http=<port> <port>`.
 - Toggling off: `tailscale serve --http=<port> off` (a surgical removal of
   just that one mapping; other active mappings are left alone).
+- Registry writes: the config file is rewritten immediately after every
+  toggle, label, or favorite/unfavorite — there's no in-memory-only state
+  to lose if tailport is killed rather than quit normally.
 
 tailport has no dependencies beyond the `tailscale` CLI and the OS tools
 above — no daemon, no config beyond the YAML file, and nothing is installed
