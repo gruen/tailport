@@ -1024,17 +1024,32 @@ func (m *model) rebuildItems() tea.Cmd {
 		// Non-favorite matches recede only when filtering FROM the Favorites
 		// view; the All ports view (and a plain All-ports filter) dims nothing.
 		dimNonFav := m.filtering && !m.showAllPorts
+		// All ports = every listening port UNION all favorites, so a favorite
+		// stays visible here even when its process is down (qqkx), shown as a
+		// synthetic not-listening entry like the Favorites view already does.
+		seen := make(map[int]bool, len(portsByNumber))
 		numbers := make([]int, 0, len(portsByNumber))
 		for n := range portsByNumber {
 			numbers = append(numbers, n)
+			seen[n] = true
+		}
+		for n, meta := range m.cfg.Ports {
+			if meta.Favorite && !seen[n] {
+				numbers = append(numbers, n)
+				seen[n] = true
+			}
 		}
 		sort.Ints(numbers)
 		items := make([]list.Item, 0, len(numbers))
 		for _, n := range numbers {
-			// This branch iterates portsByNumber, so every port here is
-			// currently listening.
+			// ok is the listening bool: present in portsByNumber iff a local
+			// process is bound; a non-listening favorite gets a synthetic port.
+			p, ok := portsByNumber[n]
+			if !ok {
+				p = portscan.Port{Number: n}
+			}
 			meta := m.cfg.Ports[n]
-			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta})
 		}
 		return m.setItems(items)
 	}
@@ -1192,7 +1207,7 @@ func (m model) helpView() string {
 	rows := []struct{ key, desc string }{
 		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (●) its tailnet URL is shown beneath it."},
 		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (◉), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
-		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port currently listening locally)."},
+		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
 		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
 		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
 		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default."},

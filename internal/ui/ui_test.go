@@ -121,13 +121,14 @@ func TestSelectIndexForPort(t *testing.T) {
 // TestRebuildItemsViews covers the two "a" views (vk30): Favorites shows only
 // meta.Favorite ports -- including a synthetic entry for a favorite whose
 // process isn't running -- while All ports shows every currently-listening
-// port. A labeled-but-not-favorited port appears only in All ports.
+// port UNIONed with all favorites (qqkx), so a favorite stays visible in both
+// views even when down. A non-favorite non-listening port appears in neither.
 func TestRebuildItemsViews(t *testing.T) {
 	cfg := config.Config{Ports: map[int]config.PortMeta{
 		3000: {Favorite: true},
 		8080: {Favorite: true, Label: "web"},
 		4000: {Favorite: true}, // favorite but not listening -> synthetic entry
-		5000: {Label: "api"},   // labeled, not favorited -> All ports only
+		5000: {Label: "api"},   // labeled, not favorited, not listening -> nowhere
 	}}
 	m := New(cfg)
 	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}, {Number: 9000, Process: "x"}, {Number: 8080, Process: "srv"}}
@@ -141,8 +142,18 @@ func TestRebuildItemsViews(t *testing.T) {
 
 	m.showAllPorts = true
 	m.rebuildItems()
-	if got, want := portNumbers(m), []int{3000, 8080, 9000}; !reflect.DeepEqual(got, want) {
+	// Listening {3000,8080,9000} UNION favorites {3000,4000,8080} = the below;
+	// :4000 (down favorite) is now included, :5000 (non-fav, down) is not, and
+	// :3000/:8080 (favorite AND listening) appear once each (deduped).
+	if got, want := portNumbers(m), []int{3000, 4000, 8080, 9000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("all ports view = %v, want %v", got, want)
+	}
+	// The down favorite renders as a synthetic not-listening entry.
+	for _, it := range m.list.Items() {
+		pi := it.(portItem)
+		if pi.port.Number == 4000 && pi.listening {
+			t.Error(":4000 (down favorite) should be a non-listening synthetic entry in All ports")
+		}
 	}
 }
 

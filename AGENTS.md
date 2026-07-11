@@ -71,8 +71,15 @@ contract. The short version:
 
 - Use kata for all real feature/bug work in this repo. Search before
   creating, claim before starting, close only with evidence.
+- Signal that work has started by claiming the issue: `kata claim <ref>`
+  (optionally with `--comment "<what I'm starting>"`). Ownership is the
+  "actively being worked" signal — kata has no in-progress status, so an
+  owned issue means someone is on it. Before claiming, check it isn't
+  already owned (`kata show <ref>` / `kata list --unowned`) to avoid
+  colliding with another agent; only `--force` a reclaim deliberately.
 - Parallel feature work happens in git worktrees, one subagent per
-  feature branch, rebased (not merge-commit) into `main` once its kata
-  issue is closed with verification.
+  feature branch. Each subagent claims its kata issue before starting,
+  then rebases (not merge-commit) into `main` once that issue is closed
+  with verification.
 - No force-push, no `git reset --hard`, no skipping hooks, without
   explicit user authorization for that specific action.
