@@ -5,6 +5,7 @@ package ui
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -1385,35 +1386,46 @@ var (
 	eggZalgoMarks   = []rune{'́', '҉', '̴', '͓', 'ͯ'}
 )
 
-// eggSpin renders the golden egg: a fixed outline whose interior is filled by
-// a shimmer band that shifts with the frame, reading as rotation. Bounded to
-// 11 columns and pulsing through gold shades.
-func eggSpin(frame int) []string {
-	tmpl := []string{
-		"  .-‾‾‾-.  ",
-		" /       \\ ",
-		"|         |",
-		"|         |",
-		"|         |",
-		" \\       / ",
-		"  '-___-'  ",
+// eggSpin renders a BIG, borderless, egg-shaped golden shimmer (amac): no
+// outline glyphs -- the shimmer mass IS the silhouette. The half-width of each
+// row comes from an ovoid curve (a rounded ellipse skewed so the widest point
+// sits BELOW centre: narrow rounded top, fuller rounded bottom), so it reads as
+// a real egg. The shimmer band (░▒▓█) and gold shade both cycle with the frame,
+// so the solid mass still spins/breathes. Deterministic per (frame, maxCols,
+// maxRows); dimensions clamp DOWN to the budget so it never overflows.
+func eggSpin(frame, maxCols, maxRows int) []string {
+	a := 8 // nominal half-width
+	if a > (maxCols-1)/2 {
+		a = (maxCols - 1) / 2
 	}
+	if a < 3 {
+		a = 3
+	}
+	h := 15 // nominal height
+	if h > maxRows {
+		h = maxRows
+	}
+	if h < 7 {
+		h = 7
+	}
+	const skew = 0.32 // >0 pushes the widest point below centre (egg, not ellipse)
+	w := 2*a + 1
 	shim := []rune("░▒▓█▓▒")
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[frame%len(eggGold)])).Bold(true)
-	out := make([]string, len(tmpl))
-	for y, line := range tmpl {
-		rs := []rune(line)
-		lo, hi := -1, -1
-		for x, r := range rs {
-			if r != ' ' {
-				if lo < 0 {
-					lo = x
-				}
-				hi = x
-			}
+
+	out := make([]string, h)
+	cx := a
+	for y := 0; y < h; y++ {
+		// u in [-1,1]: -1 at the top, +1 at the bottom.
+		u := 2*float64(y)/float64(h-1) - 1
+		hw := float64(a) * math.Sqrt(math.Max(0, 1-u*u)) * (1 + skew*u)
+		half := int(math.Round(hw))
+		rs := make([]rune, w)
+		for x := range rs {
+			rs[x] = ' '
 		}
-		for x := lo + 1; x < hi; x++ {
-			if rs[x] == ' ' {
+		for x := cx - half; x <= cx+half; x++ {
+			if x >= 0 && x < w {
 				rs[x] = shim[(x+y*2+frame)%len(shim)]
 			}
 		}
@@ -1468,7 +1480,11 @@ func (m model) eggView() string {
 	}
 	f := m.eggFrame
 
-	if w < 34 || h < 15 {
+	// The full art needs room for a ~7+ row egg plus ~9 rows of sparkles/
+	// credits/hint. The widest credit line is 48 cols, so require sw >= 48
+	// (w >= 52) to keep everything untruncated; below that (or too short), a
+	// bounded fallback rather than any overflow.
+	if w < 52 || h < 17 {
 		msg := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[f%len(eggGold)])).Bold(true).
 			Render("🥚 enlarge the terminal — esc: back")
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, msg)
@@ -1482,9 +1498,20 @@ func (m model) eggView() string {
 	title := lipgloss.NewStyle().Foreground(lipgloss.Color(eggSparkColors[f%len(eggSparkColors)])).Bold(true).
 		Render("✦ " + eggZalgo("tailport", f) + " ✦")
 
+	// Size the egg to the remaining vertical budget (9 non-egg rows) and a
+	// pleasing width, clamped so it never overflows.
+	eggRows := h - 10
+	if eggRows > 15 {
+		eggRows = 15
+	}
+	eggCols := sw
+	if eggCols > 21 {
+		eggCols = 21
+	}
+
 	var lines []string
 	lines = append(lines, eggSparkleLine(sw, f, 1))
-	lines = append(lines, eggSpin(f)...)
+	lines = append(lines, eggSpin(f, eggCols, eggRows)...)
 	lines = append(lines, eggSparkleLine(sw, f, 2))
 	lines = append(lines, title)
 	lines = append(lines,

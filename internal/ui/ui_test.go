@@ -456,6 +456,65 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestEggArt covers amac's invariants (the shape itself is visual): the
+// borderless egg's rows never exceed the width budget, its height matches the
+// clamp, it's deterministic per (frame,size), it changes with the frame
+// (animation), and it never overflows a narrow budget.
+func TestEggArt(t *testing.T) {
+	a := eggSpin(0, 21, 15)
+	if len(a) != 15 {
+		t.Errorf("egg height = %d, want 15", len(a))
+	}
+	for _, ln := range a {
+		if w := lipgloss.Width(ln); w > 21 {
+			t.Errorf("egg row width %d exceeds the 21-col budget", w)
+		}
+	}
+	// Borderless: rows are shimmer + spaces only, no outline glyphs.
+	for _, ln := range a {
+		for _, r := range stripANSI(ln) {
+			switch r {
+			case '|', '/', '\\', '-', '.', '\'', '‾', '_':
+				t.Errorf("egg should be borderless; found outline glyph %q", r)
+			}
+		}
+	}
+	// Deterministic per (frame,size).
+	if !reflect.DeepEqual(a, eggSpin(0, 21, 15)) {
+		t.Error("eggSpin must be deterministic for a given (frame,size)")
+	}
+	// Animates: a later frame differs (shimmer + gold cycle).
+	if reflect.DeepEqual(a, eggSpin(1, 21, 15)) {
+		t.Error("eggSpin should change with the frame")
+	}
+	// Narrow budget: clamps down, never overflows.
+	for _, ln := range eggSpin(3, 8, 15) {
+		if w := lipgloss.Width(ln); w > 8 {
+			t.Errorf("clamped egg row width %d exceeds the 8-col budget", w)
+		}
+	}
+}
+
+// stripANSI removes SGR escape sequences so the underlying glyphs can be
+// inspected in tests.
+func stripANSI(s string) string {
+	var b strings.Builder
+	inEsc := false
+	for _, r := range s {
+		switch {
+		case r == '\x1b':
+			inEsc = true
+		case inEsc && r == 'm':
+			inEsc = false
+		case inEsc:
+			// skip
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // TestEasterEgg covers 28mv at the state-machine level (visuals aren't unit
 // tested): 'E' opens the overlay + schedules the animation tick; it's modal;
 // 'c' copies the author's link with a toast without closing; esc/q/'E' close
