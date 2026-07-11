@@ -16,6 +16,8 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+          - goos: linux
+            goarch: arm64
           - goos: darwin
             goarch: arm64
     steps:
@@ -31,13 +33,23 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
+          # Strip the leading "v" from the tag (v0.1.0 -> 0.1.0) so
+          # `tailport --version` matches the AUR pkgver.
+          version="${GITHUB_REF_NAME#v}"
           out="tailport-${{ matrix.goos }}-${{ matrix.goarch }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/$out" ./cmd/tailport
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${version}" \
+            -o "dist/$out" ./cmd/tailport
+          # Emit a sha256 next to the binary; the AUR -bin PKGBUILD needs these
+          # for its per-arch sha256sums.
+          ( cd dist && sha256sum "$out" > "$out.sha256" )
 
       - uses: actions/upload-artifact@v4
         with:
           name: tailport-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/tailport-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/tailport-${{ matrix.goos }}-${{ matrix.goarch }}
+            dist/tailport-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
 
   release:
     needs: build

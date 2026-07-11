@@ -1,0 +1,33 @@
+# Maintainer: Michael E. Gruen <contact@michaelgruen.com>
+pkgname=tailport-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="TUI to expose local ports across your tailnet via tailscale serve (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url='https://github.com/gruen/tailport'
+license=('MIT')
+depends=('tailscale' 'iproute2')
+provides=('tailport')
+conflicts=('tailport')
+
+# Arch-independent sources: LICENSE (required per-package) and README, pulled
+# from the tag so the -bin package can ship them without the source tarball.
+source=("LICENSE-$pkgver::https://raw.githubusercontent.com/gruen/tailport/v$pkgver/LICENSE"
+        "README-$pkgver.md::https://raw.githubusercontent.com/gruen/tailport/v$pkgver/README.md")
+# Per-arch prebuilt binaries from the GitHub release (built by build.yml).
+source_x86_64=("tailport-$pkgver-x86_64::https://github.com/gruen/tailport/releases/download/v$pkgver/tailport-linux-amd64")
+source_aarch64=("tailport-$pkgver-aarch64::https://github.com/gruen/tailport/releases/download/v$pkgver/tailport-linux-arm64")
+
+# TODO(release): fill all four digests once the v0.1.0 release assets exist.
+# The per-arch binary digests are published alongside the assets as
+# tailport-linux-amd64.sha256 / tailport-linux-arm64.sha256 (see build.yml).
+sha256sums=('REPLACE_WITH_SHA256_OF_v0.1.0_LICENSE'
+            'REPLACE_WITH_SHA256_OF_v0.1.0_README_md')
+sha256sums_x86_64=('REPLACE_WITH_SHA256_OF_tailport-linux-amd64')
+sha256sums_aarch64=('REPLACE_WITH_SHA256_OF_tailport-linux-arm64')
+
+package() {
+  install -Dm755 "$srcdir/tailport-$pkgver-$CARCH" "$pkgdir/usr/bin/tailport"
+  install -Dm644 "$srcdir/LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/README-$pkgver.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

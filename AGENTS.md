@@ -41,6 +41,10 @@ contract. The short version:
 - Fleet targets: `linux/amd64` (host-a, host-b) and `darwin/arm64` (mac-a,
   mac-b, mac-c). Keep `.github/workflows/build.yml` and `install.sh` in
   sync with this list if it changes.
+- Release-artifact targets (broader than the fleet): `build.yml` also
+  builds `linux/arm64` purely so the AUR `tailport-bin` package can offer
+  an `aarch64` binary (jtpx). It is a distribution artifact, not a deployed
+  fleet node — don't add it to `install.sh`'s fleet list.
 - Zero non-Go runtime dependencies in the shipped binary. It shells out
   to `tailscale`, and to `ss` (Linux) / `lsof` (macOS) for port discovery
   — nothing else *required*. Don't add a dependency on `yq`, `gum`, `fzf`,
