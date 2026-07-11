@@ -465,28 +465,53 @@ func TestEggArt(t *testing.T) {
 	if len(a) != 15 {
 		t.Errorf("egg height = %d, want 15", len(a))
 	}
-	for _, ln := range a {
-		if w := lipgloss.Width(ln); w > 21 {
-			t.Errorf("egg row width %d exceeds the 21-col budget", w)
+
+	// Every row has the SAME display width (all padded to the field width),
+	// and none exceeds the budget.
+	fieldW := lipgloss.Width(a[0])
+	fill := make([]int, len(a)) // shimmer (non-space) run per row
+	for i, ln := range a {
+		if w := lipgloss.Width(ln); w != fieldW {
+			t.Errorf("row %d width %d != field width %d (rows must be equal width)", i, w, fieldW)
 		}
-	}
-	// Borderless: rows are shimmer + spaces only, no outline glyphs.
-	for _, ln := range a {
+		if fieldW > 21 {
+			t.Errorf("egg field width %d exceeds the 21-col budget", fieldW)
+		}
 		for _, r := range stripANSI(ln) {
-			switch r {
+			if r != ' ' {
+				fill[i]++
+			}
+			switch r { // borderless: no outline glyphs
 			case '|', '/', '\\', '-', '.', '\'', '‾', '_':
 				t.Errorf("egg should be borderless; found outline glyph %q", r)
 			}
 		}
 	}
-	// Deterministic per (frame,size).
+
+	// Rounded caps: neither the top nor bottom row collapses to a spike.
+	if fill[0] < 5 || fill[len(fill)-1] < 5 {
+		t.Errorf("egg caps should be rounded (>=5 wide); top=%d bottom=%d", fill[0], fill[len(fill)-1])
+	}
+
+	// Egg asymmetry: the widest row is BELOW the vertical centre.
+	widest := 0
+	for i, f := range fill {
+		if f > fill[widest] {
+			widest = i
+		}
+	}
+	if widest <= len(fill)/2 {
+		t.Errorf("widest row %d should be below centre (%d)", widest, len(fill)/2)
+	}
+
+	// Deterministic per (frame,size); animates with the frame.
 	if !reflect.DeepEqual(a, eggSpin(0, 21, 15)) {
 		t.Error("eggSpin must be deterministic for a given (frame,size)")
 	}
-	// Animates: a later frame differs (shimmer + gold cycle).
 	if reflect.DeepEqual(a, eggSpin(1, 21, 15)) {
 		t.Error("eggSpin should change with the frame")
 	}
+
 	// Narrow budget: clamps down, never overflows.
 	for _, ln := range eggSpin(3, 8, 15) {
 		if w := lipgloss.Width(ln); w > 8 {

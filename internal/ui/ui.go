@@ -1386,21 +1386,41 @@ var (
 	eggZalgoMarks   = []rune{'́', '҉', '̴', '͓', 'ͯ'}
 )
 
-// eggSpin renders a BIG, borderless, egg-shaped golden shimmer (amac): no
-// outline glyphs -- the shimmer mass IS the silhouette. The half-width of each
-// row comes from an ovoid curve (a rounded ellipse skewed so the widest point
-// sits BELOW centre: narrow rounded top, fuller rounded bottom), so it reads as
-// a real egg. The shimmer band (░▒▓█) and gold shade both cycle with the frame,
-// so the solid mass still spins/breathes. Deterministic per (frame, maxCols,
-// maxRows); dimensions clamp DOWN to the budget so it never overflows.
+// eggHalves computes the per-row half-width of the egg silhouette for a
+// nominal height h and half-width a. The profile is a CAPPED SUPERELLIPSE
+// skewed so the widest point sits below centre (frag): a superellipse (n>2)
+// gives fuller shoulders and rounder caps than an ellipse, the skew makes it a
+// classic egg (narrow rounded top, broad rounded bottom), and trimming the
+// vertical parameterisation away from the poles (cap) keeps the end rows a few
+// chars wide -- rounded caps, never a single-char spike.
+func eggHalves(h int, a float64) []int {
+	const (
+		n    = 2.4  // superellipse exponent (>2: fuller shoulders / rounder caps)
+		skew = 0.40 // pushes the widest row below centre
+		cap  = 0.08 // trims the poles so top/bottom rows aren't a single char
+	)
+	out := make([]int, h)
+	for y := 0; y < h; y++ {
+		t := float64(y) / float64(h-1)
+		u := (2*t - 1) * (1 - cap)
+		base := math.Pow(math.Max(0, 1-math.Pow(math.Abs(u), n)), 1/n)
+		half := int(math.Round(a * base * (1 + skew*u)))
+		if half < 0 {
+			half = 0
+		}
+		out[y] = half
+	}
+	return out
+}
+
+// eggSpin renders a BIG, borderless, egg-shaped golden shimmer (amac/frag): no
+// outline glyphs -- the shimmer mass IS the silhouette, from eggHalves. Because
+// the skew makes some rows wider than the nominal half-width a, the field is
+// padded on maxHalf (not a) so nothing overflows or panics on a negative pad.
+// The shimmer band (░▒▓█) and gold shade cycle with the frame, so the solid
+// mass still spins/breathes. Deterministic per (frame, maxCols, maxRows);
+// dimensions clamp DOWN to the budget.
 func eggSpin(frame, maxCols, maxRows int) []string {
-	a := 8 // nominal half-width
-	if a > (maxCols-1)/2 {
-		a = (maxCols - 1) / 2
-	}
-	if a < 3 {
-		a = 3
-	}
 	h := 15 // nominal height
 	if h > maxRows {
 		h = maxRows
@@ -1408,30 +1428,64 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 	if h < 7 {
 		h = 7
 	}
-	const skew = 0.32 // >0 pushes the widest point below centre (egg, not ellipse)
-	w := 2*a + 1
+	a := 8.0 // nominal half-width
+	halves := eggHalves(h, a)
+	maxHalf := maxInts(halves)
+
+	// Scale a down so the widest row's field (2*maxHalf+1) fits maxCols.
+	if maxHalf >= 1 && 2*maxHalf+1 > maxCols {
+		target := (maxCols - 1) / 2
+		if target < 1 {
+			target = 1
+		}
+		a *= float64(target) / float64(maxHalf)
+		if a < 2 {
+			a = 2
+		}
+		halves = eggHalves(h, a)
+		maxHalf = maxInts(halves)
+	}
+	if maxHalf < 1 {
+		maxHalf = 1
+	}
+	if 2*maxHalf+1 > maxCols { // final rounding safety
+		maxHalf = (maxCols - 1) / 2
+		if maxHalf < 1 {
+			maxHalf = 1
+		}
+	}
+
+	w := 2*maxHalf + 1
+	cx := maxHalf
 	shim := []rune("░▒▓█▓▒")
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[frame%len(eggGold)])).Bold(true)
 
 	out := make([]string, h)
-	cx := a
 	for y := 0; y < h; y++ {
-		// u in [-1,1]: -1 at the top, +1 at the bottom.
-		u := 2*float64(y)/float64(h-1) - 1
-		hw := float64(a) * math.Sqrt(math.Max(0, 1-u*u)) * (1 + skew*u)
-		half := int(math.Round(hw))
+		half := halves[y]
+		if half > maxHalf {
+			half = maxHalf
+		}
 		rs := make([]rune, w)
 		for x := range rs {
 			rs[x] = ' '
 		}
 		for x := cx - half; x <= cx+half; x++ {
-			if x >= 0 && x < w {
-				rs[x] = shim[(x+y*2+frame)%len(shim)]
-			}
+			rs[x] = shim[(x+y*2+frame)%len(shim)]
 		}
 		out[y] = style.Render(string(rs))
 	}
 	return out
+}
+
+func maxInts(v []int) int {
+	m := 0
+	for _, x := range v {
+		if x > m {
+			m = x
+		}
+	}
+	return m
 }
 
 // eggSparkleLine builds one row of fireworks: mostly spaces with a few
