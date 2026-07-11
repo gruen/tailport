@@ -367,6 +367,81 @@ func TestFilterDiscoverable(t *testing.T) {
 	}
 }
 
+// addPort drives the "n" flow: open the input, type digits, submit.
+func addPort(m model, digits string) model {
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = res.(model)
+	for _, r := range digits {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = res.(model)
+	}
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	return res.(model)
+}
+
+// TestAddPortFavorites covers ykgj: "n" registers + favorites a port (even one
+// not listening), it shows up in the Favorites view, it does NOT serve, and it
+// persists -- so an added port for a not-yet-running service sticks instead of
+// vanishing.
+func TestAddPortFavorites(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}} // :3000 is NOT listening
+	m.active = map[int]bool{}
+	m.showAllPorts = false // Favorites view
+	m.rebuildItems()
+
+	m = addPort(m, "3000")
+
+	// (1) Favorited, and visible in the Favorites view as a synthetic entry.
+	if !m.cfg.Ports[3000].Favorite {
+		t.Error("n should set Favorite=true for :3000")
+	}
+	found := false
+	for _, n := range portNumbers(m) {
+		if n == 3000 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Favorites view should include the added :3000; got %v", portNumbers(m))
+	}
+
+	// (2) No serve state change, no toggle in flight.
+	if len(m.active) != 0 {
+		t.Errorf("n must not change serve state; active = %v", m.active)
+	}
+	if m.pending != 0 {
+		t.Errorf("n must not toggle serve; pending = %d", m.pending)
+	}
+
+	// (4) Persisted to disk so it survives a restart.
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Ports[3000].Favorite {
+		t.Error("the favorite should persist to disk")
+	}
+}
+
+// TestAddPortPreservesMeta covers ykgj point 3: "n" sets Favorite while
+// preserving any existing label and lock on that port.
+func TestAddPortPreservesMeta(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{3000: {Label: "api", Locked: true}}})
+	m.allPorts = nil
+	m.active = map[int]bool{}
+	m.rebuildItems()
+
+	m = addPort(m, "3000")
+
+	meta := m.cfg.Ports[3000]
+	if !meta.Favorite || meta.Label != "api" || !meta.Locked {
+		t.Errorf("n should set Favorite while preserving label/lock; got %+v", meta)
+	}
+}
+
 // TestCopyKeymap covers vnq7's remap: "c" is copy, clean moved to "C", and
 // the two don't collide.
 func TestCopyKeymap(t *testing.T) {

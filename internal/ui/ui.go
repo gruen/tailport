@@ -92,7 +92,7 @@ func newKeyMap() keyMap {
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter:     key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
-		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new port")),
+		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "add favorite")),
 		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
 		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
 		Unfavorite: key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "unfavorite")),
@@ -501,6 +501,22 @@ func (m *model) remember(port int) {
 	}
 }
 
+// favorite registers port with Favorite=true, preserving any existing label
+// or lock, and persists it. Backs the "n" add-port flow (ykgj): the port
+// sticks in the Favorites view even before its service is running, ready to be
+// served with space once it is.
+func (m *model) favorite(port int) {
+	if m.cfg.Ports == nil {
+		m.cfg.Ports = map[int]config.PortMeta{}
+	}
+	meta := m.cfg.Ports[port]
+	meta.Favorite = true
+	m.cfg.Ports[port] = meta
+	if err := m.cfg.Save(); err != nil {
+		m.err = err
+	}
+}
+
 // requestToggle begins toggling a port on/off from either entry point (the
 // space handler or the "n" add-port submit). It enforces the lock guard
 // (turning a locked port on is refused) and interposes the :22 SSH confirm:
@@ -768,13 +784,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.err = fmt.Errorf("invalid port")
 						return m, nil
 					}
-					if m.pending != 0 {
-						return m, nil
-					}
-					// requestToggle applies the lock guard and the :22 SSH
-					// confirm; typing "22" here gets the same y/n prompt as
-					// pressing space on the :22 row.
-					return m, m.requestToggle(port, !m.active[port])
+					// "n" registers + favorites the port; it does NOT serve
+					// (ykgj). Exposing is always space. A not-yet-running
+					// favorite then shows in the Favorites view as a synthetic
+					// entry, ready to serve once its service is up -- so an
+					// added port sticks instead of vanishing. No lock/:22 guard
+					// is needed here since nothing is exposed.
+					m.favorite(port)
+					return m, m.rebuildItems()
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
 					port := m.labelPort
@@ -1179,7 +1196,7 @@ func (m model) helpView() string {
 		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
 		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
 		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default."},
-		{"n", "Expose an arbitrary port by number, even one not in the list."},
+		{"n", "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up."},
 		{"l", "Set a text label for the selected port."},
 		{"r", "Refresh the port list and serve status."},
 		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
@@ -1335,7 +1352,7 @@ func (m model) statusText() string {
 func (m model) renderBottom() string {
 	switch m.mode {
 	case entryAddPort:
-		return helpStyle.Render("expose port: ") + m.portInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
+		return helpStyle.Render("add port to favorites: ") + m.portInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
 	case entryLabel:
 		return helpStyle.Render(fmt.Sprintf("label :%d: ", m.labelPort)) + m.labelInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
 	case entryConfirmClean:
