@@ -471,4 +471,18 @@ func TestEmptyStateMessage(t *testing.T) {
 			t.Errorf("showAllPorts=%v: empty-state should mention %q; got %q", all, wantView, msg)
 		}
 	}
+
+	// 2fgk: the Favorites empty state drops the redundant green heading, so it
+	// now leads with the intro line, not a "Favorites" heading. The symmetric
+	// All ports heading is kept.
+	m.showAllPorts = false
+	if favFirst := strings.SplitN(m.emptyStateMessage(), "\n", 2)[0]; strings.Contains(favFirst, "Favorites") {
+		t.Errorf("Favorites empty state should not lead with a 'Favorites' heading; first line = %q", favFirst)
+	} else if !strings.Contains(favFirst, "tailport") {
+		t.Errorf("Favorites empty state should lead with the intro; first line = %q", favFirst)
+	}
+	m.showAllPorts = true
+	if allFirst := strings.SplitN(m.emptyStateMessage(), "\n", 2)[0]; !strings.Contains(allFirst, "All ports") {
+		t.Errorf("All ports empty state should keep its heading; first line = %q", allFirst)
+	}
 }

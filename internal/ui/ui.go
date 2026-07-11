@@ -1084,7 +1084,11 @@ func (m model) emptyStateMessage() string {
 		t("even when the process isn't running. Press ")+k("a")+t(" for All ports, then ")+k("f"),
 		t("to favorite one. Press ")+k("?")+t(" for help."),
 	)
-	return helpTitleStyle.Render("Favorites") + "\n\n" + strings.Join(lines, "\n")
+	// No "Favorites" heading here (2fgk): the persistent header already names
+	// the view, and the body line above already says "your Favorites view", so
+	// a green heading too would just be redundant. The symmetric "All ports"
+	// heading is deliberately kept.
+	return strings.Join(lines, "\n")
 }
 
 // renderEmptyState renders the empty-view explanation in place of the list
