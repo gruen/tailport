@@ -837,6 +837,29 @@ func (m model) helpView() string {
 	return b.String()
 }
 
+// emptyStateMessage explains the current (empty) view: why it's empty and
+// what to press to get somewhere. It's the friendly stand-in for the list's
+// bare "No items." -- most important on a fresh install, where the default
+// Favorites view is empty until the user favorites something.
+func (m model) emptyStateMessage() string {
+	if m.showAllPorts {
+		return "No TCP ports are listening on this machine right now.\n\n" +
+			"Start a local server (a dev server, database, and so on), then\n" +
+			"press r to refresh. Press ? for help."
+	}
+	return "No favorite ports yet -- this is your Favorites view.\n\n" +
+		"Favorites (" + favStyle.Render("★") + ") are a shortlist you curate: they stay here across\n" +
+		"restarts even when the process isn't running.\n\n" +
+		"Press " + helpKeyStyle.Render("a") + " to switch to All ports (everything listening now),\n" +
+		"then " + helpKeyStyle.Render("f") + " to favorite one. Press " + helpKeyStyle.Render("?") + " for help."
+}
+
+// renderEmptyState renders the title plus emptyStateMessage in place of the
+// list body when the current view has no items.
+func (m model) renderEmptyState() string {
+	return helpTitleStyle.Render("tailport") + "\n\n" + helpTextStyle.Render(m.emptyStateMessage())
+}
+
 func (m model) View() string {
 	if m.showHelp {
 		return m.helpView()
@@ -846,7 +869,16 @@ func (m model) View() string {
 	if m.err != nil {
 		b += errStyle.Render("error: "+m.err.Error()) + "\n"
 	}
-	b += m.list.View()
+	// An empty Items() means the current view itself has nothing (no
+	// favorites, or nothing listening) -- as opposed to a "/" filter that
+	// matched nothing, where Items() is still populated. In the former case
+	// bubbles/list would just print a bare "No items."; render a contextual
+	// explanation of what the view is and how to get somewhere instead.
+	if len(m.list.Items()) == 0 && m.list.FilterState() != list.Filtering {
+		b += m.renderEmptyState()
+	} else {
+		b += m.list.View()
+	}
 
 	switch m.mode {
 	case entryAddPort:
