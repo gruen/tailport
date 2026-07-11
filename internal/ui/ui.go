@@ -32,8 +32,8 @@ var (
 
 // keyMap describes every keybinding the TUI responds to, for the bubbles/help
 // legend. It satisfies help.KeyMap. Most bindings carry static help text;
-// ShowAll's Desc is refreshed on each render to reflect the current filter
-// mode (see model.renderLegend).
+// ShowAll's Desc is refreshed on each render to reflect the current view
+// (favorites vs all ports; see model.renderLegend).
 type keyMap struct {
 	Toggle     key.Binding
 	NewPort    key.Binding
@@ -159,7 +159,10 @@ type model struct {
 	keys    keyMap
 	cfg     config.Config
 	host    string
-	showAll bool
+	// showAllPorts selects the list view: false = Favorites (only ports
+	// marked meta.Favorite), true = All ports (every currently-listening
+	// port). Toggled by "a".
+	showAllPorts bool
 
 	allPorts []portscan.Port
 	active   map[int]bool
@@ -429,8 +432,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "a":
-			m.showAll = !m.showAll
+			// Anchor the cursor to the port under it, not the row index:
+			// capture the selected port number, switch views, then re-select
+			// that port if it survived into the new view (else the nearest
+			// remaining port -- see selectPort).
+			var cur int
+			if sel, ok := m.list.SelectedItem().(portItem); ok {
+				cur = sel.port.Number
+			}
+			m.showAllPorts = !m.showAllPorts
 			m.rebuildItems()
+			if cur != 0 {
+				m.selectPort(cur)
+			}
 			return m, nil
 		case "r":
 			return m, refresh
@@ -544,19 +558,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// rebuildItems recomputes the visible list. In discovery mode (showAll)
-// it shows every currently-listening port, full stop. Otherwise it shows
-// the union of currently-active ports and the port registry (labeled
-// and/or favorited ports, plus any port ever toggled on), merging in
-// synthetic entries (empty Process) for registry ports that aren't
-// currently listening locally.
+// rebuildItems recomputes the visible list for the current view. In the
+// All ports view (showAllPorts) it shows every currently-listening port,
+// full stop. In the Favorites view it shows only ports marked
+// meta.Favorite, merging in synthetic entries (empty Process) for favorite
+// ports that aren't currently listening locally so a favorite never
+// silently disappears just because its process is down.
 func (m *model) rebuildItems() {
 	portsByNumber := make(map[int]portscan.Port, len(m.allPorts))
 	for _, p := range m.allPorts {
 		portsByNumber[p.Number] = p
 	}
 
-	if m.showAll {
+	if m.showAllPorts {
 		numbers := make([]int, 0, len(portsByNumber))
 		for n := range portsByNumber {
 			numbers = append(numbers, n)
@@ -572,21 +586,11 @@ func (m *model) rebuildItems() {
 		return
 	}
 
-	candidates := map[int]bool{}
-	for n := range portsByNumber {
-		candidates[n] = true
-	}
-	for n := range m.cfg.Ports {
-		candidates[n] = true
-	}
-	for n := range m.active {
-		candidates[n] = true
-	}
-
-	numbers := make([]int, 0, len(candidates))
-	for n := range candidates {
-		_, inRegistry := m.cfg.Ports[n]
-		if m.active[n] || inRegistry {
+	// Favorites view: exactly the ports flagged meta.Favorite. Unfavoriting
+	// a port (which clears the flag) makes it drop out here immediately.
+	numbers := make([]int, 0, len(m.cfg.Ports))
+	for n, meta := range m.cfg.Ports {
+		if meta.Favorite {
 			numbers = append(numbers, n)
 		}
 	}
@@ -608,15 +612,49 @@ func (m *model) rebuildItems() {
 // setItems replaces the list's items and clamps the selection if it's now
 // out of range. list.Model.SetItems does not do this itself: its cursor
 // index is left pointing past the end whenever the item count shrinks
-// (e.g. switching from discovery mode back to the filtered view, or a
-// refresh that drops a since-unregistered port), which makes
-// SelectedItem() return nil and silently turns every selection-based key
-// (enter/space, l, f, u) into a no-op.
+// (e.g. switching from the All ports view back to Favorites, or a refresh
+// that drops a since-unregistered port), which makes SelectedItem() return
+// nil and silently turns every selection-based key (space, l, f, u) into a
+// no-op.
 func (m *model) setItems(items []list.Item) {
 	m.list.SetItems(items)
 	if idx := m.list.Index(); len(items) > 0 && (idx < 0 || idx >= len(items)) {
 		m.list.Select(len(items) - 1)
 	}
+}
+
+// selectPort moves the cursor to the row for the given port number,
+// anchoring selection to the port rather than the row index across a view
+// switch. If that port isn't present in the current list, it falls back to
+// the nearest remaining port (see selectIndexForPort). No-op on an empty
+// list.
+func (m *model) selectPort(number int) {
+	items := m.list.Items()
+	if len(items) == 0 {
+		return
+	}
+	numbers := make([]int, len(items))
+	for i, it := range items {
+		numbers[i] = it.(portItem).port.Number
+	}
+	m.list.Select(selectIndexForPort(numbers, number))
+}
+
+// selectIndexForPort returns the index in numbers (sorted ascending) to
+// select when anchoring the cursor to target. If target is present, its
+// index is returned. Otherwise the nearest next-lowest port is chosen (the
+// row just before target's insertion point), falling back to the first row
+// when target is below every remaining port. Example: numbers=[3000,8080],
+// target 9000 -> index 1 (:8080); target 22 -> index 0 (:3000).
+func selectIndexForPort(numbers []int, target int) int {
+	i := sort.SearchInts(numbers, target)
+	if i < len(numbers) && numbers[i] == target {
+		return i
+	}
+	if i > 0 {
+		return i - 1
+	}
+	return 0
 }
 
 // renderLegend renders the keybinding legend, wrapping onto additional
@@ -625,11 +663,11 @@ func (m *model) setItems(items []list.Item) {
 // they don't wrap, so the packing is done by hand in wrapBindings).
 func (m model) renderLegend() string {
 	keys := m.keys
-	filter := "filtered"
-	if m.showAll {
-		filter = "all ports"
+	view := "favorites"
+	if m.showAllPorts {
+		view = "all ports"
 	}
-	keys.ShowAll.SetHelp("a", filter)
+	keys.ShowAll.SetHelp("a", view)
 	// "clean stale" only makes sense when there's something stale to clean;
 	// wrapBindings skips disabled bindings, so it drops out otherwise.
 	keys.Clean.SetEnabled(m.hasDangling())

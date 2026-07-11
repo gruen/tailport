@@ -68,3 +68,33 @@ func TestDanglingPorts(t *testing.T) {
 		})
 	}
 }
+
+// TestSelectIndexForPort covers the cursor-anchoring helper behind the "a"
+// view toggle (vk30): the cursor tracks the port number, not the row index.
+// numbers is always sorted ascending (rebuildItems sorts before setItems).
+func TestSelectIndexForPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		numbers []int
+		target  int
+		want    int
+	}{
+		{"exact match first", []int{22, 3000, 8080}, 22, 0},
+		{"exact match middle", []int{22, 3000, 8080}, 3000, 1},
+		{"exact match last", []int{22, 3000, 8080}, 8080, 2},
+		// vk30's :9000 example: not a favorite, so favorites view lacks it;
+		// cursor lands on the nearest next-lowest favorite (:8080).
+		{"missing lands on next-lowest", []int{3000, 8080}, 9000, 1},
+		{"missing between two", []int{3000, 8080}, 5000, 0},
+		{"missing above all", []int{3000, 8080}, 65535, 1},
+		{"missing below all", []int{3000, 8080}, 80, 0},
+		{"single item", []int{3000}, 9000, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := selectIndexForPort(tt.numbers, tt.target); got != tt.want {
+				t.Errorf("selectIndexForPort(%v, %d) = %d, want %d", tt.numbers, tt.target, got, tt.want)
+			}
+		})
+	}
+}
