@@ -1406,16 +1406,27 @@ var (
 // chars wide -- rounded caps, never a single-char spike.
 func eggHalves(h int, a float64) []int {
 	const (
-		n     = 2.4  // superellipse exponent (>2: fuller shoulders / rounder caps)
-		skew  = 0.40 // pushes the widest row below centre
-		cap   = 0.08 // trims the poles so top/bottom rows aren't a single char
-		bulge = 1.0  // fattens the belly by ~2 cols; sin() is 0 at the poles so
-		//              the top/bottom caps are preserved exactly (widen middle only)
+		n      = 2.4  // superellipse exponent (>2: fuller shoulders / rounder caps)
+		skew   = 0.42 // pushes the widest row below centre
+		capTop = 0.22 // trims the TOP pole hard: the top row starts a few cols
+		//               wide and steps in one col per side -> a rounded dome,
+		//               not the old pointy single-step cap.
+		capBot = 0.05 // trims the bottom pole only lightly, keeping the tighter
+		//               rounded point that reads as the broad base of an egg.
+		bulge = 1.2 // fattens the belly by ~2 cols; sin() is 0 at the poles so
+		//             the top/bottom caps are shaped by cap*/skew, not this term.
 	)
 	out := make([]int, h)
 	for y := 0; y < h; y++ {
 		t := float64(y) / float64(h-1)
-		u := (2*t - 1) * (1 - cap)
+		// Asymmetric cap: trim the top pole more than the bottom so the crown
+		// rounds off while the base stays egg-broad (2b4r follow-up).
+		u := 2*t - 1
+		if u < 0 {
+			u *= (1 - capTop)
+		} else {
+			u *= (1 - capBot)
+		}
 		base := math.Pow(math.Max(0, 1-math.Pow(math.Abs(u), n)), 1/n)
 		half := int(math.Round(a*base*(1+skew*u) + bulge*math.Sin(math.Pi*t)))
 		if half < 0 {
