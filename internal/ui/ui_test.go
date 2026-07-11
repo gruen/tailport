@@ -1412,3 +1412,60 @@ func TestEmptyStateMessage(t *testing.T) {
 		t.Errorf("All ports empty state should keep its heading; first line = %q", allFirst)
 	}
 }
+
+// TestHelpConfigPath covers gahj: the "?" help overlay states where settings
+// live and shows the ACTUAL resolved config path, honoring XDG_CONFIG_HOME.
+func TestHelpConfigPath(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	// New() captures the resolved path; it must reflect the XDG override.
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	want, err := config.Path()
+	if err != nil {
+		t.Fatalf("config.Path() error: %v", err)
+	}
+	if m.configPath != want {
+		t.Fatalf("model.configPath = %q, want %q", m.configPath, want)
+	}
+	if !strings.HasPrefix(want, xdg) {
+		t.Fatalf("resolved path %q should sit under XDG_CONFIG_HOME %q", want, xdg)
+	}
+
+	// The overlay names where settings save and shows that exact path.
+	view := stripANSI(m.helpView())
+	if !strings.Contains(view, "saved to") {
+		t.Errorf("help overlay should state where settings are saved; got:\n%s", view)
+	}
+	if !strings.Contains(view, want) {
+		t.Errorf("help overlay should show the resolved path %q; got:\n%s", want, view)
+	}
+}
+
+// TestConfigSaveLines covers the display helper directly: the default rule
+// (unset XDG) ends at .config/tailport/config.yaml, an explicit path is shown
+// verbatim, $HOME is abbreviated to ~, and an empty path falls back to the rule.
+func TestConfigSaveLines(t *testing.T) {
+	// Default rule: with XDG unset the resolved path ends at the ~/.config leaf.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	def, err := config.Path()
+	if err != nil {
+		t.Fatalf("config.Path() error: %v", err)
+	}
+	if !strings.HasSuffix(def, ".config/tailport/config.yaml") {
+		t.Errorf("default config path = %q, want it to end with .config/tailport/config.yaml", def)
+	}
+
+	// An explicit absolute path is shown as-is (joined into one of the lines).
+	lines := configSaveLines("/etc/xdg/tailport/config.yaml")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "/etc/xdg/tailport/config.yaml") {
+		t.Errorf("configSaveLines should show the literal path; got %q", joined)
+	}
+
+	// Empty path -> fall back to describing the rule, never nothing.
+	fb := strings.Join(configSaveLines(""), "\n")
+	if !strings.Contains(fb, "XDG_CONFIG_HOME") || !strings.Contains(fb, ".config/tailport/config.yaml") {
+		t.Errorf("configSaveLines(\"\") should describe the rule; got %q", fb)
+	}
+}

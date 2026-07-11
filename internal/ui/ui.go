@@ -343,6 +343,12 @@ type model struct {
 	flash      string
 	flashLevel flashLevel
 	flashID    int
+	// configPath is the resolved absolute path where preferences (the port
+	// registry: favorites, labels, locks) are persisted, captured once at
+	// New() from config.Path() so the help overlay can state it exactly --
+	// honoring XDG_CONFIG_HOME rather than guessing (gahj). Empty if
+	// config.Path() errored, in which case helpView describes the rule instead.
+	configPath string
 }
 
 func New(cfg config.Config) model {
@@ -389,7 +395,12 @@ func New(cfg config.Config) model {
 
 	h := help.New()
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si}
+	// Resolve the config path once here (best-effort) so the help overlay can
+	// show exactly where settings live, XDG override and all. On error we leave
+	// it empty and helpView falls back to describing the rule.
+	configPath, _ := config.Path()
+
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath}
 }
 
 func Run(cfg config.Config) error {
@@ -1594,6 +1605,29 @@ func (m model) eggView() string {
 // helpView renders the full-screen "?" overlay: a short intro to what
 // tailport is, then a real explanation of every key (not the terse legend).
 // It replaces the whole View while m.showHelp is set.
+// configSaveLines describes where preferences are persisted, for the help
+// overlay (gahj). Given the resolved path it returns a headline plus the exact
+// location, abbreviating $HOME to ~ when the path is under it (cosmetic). When
+// path is empty (config.Path() errored) it falls back to stating the rule so
+// the overlay never shows nothing.
+func configSaveLines(path string) []string {
+	const head = "Settings (favorites, labels, locks) are saved to:"
+	if path == "" {
+		return []string{
+			head,
+			"  $XDG_CONFIG_HOME/tailport/config.yaml, or",
+			"  ~/.config/tailport/config.yaml",
+		}
+	}
+	loc := path
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if prefix := home + string(os.PathSeparator); strings.HasPrefix(loc, prefix) {
+			loc = "~" + string(os.PathSeparator) + loc[len(prefix):]
+		}
+	}
+	return []string{head, "  " + loc}
+}
+
 func (m model) helpView() string {
 	var b strings.Builder
 
@@ -1638,6 +1672,11 @@ func (m model) helpView() string {
 		"Toggling port :22 (SSH) asks for a y/n confirmation first, in both\n" +
 			"directions — turning serve off for :22 can drop your live SSH session."))
 	b.WriteString("\n\n")
+	for _, line := range configSaveLines(m.configPath) {
+		b.WriteString(helpTextStyle.Render(line) + "\n")
+	}
+
+	b.WriteString("\n")
 	b.WriteString(helpStyle.Render("press ? / esc / q to close"))
 	return b.String()
 }
