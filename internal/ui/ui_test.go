@@ -453,6 +453,106 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestLabelPrefill covers vgn5: the 'l' label input prefills with the current
+// label if set, else the process name, else empty; confirming the prefill
+// persists it, editing replaces it, and esc leaves the existing label alone.
+func TestLabelPrefill(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	lKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}}
+	build := func(cfg config.Config, ports []portscan.Port) model {
+		m := New(cfg)
+		m.allPorts = ports
+		m.active = map[int]bool{}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+	openLabel := func(m model) model {
+		res, _ := m.Update(lKey)
+		return res.(model)
+	}
+
+	// (1) Existing label wins over the process name.
+	m := openLabel(build(
+		config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true, Label: "web"}}},
+		[]portscan.Port{{Number: 8080, Process: "srv"}}))
+	if m.mode != entryLabel {
+		t.Fatalf("l should open entryLabel; mode = %v", m.mode)
+	}
+	if got := m.labelInput.Value(); got != "web" {
+		t.Errorf("prefill with a label = %q, want \"web\"", got)
+	}
+
+	// (2) No label, has process -> process name.
+	m = openLabel(build(config.Config{Ports: map[int]config.PortMeta{}},
+		[]portscan.Port{{Number: 8080, Process: "srv"}}))
+	if got := m.labelInput.Value(); got != "srv" {
+		t.Errorf("prefill = %q, want the process name \"srv\"", got)
+	}
+
+	// (3) Neither (down favorite, no process) -> empty.
+	m = openLabel(build(config.Config{Ports: map[int]config.PortMeta{9000: {Favorite: true}}}, nil))
+	if got := m.labelInput.Value(); got != "" {
+		t.Errorf("prefill = %q, want empty", got)
+	}
+
+	// (4) Confirming a prefilled process name (enter, no edits) persists it.
+	m = openLabel(build(config.Config{Ports: map[int]config.PortMeta{}},
+		[]portscan.Port{{Number: 8080, Process: "srv"}}))
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(model)
+	if m.cfg.Ports[8080].Label != "srv" {
+		t.Errorf("confirming the prefill should save the process name; got %q", m.cfg.Ports[8080].Label)
+	}
+
+	// (5a) Editing then confirming replaces the label.
+	m = openLabel(build(config.Config{Ports: map[int]config.PortMeta{8080: {Label: "web"}}},
+		[]portscan.Port{{Number: 8080}}))
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}}) // "web" -> "web2"
+	m = res.(model)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(model)
+	if m.cfg.Ports[8080].Label != "web2" {
+		t.Errorf("edit+confirm should save the new label; got %q", m.cfg.Ports[8080].Label)
+	}
+
+	// (5b) esc leaves the existing label unchanged.
+	m = openLabel(build(config.Config{Ports: map[int]config.PortMeta{8080: {Label: "web"}}},
+		[]portscan.Port{{Number: 8080}}))
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(model)
+	if m.cfg.Ports[8080].Label != "web" {
+		t.Errorf("esc should leave the label unchanged; got %q", m.cfg.Ports[8080].Label)
+	}
+}
+
+// TestNoDefaultLabel pins the "nothing" non-bug (vgn5): newly registered ports
+// carry an empty label -- there is no placeholder/default label.
+func TestNoDefaultLabel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// 'n' (favorite()) -> empty label.
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m = addPort(m, "3000")
+	if m.cfg.Ports[3000].Label != "" {
+		t.Errorf("n-added :3000 should have an empty label; got %q", m.cfg.Ports[3000].Label)
+	}
+
+	// A bare remembered port -> empty label.
+	m2 := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m2.remember(4000)
+	if m2.cfg.Ports[4000].Label != "" {
+		t.Errorf("remembered :4000 should have an empty label; got %q", m2.cfg.Ports[4000].Label)
+	}
+
+	// The seeded default (:22) also carries no label.
+	if config.Default().Ports[22].Label != "" {
+		t.Error("default :22 should have an empty label")
+	}
+}
+
 // TestUnlockSSHConfirm covers ah23: unlocking :22 is gated behind a
 // type-"ssh" confirm, while locking :22 and non-:22 toggles stay instant.
 func TestUnlockSSHConfirm(t *testing.T) {

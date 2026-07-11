@@ -946,7 +946,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.mode = entryLabel
 			m.labelPort = sel.port.Number
-			m.labelInput.SetValue(sel.port.Process)
+			// Prefill precedence (vgn5): the current label if set (so adjusting
+			// starts from existing text, not the process name), else the
+			// process name for a listening port, else empty. It's an editable
+			// value, so enter with no edits commits the prefill.
+			prefill := sel.meta.Label
+			if prefill == "" {
+				prefill = sel.port.Process
+			}
+			m.labelInput.SetValue(prefill)
 			m.labelInput.CursorEnd()
 			m.labelInput.Focus()
 			return m, nil
