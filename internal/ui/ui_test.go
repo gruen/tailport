@@ -1303,8 +1303,8 @@ func TestNextFunnelPort(t *testing.T) {
 }
 
 // TestFunnelItemRender covers the list row for a funnelled port: the distinct
-// ◉ marker and a public HTTPS URL in the description, both overriding the
-// tailnet-serve presentation even when the port is also served.
+// public ● marker (ASCII mode) and a public HTTPS URL in the description, both
+// overriding the tailnet-serve presentation even when the port is also served.
 func TestFunnelItemRender(t *testing.T) {
 	it := portItem{
 		port:         portscan.Port{Number: 3000, Process: "node"},
@@ -1314,8 +1314,12 @@ func TestFunnelItemRender(t *testing.T) {
 		fqdn:         "host.example.ts.net",
 		funnelPublic: 8443, // ... but funnel outranks it
 	}
-	if got := it.Title(); !strings.Contains(got, "◉") {
-		t.Errorf("funnelled Title should carry the ◉ marker; got %q", got)
+	got := it.Title()
+	if !strings.Contains(got, "●") {
+		t.Errorf("funnelled Title should carry the public ● marker; got %q", got)
+	}
+	if strings.Contains(got, "◉") {
+		t.Errorf("funnelled Title should not show the tailnet ◉ marker; got %q", got)
 	}
 	desc := it.Description()
 	if !strings.Contains(desc, "https://host.example.ts.net:8443") {
@@ -1470,5 +1474,75 @@ func TestConfigSaveLines(t *testing.T) {
 	fb := strings.Join(configSaveLines(""), "\n")
 	if !strings.Contains(fb, "XDG_CONFIG_HOME") || !strings.Contains(fb, ".config/tailport/config.yaml") {
 		t.Errorf("configSaveLines(\"\") should describe the rule; got %q", fb)
+	}
+}
+
+// TestMarkerGlyph covers sqvm: the exposure-state marker resolves to the egg
+// lifecycle in emoji mode and the styled ASCII fallback otherwise, with funnel
+// outranking a dangling forward, which outranks a healthy serve.
+func TestMarkerGlyph(t *testing.T) {
+	cases := []struct {
+		name                 string
+		active, listening    bool
+		funnel               int
+		wantEmoji, wantASCII string
+	}{
+		{"idle", false, false, 0, "🥚", "○"},
+		{"tailnet", true, true, 0, "🐣", "◉"},
+		{"dangling", true, false, 0, "🪹", "▲"},
+		{"funnel", true, true, 443, "🐦", "●"},
+		{"funnel outranks dangling", true, false, 443, "🐦", "●"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			em := portItem{active: c.active, listening: c.listening, funnelPublic: c.funnel, emoji: true}
+			got := em.markerGlyph()
+			if !strings.Contains(got, c.wantEmoji) {
+				t.Errorf("emoji marker = %q, want to contain %q", got, c.wantEmoji)
+			}
+			if lipgloss.Width(got) < 2 {
+				t.Errorf("emoji marker %q should pad to a 2-cell column, width=%d", got, lipgloss.Width(got))
+			}
+			as := portItem{active: c.active, listening: c.listening, funnelPublic: c.funnel, emoji: false}
+			if got := stripANSI(as.markerGlyph()); got != c.wantASCII {
+				t.Errorf("ascii marker = %q, want %q", got, c.wantASCII)
+			}
+		})
+	}
+}
+
+// TestResolveEmoji covers the markers-mode resolution: emoji/ascii force it,
+// auto (or empty) defers to the terminal heuristic (UTF-8 locale + sane TERM).
+func TestResolveEmoji(t *testing.T) {
+	if !resolveEmoji("emoji") {
+		t.Error("markers=emoji should force emoji")
+	}
+	if resolveEmoji("ascii") {
+		t.Error("markers=ascii should force ascii")
+	}
+
+	// auto: a UTF-8 locale on a normal terminal -> emoji.
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LC_CTYPE", "")
+	t.Setenv("LANG", "en_US.UTF-8")
+	if !resolveEmoji("auto") {
+		t.Error("auto with UTF-8 LANG on xterm should resolve emoji")
+	}
+	if !resolveEmoji("") {
+		t.Error("empty (=auto) with UTF-8 should resolve emoji")
+	}
+
+	// The bare Linux console can't render emoji, even with a UTF-8 locale.
+	t.Setenv("TERM", "linux")
+	if resolveEmoji("auto") {
+		t.Error("auto on the linux console should resolve ascii")
+	}
+
+	// A non-UTF-8 locale -> ascii.
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("LANG", "C")
+	if resolveEmoji("auto") {
+		t.Error("auto with a non-UTF-8 locale should resolve ascii")
 	}
 }

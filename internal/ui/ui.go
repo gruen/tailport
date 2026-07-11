@@ -33,8 +33,8 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	// publicStyle marks a port funnelled to the public internet -- deliberately
-	// a hot magenta, distinct from the green ● tailnet-serve and amber ▲
-	// dangling markers, so "this is on the public internet" reads at a glance.
+	// a hot magenta ● (ASCII mode), distinct from the green ◉ tailnet-serve and
+	// amber ▲ dangling markers, so "this is on the public internet" reads at a glance.
 	publicStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("201")).Bold(true)
 
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
@@ -125,6 +125,9 @@ type portItem struct {
 	// stand out among the wider search results. See portDelegate.Render.
 	dimmed bool
 	meta   config.PortMeta
+	// emoji selects the egg-lifecycle marker set (🥚/🐣/🐦/🪹) over the ASCII
+	// fallback (○/●/◉/▲). Resolved once for the model and copied onto each item.
+	emoji bool
 }
 
 // portDelegate is the list's item renderer: the stock DefaultDelegate, except
@@ -152,22 +155,53 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 	d.DefaultDelegate.Render(w, m, index, item)
 }
 
-func (i portItem) Title() string {
-	marker := "○"
-	if i.active {
-		marker = activeStyle.Render("●")
-		if !i.listening {
-			// Dangling forward: exposed via serve, but nothing is bound
-			// locally, so a tailnet peer hitting the URL gets connection
-			// refused. Flag it distinctly rather than as a healthy ●.
-			marker = warnStyle.Render("▲")
+// markerGlyph is the port's exposure-state marker. In emoji mode it's the egg
+// life cycle (🥚 idle → 🐣 tailnet → 🐦 public, 🪹 empty nest for a dead
+// forward); otherwise the styled ASCII fallback. Funnel outranks serve state,
+// which outranks a dangling forward, which outranks idle. Emoji markers are
+// padded to a stable 2-cell width so the :port column stays aligned even if a
+// terminal renders a given emoji narrow.
+func (i portItem) markerGlyph() string {
+	var m string
+	switch {
+	case i.funnelPublic != 0:
+		// Reachable from the open internet -- outranks tailnet-serve state.
+		if i.emoji {
+			m = "🐦"
+		} else {
+			m = publicStyle.Render("●")
+		}
+	case i.active && !i.listening:
+		// Dangling forward: served, but nothing is bound locally, so a tailnet
+		// peer hitting the URL gets connection refused. An empty nest.
+		if i.emoji {
+			m = "🪹"
+		} else {
+			m = warnStyle.Render("▲")
+		}
+	case i.active:
+		if i.emoji {
+			m = "🐣"
+		} else {
+			m = activeStyle.Render("◉")
+		}
+	default:
+		if i.emoji {
+			m = "🥚"
+		} else {
+			m = "○"
 		}
 	}
-	if i.funnelPublic != 0 {
-		// Public/funnel outranks serve state: a hot ◉ so it's unmistakable
-		// this port is reachable from the open internet, not just the tailnet.
-		marker = publicStyle.Render("◉")
+	if i.emoji {
+		for lipgloss.Width(m) < 2 {
+			m += " "
+		}
 	}
+	return m
+}
+
+func (i portItem) Title() string {
+	marker := i.markerGlyph()
 	lock := ""
 	if i.meta.Locked {
 		lock = " " + lockStyle.Render("🔒")
@@ -349,6 +383,43 @@ type model struct {
 	// honoring XDG_CONFIG_HOME rather than guessing (gahj). Empty if
 	// config.Path() errored, in which case helpView describes the rule instead.
 	configPath string
+	// emoji selects the egg-lifecycle exposure markers over the ASCII fallback,
+	// resolved once at New() from cfg.Markers + the terminal's capabilities.
+	emoji bool
+}
+
+// resolveEmoji picks the marker set from the configured mode: "emoji"/"ascii"
+// force it; anything else ("auto" or empty) defers to the terminal's apparent
+// UTF-8 capability.
+func resolveEmoji(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "emoji":
+		return true
+	case "ascii":
+		return false
+	default:
+		return emojiCapable()
+	}
+}
+
+// emojiCapable is a best-effort heuristic for "this terminal can render emoji":
+// a UTF-8 effective locale (LC_ALL, else LC_CTYPE, else LANG) and a TERM that
+// isn't the bare Linux console or a dumb terminal. It never guarantees glyph
+// coverage -- that's why "ascii" (and "emoji") can force the choice.
+func emojiCapable() bool {
+	switch os.Getenv("TERM") {
+	case "", "dumb", "linux":
+		return false
+	}
+	loc := os.Getenv("LC_ALL")
+	if loc == "" {
+		loc = os.Getenv("LC_CTYPE")
+	}
+	if loc == "" {
+		loc = os.Getenv("LANG")
+	}
+	loc = strings.ToLower(loc)
+	return strings.Contains(loc, "utf-8") || strings.Contains(loc, "utf8")
 }
 
 func New(cfg config.Config) model {
@@ -400,7 +471,7 @@ func New(cfg config.Config) model {
 	// it empty and helpView falls back to describing the rule.
 	configPath, _ := config.Path()
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath}
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(cfg.Markers)}
 }
 
 func Run(cfg config.Config) error {
@@ -1244,7 +1315,7 @@ func (m *model) rebuildItems() tea.Cmd {
 				p = portscan.Port{Number: n}
 			}
 			meta := m.cfg.Ports[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.emoji})
 		}
 		return m.setItems(items)
 	}
@@ -1267,7 +1338,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		}
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n]})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.emoji})
 	}
 	return m.setItems(items)
 }
@@ -1780,6 +1851,17 @@ func configSaveLines(path string) []string {
 	return []string{head, "  " + loc}
 }
 
+// markerLegend describes the exposure-state glyph column, using whichever
+// marker set (emoji or ASCII) is active, plus the always-present lock/favorite.
+func (m model) markerLegend() string {
+	if m.emoji {
+		return "🥚 idle   🐣 tailnet-served   🐦 public (funnel)   🪹 served, nothing listening\n" +
+			"🔒 locked   ★ favorite"
+	}
+	return "○ idle   ◉ tailnet-served   ● public (funnel)   ▲ served, nothing listening\n" +
+		"🔒 locked   ★ favorite"
+}
+
 func (m model) helpView() string {
 	var b strings.Builder
 
@@ -1792,12 +1874,23 @@ func (m model) helpView() string {
 			"tailnet-only and a 1:1 port mapping (same port in and out). A port can\n" +
 			"also be funnelled to the PUBLIC internet with `p` (opt-in, see below)."))
 	b.WriteString("\n\n")
+	b.WriteString(helpTitleStyle.Render("Markers"))
+	b.WriteString("\n")
+	b.WriteString(helpTextStyle.Render(m.markerLegend()))
+	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Keys"))
 	b.WriteString("\n")
 
+	// Exposure glyph shown inline in the key descriptions below, matching the
+	// active marker set so "exposed (X)" reads correctly in either mode.
+	served, funneled, dangling := "◉", "●", "▲"
+	if m.emoji {
+		served, funneled, dangling = "🐣", "🐦", "🪹"
+	}
+
 	rows := []struct{ key, desc string }{
-		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (●) its tailnet URL is shown beneath it."},
-		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (◉), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
+		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it."},
+		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
 		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
 		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
 		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
@@ -1807,7 +1900,7 @@ func (m model) helpView() string {
 		{"r", "Refresh the port list and serve status."},
 		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
 		{"c", "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so."},
-		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown ▲). Offered only when some exist."},
+		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist."},
 		{"?", "Toggle this help. esc or q also close it."},
 		{"q", "Quit."},
 	}

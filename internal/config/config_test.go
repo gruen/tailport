@@ -82,6 +82,25 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMarkersRoundTrip covers the display preference (sqvm): the markers mode
+// persists and reloads, and is omitted from the file when empty (auto).
+func TestMarkersRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	cfg := Default()
+	cfg.Markers = "emoji"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Markers != "emoji" {
+		t.Errorf("Load() Markers = %q, want %q", got.Markers, "emoji")
+	}
+}
+
 func TestLoadReturnsDefaultWhenAbsent(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 

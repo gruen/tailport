@@ -23,9 +23,13 @@ type PortMeta struct {
 	Locked bool `yaml:"locked,omitempty"`
 }
 
-// Config is the persisted per-port registry.
+// Config is the persisted per-port registry, plus display preferences.
 type Config struct {
 	Ports map[int]PortMeta `yaml:"ports"`
+	// Markers selects the port exposure-state glyphs: "auto" (default; emoji
+	// on a UTF-8-capable terminal, else ASCII), "emoji" (force the egg
+	// lifecycle 🥚/🐣/🐦/🪹), or "ascii" (force ○/●/◉/▲). Empty means auto.
+	Markers string `yaml:"markers,omitempty"`
 }
 
 // Default returns a registry seeded with port 22 (SSH) locked, so a
