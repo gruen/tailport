@@ -1521,26 +1521,32 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 var eggChars = []rune{'░', '▒', '▓', '█'}
 
 // eggShade returns the brightness in [0,1] at a normalised horizontal position
-// rel in [-1,1] (left edge .. right edge of the row). The look is a fixed light
+// rel in [-1,1] (left edge .. right edge of the row). The look is a key light
 // from the upper-left plus a specular glint that EASES back and forth over a
 // small left-of-centre arc -- the frames-32..36 motion picked from the study,
-// so the highlight breathes in place instead of orbiting the egg. The cosine
-// on the glint centre gives zero velocity at each extreme (ease-in-out).
+// so the highlight breathes in place instead of orbiting the egg. The light
+// azimuth ITSELF sways a hair on the same breath, so the shadow-side terminator
+// drifts too and the right side isn't dead static. One shared cosine drives
+// both, giving zero velocity at each extreme (ease-in-out) and keeping the
+// highlight and shadow coherent (light leans left -> shadow deepens right).
 func eggShade(rel, frame float64) float64 {
 	if rel < -1 {
 		rel = -1
 	} else if rel > 1 {
 		rel = 1
 	}
+	const (
+		omega    = 0.28    // ~2.2s per full back-and-forth at 100ms/frame
+		lightMid = -0.5    // key light, upper-left
+		lightAmp = 0.20    // gentle sway so the shadow terminator breathes
+		gMid     = -0.9215 // midpoint of the frame 32..36 glint arc
+		gAmp     = 0.2725  // half its span
+	)
+	breath := math.Cos(frame * omega)
 	lon := math.Asin(rel) // -pi/2 .. pi/2 across the row
-	const lightAz = -0.5  // fixed key light, upper-left
+	lightAz := lightMid + lightAmp*breath
 	base := math.Max(0, math.Cos(lon-lightAz))
-	// Glint centre swings between the two positions of the liked frames,
-	// eased at both ends by the cosine.
-	const gMid = -0.9215 // midpoint of the frame 32..36 glint arc
-	const gAmp = 0.2725  // half its span
-	const gOmega = 0.28  // ~2.2s per full back-and-forth at 100ms/frame
-	g := gMid + gAmp*math.Cos(frame*gOmega)
+	g := gMid + gAmp*breath
 	glint := math.Exp(-math.Pow((lon-g)/0.33, 2))
 	br := 0.16 + 0.5*base + 0.72*glint
 	if br < 0 {
