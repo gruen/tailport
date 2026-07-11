@@ -220,6 +220,151 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 }
 
+// TestRequestFunnel covers yt69's escalation gate: :22 is hard-blocked, a
+// normal turn-on defers to the entryConfirmFunnel prompt with the auto-assigned
+// public port, a 4th funnel is refused, and turning an already-funnelled port
+// off runs immediately (no confirm) back toward tailnet-served.
+func TestRequestFunnel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// :22 hard-block: no funnel cmd, error set, no confirm opened.
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	if cmd := m.requestFunnel(22); cmd != nil {
+		t.Error("funnel :22 should be refused (nil cmd)")
+	}
+	if m.err == nil {
+		t.Error("funnel :22 should set an error")
+	}
+	if m.mode != entryNone {
+		t.Errorf("funnel :22 mode = %v, want entryNone", m.mode)
+	}
+
+	// Normal port turn-on: defers to the confirm, auto-assigns :443 first.
+	m = New(config.Config{Ports: map[int]config.PortMeta{}})
+	if cmd := m.requestFunnel(3000); cmd != nil {
+		t.Error("funnel turn-on should defer (nil cmd) pending confirm")
+	}
+	if m.mode != entryConfirmFunnel || m.funnelPort != 3000 || m.funnelPublic != 443 || !m.funnelTurnOn {
+		t.Errorf("funnel state = mode:%v port:%d pub:%d on:%v", m.mode, m.funnelPort, m.funnelPublic, m.funnelTurnOn)
+	}
+
+	// From that confirm, "y" begins the funnel: real cmd, pending set, closed.
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Error("y should begin the funnel (non-nil cmd)")
+	}
+	gm := res.(model)
+	if gm.pending != 3000 {
+		t.Errorf("after confirm, pending = %d, want 3000", gm.pending)
+	}
+	if gm.mode != entryNone {
+		t.Errorf("after confirm, mode = %v, want entryNone", gm.mode)
+	}
+
+	// Any other key cancels the confirm with no funnel call.
+	m = New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.requestFunnel(3000)
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if cmd != nil {
+		t.Error("non-y should cancel the funnel confirm (nil cmd)")
+	}
+	if gm := res.(model); gm.mode != entryNone || gm.pending != 0 {
+		t.Errorf("cancel state = mode:%v pending:%d", gm.mode, gm.pending)
+	}
+
+	// All three ingress ports taken: a 4th funnel is refused.
+	m = New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.funnel = map[int]int{3000: 443, 3001: 8443, 3002: 10000}
+	if cmd := m.requestFunnel(9999); cmd != nil {
+		t.Error("a 4th funnel should be refused (nil cmd)")
+	}
+	if m.err == nil || m.mode != entryNone {
+		t.Errorf("4th funnel should error without a confirm; err=%v mode=%v", m.err, m.mode)
+	}
+
+	// Already funnelled: "p" turns it off immediately (no confirm), pending set.
+	m = New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.funnel = map[int]int{3000: 443}
+	if cmd := m.requestFunnel(3000); cmd == nil {
+		t.Error("funnel-off should return a cmd")
+	}
+	if m.mode != entryNone {
+		t.Errorf("funnel-off should not open a confirm; mode = %v", m.mode)
+	}
+	if m.pending != 3000 {
+		t.Errorf("funnel-off pending = %d, want 3000", m.pending)
+	}
+}
+
+// TestNextFunnelPort covers the 443 -> 8443 -> 10000 auto-assign order and the
+// "all three taken" refusal.
+func TestNextFunnelPort(t *testing.T) {
+	cases := []struct {
+		name string
+		used map[int]int
+		want int
+		ok   bool
+	}{
+		{"none used -> 443", map[int]int{}, 443, true},
+		{"443 used -> 8443", map[int]int{3000: 443}, 8443, true},
+		{"443+8443 used -> 10000", map[int]int{3000: 443, 3001: 8443}, 10000, true},
+		{"all three used -> refuse", map[int]int{3000: 443, 3001: 8443, 3002: 10000}, 0, false},
+		{"gap at 443 -> lowest free", map[int]int{3001: 8443}, 443, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := model{funnel: c.used}
+			got, ok := m.nextFunnelPort()
+			if got != c.want || ok != c.ok {
+				t.Errorf("nextFunnelPort(%v) = (%d,%v), want (%d,%v)", c.used, got, ok, c.want, c.ok)
+			}
+		})
+	}
+}
+
+// TestFunnelItemRender covers the list row for a funnelled port: the distinct
+// ◉ marker and a public HTTPS URL in the description, both overriding the
+// tailnet-serve presentation even when the port is also served.
+func TestFunnelItemRender(t *testing.T) {
+	it := portItem{
+		port:         portscan.Port{Number: 3000, Process: "node"},
+		active:       true, // also served on the tailnet ...
+		listening:    true,
+		host:         "host",
+		fqdn:         "host.example.ts.net",
+		funnelPublic: 8443, // ... but funnel outranks it
+	}
+	if got := it.Title(); !strings.Contains(got, "◉") {
+		t.Errorf("funnelled Title should carry the ◉ marker; got %q", got)
+	}
+	desc := it.Description()
+	if !strings.Contains(desc, "https://host.example.ts.net:8443") {
+		t.Errorf("funnelled Description should show the public URL; got %q", desc)
+	}
+	if strings.Contains(desc, "http://host:3000") {
+		t.Errorf("funnelled Description should not show the tailnet URL; got %q", desc)
+	}
+}
+
+// TestUpdateFunnelKey covers the "p" key at the Update layer: on a selected
+// non-:22 port it opens the public-internet confirm.
+func TestUpdateFunnelKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "srv"}}
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmd != nil {
+		t.Error("p should defer to the confirm (nil cmd)")
+	}
+	if got := res.(model); got.mode != entryConfirmFunnel || got.funnelPort != 8080 {
+		t.Errorf("after p, mode=%v funnelPort=%d, want entryConfirmFunnel/8080", got.mode, got.funnelPort)
+	}
+}
+
 // TestHeader covers ttny: the cyan "tailport" wordmark and the Favorites|All
 // toggle live in one persistent top header, drawn above both the list and the
 // empty state -- so the logo survives an empty view -- and the toggle no

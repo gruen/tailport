@@ -28,6 +28,10 @@ var (
 	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	// publicStyle marks a port funnelled to the public internet -- deliberately
+	// a hot magenta, distinct from the green ● tailnet-serve and amber ▲
+	// dangling markers, so "this is on the public internet" reads at a glance.
+	publicStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("201")).Bold(true)
 
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
@@ -49,6 +53,7 @@ var (
 // (favorites vs all ports; see model.renderLegend).
 type keyMap struct {
 	Toggle     key.Binding
+	Funnel     key.Binding
 	NewPort    key.Binding
 	Label      key.Binding
 	Favorite   key.Binding
@@ -66,7 +71,7 @@ type keyMap struct {
 // relies on width-based wrapping (see wrapBindings) instead of truncation.
 func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
-		k.Toggle, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
+		k.Toggle, k.Funnel, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
 		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
 	}
 }
@@ -78,6 +83,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 func newKeyMap() keyMap {
 	return keyMap{
 		Toggle:     key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
+		Funnel:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
 		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new port")),
 		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
 		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
@@ -96,7 +102,12 @@ type portItem struct {
 	active    bool
 	listening bool
 	host      string
-	meta      config.PortMeta
+	fqdn      string
+	// funnelPublic is the public ingress port (443/8443/10000) this port is
+	// funnelled on, or 0 if it isn't funnelled. A funnelled port is exposed to
+	// the public internet, which outranks its tailnet-serve state in the UI.
+	funnelPublic int
+	meta         config.PortMeta
 }
 
 func (i portItem) Title() string {
@@ -109,6 +120,11 @@ func (i portItem) Title() string {
 			// refused. Flag it distinctly rather than as a healthy ●.
 			marker = warnStyle.Render("▲")
 		}
+	}
+	if i.funnelPublic != 0 {
+		// Public/funnel outranks serve state: a hot ◉ so it's unmistakable
+		// this port is reachable from the open internet, not just the tailnet.
+		marker = publicStyle.Render("◉")
 	}
 	lock := ""
 	if i.meta.Locked {
@@ -129,6 +145,11 @@ func (i portItem) Title() string {
 }
 
 func (i portItem) Description() string {
+	if i.funnelPublic != 0 {
+		// Public URL, not the tailnet one: this is what "anyone on the
+		// internet" reaches. Degrades to a hostless URL if the FQDN is unknown.
+		return publicStyle.Render("public: " + tsserve.PublicURL(i.fqdn, i.funnelPublic))
+	}
 	if i.active {
 		if !i.listening {
 			return warnStyle.Render("exposed, nothing listening")
@@ -145,6 +166,8 @@ func (i portItem) FilterValue() string {
 type refreshMsg struct {
 	ports  []portscan.Port
 	active map[int]bool
+	funnel map[int]int
+	fqdn   string
 	err    error
 }
 
@@ -170,14 +193,22 @@ const (
 	// y/n prompt: turning serve on/off for :22 can drop the operator's live
 	// SSH session, so :22 -- and only :22 -- always confirms first.
 	entryConfirm22
+	// entryConfirmFunnel gates turning funnel ON for a port behind a strong
+	// y/n prompt that names the port and shows the resulting public HTTPS URL
+	// with an explicit "anyone on the internet" warning. Turning funnel OFF
+	// (de-escalation back to tailnet-served) is not gated.
+	entryConfirmFunnel
 )
 
 type model struct {
-	list    list.Model
-	help    help.Model
-	keys    keyMap
-	cfg     config.Config
-	host    string
+	list list.Model
+	help help.Model
+	keys keyMap
+	cfg  config.Config
+	host string
+	// fqdn is this node's MagicDNS name (host.tailnet.ts.net), refreshed
+	// alongside serve/funnel status and used to build public funnel URLs.
+	fqdn string
 	// showAllPorts selects the list view: false = Favorites (only ports
 	// marked meta.Favorite), true = All ports (every currently-listening
 	// port). Toggled by "a".
@@ -195,6 +226,9 @@ type model struct {
 
 	allPorts []portscan.Port
 	active   map[int]bool
+	// funnel maps a local port to the public ingress port it's funnelled on
+	// (443/8443/10000). Reconciled from tsserve.FunnelStatus on refresh.
+	funnel map[int]int
 
 	mode       entryMode
 	portInput  textinput.Model
@@ -206,7 +240,12 @@ type model struct {
 	cleanTargets  []int // ports the entryConfirmClean prompt is asking about
 	confirmPort   int   // port the entryConfirm22 prompt is asking about (always 22)
 	confirmTurnOn bool  // direction of the pending entryConfirm22 toggle
-	err           error
+	// entryConfirmFunnel state: the local port being funnelled, the public
+	// ingress port it will use, and the toggle direction.
+	funnelPort   int
+	funnelPublic int
+	funnelTurnOn bool
+	err          error
 }
 
 func New(cfg config.Config) model {
@@ -268,7 +307,14 @@ func refresh() tea.Msg {
 	for _, p := range activeList {
 		active[p] = true
 	}
-	return refreshMsg{ports: ports, active: active}
+	funnel, err := tsserve.FunnelStatus()
+	if err != nil {
+		return refreshMsg{err: err}
+	}
+	// FQDN is best-effort: a failure here shouldn't blank the whole view, it
+	// only degrades the public URL to a hostless form, so the error is dropped.
+	fqdn, _ := tsserve.FQDN()
+	return refreshMsg{ports: ports, active: active, funnel: funnel, fqdn: fqdn}
 }
 
 func toggle(port int, turnOn bool) tea.Cmd {
@@ -280,6 +326,23 @@ func toggle(port int, turnOn bool) tea.Cmd {
 			err = tsserve.Off(port)
 		}
 		return toggleDoneMsg{port: port, err: err}
+	}
+}
+
+// funnelCmd turns the public funnel for localPort on or off. Turning on
+// exposes it to the internet at publicPort; turning off drops the public
+// ingress and restores tailnet serve (see tsserve.FunnelOff). It reuses
+// toggleDoneMsg, so completion clears m.pending and triggers a refresh just
+// like a serve toggle.
+func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		if turnOn {
+			err = tsserve.FunnelOn(localPort, publicPort)
+		} else {
+			err = tsserve.FunnelOff(localPort, publicPort)
+		}
+		return toggleDoneMsg{port: localPort, err: err}
 	}
 }
 
@@ -371,6 +434,91 @@ func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
 	return toggle(port, turnOn)
 }
 
+// requestFunnel begins toggling the public funnel for a port (the "p" key).
+// Turning ON is the escalation to the public internet, so it's hard-blocked
+// for :22 (SSH), refused when all three ingress ports are taken, and
+// otherwise deferred to a strong y/n confirm (entryConfirmFunnel). Turning
+// OFF is de-escalation back to tailnet-served and runs immediately. Returns a
+// nil cmd whenever it defers or refuses.
+func (m *model) requestFunnel(port int) tea.Cmd {
+	if pub, on := m.funnel[port]; on {
+		// Already public -> drop back to tailnet-served. No confirm: this
+		// reduces exposure.
+		return m.beginFunnel(port, pub, false)
+	}
+	if port == 22 {
+		m.err = fmt.Errorf("refusing to funnel :22 (SSH) to the public internet")
+		return nil
+	}
+	pub, ok := m.nextFunnelPort()
+	if !ok {
+		m.err = fmt.Errorf("all funnel ingress ports (443, 8443, 10000) are in use -- tailscale allows at most three")
+		return nil
+	}
+	m.funnelPort = port
+	m.funnelPublic = pub
+	m.funnelTurnOn = true
+	m.mode = entryConfirmFunnel
+	return nil
+}
+
+// beginFunnel records the pending funnel op and returns the command that runs
+// it. Turning on remembers the port (so it stays visible once toggled back
+// down), mirroring beginToggle.
+func (m *model) beginFunnel(localPort, publicPort int, turnOn bool) tea.Cmd {
+	if turnOn {
+		m.remember(localPort)
+	}
+	m.pending = localPort
+	return funnelCmd(localPort, publicPort, turnOn)
+}
+
+// selectedProcess returns the process name discovered for a local port (from
+// the last portscan), or "" if the port isn't currently listening. Used to
+// sharpen the funnel confirm's HTTP heuristic.
+func (m model) selectedProcess(port int) string {
+	for _, p := range m.allPorts {
+		if p.Number == port {
+			return p.Process
+		}
+	}
+	return ""
+}
+
+// nextFunnelPort returns the lowest public ingress port not already in use by
+// another funnel, in tsserve.FunnelPorts order (443 -> 8443 -> 10000). The
+// bool is false when all three are taken (tailscale's per-node funnel limit).
+func (m model) nextFunnelPort() (int, bool) {
+	used := make(map[int]bool, len(m.funnel))
+	for _, pub := range m.funnel {
+		used[pub] = true
+	}
+	for _, p := range tsserve.FunnelPorts {
+		if !used[p] {
+			return p, true
+		}
+	}
+	return 0, false
+}
+
+// looksHTTP is a best-effort guess at whether a port speaks HTTP, used only
+// to decide whether the funnel confirm shows an extra caution line: funnel
+// proxies HTTP(S) to the local target, so a non-HTTP service won't work.
+// Deliberately conservative -- an unknown port gets the caution, not silence.
+func looksHTTP(port int, process string) bool {
+	switch port {
+	case 80, 443, 3000, 3001, 4000, 4200, 5000, 5173, 8000, 8080, 8443, 8888, 9000:
+		return true
+	}
+	p := strings.ToLower(process)
+	for _, h := range []string{"http", "node", "next", "vite", "nginx", "caddy", "gunicorn", "uvicorn", "flask", "rails", "puma", "deno", "bun"} {
+		if strings.Contains(p, h) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -397,13 +545,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.allPorts = msg.ports
 		m.active = msg.active
+		m.funnel = msg.funnel
+		if msg.fqdn != "" {
+			m.fqdn = msg.fqdn
+		}
 		m.rebuildItems()
 		return m, nil
 
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
+			// Keep the error visible: a failed toggle/funnel changed no state,
+			// and a follow-up refresh would immediately clear m.err (refreshMsg
+			// resets it), swallowing messages like the funnel "not enabled"
+			// guidance. The next user action refreshes.
 			m.err = msg.err
+			return m, nil
 		}
 		return m, refresh
 
@@ -459,6 +616,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 					m.mode = entryNone
 					m.confirmPort = 0
+					return m, nil
+				}
+			}
+			// The funnel confirm is the same y/n gate, guarding the escalation
+			// to the PUBLIC INTERNET: "y"/"Y" proceeds with the funnel, every
+			// other key cancels with no funnel call.
+			if m.mode == entryConfirmFunnel {
+				switch msg.String() {
+				case "y", "Y":
+					port := m.funnelPort
+					pub := m.funnelPublic
+					m.mode = entryNone
+					m.funnelPort = 0
+					m.funnelPublic = 0
+					if m.pending != 0 {
+						return m, nil
+					}
+					return m, m.beginFunnel(port, pub, true)
+				default:
+					m.mode = entryNone
+					m.funnelPort = 0
+					m.funnelPublic = 0
 					return m, nil
 				}
 			}
@@ -642,6 +821,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestToggle applies the lock guard and, for :22 only, the SSH
 			// y/n confirm before any serve call.
 			return m, m.requestToggle(sel.port.Number, !sel.active)
+		case "p":
+			if m.pending != 0 {
+				return m, nil // a toggle/funnel is already in flight
+			}
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			// requestFunnel hard-blocks :22, refuses when all ingress ports are
+			// taken, and defers a turn-on to the strong public-internet confirm.
+			return m, m.requestFunnel(sel.port.Number)
 		}
 	}
 
@@ -672,7 +862,7 @@ func (m *model) rebuildItems() {
 		for _, n := range numbers {
 			// This branch iterates portsByNumber, so every port here is
 			// currently listening.
-			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, meta: m.cfg.Ports[n]})
+			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n]})
 		}
 		m.setItems(items)
 		return
@@ -696,7 +886,7 @@ func (m *model) rebuildItems() {
 		}
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, meta: m.cfg.Ports[n]})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n]})
 	}
 	m.setItems(items)
 }
@@ -821,14 +1011,15 @@ func (m model) helpView() string {
 		"tailport lists the TCP ports listening on this machine and toggles\n" +
 			"`tailscale serve` on or off for each one. An exposed port is reachable\n" +
 			"by your other tailnet devices over plain HTTP at http://<host>:<port> —\n" +
-			"tailnet-only, a 1:1 port mapping (same port in and out), never the\n" +
-			"public internet (tailport never uses `tailscale funnel`)."))
+			"tailnet-only and a 1:1 port mapping (same port in and out). A port can\n" +
+			"also be funnelled to the PUBLIC internet with `p` (opt-in, see below)."))
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Keys"))
 	b.WriteString("\n")
 
 	rows := []struct{ key, desc string }{
 		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (●) its tailnet URL is shown beneath it."},
+		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (◉), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
 		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port currently listening locally)."},
 		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
 		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
@@ -877,7 +1068,7 @@ func (m model) emptyStateMessage() string {
 		t("tailport exposes your machine's listening TCP ports to your tailnet."),
 		t("It discovers them with ") + k("ss") + t(" (Linux) / ") + k("lsof") + t(" (macOS), and turns"),
 		t("each one on or off with ") + k("tailscale serve --http=<port>") + t(" -- tailnet-only,"),
-		t("plain HTTP, same port in and out, never ") + k("tailscale funnel") + t("."),
+		t("plain HTTP, same port in and out. Press ") + k("p") + t(" to funnel one publicly."),
 		"",
 	}
 	if m.showAllPorts {
@@ -982,6 +1173,18 @@ func (m model) renderBottom() string {
 			action = "stop serving :22 (SSH) -- this can drop your live session"
 		}
 		return warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
+	case entryConfirmFunnel:
+		url := tsserve.PublicURL(m.fqdn, m.funnelPublic)
+		lines := []string{
+			warnStyle.Render(fmt.Sprintf("⚠ Expose :%d to the PUBLIC INTERNET via funnel?", m.funnelPort)),
+			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
+		}
+		// Funnel proxies HTTP(S); warn when the target may not speak it.
+		if proc := m.selectedProcess(m.funnelPort); !looksHTTP(m.funnelPort, proc) {
+			lines = append(lines, warnStyle.Render(fmt.Sprintf("   note: funnel only proxies HTTP; :%d may not speak it", m.funnelPort)))
+		}
+		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
+		return strings.Join(lines, "\n")
 	}
 	bar := helpStyle.Render(m.statusText())
 	if legend := m.renderLegend(); legend != "" {

@@ -17,14 +17,27 @@ contract. The short version:
 
 ### Design constraints (do not relax without asking)
 
-- Tailnet-only. `tailscale funnel` (public internet exposure) is never invoked
-  by this tool, under any flag or code path. `tailscale serve` only.
-- Plain HTTP only (`--http=PORT`). No HTTPS/TLS serve mode — deliberate,
-  see project history: Tailscale's WireGuard tunnel already encrypts
-  peer-to-peer traffic, so app-layer TLS added no real confidentiality
-  here, and it would have pulled in cert/HTTPS complexity for no benefit.
-- 1:1 port mapping only — the exposed tailnet port always equals the local
-  port. No remapping (public port != local port).
+- Tailnet-first. `tailscale serve` (tailnet-only exposure) is the default
+  path. `tailscale funnel` (public internet exposure) IS supported, but only
+  as a deliberate, per-service opt-in via the `p` key behind a strong y/n
+  confirm that names the port and shows the resulting public URL. `:22` (SSH)
+  is hard-blocked from funnel. Never funnel implicitly, in bulk, or without
+  that confirm. (Implemented under kata yt69: the `p` key, `entryConfirmFunnel`
+  gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`.)
+- Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
+  mode — deliberate, see project history: Tailscale's WireGuard tunnel
+  already encrypts peer-to-peer traffic, so app-layer TLS added no real
+  confidentiality here, and it would have pulled in cert/HTTPS complexity
+  for no benefit. Funnel is necessarily different: its public ingress is
+  always HTTPS/TLS (Tailscale terminates TLS with the node's `ts.net` cert;
+  there is no plain-HTTP funnel). The local proxy target stays plain
+  `http://127.0.0.1:PORT` either way.
+- 1:1 port mapping for serve (tailnet) — the exposed tailnet port always
+  equals the local port; no remapping. Funnel is exempt because Tailscale
+  restricts funnel ingress to ports `443`, `8443`, and `10000` only: the
+  local target port is unrestricted, but the public port is one of those
+  three (auto-assigned 443 → 8443 → 10000, max three concurrent funnels
+  per node). Serve mappings stay strictly 1:1.
 - Fleet targets: `linux/amd64` (host-a, host-b) and `darwin/arm64` (mac-a,
   mac-b, mac-c). Keep `.github/workflows/build.yml` and `install.sh` in
   sync with this list if it changes.
