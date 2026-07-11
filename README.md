@@ -152,6 +152,21 @@ An entry can have a `label`, be marked `favorite`, or both. An empty entry
 a custom label or favorite status — the state left behind by toggling a
 port on without labeling or favoriting it.
 
+### Status markers
+
+A top-level `markers` key selects how a port's exposure state is drawn:
+
+```yaml
+markers: auto # auto (default) | emoji | ascii
+```
+
+- `auto` — egg-lifecycle emoji on a UTF-8-capable terminal (locale is
+  UTF-8 and `TERM` isn't the bare Linux console or `dumb`), otherwise ASCII.
+- `emoji` — always 🥚 idle · 🐣 tailnet-served · 🐦 public (funnel) ·
+  🪹 served but nothing listening.
+- `ascii` — always ○ idle · ◉ tailnet-served · ● public (funnel) ·
+  ▲ served but nothing listening.
+
 ## How it works
 
 - Port discovery: `ss -H -t -l -n -p` on Linux, `lsof -iTCP -sTCP:LISTEN -n
