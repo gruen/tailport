@@ -151,6 +151,10 @@ const (
 	entryAddPort
 	entryLabel
 	entryConfirmClean
+	// entryConfirm22 gates a toggle of port :22 (SSH) behind an explicit
+	// y/n prompt: turning serve on/off for :22 can drop the operator's live
+	// SSH session, so :22 -- and only :22 -- always confirms first.
+	entryConfirm22
 )
 
 type model struct {
@@ -172,10 +176,12 @@ type model struct {
 	labelInput textinput.Model
 	labelPort  int // port being labeled while mode == entryLabel
 
-	pending      int   // port currently being toggled; 0 = none
-	cleaning     int   // number of dangling forwards being torn down; 0 = none
-	cleanTargets []int // ports the entryConfirmClean prompt is asking about
-	err          error
+	pending       int   // port currently being toggled; 0 = none
+	cleaning      int   // number of dangling forwards being torn down; 0 = none
+	cleanTargets  []int // ports the entryConfirmClean prompt is asking about
+	confirmPort   int   // port the entryConfirm22 prompt is asking about (always 22)
+	confirmTurnOn bool  // direction of the pending entryConfirm22 toggle
+	err           error
 }
 
 func New(cfg config.Config) model {
@@ -305,6 +311,38 @@ func (m *model) remember(port int) {
 	}
 }
 
+// requestToggle begins toggling a port on/off from either entry point (the
+// space handler or the "n" add-port submit). It enforces the lock guard
+// (turning a locked port on is refused) and interposes the :22 SSH confirm:
+// for port 22 -- in either direction, since turning serve off is what kicks
+// you off SSH -- it opens an entryConfirm22 prompt and returns a nil cmd,
+// deferring the actual toggle to the y/n handler. Every other port toggles
+// immediately. The :22 confirm is independent of the lock mechanism.
+func (m *model) requestToggle(port int, turnOn bool) tea.Cmd {
+	if turnOn && m.cfg.Ports[port].Locked {
+		m.err = fmt.Errorf("port :%d is locked -- press x to unlock", port)
+		return nil
+	}
+	if port == 22 {
+		m.confirmPort = port
+		m.confirmTurnOn = turnOn
+		m.mode = entryConfirm22
+		return nil
+	}
+	return m.beginToggle(port, turnOn)
+}
+
+// beginToggle records the pending toggle and returns the command that runs
+// it. Callers must have already cleared the lock and :22 guards (see
+// requestToggle and the entryConfirm22 handler).
+func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
+	if turnOn {
+		m.remember(port)
+	}
+	m.pending = port
+	return toggle(port, turnOn)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -363,6 +401,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
+			// The :22 SSH confirm is the same y/n gate: "y"/"Y" proceeds with
+			// the deferred toggle, every other key cancels with no serve call.
+			if m.mode == entryConfirm22 {
+				switch msg.String() {
+				case "y", "Y":
+					port := m.confirmPort
+					turnOn := m.confirmTurnOn
+					m.mode = entryNone
+					m.confirmPort = 0
+					if m.pending != 0 {
+						return m, nil
+					}
+					return m, m.beginToggle(port, turnOn)
+				default:
+					m.mode = entryNone
+					m.confirmPort = 0
+					return m, nil
+				}
+			}
 			switch msg.String() {
 			case "esc":
 				m.mode = entryNone
@@ -383,16 +440,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.pending != 0 {
 						return m, nil
 					}
-					turnOn := !m.active[port]
-					if turnOn && m.cfg.Ports[port].Locked {
-						m.err = fmt.Errorf("port :%d is locked -- press x to unlock", port)
-						return m, nil
-					}
-					if turnOn {
-						m.remember(port)
-					}
-					m.pending = port
-					return m, toggle(port, turnOn)
+					// requestToggle applies the lock guard and the :22 SSH
+					// confirm; typing "22" here gets the same y/n prompt as
+					// pressing space on the :22 row.
+					return m, m.requestToggle(port, !m.active[port])
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
 					port := m.labelPort
@@ -540,16 +591,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
-			turnOn := !sel.active
-			if turnOn && sel.meta.Locked {
-				m.err = fmt.Errorf("port :%d is locked -- press x to unlock", sel.port.Number)
-				return m, nil
-			}
-			if turnOn {
-				m.remember(sel.port.Number)
-			}
-			m.pending = sel.port.Number
-			return m, toggle(sel.port.Number, turnOn)
+			// requestToggle applies the lock guard and, for :22 only, the SSH
+			// y/n confirm before any serve call.
+			return m, m.requestToggle(sel.port.Number, !sel.active)
 		}
 	}
 
@@ -739,6 +783,13 @@ func (m model) View() string {
 			targets[i] = strconv.Itoa(p)
 		}
 		b += "\n" + helpStyle.Render(fmt.Sprintf("tear down forwards on :%s? ", strings.Join(targets, ", :"))) + helpStyle.Render("(y: confirm, any other key: cancel)")
+		return b
+	case entryConfirm22:
+		action := "expose :22 (SSH) via tailscale serve"
+		if !m.confirmTurnOn {
+			action = "stop serving :22 (SSH) -- this can drop your live session"
+		}
+		b += "\n" + warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
 		return b
 	}
 
