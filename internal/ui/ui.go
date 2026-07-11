@@ -63,7 +63,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 
 func newKeyMap() keyMap {
 	return keyMap{
-		Toggle:     key.NewBinding(key.WithKeys("enter", " "), key.WithHelp("enter", "toggle")),
+		Toggle:     key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
 		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new port")),
 		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
 		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
@@ -518,7 +518,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.rebuildItems()
 			return m, nil
-		case "enter", " ":
+		case " ":
 			if m.pending != 0 {
 				return m, nil // a toggle is already in flight
 			}
