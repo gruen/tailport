@@ -456,6 +456,80 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestEasterEgg covers 28mv at the state-machine level (visuals aren't unit
+// tested): 'E' opens the overlay + schedules the animation tick; it's modal;
+// 'c' copies the author's link with a toast without closing; esc/q/'E' close
+// it and the tick stops (no leak); and it's hidden from help + legend.
+func TestEasterEgg(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+
+	// 'E' opens and schedules the tick.
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	m = res.(model)
+	if !m.showEgg {
+		t.Fatal("E should open the egg overlay")
+	}
+	if cmd == nil {
+		t.Error("opening the egg should schedule the animation tick")
+	}
+
+	// The tick advances the frame and reschedules while open.
+	res, cmd = m.Update(eggTickMsg{})
+	m = res.(model)
+	if m.eggFrame == 0 || cmd == nil {
+		t.Errorf("a tick while open should advance the frame (%d) and reschedule (%v)", m.eggFrame, cmd != nil)
+	}
+
+	// Modality: normal keys are swallowed; the egg stays open, nothing acts.
+	for _, k := range []rune{' ', 'p', 'n', 'x', 'a'} {
+		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{k}})
+	}
+	if !m.showEgg || m.pending != 0 || m.mode != entryNone {
+		t.Errorf("keys must be swallowed while the egg is open; showEgg=%v pending=%d mode=%v", m.showEgg, m.pending, m.mode)
+	}
+
+	// 'c' copies the author's link with a toast and stays open.
+	if eggURL != "https://michaelgruen.com/" {
+		t.Errorf("egg link = %q, want the author's site", eggURL)
+	}
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if !m.showEgg {
+		t.Error("'c' must not close the egg")
+	}
+	if cmd == nil || !strings.Contains(m.flash, eggDomain) {
+		t.Errorf("'c' should copy the link and toast; flash=%q cmd=%v", m.flash, cmd != nil)
+	}
+
+	// esc closes; a subsequent tick must NOT reschedule (no ticker leak).
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showEgg {
+		t.Error("esc should close the egg")
+	}
+	if _, cmd := m.Update(eggTickMsg{}); cmd != nil {
+		t.Error("a tick after the egg closes must not reschedule (leak)")
+	}
+
+	// Pressing 'E' while open also closes it.
+	m = mustUpdate(t, New(config.Config{}), tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	if m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}}); m.showEgg {
+		t.Error("pressing E again should close the egg")
+	}
+
+	// Hidden: the egg is not advertised in the help overlay or the legend.
+	m3 := New(config.Config{})
+	m3.help.Width = 200
+	if strings.Contains(m3.helpView(), eggDomain) {
+		t.Error("the egg must not be documented in the help overlay")
+	}
+	if strings.Contains(m3.renderLegend(), eggDomain) {
+		t.Error("the egg must not appear in the bottom legend")
+	}
+}
+
 // TestAutoRefresh covers e40f: the periodic tick reschedules itself and polls
 // only when idle; a periodic poll's error fades silently while a manual/toggle
 // refresh error still toasts; and the FQDN arrives via its own cached message.

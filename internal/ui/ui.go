@@ -221,6 +221,9 @@ type fqdnMsg struct{ fqdn string }
 // refreshTickMsg fires on the periodic auto-refresh timer (e40f).
 type refreshTickMsg struct{}
 
+// eggTickMsg advances the hidden Easter-egg animation (28mv).
+type eggTickMsg struct{}
+
 type toggleDoneMsg struct {
 	port int
 	err  error
@@ -292,6 +295,12 @@ type model struct {
 	// it's open the overlay replaces the whole view and swallows every key
 	// except the ?/esc/q that dismiss it.
 	showHelp bool
+	// showEgg gates the hidden "E" Easter-egg overlay (eggView); eggFrame is
+	// its animation counter, advanced by an eggTickMsg that STOPS rescheduling
+	// the moment showEgg goes false (no leaked ticker). Like showHelp it's
+	// fully modal and always exitable via esc/q/E.
+	showEgg  bool
+	eggFrame int
 	// width and height are the terminal dimensions from the last
 	// WindowSizeMsg. height pins the bottom bar (status, shortcuts) to the
 	// last rows of the viewport regardless of how short the body is; width
@@ -404,6 +413,19 @@ func refreshTick() tea.Cmd {
 	return tea.Tick(refreshInterval, func(time.Time) tea.Msg { return refreshTickMsg{} })
 }
 
+const (
+	eggURL      = "https://michaelgruen.com/"
+	eggDomain   = "michaelgruen.com"
+	eggInterval = 100 * time.Millisecond // ~10fps: responsive over SSH, no flood
+)
+
+// eggTick schedules the next Easter-egg animation frame. It is only ever
+// rescheduled while showEgg is true (see the eggTickMsg handler), so closing
+// the overlay stops the ticker -- no leaked goroutine, no busy loop.
+func eggTick() tea.Cmd {
+	return tea.Tick(eggInterval, func(time.Time) tea.Msg { return eggTickMsg{} })
+}
+
 func refresh() tea.Msg {
 	ports, err := portscan.List()
 	if err != nil {
@@ -491,6 +513,12 @@ func copyCmd(url string) tea.Cmd {
 		clip.Copy(url)
 		return nil
 	}
+}
+
+// copyEggLink copies the Easter-egg site link via the same vetted clip/OSC 52
+// path as copyURL, and toasts -- without closing the overlay (28mv).
+func (m *model) copyEggLink() tea.Cmd {
+	return tea.Batch(copyCmd(eggURL), m.setFlash("copied "+eggDomain, flashInfo))
 }
 
 // setFlash shows a transient toast at the given severity and returns the
@@ -755,6 +783,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(autoRefresh, refreshTick())
 
+	case eggTickMsg:
+		// Advance the animation only while the overlay is open; once closed we
+		// stop rescheduling so the ticker dies (no leak).
+		if !m.showEgg {
+			return m, nil
+		}
+		m.eggFrame++
+		return m, eggTick()
+
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
@@ -785,6 +822,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// this key produces it), so notifications never stick around stale.
 		m.flash = ""
 		m.flashLevel = flashInfo
+		// The Easter-egg overlay (28mv) is modal like help: esc/q/E close it,
+		// "c" copies the site link (with a toast, staying open), ctrl+c quits
+		// the app entirely, and every other key is swallowed. It never traps.
+		if m.showEgg {
+			switch msg.String() {
+			case "esc", "q", "E":
+				m.showEgg = false // the eggTickMsg handler then stops the ticker
+				return m, nil
+			case "ctrl+c":
+				return m, tea.Quit
+			case "c":
+				return m, m.copyEggLink()
+			}
+			return m, nil
+		}
 		// The help overlay is modal: while it's open, only ?/esc/q close it
 		// and every other key is swallowed (so nothing happens "behind" it).
 		if m.showHelp {
@@ -965,6 +1017,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// "/" filter query while a filter is active.
 			m.showHelp = true
 			return m, nil
+		case "E":
+			// Hidden Easter egg (28mv): deliberately NOT in the legend or help.
+			// Opens the animated overlay and starts its ticker.
+			m.showEgg = true
+			m.eggFrame = 0
+			return m, eggTick()
 		case "a":
 			// Anchor the cursor to the port under it, not the row index:
 			// capture the selected port number, switch views, then re-select
@@ -1305,6 +1363,144 @@ func wrapBindings(styles help.Styles, bindings []key.Binding, width int, sep str
 	return strings.Join(lines, "\n")
 }
 
+// --- hidden Easter egg (28mv) ---
+//
+// All egg rendering goes through eggView -> Bubble Tea's View() in the
+// alt-screen: styled lipgloss text and Unicode only, bounded to m.width/
+// m.height. No raw tty writes, no cursor-control "glitch" -- the cursed
+// aesthetic is simulated with colour + combining marks, so it can never
+// desync the pty (critical: the app is often run over SSH).
+
+var (
+	eggGold         = []string{"220", "214", "178", "226", "184"}
+	eggSparks       = []rune("✦✧⋆∗✺❋✸•*")
+	eggSparkColors  = []string{"196", "202", "226", "46", "51", "201", "213", "129"}
+	eggCreditColors = []string{"213", "219", "225", "51", "45", "87"}
+	eggZalgoMarks   = []rune{'́', '҉', '̴', '͓', 'ͯ'}
+)
+
+// eggSpin renders the golden egg: a fixed outline whose interior is filled by
+// a shimmer band that shifts with the frame, reading as rotation. Bounded to
+// 11 columns and pulsing through gold shades.
+func eggSpin(frame int) []string {
+	tmpl := []string{
+		"  .-‾‾‾-.  ",
+		" /       \\ ",
+		"|         |",
+		"|         |",
+		"|         |",
+		" \\       / ",
+		"  '-___-'  ",
+	}
+	shim := []rune("░▒▓█▓▒")
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[frame%len(eggGold)])).Bold(true)
+	out := make([]string, len(tmpl))
+	for y, line := range tmpl {
+		rs := []rune(line)
+		lo, hi := -1, -1
+		for x, r := range rs {
+			if r != ' ' {
+				if lo < 0 {
+					lo = x
+				}
+				hi = x
+			}
+		}
+		for x := lo + 1; x < hi; x++ {
+			if rs[x] == ' ' {
+				rs[x] = shim[(x+y*2+frame)%len(shim)]
+			}
+		}
+		out[y] = style.Render(string(rs))
+	}
+	return out
+}
+
+// eggSparkleLine builds one row of fireworks: mostly spaces with a few
+// deterministically-placed coloured sparkles (varying per frame). Width is
+// clamped so it never overflows the screen.
+func eggSparkleLine(w, frame, salt int) string {
+	if w > 56 {
+		w = 56
+	}
+	var b strings.Builder
+	for x := 0; x < w; x++ {
+		if (x*29+frame*13+salt*7)%9 == 0 {
+			c := eggSparkColors[(x+frame+salt)%len(eggSparkColors)]
+			s := eggSparks[(x*3+frame)%len(eggSparks)]
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(string(s)))
+		} else {
+			b.WriteRune(' ')
+		}
+	}
+	return b.String()
+}
+
+// eggZalgo sprinkles zero-width combining marks over s for a light glitch
+// accent. Combining marks don't change display width, so this can't overflow.
+func eggZalgo(s string, frame int) string {
+	var b strings.Builder
+	for i, r := range []rune(s) {
+		b.WriteRune(r)
+		if (i+frame)%5 == 2 {
+			b.WriteRune(eggZalgoMarks[(i+frame)%len(eggZalgoMarks)])
+		}
+	}
+	return b.String()
+}
+
+// eggView renders the full-screen Easter egg for the current frame, centred
+// and padded to exactly m.width x m.height. Tiny terminals get a bounded
+// fallback rather than any risk of overflow.
+func (m model) eggView() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	f := m.eggFrame
+
+	if w < 34 || h < 15 {
+		msg := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[f%len(eggGold)])).Bold(true).
+			Render("🥚 enlarge the terminal — esc: back")
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, msg)
+	}
+
+	sw := w - 4
+	cred := func(i int, s string) string {
+		c := eggCreditColors[(f/2+i)%len(eggCreditColors)]
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(s)
+	}
+	title := lipgloss.NewStyle().Foreground(lipgloss.Color(eggSparkColors[f%len(eggSparkColors)])).Bold(true).
+		Render("✦ " + eggZalgo("tailport", f) + " ✦")
+
+	var lines []string
+	lines = append(lines, eggSparkleLine(sw, f, 1))
+	lines = append(lines, eggSpin(f)...)
+	lines = append(lines, eggSparkleLine(sw, f, 2))
+	lines = append(lines, title)
+	lines = append(lines,
+		cred(0, "Michael E. Gruen"),
+		cred(1, "· The LLM Agent Fleet ·"),
+		cred(2, "Claude Opus 4.8 · Sonnet 5 · Haiku 4.5 · Fable 5"),
+		cred(3, eggURL),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("c: copy link   esc / q: back"),
+	)
+	if m.flash != "" {
+		lines = append(lines, activeStyle.Render(m.flash))
+	}
+	// Safety net: never exceed the viewport height.
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for i, ln := range lines {
+		lines[i] = lipgloss.PlaceHorizontal(sw, lipgloss.Center, ln)
+	}
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
+}
+
 // helpView renders the full-screen "?" overlay: a short intro to what
 // tailport is, then a real explanation of every key (not the terse legend).
 // It replaces the whole View while m.showHelp is set.
@@ -1546,6 +1742,9 @@ func (m model) renderBottom() string {
 }
 
 func (m model) View() string {
+	if m.showEgg {
+		return m.eggView()
+	}
 	if m.showHelp {
 		return m.helpView()
 	}
