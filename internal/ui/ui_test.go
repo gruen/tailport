@@ -504,12 +504,15 @@ func TestEggArt(t *testing.T) {
 		t.Errorf("widest row %d should be below centre (%d)", widest, len(fill)/2)
 	}
 
-	// Deterministic per (frame,size); animates with the frame.
+	// Deterministic per (frame,size); animates across the frame range. The
+	// glint eases in/out, so adjacent frames near an extreme are visually
+	// identical by design -- compare against the far end of the swing (~half
+	// the ~22-frame breathing period) to confirm it does move.
 	if !reflect.DeepEqual(a, eggSpin(0, 21, 15)) {
 		t.Error("eggSpin must be deterministic for a given (frame,size)")
 	}
-	if reflect.DeepEqual(a, eggSpin(1, 21, 15)) {
-		t.Error("eggSpin should change with the frame")
+	if reflect.DeepEqual(a, eggSpin(11, 21, 15)) {
+		t.Error("eggSpin should change across the frame range")
 	}
 
 	// Narrow budget: clamps down, never overflows.

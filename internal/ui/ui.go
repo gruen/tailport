@@ -1434,6 +1434,11 @@ func eggHalves(h int, a float64) []int {
 		}
 		out[y] = half
 	}
+	// Shave one block off each side of the very top row for a smaller, rounder
+	// crown than the dome's own first step would give.
+	if h > 1 && out[0] > 1 {
+		out[0]--
+	}
 	return out
 }
 
@@ -1481,8 +1486,6 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 
 	w := 2*maxHalf + 1
 	cx := maxHalf
-	shim := []rune("░▒▓█▓▒")
-	style := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[frame%len(eggGold)])).Bold(true)
 
 	out := make([]string, h)
 	for y := 0; y < h; y++ {
@@ -1490,16 +1493,84 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 		if half > maxHalf {
 			half = maxHalf
 		}
-		rs := make([]rune, w)
-		for x := range rs {
-			rs[x] = ' '
+		var b strings.Builder
+		for x := 0; x < w; x++ {
+			if x < cx-half || x > cx+half {
+				b.WriteByte(' ')
+				continue
+			}
+			// Normalise the cell's horizontal position to THIS row's width so
+			// the shading hugs the silhouette (pinches at the narrow caps,
+			// spreads across the belly) rather than washing straight down.
+			rel := 0.0
+			if half > 0 {
+				rel = float64(x-cx) / float64(half)
+			}
+			br := eggShade(rel, float64(frame))
+			ch := eggChars[int(br*float64(len(eggChars)-1)+0.5)]
+			st := lipgloss.NewStyle().Foreground(eggRampColor(br)).Bold(true)
+			b.WriteString(st.Render(string(ch)))
 		}
-		for x := cx - half; x <= cx+half; x++ {
-			rs[x] = shim[(x+y*2+frame)%len(shim)]
-		}
-		out[y] = style.Render(string(rs))
+		out[y] = b.String()
 	}
 	return out
+}
+
+// eggChars is the density ramp from shadow (sparse) to lit (solid); brightness
+// picks the glyph, gold hue reinforces it (eggRampColor).
+var eggChars = []rune{'░', '▒', '▓', '█'}
+
+// eggShade returns the brightness in [0,1] at a normalised horizontal position
+// rel in [-1,1] (left edge .. right edge of the row). The look is a fixed light
+// from the upper-left plus a specular glint that EASES back and forth over a
+// small left-of-centre arc -- the frames-32..36 motion picked from the study,
+// so the highlight breathes in place instead of orbiting the egg. The cosine
+// on the glint centre gives zero velocity at each extreme (ease-in-out).
+func eggShade(rel, frame float64) float64 {
+	if rel < -1 {
+		rel = -1
+	} else if rel > 1 {
+		rel = 1
+	}
+	lon := math.Asin(rel) // -pi/2 .. pi/2 across the row
+	const lightAz = -0.5  // fixed key light, upper-left
+	base := math.Max(0, math.Cos(lon-lightAz))
+	// Glint centre swings between the two positions of the liked frames,
+	// eased at both ends by the cosine.
+	const gMid = -0.9215 // midpoint of the frame 32..36 glint arc
+	const gAmp = 0.2725  // half its span
+	const gOmega = 0.28  // ~2.2s per full back-and-forth at 100ms/frame
+	g := gMid + gAmp*math.Cos(frame*gOmega)
+	glint := math.Exp(-math.Pow((lon-g)/0.33, 2))
+	br := 0.16 + 0.5*base + 0.72*glint
+	if br < 0 {
+		br = 0
+	} else if br > 1 {
+		br = 1
+	}
+	return br
+}
+
+// eggRampColor maps brightness in [0,1] to a gold gradient: deep bronze in
+// shadow, through mid gold, to a near-white highlight. Truecolor hex; lipgloss
+// degrades it to the nearest 256-colour on terminals without 24-bit support.
+func eggRampColor(br float64) lipgloss.Color {
+	dark := [3]float64{92, 63, 4}       // #5c3f04 bronze
+	mid := [3]float64{217, 165, 32}     // #d9a520 gold
+	bright := [3]float64{255, 244, 194} // #fff4c2 highlight
+	var c [3]float64
+	if br < 0.5 {
+		t := br * 2
+		for i := 0; i < 3; i++ {
+			c[i] = dark[i] + (mid[i]-dark[i])*t
+		}
+	} else {
+		t := (br - 0.5) * 2
+		for i := 0; i < 3; i++ {
+			c[i] = mid[i] + (bright[i]-mid[i])*t
+		}
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", int(c[0]+0.5), int(c[1]+0.5), int(c[2]+0.5)))
 }
 
 func maxInts(v []int) int {
