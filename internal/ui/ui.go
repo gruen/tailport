@@ -1228,9 +1228,11 @@ func (m model) statusText() string {
 	public := len(m.funnel)
 
 	full := fmt.Sprintf("%d listening · %d exposed on tailnet · %d public", listening, tailnet, public)
+	// The host rides the "listening" segment ("N listening on <host>") rather
+	// than a trailing "— <host>" (20w6); the other segments are unchanged.
 	withHost := full
 	if m.host != "" {
-		withHost = full + " — " + m.host
+		withHost = fmt.Sprintf("%d listening on %s · %d exposed on tailnet · %d public", listening, m.host, tailnet, public)
 	}
 	// Widest form that fits, degrading host -> shorter labels -> initials.
 	switch {

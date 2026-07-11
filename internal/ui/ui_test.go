@@ -380,16 +380,20 @@ func TestStatusText(t *testing.T) {
 	}
 
 	got := base.statusText()
-	for _, want := range []string{"5 listening", "2 exposed on tailnet", "1 public", "host"} {
+	// The host attaches to the listening segment (20w6), not a trailing "— host".
+	for _, want := range []string{"5 listening on host", "2 exposed on tailnet", "1 public"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("statusText = %q, want it to contain %q", got, want)
 		}
 	}
+	if strings.Contains(got, "— host") {
+		t.Errorf("statusText should not use the trailing '— host' form; got %q", got)
+	}
 
-	// Zero of everything reads cleanly, not "no ports".
-	empty := model{host: "host", width: 120}
-	if got := empty.statusText(); !strings.Contains(got, "0 listening · 0 exposed on tailnet · 0 public") {
-		t.Errorf("empty statusText = %q", got)
+	// Zero of everything reads cleanly, not "no ports"; no host -> no "on".
+	empty := model{host: "", width: 120}
+	if got := empty.statusText(); got != "0 listening · 0 exposed on tailnet · 0 public" {
+		t.Errorf("empty (no host) statusText = %q", got)
 	}
 
 	// In-flight operations take precedence over the breakdown.
