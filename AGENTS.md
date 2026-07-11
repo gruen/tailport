@@ -43,8 +43,13 @@ contract. The short version:
   sync with this list if it changes.
 - Zero non-Go runtime dependencies in the shipped binary. It shells out
   to `tailscale`, and to `ss` (Linux) / `lsof` (macOS) for port discovery
-  — nothing else. Don't add a dependency on `yq`, `gum`, `fzf`, etc.;
-  config parsing uses `gopkg.in/yaml.v3` natively for this reason.
+  — nothing else *required*. Don't add a dependency on `yq`, `gum`, `fzf`,
+  etc.; config parsing uses `gopkg.in/yaml.v3` natively for this reason.
+  Carve-out (vnq7): an OPTIONAL, best-effort clipboard helper
+  (`pbcopy` / `wl-copy` / `xclip` / `xsel`) may be shelled out to for the
+  `c` copy-URL action, but it is never required to build or run — the
+  primary clipboard path is OSC 52 (pure Go, no external binary), and a
+  missing helper is silently skipped.
 
 ### Verification bar
 

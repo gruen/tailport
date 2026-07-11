@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -363,6 +364,120 @@ func TestFilterDiscoverable(t *testing.T) {
 	}
 	if help := m.helpView(); !strings.Contains(help, "Filter by port number") {
 		t.Errorf("help overlay should describe '/' filter; got %q", help)
+	}
+}
+
+// TestCopyKeymap covers vnq7's remap: "c" is copy, clean moved to "C", and
+// the two don't collide.
+func TestCopyKeymap(t *testing.T) {
+	k := newKeyMap()
+	if k.Copy.Help().Key != "c" {
+		t.Errorf("Copy help key = %q, want c", k.Copy.Help().Key)
+	}
+	if k.Clean.Help().Key != "C" {
+		t.Errorf("Clean help key = %q, want C", k.Clean.Help().Key)
+	}
+	cLower := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}}
+	cUpper := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}}
+	if !key.Matches(cLower, k.Copy) || key.Matches(cLower, k.Clean) {
+		t.Error("'c' should match Copy, not Clean")
+	}
+	if !key.Matches(cUpper, k.Clean) || key.Matches(cUpper, k.Copy) {
+		t.Error("'C' should match Clean, not Copy")
+	}
+}
+
+// TestCopyURL covers vnq7's copy action and toast: "c" copies the tailnet URL
+// (with a success toast when exposed, an amber caveat when not), and the toast
+// clears on the next keypress.
+func TestCopyURL(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	newModel := func(active bool) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+		m.host = "host"
+		m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+		if active {
+			m.active = map[int]bool{8080: true}
+		} else {
+			m.active = map[int]bool{}
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+
+	// Exposed: success toast naming the tailnet URL, not amber, with a cmd.
+	m := newModel(true)
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if cmd == nil {
+		t.Error("c should return a copy/flash cmd")
+	}
+	if !strings.Contains(m.flash, "copied") || !strings.Contains(m.flash, "http://host:8080") {
+		t.Errorf("flash = %q, want a copied-URL toast", m.flash)
+	}
+	if m.flashWarn {
+		t.Error("exposed copy should not warn (amber)")
+	}
+	// The next keypress dismisses the toast.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if got := res.(model); got.flash != "" {
+		t.Errorf("toast should clear on the next key; got %q", got.flash)
+	}
+
+	// Not exposed: still copies, but the toast warns it won't resolve yet.
+	m = newModel(false)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if !m.flashWarn || !strings.Contains(m.flash, "not exposed") {
+		t.Errorf("not-exposed copy flash = %q (warn=%v), want a NOT-exposed caveat", m.flash, m.flashWarn)
+	}
+}
+
+// TestFlashExpire covers the toast's timed clear: a matching flashExpireMsg
+// clears it, a stale one (older id, from a superseded toast) does not.
+func TestFlashExpire(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	m.allPorts = []portscan.Port{{Number: 8080}}
+	m.active = map[int]bool{8080: true}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	id := m.flashID
+
+	res, _ = m.Update(flashExpireMsg{id: id - 1})
+	if got := res.(model); got.flash == "" {
+		t.Error("a stale flashExpireMsg should not clear a newer toast")
+	}
+	res, _ = m.Update(flashExpireMsg{id: id})
+	if got := res.(model); got.flash != "" {
+		t.Error("a matching flashExpireMsg should clear the toast")
+	}
+}
+
+// TestCleanMovedToShiftC covers vnq7's other half: "C" still opens the clean
+// confirm when dangling forwards exist, and "c" no longer does.
+func TestCleanMovedToShiftC(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	m.allPorts = []portscan.Port{{Number: 3000}} // listening
+	m.active = map[int]bool{8080: true}          // served but not listening -> dangling
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	if got := res.(model); got.mode != entryConfirmClean {
+		t.Errorf("'C' should open the clean confirm; mode = %v", got.mode)
+	}
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if got := res.(model); got.mode == entryConfirmClean {
+		t.Error("'c' should copy, not open the clean confirm")
 	}
 }
 

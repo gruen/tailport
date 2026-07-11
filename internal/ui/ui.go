@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -17,6 +18,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/gruen/tailport/internal/clip"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
 	"github.com/gruen/tailport/internal/tsserve"
@@ -62,6 +64,7 @@ type keyMap struct {
 	Unfavorite key.Binding
 	Lock       key.Binding
 	ShowAll    key.Binding
+	Copy       key.Binding
 	Clean      key.Binding
 	Refresh    key.Binding
 	Help       key.Binding
@@ -73,8 +76,8 @@ type keyMap struct {
 // relies on width-based wrapping (see wrapBindings) instead of truncation.
 func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
-		k.Toggle, k.Funnel, k.Filter, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
-		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
+		k.Toggle, k.Funnel, k.Filter, k.Copy, k.NewPort, k.Label, k.Favorite,
+		k.Unfavorite, k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
 	}
 }
 
@@ -95,10 +98,14 @@ func newKeyMap() keyMap {
 		Unfavorite: key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "unfavorite")),
 		Lock:       key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "lock/unlock")),
 		ShowAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
-		Clean:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "clean stale")),
-		Refresh:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Help:       key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		Copy:       key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
+		// Clean moved to shift-C when "c" was reassigned to copy (vnq7); it's
+		// contextual (only enabled when dangling forwards exist), so demoting
+		// it to a shifted key is fine.
+		Clean:   key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "clean stale")),
+		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
@@ -212,6 +219,10 @@ type toggleDoneMsg struct {
 
 type cleanupDoneMsg struct{ err error }
 
+// flashExpireMsg clears the transient toast if it's still the one that
+// scheduled this expiry (matched by id), so a newer toast isn't cut short.
+type flashExpireMsg struct{ id int }
+
 // entryMode tracks which (if any) text-input flow is currently active.
 // Both "n" (add/toggle an arbitrary port) and "l" (label the selected
 // port) reuse the same open-textinput interaction pattern, but need
@@ -284,7 +295,14 @@ type model struct {
 	funnelPort   int
 	funnelPublic int
 	funnelTurnOn bool
-	err          error
+	// flash is a transient toast shown in the bottom bar (e.g. after "c"
+	// copies a URL). Unlike err it isn't red; flashWarn tints it amber for a
+	// caveat ("port NOT exposed"). It clears on the next keypress or when a
+	// matching flashExpireMsg (tagged with flashID) fires after a short delay.
+	flash     string
+	flashWarn bool
+	flashID   int
+	err       error
 }
 
 func New(cfg config.Config) model {
@@ -388,6 +406,43 @@ func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
 		}
 		return toggleDoneMsg{port: localPort, err: err}
 	}
+}
+
+// copyURL copies the selected port's TAILNET URL to the clipboard and returns
+// a command that runs the copy and shows a confirmation toast. The URL is
+// always the tailnet form (http://<host>:<port>), matching the row
+// description, regardless of any public funnel. When the port isn't served on
+// the tailnet the toast warns that the URL won't resolve until it's toggled on.
+func (m *model) copyURL(sel portItem) tea.Cmd {
+	url := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
+	var flash tea.Cmd
+	if sel.active {
+		flash = m.setFlash("copied ✓  "+url, false)
+	} else {
+		flash = m.setFlash(fmt.Sprintf("copied — :%d not exposed on tailnet (toggle it on first)", sel.port.Number), true)
+	}
+	return tea.Batch(copyCmd(url), flash)
+}
+
+// copyCmd performs the clipboard write off the render path (it may shell out to
+// a local helper). clip.Copy is best-effort and can't be confirmed, so it
+// returns no message -- the toast set by copyURL is the user's feedback.
+func copyCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		clip.Copy(url)
+		return nil
+	}
+}
+
+// setFlash shows a transient toast (warn tints it amber) and returns the
+// command that expires it after a short delay. flashID tags the expiry so a
+// newer toast supersedes rather than being cut short by an older timer.
+func (m *model) setFlash(text string, warn bool) tea.Cmd {
+	m.flashID++
+	m.flash = text
+	m.flashWarn = warn
+	id := m.flashID
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return flashExpireMsg{id: id} })
 }
 
 // cleanupDangling turns off every serve mapping in ports, one at a time.
@@ -614,7 +669,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, refresh
 
+	case flashExpireMsg:
+		// Only clear if no newer toast has replaced this one (see flashID).
+		if msg.id == m.flashID {
+			m.flash = ""
+			m.flashWarn = false
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// Any keypress dismisses a lingering toast (a fresh one is set below if
+		// this key produces it), so the flash never sticks around stale.
+		m.flash = ""
+		m.flashWarn = false
 		// The help overlay is modal: while it's open, only ?/esc/q close it
 		// and every other key is swallowed (so nothing happens "behind" it).
 		if m.showHelp {
@@ -788,10 +855,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			return m, refresh
 		case "c":
-			// Batch-tear-down of dangling forwards, behind a y/n confirm.
-			// No-op while a toggle or cleanup is already in flight, and a
-			// silent no-op when there's nothing to clean (setting m.err here
-			// would render red, like a failure).
+			// Copy the selected port's TAILNET URL (http://<host>:<port>) to the
+			// clipboard, even when it isn't currently exposed -- the toast then
+			// says so. Always the tailnet URL, never the public/funnel one.
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			return m, m.copyURL(sel)
+		case "C":
+			// Batch-tear-down of dangling forwards, behind a y/n confirm (moved
+			// from "c" to shift-C when "c" became copy; see vnq7). No-op while a
+			// toggle or cleanup is already in flight, and a silent no-op when
+			// there's nothing to clean (setting m.err here would render red,
+			// like a failure).
 			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil
 			}
@@ -1106,7 +1183,8 @@ func (m model) helpView() string {
 		{"l", "Set a text label for the selected port."},
 		{"r", "Refresh the port list and serve status."},
 		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
-		{"c", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown ▲). Offered only when some exist."},
+		{"c", "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so."},
+		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown ▲). Offered only when some exist."},
 		{"?", "Toggle this help. esc or q also close it."},
 		{"q", "Quit."},
 	}
@@ -1285,7 +1363,18 @@ func (m model) renderBottom() string {
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
 	}
-	bar := helpStyle.Render(m.statusText())
+	// A transient toast (e.g. "copied ✓ ...") takes the status line's spot
+	// while it's showing; otherwise the normal breakdown. flashWarn tints an
+	// amber caveat; a plain toast is green.
+	statusLine := helpStyle.Render(m.statusText())
+	if m.flash != "" {
+		toast := activeStyle
+		if m.flashWarn {
+			toast = warnStyle
+		}
+		statusLine = toast.Render(m.flash)
+	}
+	bar := statusLine
 	if legend := m.renderLegend(); legend != "" {
 		bar += "\n" + legend
 	}
