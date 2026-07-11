@@ -23,6 +23,7 @@ import (
 
 var (
 	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	favStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
@@ -41,6 +42,7 @@ type keyMap struct {
 	Unfavorite key.Binding
 	Lock       key.Binding
 	ShowAll    key.Binding
+	Clean      key.Binding
 	Refresh    key.Binding
 	Quit       key.Binding
 }
@@ -51,7 +53,7 @@ type keyMap struct {
 func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Toggle, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
-		k.Lock, k.ShowAll, k.Refresh, k.Quit,
+		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Quit,
 	}
 }
 
@@ -68,22 +70,30 @@ func newKeyMap() keyMap {
 		Unfavorite: key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "unfavorite")),
 		Lock:       key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "lock/unlock")),
 		ShowAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
+		Clean:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "clean stale")),
 		Refresh:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 type portItem struct {
-	port   portscan.Port
-	active bool
-	host   string
-	meta   config.PortMeta
+	port      portscan.Port
+	active    bool
+	listening bool
+	host      string
+	meta      config.PortMeta
 }
 
 func (i portItem) Title() string {
 	marker := "○"
 	if i.active {
 		marker = activeStyle.Render("●")
+		if !i.listening {
+			// Dangling forward: exposed via serve, but nothing is bound
+			// locally, so a tailnet peer hitting the URL gets connection
+			// refused. Flag it distinctly rather than as a healthy ●.
+			marker = warnStyle.Render("▲")
+		}
 	}
 	lock := ""
 	if i.meta.Locked {
@@ -105,6 +115,9 @@ func (i portItem) Title() string {
 
 func (i portItem) Description() string {
 	if i.active {
+		if !i.listening {
+			return warnStyle.Render("exposed, nothing listening")
+		}
 		return fmt.Sprintf("http://%s:%d", i.host, i.port.Number)
 	}
 	return "not exposed"
@@ -125,6 +138,8 @@ type toggleDoneMsg struct {
 	err  error
 }
 
+type cleanupDoneMsg struct{ err error }
+
 // entryMode tracks which (if any) text-input flow is currently active.
 // Both "n" (add/toggle an arbitrary port) and "l" (label the selected
 // port) reuse the same open-textinput interaction pattern, but need
@@ -135,6 +150,7 @@ const (
 	entryNone entryMode = iota
 	entryAddPort
 	entryLabel
+	entryConfirmClean
 )
 
 type model struct {
@@ -153,8 +169,10 @@ type model struct {
 	labelInput textinput.Model
 	labelPort  int // port being labeled while mode == entryLabel
 
-	pending int // port currently being toggled; 0 = none
-	err     error
+	pending      int   // port currently being toggled; 0 = none
+	cleaning     int   // number of dangling forwards being torn down; 0 = none
+	cleanTargets []int // ports the entryConfirmClean prompt is asking about
+	err          error
 }
 
 func New(cfg config.Config) model {
@@ -228,6 +246,46 @@ func toggle(port int, turnOn bool) tea.Cmd {
 	}
 }
 
+// cleanupDangling turns off every serve mapping in ports, one at a time.
+// It reports the ports it could not tear down (if any) as a single error.
+func cleanupDangling(ports []int) tea.Cmd {
+	return func() tea.Msg {
+		var failed []string
+		for _, p := range ports {
+			if err := tsserve.Off(p); err != nil {
+				failed = append(failed, strconv.Itoa(p))
+			}
+		}
+		if len(failed) > 0 {
+			return cleanupDoneMsg{err: fmt.Errorf("could not clean :%s", strings.Join(failed, ", :"))}
+		}
+		return cleanupDoneMsg{}
+	}
+}
+
+// danglingPorts returns the sorted set of ports that are exposed via
+// tailscale serve but have no local process listening (exposed &&
+// !listening). These are the "connection refused" forwards.
+func (m model) danglingPorts() []int {
+	listening := make(map[int]bool, len(m.allPorts))
+	for _, p := range m.allPorts {
+		listening[p.Number] = true
+	}
+	var ports []int
+	for p, active := range m.active {
+		if active && !listening[p] {
+			ports = append(ports, p)
+		}
+	}
+	sort.Ints(ports)
+	return ports
+}
+
+// hasDangling reports whether any dangling forward exists.
+func (m model) hasDangling() bool {
+	return len(m.danglingPorts()) > 0
+}
+
 // remember ensures port has a registry entry (creating a bare one if
 // needed) and persists it. Called whenever a port is toggled on, so it
 // stays visible in the default view even after being toggled back off.
@@ -275,8 +333,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, refresh
 
+	case cleanupDoneMsg:
+		m.cleaning = 0
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		return m, refresh
+
 	case tea.KeyMsg:
 		if m.mode != entryNone {
+			// The clean-confirm prompt is a y/n gate, not a text input, so
+			// it's handled before the esc/enter switch below (and before the
+			// keys ever reach a textinput). "y"/"Y" is the ONLY affirmative;
+			// every other key -- including esc, n, and enter -- cancels.
+			if m.mode == entryConfirmClean {
+				switch msg.String() {
+				case "y", "Y":
+					targets := m.cleanTargets
+					m.mode = entryNone
+					m.cleanTargets = nil
+					m.cleaning = len(targets)
+					return m, cleanupDangling(targets)
+				default:
+					m.mode = entryNone
+					m.cleanTargets = nil
+					return m, nil
+				}
+			}
 			switch msg.String() {
 			case "esc":
 				m.mode = entryNone
@@ -351,6 +434,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			return m, refresh
+		case "c":
+			// Batch-tear-down of dangling forwards, behind a y/n confirm.
+			// No-op while a toggle or cleanup is already in flight, and a
+			// silent no-op when there's nothing to clean (setting m.err here
+			// would render red, like a failure).
+			if m.pending != 0 || m.cleaning != 0 {
+				return m, nil
+			}
+			targets := m.danglingPorts()
+			if len(targets) == 0 {
+				return m, nil
+			}
+			m.cleanTargets = targets
+			m.mode = entryConfirmClean
+			return m, nil
 		case "n":
 			m.mode = entryAddPort
 			m.portInput.Focus()
@@ -466,7 +564,9 @@ func (m *model) rebuildItems() {
 		sort.Ints(numbers)
 		items := make([]list.Item, 0, len(numbers))
 		for _, n := range numbers {
-			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], host: m.host, meta: m.cfg.Ports[n]})
+			// This branch iterates portsByNumber, so every port here is
+			// currently listening.
+			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, meta: m.cfg.Ports[n]})
 		}
 		m.setItems(items)
 		return
@@ -498,7 +598,9 @@ func (m *model) rebuildItems() {
 		if !ok {
 			p = portscan.Port{Number: n}
 		}
-		items = append(items, portItem{port: p, active: m.active[n], host: m.host, meta: m.cfg.Ports[n]})
+		// ok is exactly the listening bool: the port is present in
+		// portsByNumber iff a local process is bound to it.
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, meta: m.cfg.Ports[n]})
 	}
 	m.setItems(items)
 }
@@ -528,6 +630,9 @@ func (m model) renderLegend() string {
 		filter = "all ports"
 	}
 	keys.ShowAll.SetHelp("a", filter)
+	// "clean stale" only makes sense when there's something stale to clean;
+	// wrapBindings skips disabled bindings, so it drops out otherwise.
+	keys.Clean.SetEnabled(m.hasDangling())
 	return wrapBindings(m.help.Styles, keys.ShortHelp(), m.help.Width, m.help.ShortSeparator)
 }
 
@@ -590,11 +695,21 @@ func (m model) View() string {
 	case entryLabel:
 		b += "\n" + helpStyle.Render(fmt.Sprintf("label :%d: ", m.labelPort)) + m.labelInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
 		return b
+	case entryConfirmClean:
+		targets := make([]string, len(m.cleanTargets))
+		for i, p := range m.cleanTargets {
+			targets[i] = strconv.Itoa(p)
+		}
+		b += "\n" + helpStyle.Render(fmt.Sprintf("tear down forwards on :%s? ", strings.Join(targets, ", :"))) + helpStyle.Render("(y: confirm, any other key: cancel)")
+		return b
 	}
 
 	status := "ready"
 	if m.pending != 0 {
 		status = fmt.Sprintf("toggling :%d...", m.pending)
+	}
+	if m.cleaning != 0 {
+		status = fmt.Sprintf("cleaning %d stale forwards...", m.cleaning)
 	}
 	if legend := m.renderLegend(); legend != "" {
 		b += "\n" + legend
