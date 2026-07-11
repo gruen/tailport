@@ -453,6 +453,137 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestUnlockSSHConfirm covers ah23: unlocking :22 is gated behind a
+// type-"ssh" confirm, while locking :22 and non-:22 toggles stay instant.
+func TestUnlockSSHConfirm(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	xKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}}
+
+	// A model with a locked, selected :22 in the All ports view.
+	lockedModel := func() model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}})
+		m.allPorts = []portscan.Port{{Number: 22, Process: "sshd"}}
+		m.active = map[int]bool{}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+	// Type input then press enter, from within the confirm mode.
+	confirm := func(m model, input string) model {
+		for _, r := range input {
+			res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			m = res.(model)
+		}
+		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		return res.(model)
+	}
+
+	// (1) 'x' on locked :22 opens the confirm and does NOT unlock yet.
+	m := lockedModel()
+	res, _ := m.Update(xKey)
+	m = res.(model)
+	if m.mode != entryConfirmUnlockSSH {
+		t.Fatalf("x on locked :22 should open the ssh confirm; mode = %v", m.mode)
+	}
+	if !m.cfg.Ports[22].Locked {
+		t.Error("x must not unlock :22 before confirmation")
+	}
+
+	// (2) Wrong/empty inputs never unlock; mode resets.
+	for _, bad := range []string{"", "y", "no", "sshh", "s s h"} {
+		m := lockedModel()
+		res, _ := m.Update(xKey)
+		m = confirm(res.(model), bad)
+		if !m.cfg.Ports[22].Locked {
+			t.Errorf("input %q must NOT unlock :22", bad)
+		}
+		if m.mode != entryNone {
+			t.Errorf("input %q should reset mode to entryNone; got %v", bad, m.mode)
+		}
+	}
+
+	// (3) Exact "ssh" unlocks and persists to disk.
+	m = lockedModel()
+	res, _ = m.Update(xKey)
+	m = confirm(res.(model), "ssh")
+	if m.cfg.Ports[22].Locked {
+		t.Error(`"ssh" should unlock :22`)
+	}
+	if m.mode != entryNone {
+		t.Errorf("mode should reset after unlock; got %v", m.mode)
+	}
+	if loaded, err := config.Load(); err != nil {
+		t.Fatal(err)
+	} else if loaded.Ports[22].Locked {
+		t.Error("the unlock should persist to disk")
+	}
+
+	// (4) Case-insensitive + trimmed accept.
+	for _, good := range []string{"SSH", "Ssh", " ssh "} {
+		m := lockedModel()
+		res, _ := m.Update(xKey)
+		m = confirm(res.(model), good)
+		if m.cfg.Ports[22].Locked {
+			t.Errorf("%q should unlock :22 (case-insensitive/trimmed)", good)
+		}
+	}
+
+	// (5) esc cancels: :22 stays locked.
+	m = lockedModel()
+	res, _ = m.Update(xKey)
+	m = res.(model)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(model)
+	if !m.cfg.Ports[22].Locked {
+		t.Error("esc should leave :22 locked")
+	}
+	if m.mode != entryNone {
+		t.Errorf("esc should reset mode; got %v", m.mode)
+	}
+
+	// (6) 'x' on UNLOCKED :22 locks instantly, no prompt.
+	m = New(config.Config{Ports: map[int]config.PortMeta{22: {Locked: false}}})
+	m.allPorts = []portscan.Port{{Number: 22}}
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ = m.Update(xKey)
+	m = res.(model)
+	if m.mode != entryNone {
+		t.Errorf("locking :22 should not prompt; mode = %v", m.mode)
+	}
+	if !m.cfg.Ports[22].Locked {
+		t.Error("x on unlocked :22 should lock instantly")
+	}
+
+	// (7) 'x' on a non-:22 port toggles instantly (regression).
+	m = New(config.Config{Ports: map[int]config.PortMeta{8080: {}}})
+	m.allPorts = []portscan.Port{{Number: 8080}}
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ = m.Update(xKey)
+	m = res.(model)
+	if m.mode != entryNone || !m.cfg.Ports[8080].Locked {
+		t.Errorf("x on :8080 should lock instantly; mode=%v locked=%v", m.mode, m.cfg.Ports[8080].Locked)
+	}
+
+	// (8) Modality: space/p while confirming must NOT toggle serve/funnel.
+	m = lockedModel()
+	res, _ = m.Update(xKey)
+	m = res.(model)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = res.(model)
+	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
+		t.Errorf("space in ssh-confirm must not toggle; pending=%d mode=%v", m.pending, m.mode)
+	}
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = res.(model)
+	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
+		t.Errorf("p in ssh-confirm must not funnel; pending=%d mode=%v", m.pending, m.mode)
+	}
+}
+
 // TestCopyKeymap covers vnq7's remap: "c" is copy, clean moved to "C", and
 // the two don't collide.
 func TestCopyKeymap(t *testing.T) {

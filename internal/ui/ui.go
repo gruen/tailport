@@ -243,6 +243,11 @@ const (
 	// with an explicit "anyone on the internet" warning. Turning funnel OFF
 	// (de-escalation back to tailnet-served) is not gated.
 	entryConfirmFunnel
+	// entryConfirmUnlockSSH gates UNLOCKING port :22 behind a type-"ssh"
+	// text confirm (ah23): the lock is the primary guard on SSH access, so a
+	// stray "x" must not remove it. Only unlocking is gated -- locking :22 and
+	// any non-:22 lock toggle stay a single instant keypress.
+	entryConfirmUnlockSSH
 )
 
 type model struct {
@@ -284,6 +289,11 @@ type model struct {
 	portInput  textinput.Model
 	labelInput textinput.Model
 	labelPort  int // port being labeled while mode == entryLabel
+	// sshInput is the type-"ssh" text field for the entryConfirmUnlockSSH
+	// gate; sshUnlockPort is the port being unlocked (always 22, stored for
+	// symmetry). See the "x" handler.
+	sshInput      textinput.Model
+	sshUnlockPort int
 
 	pending       int   // port currently being toggled; 0 = none
 	cleaning      int   // number of dangling forwards being torn down; 0 = none
@@ -338,13 +348,18 @@ func New(cfg config.Config) model {
 	li.CharLimit = 40
 	li.Width = 30
 
+	si := textinput.New()
+	si.Placeholder = "ssh"
+	si.CharLimit = 8
+	si.Width = 10
+
 	if cfg.Ports == nil {
 		cfg.Ports = map[int]config.PortMeta{}
 	}
 
 	h := help.New()
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li}
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si}
 }
 
 func Run(cfg config.Config) error {
@@ -773,6 +788,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.portInput.Reset()
 				m.labelInput.Reset()
 				m.labelPort = 0
+				m.sshInput.Reset()
+				m.sshUnlockPort = 0
 				return m, nil
 			case "enter":
 				switch m.mode {
@@ -811,12 +828,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					return m, m.rebuildItems()
+				case entryConfirmUnlockSSH:
+					// Only an exact "ssh" (trimmed, case-insensitive) unlocks;
+					// anything else -- including empty -- cancels without
+					// touching the lock. This edits config only, no tailscale.
+					typed := strings.ToLower(strings.TrimSpace(m.sshInput.Value()))
+					port := m.sshUnlockPort
+					m.mode = entryNone
+					m.sshInput.Reset()
+					m.sshUnlockPort = 0
+					if typed != "ssh" {
+						return m, nil // cancelled: :22 stays locked
+					}
+					meta := m.cfg.Ports[port]
+					meta.Locked = false
+					m.cfg.Ports[port] = meta
+					if err := m.cfg.Save(); err != nil {
+						m.err = err
+					}
+					return m, m.rebuildItems()
 				}
 			}
 			var cmd tea.Cmd
-			if m.mode == entryAddPort {
+			switch m.mode {
+			case entryAddPort:
 				m.portInput, cmd = m.portInput.Update(msg)
-			} else {
+			case entryConfirmUnlockSSH:
+				m.sshInput, cmd = m.sshInput.Update(msg)
+			default:
 				m.labelInput, cmd = m.labelInput.Update(msg)
 			}
 			return m, cmd
@@ -957,6 +996,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// "known" and visible in the default view, same as a port
 			// that's been toggled on at least once (see remember).
 			meta := m.cfg.Ports[sel.port.Number]
+			// Unlocking :22 removes the guard on SSH access, so it's gated
+			// behind a type-"ssh" confirm (ah23) rather than flipped here.
+			// Locking :22, and any non-:22 lock toggle, stay instant.
+			if sel.port.Number == 22 && meta.Locked {
+				m.sshUnlockPort = 22
+				m.sshInput.Reset()
+				m.sshInput.Focus()
+				m.mode = entryConfirmUnlockSSH
+				return m, nil
+			}
 			meta.Locked = !meta.Locked
 			m.cfg.Ports[sel.port.Number] = meta
 			if err := m.cfg.Save(); err != nil {
@@ -1210,7 +1259,7 @@ func (m model) helpView() string {
 		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
 		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
 		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
-		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default."},
+		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access)."},
 		{"n", "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up."},
 		{"l", "Set a text label for the selected port."},
 		{"r", "Refresh the port list and serve status."},
@@ -1388,6 +1437,10 @@ func (m model) renderBottom() string {
 			action = "stop serving :22 (SSH) -- this can drop your live session"
 		}
 		return warnStyle.Render(action+"? ") + helpStyle.Render("(y: confirm, any other key: cancel)")
+	case entryConfirmUnlockSSH:
+		return warnStyle.Render("⚠ this can break SSH access to this machine — ") +
+			helpStyle.Render("type ") + helpKeyStyle.Render("ssh") + helpStyle.Render(" to confirm unlocking :22: ") +
+			m.sshInput.View() + helpStyle.Render("  (esc: cancel)")
 	case entryConfirmFunnel:
 		url := tsserve.PublicURL(m.fqdn, m.funnelPublic)
 		lines := []string{
