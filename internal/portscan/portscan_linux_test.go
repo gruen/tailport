@@ -4,22 +4,23 @@ package portscan
 
 import "testing"
 
-func TestExtractPort(t *testing.T) {
+func TestSplitHostPort(t *testing.T) {
 	cases := []struct {
-		addr string
-		want int
-		ok   bool
+		addr     string
+		wantHost string
+		wantPort int
+		ok       bool
 	}{
-		{"0.0.0.0:22", 22, true},
-		{"100.100.100.100:61584", 61584, true},
-		{"[::]:22", 22, true},
-		{"[fd7a:115c:a1e0::1]:57619", 57619, true},
-		{"garbage", 0, false},
+		{"0.0.0.0:22", "0.0.0.0", 22, true},
+		{"100.100.100.100:61584", "100.100.100.100", 61584, true},
+		{"[::]:22", "::", 22, true},
+		{"[fd7a:115c:a1e0::1]:57619", "fd7a:115c:a1e0::1", 57619, true},
+		{"garbage", "", 0, false},
 	}
 	for _, c := range cases {
-		got, ok := extractPort(c.addr)
-		if ok != c.ok || (ok && got != c.want) {
-			t.Errorf("extractPort(%q) = (%d, %v), want (%d, %v)", c.addr, got, ok, c.want, c.ok)
+		host, port, ok := splitHostPort(c.addr)
+		if ok != c.ok || (ok && (port != c.wantPort || host != c.wantHost)) {
+			t.Errorf("splitHostPort(%q) = (%q, %d, %v), want (%q, %d, %v)", c.addr, host, port, ok, c.wantHost, c.wantPort, c.ok)
 		}
 	}
 }

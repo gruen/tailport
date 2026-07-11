@@ -33,8 +33,20 @@ func List() ([]Port, error) {
 		if len(fields) < 4 {
 			continue
 		}
-		port, ok := extractPort(fields[3])
-		if !ok || seen[port] {
+		host, port, ok := splitHostPort(fields[3])
+		if !ok {
+			continue
+		}
+		// Skip tailscaled's own serve-proxy sockets (bound to a tailnet
+		// address) BEFORE the seen[] dedup, so that a real app socket
+		// sharing the port (e.g. 127.0.0.1:8808 alongside 100.x:8808) still
+		// registers the port as listening regardless of line order. A
+		// dangling serve -- only tailnet-range sockets -- filters to empty,
+		// so its port is never added and reads as not-listening.
+		if isTailscaleAddr(host) {
+			continue
+		}
+		if seen[port] {
 			continue
 		}
 		seen[port] = true
@@ -50,19 +62,26 @@ func List() ([]Port, error) {
 	return ports, scanner.Err()
 }
 
-func extractPort(addr string) (int, bool) {
-	var portStr string
+// splitHostPort splits an `ss` local-address field into its bare host (no
+// brackets) and port. Handles bracketed IPv6 (`[fd7a:...]:57619`) and plain
+// v4/wildcard (`0.0.0.0:22`, `100.100.100.100:61584`).
+func splitHostPort(addr string) (host string, port int, ok bool) {
+	var hostStr, portStr string
 	switch {
 	case strings.Contains(addr, "]:"):
-		portStr = addr[strings.LastIndex(addr, "]:")+2:]
+		i := strings.LastIndex(addr, "]:")
+		hostStr = strings.TrimPrefix(addr[:i], "[")
+		portStr = addr[i+2:]
 	case strings.Contains(addr, ":"):
-		portStr = addr[strings.LastIndex(addr, ":")+1:]
+		i := strings.LastIndex(addr, ":")
+		hostStr = addr[:i]
+		portStr = addr[i+1:]
 	default:
-		return 0, false
+		return "", 0, false
 	}
-	port, err := strconv.Atoi(portStr)
+	p, err := strconv.Atoi(portStr)
 	if err != nil {
-		return 0, false
+		return "", 0, false
 	}
-	return port, true
+	return hostStr, p, true
 }
