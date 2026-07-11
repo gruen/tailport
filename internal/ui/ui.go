@@ -28,6 +28,10 @@ var (
 	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+
+	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
+	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 )
 
 // keyMap describes every keybinding the TUI responds to, for the bubbles/help
@@ -44,6 +48,7 @@ type keyMap struct {
 	ShowAll    key.Binding
 	Clean      key.Binding
 	Refresh    key.Binding
+	Help       key.Binding
 	Quit       key.Binding
 }
 
@@ -53,7 +58,7 @@ type keyMap struct {
 func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Toggle, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
-		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Quit,
+		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
 	}
 }
 
@@ -72,6 +77,7 @@ func newKeyMap() keyMap {
 		ShowAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
 		Clean:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "clean stale")),
 		Refresh:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Help:       key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
@@ -167,6 +173,10 @@ type model struct {
 	// marked meta.Favorite), true = All ports (every currently-listening
 	// port). Toggled by "a".
 	showAllPorts bool
+	// showHelp gates the full-screen "?" help overlay (see helpView). While
+	// it's open the overlay replaces the whole view and swallows every key
+	// except the ?/esc/q that dismiss it.
+	showHelp bool
 
 	allPorts []portscan.Port
 	active   map[int]bool
@@ -382,6 +392,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, refresh
 
 	case tea.KeyMsg:
+		// The help overlay is modal: while it's open, only ?/esc/q close it
+		// and every other key is swallowed (so nothing happens "behind" it).
+		if m.showHelp {
+			switch msg.String() {
+			case "?", "esc", "q", "ctrl+c":
+				m.showHelp = false
+			}
+			return m, nil
+		}
 		if m.mode != entryNone {
 			// The clean-confirm prompt is a y/n gate, not a text input, so
 			// it's handled before the esc/enter switch below (and before the
@@ -482,6 +501,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "?":
+			// This is reached only when not filtering (filtering does the
+			// break above), so "?" opens help normally but is typed into the
+			// "/" filter query while a filter is active.
+			m.showHelp = true
+			return m, nil
 		case "a":
 			// Anchor the cursor to the port under it, not the row index:
 			// capture the selected port number, switch views, then re-select
@@ -763,7 +788,60 @@ func wrapBindings(styles help.Styles, bindings []key.Binding, width int, sep str
 	return strings.Join(lines, "\n")
 }
 
+// helpView renders the full-screen "?" overlay: a short intro to what
+// tailport is, then a real explanation of every key (not the terse legend).
+// It replaces the whole View while m.showHelp is set.
+func (m model) helpView() string {
+	var b strings.Builder
+
+	b.WriteString(helpTitleStyle.Render("tailport — expose local ports across your tailnet"))
+	b.WriteString("\n\n")
+	b.WriteString(helpTextStyle.Render(
+		"tailport lists the TCP ports listening on this machine and toggles\n" +
+			"`tailscale serve` on or off for each one. An exposed port is reachable\n" +
+			"by your other tailnet devices over plain HTTP at http://<host>:<port> —\n" +
+			"tailnet-only, a 1:1 port mapping (same port in and out), never the\n" +
+			"public internet (tailport never uses `tailscale funnel`)."))
+	b.WriteString("\n\n")
+	b.WriteString(helpTitleStyle.Render("Keys"))
+	b.WriteString("\n")
+
+	rows := []struct{ key, desc string }{
+		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (●) its tailnet URL is shown beneath it."},
+		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port currently listening locally)."},
+		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
+		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
+		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default."},
+		{"n", "Expose an arbitrary port by number, even one not in the list."},
+		{"l", "Set a text label for the selected port."},
+		{"r", "Refresh the port list and serve status."},
+		{"/", "Filter the list by port number, process, or label."},
+		{"c", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown ▲). Offered only when some exist."},
+		{"?", "Toggle this help. esc or q also close it."},
+		{"q", "Quit."},
+	}
+	for _, r := range rows {
+		lines := strings.Split(r.desc, "\n")
+		b.WriteString("  " + helpKeyStyle.Render(fmt.Sprintf("%-6s", r.key)) + "  " + helpTextStyle.Render(lines[0]) + "\n")
+		for _, extra := range lines[1:] {
+			b.WriteString("          " + helpTextStyle.Render(extra) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(warnStyle.Render(
+		"Toggling port :22 (SSH) asks for a y/n confirmation first, in both\n" +
+			"directions — turning serve off for :22 can drop your live SSH session."))
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("press ? / esc / q to close"))
+	return b.String()
+}
+
 func (m model) View() string {
+	if m.showHelp {
+		return m.helpView()
+	}
+
 	var b string
 	if m.err != nil {
 		b += errStyle.Render("error: "+m.err.Error()) + "\n"
