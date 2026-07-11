@@ -1536,11 +1536,13 @@ func eggShade(rel, frame float64) float64 {
 		rel = 1
 	}
 	const (
-		omega    = 0.28    // ~2.2s per full back-and-forth at 100ms/frame
-		lightMid = -0.5    // key light, upper-left
-		lightAmp = 0.20    // gentle sway so the shadow terminator breathes
-		gMid     = -0.9215 // midpoint of the frame 32..36 glint arc
-		gAmp     = 0.2725  // half its span
+		omega    = 0.28  // ~2.2s per full back-and-forth at 100ms/frame
+		lightMid = -0.5  // key light, upper-left
+		lightAmp = 0.077 // shadow terminator sway: a whisper (~a 4-frame-worth
+		//                    of travel), so the dark side breathes without the
+		//                    high-contrast shadow reading as too fast/aggressive
+		gMid = -0.9215 // midpoint of the frame 32..36 glint arc
+		gAmp = 0.2725  // half its span
 	)
 	breath := math.Cos(frame * omega)
 	lon := math.Asin(rel) // -pi/2 .. pi/2 across the row
