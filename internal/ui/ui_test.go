@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -163,13 +164,15 @@ func TestRebuildItemsViews(t *testing.T) {
 func TestRequestToggle(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate any config.Save
 
-	// Locked :22 turn-on: lock guard fires -- no confirm, no toggle.
+	// Locked :22 turn-on: lock guard fires -- an error toast, no confirm, no
+	// toggle. (The returned cmd is the toast's expiry tick, not a toggle.)
 	m := New(config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}})
-	if cmd := m.requestToggle(22, true); cmd != nil {
-		t.Error("locked :22 turn-on should not return a toggle cmd")
+	m.requestToggle(22, true)
+	if m.flash == "" || m.flashLevel != flashError {
+		t.Errorf("locked :22 turn-on should raise an error toast; flash=%q level=%v", m.flash, m.flashLevel)
 	}
-	if m.err == nil {
-		t.Error("locked :22 turn-on should set an error")
+	if m.pending != 0 {
+		t.Error("locked :22 turn-on should not begin a toggle")
 	}
 	if m.mode != entryNone {
 		t.Errorf("locked :22 turn-on mode = %v, want entryNone", m.mode)
@@ -453,6 +456,75 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestErrorToasts covers q89g: errors are unified into the auto-dismissing
+// toast system (severity error/red), schedule an expiry, honour flashID so a
+// stale timer can't clear a newer toast, clear on the next keypress, and a
+// failed toggle / "invalid port" both fade rather than persisting.
+func TestErrorToasts(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// (1) Setting an error schedules expiry and tags severity.
+	m := New(config.Config{})
+	if cmd := m.setErr("boom"); cmd == nil {
+		t.Error("setErr should return an expiry cmd")
+	}
+	if m.flash != "boom" || m.flashLevel != flashError {
+		t.Errorf("setErr should set a red error toast; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+
+	// (2) flashExpireMsg clears on a matching id, no-ops on a stale one.
+	id := m.flashID
+	if got := mustUpdate(t, m, flashExpireMsg{id: id - 1}); got.flash == "" {
+		t.Error("a stale flashExpireMsg must not clear the toast")
+	}
+	if got := mustUpdate(t, m, flashExpireMsg{id: id}); got.flash != "" {
+		t.Error("a matching flashExpireMsg should clear the toast")
+	}
+
+	// (3) A newer toast supersedes an older; the old timer no-ops.
+	m = New(config.Config{})
+	m.setFlash("first", flashInfo)
+	m.setFlash("second", flashError)
+	if got := mustUpdate(t, m, flashExpireMsg{id: 1}); got.flash != "second" {
+		t.Errorf("an older timer must not clear the newer toast; got %q", got.flash)
+	}
+
+	// (6) A failed toggle raises an auto-dismissing error toast (not persistent).
+	m = New(config.Config{})
+	res, cmd := m.Update(toggleDoneMsg{port: 8080, err: fmt.Errorf("serve failed")})
+	m = res.(model)
+	if m.flash == "" || m.flashLevel != flashError {
+		t.Errorf("failed toggle should raise an error toast; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+	if cmd == nil {
+		t.Error("failed toggle should schedule the toast's expiry (batched cmd)")
+	}
+
+	// (7) "invalid port" (n + 0) is an auto-dismissing error toast.
+	m = New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.rebuildItems()
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(model)
+	if m.flash != "invalid port" || m.flashLevel != flashError {
+		t.Errorf("invalid port should raise an error toast; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+	if cmd == nil {
+		t.Error("invalid port should schedule the toast's expiry")
+	}
+	// A subsequent keypress dismisses it.
+	if got := mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}}); got.flash != "" {
+		t.Errorf("the error toast should clear on the next keypress; got %q", got.flash)
+	}
+}
+
+func mustUpdate(t *testing.T, m model, msg tea.Msg) model {
+	t.Helper()
+	res, _ := m.Update(msg)
+	return res.(model)
+}
+
 // TestLabelPrefill covers vgn5: the 'l' label input prefills with the current
 // label if set, else the process name, else empty; confirming the prefill
 // persists it, editing replaces it, and esc leaves the existing label alone.
@@ -733,8 +805,8 @@ func TestCopyURL(t *testing.T) {
 	if !strings.Contains(m.flash, "copied") || !strings.Contains(m.flash, "http://host:8080") {
 		t.Errorf("flash = %q, want a copied-URL toast", m.flash)
 	}
-	if m.flashWarn {
-		t.Error("exposed copy should not warn (amber)")
+	if m.flashLevel != flashInfo {
+		t.Errorf("exposed copy should be an info toast; level = %v", m.flashLevel)
 	}
 	// The next keypress dismisses the toast.
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
@@ -746,8 +818,8 @@ func TestCopyURL(t *testing.T) {
 	m = newModel(false)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
-	if !m.flashWarn || !strings.Contains(m.flash, "not exposed") {
-		t.Errorf("not-exposed copy flash = %q (warn=%v), want a NOT-exposed caveat", m.flash, m.flashWarn)
+	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "not exposed") {
+		t.Errorf("not-exposed copy flash = %q (level=%v), want a warn NOT-exposed caveat", m.flash, m.flashLevel)
 	}
 }
 
@@ -860,13 +932,15 @@ func TestStatusText(t *testing.T) {
 func TestRequestFunnel(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	// :22 hard-block: no funnel cmd, error set, no confirm opened.
+	// :22 hard-block: an error toast, no confirm opened. (The returned cmd is
+	// the toast expiry tick, not a funnel op.)
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
-	if cmd := m.requestFunnel(22); cmd != nil {
-		t.Error("funnel :22 should be refused (nil cmd)")
+	m.requestFunnel(22)
+	if m.flash == "" || m.flashLevel != flashError {
+		t.Errorf("funnel :22 should raise an error toast; flash=%q level=%v", m.flash, m.flashLevel)
 	}
-	if m.err == nil {
-		t.Error("funnel :22 should set an error")
+	if m.pending != 0 {
+		t.Error("funnel :22 should not begin a funnel")
 	}
 	if m.mode != entryNone {
 		t.Errorf("funnel :22 mode = %v, want entryNone", m.mode)
@@ -905,14 +979,15 @@ func TestRequestFunnel(t *testing.T) {
 		t.Errorf("cancel state = mode:%v pending:%d", gm.mode, gm.pending)
 	}
 
-	// All three ingress ports taken: a 4th funnel is refused.
+	// All three ingress ports taken: a 4th funnel is refused with an error toast.
 	m = New(config.Config{Ports: map[int]config.PortMeta{}})
 	m.funnel = map[int]int{3000: 443, 3001: 8443, 3002: 10000}
-	if cmd := m.requestFunnel(9999); cmd != nil {
-		t.Error("a 4th funnel should be refused (nil cmd)")
+	m.requestFunnel(9999)
+	if m.flash == "" || m.flashLevel != flashError || m.mode != entryNone {
+		t.Errorf("4th funnel should raise an error toast without a confirm; flash=%q level=%v mode=%v", m.flash, m.flashLevel, m.mode)
 	}
-	if m.err == nil || m.mode != entryNone {
-		t.Errorf("4th funnel should error without a confirm; err=%v mode=%v", m.err, m.mode)
+	if m.pending != 0 {
+		t.Error("4th funnel should not begin a funnel")
 	}
 
 	// Already funnelled: "p" turns it off immediately (no confirm), pending set.

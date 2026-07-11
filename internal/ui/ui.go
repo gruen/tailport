@@ -223,6 +223,17 @@ type cleanupDoneMsg struct{ err error }
 // scheduled this expiry (matched by id), so a newer toast isn't cut short.
 type flashExpireMsg struct{ id int }
 
+// flashLevel is the severity of a toast, driving its colour: info (green),
+// warn (amber), error (red). It unifies what used to be a bare success toast
+// plus a separate persistent m.err red line (q89g).
+type flashLevel int
+
+const (
+	flashInfo flashLevel = iota
+	flashWarn
+	flashError
+)
+
 // entryMode tracks which (if any) text-input flow is currently active.
 // Both "n" (add/toggle an arbitrary port) and "l" (label the selected
 // port) reuse the same open-textinput interaction pattern, but need
@@ -305,14 +316,14 @@ type model struct {
 	funnelPort   int
 	funnelPublic int
 	funnelTurnOn bool
-	// flash is a transient toast shown in the bottom bar (e.g. after "c"
-	// copies a URL). Unlike err it isn't red; flashWarn tints it amber for a
-	// caveat ("port NOT exposed"). It clears on the next keypress or when a
-	// matching flashExpireMsg (tagged with flashID) fires after a short delay.
-	flash     string
-	flashWarn bool
-	flashID   int
-	err       error
+	// flash is the single transient notification shown in the bottom bar --
+	// copy confirmations, refusals, and errors alike (q89g). flashLevel tints
+	// it (info green / warn amber / error red). It clears on the next keypress
+	// or when a matching flashExpireMsg (tagged with flashID) fires after a
+	// short delay, so nothing -- including errors -- sticks around stale.
+	flash      string
+	flashLevel flashLevel
+	flashID    int
 }
 
 func New(cfg config.Config) model {
@@ -432,9 +443,9 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 	url := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
 	var flash tea.Cmd
 	if sel.active {
-		flash = m.setFlash("copied ✓  "+url, false)
+		flash = m.setFlash("copied ✓  "+url, flashInfo)
 	} else {
-		flash = m.setFlash(fmt.Sprintf("copied — :%d not exposed on tailnet (toggle it on first)", sel.port.Number), true)
+		flash = m.setFlash(fmt.Sprintf("copied — :%d not exposed on tailnet (toggle it on first)", sel.port.Number), flashWarn)
 	}
 	return tea.Batch(copyCmd(url), flash)
 }
@@ -449,15 +460,37 @@ func copyCmd(url string) tea.Cmd {
 	}
 }
 
-// setFlash shows a transient toast (warn tints it amber) and returns the
-// command that expires it after a short delay. flashID tags the expiry so a
-// newer toast supersedes rather than being cut short by an older timer.
-func (m *model) setFlash(text string, warn bool) tea.Cmd {
+// setFlash shows a transient toast at the given severity and returns the
+// command that expires it after a short delay -- longer for warn/error so
+// they're readable, shorter for info. flashID tags the expiry so a newer toast
+// supersedes rather than being cut short by an older timer. CRITICAL: callers
+// MUST propagate the returned cmd (return/Batch it) or the toast never
+// auto-expires.
+func (m *model) setFlash(text string, level flashLevel) tea.Cmd {
 	m.flashID++
 	m.flash = text
-	m.flashWarn = warn
+	m.flashLevel = level
 	id := m.flashID
-	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return flashExpireMsg{id: id} })
+	d := 3 * time.Second
+	if level != flashInfo {
+		d = 5 * time.Second
+	}
+	return tea.Tick(d, func(time.Time) tea.Msg { return flashExpireMsg{id: id} })
+}
+
+// setErr is a convenience for the common "raise an auto-dismissing error
+// toast" case. Returns the expiry cmd for the caller to propagate.
+func (m *model) setErr(text string) tea.Cmd {
+	return m.setFlash(text, flashError)
+}
+
+// saveConfig persists the registry and, on failure, raises an error toast,
+// returning its expiry cmd (nil on success) for the caller to propagate.
+func (m *model) saveConfig() tea.Cmd {
+	if err := m.cfg.Save(); err != nil {
+		return m.setErr(err.Error())
+	}
+	return nil
 }
 
 // cleanupDangling turns off every serve mapping in ports, one at a time.
@@ -503,33 +536,29 @@ func (m model) hasDangling() bool {
 // remember ensures port has a registry entry (creating a bare one if
 // needed) and persists it. Called whenever a port is toggled on, so it
 // stays visible in the default view even after being toggled back off.
-func (m *model) remember(port int) {
+func (m *model) remember(port int) tea.Cmd {
 	if m.cfg.Ports == nil {
 		m.cfg.Ports = map[int]config.PortMeta{}
 	}
 	if _, ok := m.cfg.Ports[port]; ok {
-		return
+		return nil
 	}
 	m.cfg.Ports[port] = config.PortMeta{}
-	if err := m.cfg.Save(); err != nil {
-		m.err = err
-	}
+	return m.saveConfig()
 }
 
 // favorite registers port with Favorite=true, preserving any existing label
 // or lock, and persists it. Backs the "n" add-port flow (ykgj): the port
 // sticks in the Favorites view even before its service is running, ready to be
 // served with space once it is.
-func (m *model) favorite(port int) {
+func (m *model) favorite(port int) tea.Cmd {
 	if m.cfg.Ports == nil {
 		m.cfg.Ports = map[int]config.PortMeta{}
 	}
 	meta := m.cfg.Ports[port]
 	meta.Favorite = true
 	m.cfg.Ports[port] = meta
-	if err := m.cfg.Save(); err != nil {
-		m.err = err
-	}
+	return m.saveConfig()
 }
 
 // requestToggle begins toggling a port on/off from either entry point (the
@@ -541,8 +570,7 @@ func (m *model) favorite(port int) {
 // immediately. The :22 confirm is independent of the lock mechanism.
 func (m *model) requestToggle(port int, turnOn bool) tea.Cmd {
 	if turnOn && m.cfg.Ports[port].Locked {
-		m.err = fmt.Errorf("port :%d is locked -- press x to unlock", port)
-		return nil
+		return m.setErr(fmt.Sprintf("port :%d is locked -- press x to unlock", port))
 	}
 	if port == 22 {
 		m.confirmPort = port
@@ -557,11 +585,12 @@ func (m *model) requestToggle(port int, turnOn bool) tea.Cmd {
 // it. Callers must have already cleared the lock and :22 guards (see
 // requestToggle and the entryConfirm22 handler).
 func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
+	var saveCmd tea.Cmd
 	if turnOn {
-		m.remember(port)
+		saveCmd = m.remember(port)
 	}
 	m.pending = port
-	return toggle(port, turnOn)
+	return tea.Batch(saveCmd, toggle(port, turnOn))
 }
 
 // requestFunnel begins toggling the public funnel for a port (the "p" key).
@@ -577,13 +606,11 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 		return m.beginFunnel(port, pub, false)
 	}
 	if port == 22 {
-		m.err = fmt.Errorf("refusing to funnel :22 (SSH) to the public internet")
-		return nil
+		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
 	}
 	pub, ok := m.nextFunnelPort()
 	if !ok {
-		m.err = fmt.Errorf("all funnel ingress ports (443, 8443, 10000) are in use -- tailscale allows at most three")
-		return nil
+		return m.setErr("all funnel ingress ports (443, 8443, 10000) are in use -- tailscale allows at most three")
 	}
 	m.funnelPort = port
 	m.funnelPublic = pub
@@ -596,11 +623,12 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 // it. Turning on remembers the port (so it stays visible once toggled back
 // down), mirroring beginToggle.
 func (m *model) beginFunnel(localPort, publicPort int, turnOn bool) tea.Cmd {
+	var saveCmd tea.Cmd
 	if turnOn {
-		m.remember(localPort)
+		saveCmd = m.remember(localPort)
 	}
 	m.pending = localPort
-	return funnelCmd(localPort, publicPort, turnOn)
+	return tea.Batch(saveCmd, funnelCmd(localPort, publicPort, turnOn))
 }
 
 // selectedProcess returns the process name discovered for a local port (from
@@ -669,10 +697,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshMsg:
 		if msg.err != nil {
-			m.err = msg.err
-			return m, nil
+			return m, m.setErr(msg.err.Error())
 		}
-		m.err = nil
 		m.allPorts = msg.ports
 		m.active = msg.active
 		m.funnel = msg.funnel
@@ -684,19 +710,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
-			// Keep the error visible: a failed toggle/funnel changed no state,
-			// and a follow-up refresh would immediately clear m.err (refreshMsg
-			// resets it), swallowing messages like the funnel "not enabled"
-			// guidance. The next user action refreshes.
-			m.err = msg.err
-			return m, nil
+			// The error toast auto-dismisses (q89g); still refresh to reconcile
+			// state -- the toast survives a refresh now that notifications no
+			// longer live in a field the refresh clears.
+			return m, tea.Batch(m.setErr(msg.err.Error()), refresh)
 		}
 		return m, refresh
 
 	case cleanupDoneMsg:
 		m.cleaning = 0
 		if msg.err != nil {
-			m.err = msg.err
+			return m, tea.Batch(m.setErr(msg.err.Error()), refresh)
 		}
 		return m, refresh
 
@@ -704,15 +728,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Only clear if no newer toast has replaced this one (see flashID).
 		if msg.id == m.flashID {
 			m.flash = ""
-			m.flashWarn = false
+			m.flashLevel = flashInfo
 		}
 		return m, nil
 
 	case tea.KeyMsg:
 		// Any keypress dismisses a lingering toast (a fresh one is set below if
-		// this key produces it), so the flash never sticks around stale.
+		// this key produces it), so notifications never stick around stale.
 		m.flash = ""
-		m.flashWarn = false
+		m.flashLevel = flashInfo
 		// The help overlay is modal: while it's open, only ?/esc/q close it
 		// and every other key is swallowed (so nothing happens "behind" it).
 		if m.showHelp {
@@ -798,8 +822,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = entryNone
 					m.portInput.Reset()
 					if err != nil || port < 1 || port > 65535 {
-						m.err = fmt.Errorf("invalid port")
-						return m, nil
+						return m, m.setErr("invalid port")
 					}
 					// "n" registers + favorites the port; it does NOT serve
 					// (ykgj). Exposing is always space. A not-yet-running
@@ -807,8 +830,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// entry, ready to serve once its service is up -- so an
 					// added port sticks instead of vanishing. No lock/:22 guard
 					// is needed here since nothing is exposed.
-					m.favorite(port)
-					return m, m.rebuildItems()
+					return m, tea.Batch(m.favorite(port), m.rebuildItems())
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
 					port := m.labelPort
@@ -823,9 +845,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						meta := m.cfg.Ports[port]
 						meta.Label = label
 						m.cfg.Ports[port] = meta
-						if err := m.cfg.Save(); err != nil {
-							m.err = err
-						}
+						return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 					}
 					return m, m.rebuildItems()
 				case entryConfirmUnlockSSH:
@@ -843,10 +863,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					meta := m.cfg.Ports[port]
 					meta.Locked = false
 					m.cfg.Ports[port] = meta
-					if err := m.cfg.Save(); err != nil {
-						m.err = err
-					}
-					return m, m.rebuildItems()
+					return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 				}
 			}
 			var cmd tea.Cmd
@@ -923,8 +940,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Batch-tear-down of dangling forwards, behind a y/n confirm (moved
 			// from "c" to shift-C when "c" became copy; see vnq7). No-op while a
 			// toggle or cleanup is already in flight, and a silent no-op when
-			// there's nothing to clean (setting m.err here would render red,
-			// like a failure).
+			// there's nothing to clean (an error toast would read as a failure).
 			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil
 			}
@@ -969,10 +985,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			meta := m.cfg.Ports[sel.port.Number]
 			meta.Favorite = true
 			m.cfg.Ports[sel.port.Number] = meta
-			if err := m.cfg.Save(); err != nil {
-				m.err = err
-			}
-			return m, m.rebuildItems()
+			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 		case "u":
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
@@ -985,10 +998,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.cfg.Ports[sel.port.Number] = meta
 				}
-				if err := m.cfg.Save(); err != nil {
-					m.err = err
-				}
-				return m, m.rebuildItems()
+				return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 			}
 			return m, nil
 		case "x":
@@ -1016,10 +1026,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			meta.Locked = !meta.Locked
 			m.cfg.Ports[sel.port.Number] = meta
-			if err := m.cfg.Save(); err != nil {
-				m.err = err
-			}
-			return m, m.rebuildItems()
+			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 		case " ":
 			if m.pending != 0 {
 				return m, nil // a toggle is already in flight
@@ -1462,14 +1469,17 @@ func (m model) renderBottom() string {
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
 	}
-	// A transient toast (e.g. "copied ✓ ...") takes the status line's spot
-	// while it's showing; otherwise the normal breakdown. flashWarn tints an
-	// amber caveat; a plain toast is green.
+	// A transient toast (copy confirmation, refusal, or error) takes the
+	// status line's spot while it's showing; otherwise the normal breakdown.
+	// The severity colours it: info green, warn amber, error red (q89g).
 	statusLine := helpStyle.Render(m.statusText())
 	if m.flash != "" {
 		toast := activeStyle
-		if m.flashWarn {
+		switch m.flashLevel {
+		case flashWarn:
 			toast = warnStyle
+		case flashError:
+			toast = errStyle
 		}
 		statusLine = toast.Render(m.flash)
 	}
@@ -1502,9 +1512,6 @@ func (m model) View() string {
 	//     and not filtering -> the contextual empty-state explainer;
 	//   - otherwise the list itself.
 	var body string
-	if m.err != nil {
-		body += errStyle.Render("error: "+m.err.Error()) + "\n"
-	}
 	switch {
 	case filtering && len(m.list.VisibleItems()) == 0:
 		body += m.noMatchMessage()
