@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -54,6 +55,7 @@ var (
 type keyMap struct {
 	Toggle     key.Binding
 	Funnel     key.Binding
+	Filter     key.Binding
 	NewPort    key.Binding
 	Label      key.Binding
 	Favorite   key.Binding
@@ -71,7 +73,7 @@ type keyMap struct {
 // relies on width-based wrapping (see wrapBindings) instead of truncation.
 func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
-		k.Toggle, k.Funnel, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
+		k.Toggle, k.Funnel, k.Filter, k.NewPort, k.Label, k.Favorite, k.Unfavorite,
 		k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
 	}
 }
@@ -82,8 +84,11 @@ func (k keyMap) FullHelp() [][]key.Binding {
 
 func newKeyMap() keyMap {
 	return keyMap{
-		Toggle:     key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
-		Funnel:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
+		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
+		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
+		// Filter is display-only (legend + help): the actual "/" handling lives
+		// in bubbles/list. Listed here so the feature is discoverable.
+		Filter:     key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
 		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new port")),
 		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
 		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
@@ -107,7 +112,36 @@ type portItem struct {
 	// funnelled on, or 0 if it isn't funnelled. A funnelled port is exposed to
 	// the public internet, which outranks its tailnet-serve state in the UI.
 	funnelPublic int
-	meta         config.PortMeta
+	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
+	// Favorites view by an active "/" filter (4ye6), so real favorites still
+	// stand out among the wider search results. See portDelegate.Render.
+	dimmed bool
+	meta   config.PortMeta
+}
+
+// portDelegate is the list's item renderer: the stock DefaultDelegate, except
+// a portItem flagged dimmed is drawn with the delegate's built-in dimmed
+// styles so filter matches that aren't favorites recede in the Favorites view.
+type portDelegate struct {
+	list.DefaultDelegate
+}
+
+func newPortDelegate() portDelegate {
+	return portDelegate{DefaultDelegate: list.NewDefaultDelegate()}
+}
+
+func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	if it, ok := item.(portItem); ok && it.dimmed {
+		// Render this one item with dimmed styles by copying the delegate (a
+		// value) and swapping its normal styles for the dimmed ones. The copy
+		// keeps all the default layout/selection logic intact.
+		dd := d.DefaultDelegate
+		dd.Styles.NormalTitle = dd.Styles.DimmedTitle
+		dd.Styles.NormalDesc = dd.Styles.DimmedDesc
+		dd.Render(w, m, index, item)
+		return
+	}
+	d.DefaultDelegate.Render(w, m, index, item)
 }
 
 func (i portItem) Title() string {
@@ -213,6 +247,11 @@ type model struct {
 	// marked meta.Favorite), true = All ports (every currently-listening
 	// port). Toggled by "a".
 	showAllPorts bool
+	// filtering mirrors "a '/' filter is active" (Filtering or FilterApplied).
+	// It's the scope signal rebuildItems reads: while filtering, the list
+	// searches ALL listening ports regardless of showAllPorts (4ye6). Kept in
+	// sync with the list's own filter state as it toggles on/off.
+	filtering bool
 	// showHelp gates the full-screen "?" help overlay (see helpView). While
 	// it's open the overlay replaces the whole view and swallows every key
 	// except the ?/esc/q that dismiss it.
@@ -251,12 +290,17 @@ type model struct {
 func New(cfg config.Config) model {
 	host, _ := os.Hostname()
 
-	l := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	l := list.New(nil, newPortDelegate(), 0, 0)
 	// The "tailport" wordmark now lives in View()'s persistent header
 	// (renderHeader), drawn above both the list and the empty state, so the
 	// list's own built-in title is turned off to avoid rendering it twice.
 	l.SetShowTitle(false)
 	l.SetShowHelp(false)
+	// Filtering stays enabled, but its input is rendered by the app in a
+	// dedicated row under the header (see View/renderFilterRow) rather than in
+	// the list's title area, which would stack awkwardly beneath the header.
+	l.SetShowFilter(false)
+	l.FilterInput.Prompt = "filter: "
 
 	ti := textinput.New()
 	ti.Placeholder = "port"
@@ -549,8 +593,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.fqdn != "" {
 			m.fqdn = msg.fqdn
 		}
-		m.rebuildItems()
-		return m, nil
+		return m, m.rebuildItems()
 
 	case toggleDoneMsg:
 		m.pending = 0
@@ -683,8 +726,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.err = err
 						}
 					}
-					m.rebuildItems()
-					return m, nil
+					return m, m.rebuildItems()
 				}
 			}
 			var cmd tea.Cmd
@@ -697,12 +739,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.list.FilterState() == list.Filtering {
-			break // let bubbles/list's own "/" filter input consume the keys
+			// While typing a filter, every key belongs to bubbles/list's filter
+			// input -- forward it. If this key cancelled the filter (esc), drop
+			// the widened scope and restore the current view.
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			if m.list.FilterState() == list.Unfiltered {
+				m.filtering = false
+				m.rebuildItems() // Unfiltered -> nil cmd
+			}
+			return m, cmd
 		}
 
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "/":
+			// Widen scope to ALL listening ports BEFORE handing "/" to the list
+			// (4ye6): the list snapshots its current items when filtering
+			// begins, so the items must already be the full set. Rebuilding
+			// while still Unfiltered avoids bubbles/list's async re-filter path.
+			m.filtering = true
+			m.rebuildItems() // Unfiltered list -> nil cmd
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			return m, cmd
 		case "?":
 			// This is reached only when not filtering (filtering does the
 			// break above), so "?" opens help normally but is typed into the
@@ -719,11 +780,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cur = sel.port.Number
 			}
 			m.showAllPorts = !m.showAllPorts
-			m.rebuildItems()
+			cmd := m.rebuildItems()
 			if cur != 0 {
 				m.selectPort(cur)
 			}
-			return m, nil
+			return m, cmd
 		case "r":
 			return m, refresh
 		case "c":
@@ -770,8 +831,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err := m.cfg.Save(); err != nil {
 				m.err = err
 			}
-			m.rebuildItems()
-			return m, nil
+			return m, m.rebuildItems()
 		case "u":
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
@@ -787,7 +847,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := m.cfg.Save(); err != nil {
 					m.err = err
 				}
-				m.rebuildItems()
+				return m, m.rebuildItems()
 			}
 			return m, nil
 		case "x":
@@ -808,8 +868,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err := m.cfg.Save(); err != nil {
 				m.err = err
 			}
-			m.rebuildItems()
-			return m, nil
+			return m, m.rebuildItems()
 		case " ":
 			if m.pending != 0 {
 				return m, nil // a toggle is already in flight
@@ -835,8 +894,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Anything not handled above goes to the list. In FilterApplied state this
+	// is where esc clears the filter (ClearFilter), so if the filter just
+	// cleared, drop the widened scope and restore the current view.
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
+	if m.filtering && m.list.FilterState() == list.Unfiltered {
+		m.filtering = false
+		m.rebuildItems() // Unfiltered -> nil cmd
+	}
 	return m, cmd
 }
 
@@ -846,13 +912,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // meta.Favorite, merging in synthetic entries (empty Process) for favorite
 // ports that aren't currently listening locally so a favorite never
 // silently disappears just because its process is down.
-func (m *model) rebuildItems() {
+//
+// While a "/" filter is active (4ye6) the scope widens to ALL listening
+// ports regardless of view, so the filter searches everything; when the
+// origin view is Favorites, non-favorite matches are flagged dimmed so real
+// favorites still stand out among the pulled-in results.
+// It returns the list's SetItems command, which is non-nil (a re-filter
+// request) only when rebuilding while a filter is active; callers made from
+// Update must propagate it so the filtered view doesn't blank out.
+func (m *model) rebuildItems() tea.Cmd {
 	portsByNumber := make(map[int]portscan.Port, len(m.allPorts))
 	for _, p := range m.allPorts {
 		portsByNumber[p.Number] = p
 	}
 
-	if m.showAllPorts {
+	if m.showAllPorts || m.filtering {
+		// Non-favorite matches recede only when filtering FROM the Favorites
+		// view; the All ports view (and a plain All-ports filter) dims nothing.
+		dimNonFav := m.filtering && !m.showAllPorts
 		numbers := make([]int, 0, len(portsByNumber))
 		for n := range portsByNumber {
 			numbers = append(numbers, n)
@@ -862,10 +939,10 @@ func (m *model) rebuildItems() {
 		for _, n := range numbers {
 			// This branch iterates portsByNumber, so every port here is
 			// currently listening.
-			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n]})
+			meta := m.cfg.Ports[n]
+			items = append(items, portItem{port: portsByNumber[n], active: m.active[n], listening: true, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta})
 		}
-		m.setItems(items)
-		return
+		return m.setItems(items)
 	}
 
 	// Favorites view: exactly the ports flagged meta.Favorite. Unfavoriting
@@ -888,7 +965,7 @@ func (m *model) rebuildItems() {
 		// portsByNumber iff a local process is bound to it.
 		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n]})
 	}
-	m.setItems(items)
+	return m.setItems(items)
 }
 
 // setItems replaces the list's items and clamps the selection if it's now
@@ -897,12 +974,13 @@ func (m *model) rebuildItems() {
 // (e.g. switching from the All ports view back to Favorites, or a refresh
 // that drops a since-unregistered port), which makes SelectedItem() return
 // nil and silently turns every selection-based key (space, l, f, u) into a
-// no-op.
-func (m *model) setItems(items []list.Item) {
-	m.list.SetItems(items)
+// no-op. Returns SetItems' cmd (a re-filter request while a filter is active).
+func (m *model) setItems(items []list.Item) tea.Cmd {
+	cmd := m.list.SetItems(items)
 	if idx := m.list.Index(); len(items) > 0 && (idx < 0 || idx >= len(items)) {
 		m.list.Select(len(items) - 1)
 	}
+	return cmd
 }
 
 // selectPort moves the cursor to the row for the given port number,
@@ -1027,7 +1105,7 @@ func (m model) helpView() string {
 		{"n", "Expose an arbitrary port by number, even one not in the list."},
 		{"l", "Set a text label for the selected port."},
 		{"r", "Refresh the port list and serve status."},
-		{"/", "Filter the list by port number, process, or label."},
+		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
 		{"c", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown ▲). Offered only when some exist."},
 		{"?", "Toggle this help. esc or q also close it."},
 		{"q", "Quit."},
@@ -1218,20 +1296,31 @@ func (m model) View() string {
 	}
 
 	// Persistent top header (logo + view toggle), drawn above both the list
-	// and the empty state so the wordmark never disappears.
+	// and the empty state so the wordmark never disappears. While a filter is
+	// active its input gets a dedicated row just beneath the header (4ye6),
+	// rather than stacking in bubbles/list's title area.
 	header := m.renderHeader()
+	filtering := m.list.FilterState() != list.Unfiltered
+	if filtering {
+		header += "\n" + m.renderFilterRow()
+	}
 
-	// Body: the list, or -- when the current view itself is empty (no
-	// favorites, or nothing listening), as opposed to a "/" filter that
-	// matched nothing (Items() still populated) -- a contextual explanation
-	// instead of bubbles/list's bare "No items.".
+	// Body selection:
+	//   - filtering with no matches -> a clear "no ports match" line (not
+	//     bubbles/list's bare "No items." nor the fresh-install explainer);
+	//   - the current view genuinely empty (no favorites / nothing listening)
+	//     and not filtering -> the contextual empty-state explainer;
+	//   - otherwise the list itself.
 	var body string
 	if m.err != nil {
 		body += errStyle.Render("error: "+m.err.Error()) + "\n"
 	}
-	if len(m.list.Items()) == 0 && m.list.FilterState() != list.Filtering {
+	switch {
+	case filtering && len(m.list.VisibleItems()) == 0:
+		body += m.noMatchMessage()
+	case len(m.list.Items()) == 0 && !filtering:
 		body += m.renderEmptyState()
-	} else {
+	default:
 		body += m.list.View()
 	}
 
@@ -1244,4 +1333,25 @@ func (m model) View() string {
 		gap = 1
 	}
 	return header + "\n" + body + strings.Repeat("\n", gap) + bottom
+}
+
+// renderFilterRow renders the on-demand filter input shown beneath the header
+// while filtering. The input is bubbles/list's own FilterInput (built-in
+// display suppressed via SetShowFilter(false)); we surface it here so the
+// prompt sits in its own row and gives immediate feedback the moment "/" is
+// pressed.
+func (m model) renderFilterRow() string {
+	return m.list.FilterInput.View()
+}
+
+// noMatchMessage is shown in place of the list body when an active filter
+// matches nothing, naming the query so it's clear why the list is empty.
+func (m model) noMatchMessage() string {
+	q := strings.TrimSpace(m.list.FilterValue())
+	msg := helpTitleStyle.Render("No matches")
+	if q != "" {
+		msg = helpTitleStyle.Render(fmt.Sprintf("No ports match %q", q))
+	}
+	return msg + "\n\n" + helpTextStyle.Render("Try a different query, or press ") +
+		helpKeyStyle.Render("esc") + helpTextStyle.Render(" to clear the filter.")
 }

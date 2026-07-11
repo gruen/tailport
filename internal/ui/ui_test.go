@@ -4,7 +4,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -218,6 +220,149 @@ func TestUpdateToggleKeys(t *testing.T) {
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if got := res.(model); got.pending != 0 {
 		t.Errorf("enter should not toggle; pending = %d, want 0", got.pending)
+	}
+}
+
+// settle runs a command and feeds the resulting message(s) back into the
+// model, so bubbles/list's ASYNC filtering (a FilterMatchesMsg produced by a
+// tea.Cmd) is actually applied -- without this, VisibleItems never reflects a
+// typed query in tests. tea.Batch is unwrapped recursively; each cmd runs with
+// a short deadline so blocking ticks (textinput's cursor blink) are skipped
+// rather than stalling the suite.
+func settle(m model, cmd tea.Cmd) model {
+	for _, msg := range collectMsgs(cmd) {
+		res, _ := m.Update(msg)
+		m = res.(model)
+	}
+	return m
+}
+
+func collectMsgs(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	ch := make(chan tea.Msg, 1)
+	go func() { ch <- cmd() }()
+	select {
+	case msg := <-ch:
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			var out []tea.Msg
+			for _, c := range batch {
+				out = append(out, collectMsgs(c)...)
+			}
+			return out
+		}
+		if msg == nil {
+			return nil
+		}
+		return []tea.Msg{msg}
+	case <-time.After(50 * time.Millisecond):
+		return nil // a blocking cmd (e.g. cursor blink tick) -- skip it
+	}
+}
+
+// typeRunes feeds each rune of s to Update as a key press, threading the model
+// and settling the async filter after each keystroke.
+func typeRunes(m model, s string) model {
+	for _, r := range s {
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = settle(res.(model), cmd)
+	}
+	return m
+}
+
+// TestFilterScope covers 4ye6's core: pressing "/" from the Favorites view
+// widens the search to ALL listening ports, dims the non-favorite matches,
+// keeps fuzzy matching, and esc restores the Favorites view.
+func TestFilterScope(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{8808: {Favorite: true}}})
+	m.allPorts = []portscan.Port{{Number: 8808, Process: "web"}, {Number: 3000, Process: "node"}, {Number: 9000, Process: "x"}}
+	m.active = map[int]bool{}
+	m.showAllPorts = false
+	m.rebuildItems()
+
+	// Favorites view shows only the favorite.
+	if got := portNumbers(m); !reflect.DeepEqual(got, []int{8808}) {
+		t.Fatalf("favorites view = %v, want [8808]", got)
+	}
+
+	// "/" widens scope to every listening port and enters filtering.
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = settle(res.(model), cmd)
+	if m.list.FilterState() != list.Filtering {
+		t.Fatalf("after '/', FilterState = %v, want Filtering", m.list.FilterState())
+	}
+	if got := portNumbers(m); !reflect.DeepEqual(got, []int{3000, 8808, 9000}) {
+		t.Errorf("filtering scope = %v, want all listening [3000 8808 9000]", got)
+	}
+
+	// Non-favorite matches are dimmed; the favorite is not.
+	for _, it := range m.list.Items() {
+		pi := it.(portItem)
+		if wantDim := pi.port.Number != 8808; pi.dimmed != wantDim {
+			t.Errorf(":%d dimmed = %v, want %v", pi.port.Number, pi.dimmed, wantDim)
+		}
+	}
+
+	// Fuzzy match kept: "80" narrows to :8808 (the issue's example), not :3000.
+	m = typeRunes(m, "80")
+	vis := m.list.VisibleItems()
+	if len(vis) != 1 || vis[0].(portItem).port.Number != 8808 {
+		var nums []int
+		for _, it := range vis {
+			nums = append(nums, it.(portItem).port.Number)
+		}
+		t.Errorf("filter '80' visible = %v, want [8808]", nums)
+	}
+
+	// esc clears the filter and restores the Favorites view.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(model)
+	if m.list.FilterState() != list.Unfiltered {
+		t.Errorf("after esc, FilterState = %v, want Unfiltered", m.list.FilterState())
+	}
+	if got := portNumbers(m); !reflect.DeepEqual(got, []int{8808}) {
+		t.Errorf("after esc, view = %v, want [8808]", got)
+	}
+}
+
+// TestFilterNoMatch covers 4ye6's no-match state: a query that matches nothing
+// yields the dedicated "no ports match" message (naming the query), not the
+// fresh-install empty-state explainer or bubbles/list's bare "No items.".
+func TestFilterNoMatch(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = typeRunes(settle(res.(model), cmd), "zzzz")
+
+	if n := len(m.list.VisibleItems()); n != 0 {
+		t.Fatalf("expected no matches for 'zzzz', got %d visible", n)
+	}
+	if msg := m.noMatchMessage(); !strings.Contains(msg, "No ports match") || !strings.Contains(msg, "zzzz") {
+		t.Errorf("noMatchMessage = %q, want it to name the query", msg)
+	}
+	// View() must render the no-match message, not the empty-state explainer.
+	if v := m.View(); !strings.Contains(v, "No ports match") || strings.Contains(v, "haven't favorited") {
+		t.Errorf("View during no-match should show the no-match message, not the explainer")
+	}
+}
+
+// TestFilterDiscoverable covers 4ye6's discoverability: "/" is in the legend
+// and in the help overlay's key list.
+func TestFilterDiscoverable(t *testing.T) {
+	m := New(config.Config{})
+	m.help.Width = 200 // wide enough that wrapBindings keeps every binding
+	if legend := m.renderLegend(); !strings.Contains(legend, "filter") {
+		t.Errorf("legend should advertise the filter binding; got %q", legend)
+	}
+	if help := m.helpView(); !strings.Contains(help, "Filter by port number") {
+		t.Errorf("help overlay should describe '/' filter; got %q", help)
 	}
 }
 
