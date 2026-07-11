@@ -456,6 +456,47 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestAddPortAlreadyFavorited covers 7ac3: 'n' on an already-favorited port
+// is a no-op with an info toast; 'n' on a new port favorites it silently.
+func TestAddPortAlreadyFavorited(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// Already favorited -> info toast, still favorited, no success on a new one.
+	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	for _, r := range "8080" {
+		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(model)
+	if !strings.Contains(m.flash, "already favorited") || m.flashLevel != flashInfo {
+		t.Errorf("re-adding a favorite should show an info toast; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+	if cmd == nil {
+		t.Error("the toast should schedule its expiry")
+	}
+	if !m.cfg.Ports[8080].Favorite {
+		t.Error(":8080 should remain favorited")
+	}
+
+	// A brand-new add favorites silently (no toast).
+	m2 := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m2.active = map[int]bool{}
+	m2.rebuildItems()
+	m2 = addPort(m2, "3000")
+	if !m2.cfg.Ports[3000].Favorite {
+		t.Error("a new 'n' add should favorite the port")
+	}
+	if m2.flash != "" {
+		t.Errorf("a new 'n' add should be silent; got toast %q", m2.flash)
+	}
+}
+
 // TestErrorToasts covers q89g: errors are unified into the auto-dismissing
 // toast system (severity error/red), schedule an expiry, honour flashID so a
 // stale timer can't clear a newer toast, clear on the next keypress, and a

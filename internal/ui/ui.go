@@ -824,12 +824,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if err != nil || port < 1 || port > 65535 {
 						return m, m.setErr("invalid port")
 					}
+					// Re-adding an already-favorited port is a no-op that would
+					// look like nothing happened, so surface an info toast
+					// instead of silently re-saving (7ac3).
+					if m.cfg.Ports[port].Favorite {
+						return m, m.setFlash(fmt.Sprintf(":%d already favorited — no change", port), flashInfo)
+					}
 					// "n" registers + favorites the port; it does NOT serve
 					// (ykgj). Exposing is always space. A not-yet-running
 					// favorite then shows in the Favorites view as a synthetic
 					// entry, ready to serve once its service is up -- so an
 					// added port sticks instead of vanishing. No lock/:22 guard
-					// is needed here since nothing is exposed.
+					// is needed here since nothing is exposed. New adds are
+					// silent (dup-only feedback).
 					return m, tea.Batch(m.favorite(port), m.rebuildItems())
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
