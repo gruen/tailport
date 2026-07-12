@@ -3072,8 +3072,16 @@ func stepFireworks(fws []firework) []firework {
 }
 
 var (
-	fwGlyphsUnicode = []rune{'·', '∗', '✦', '❋', '✺'} // dim -> bright
-	fwGlyphsASCII   = []rune{'.', ':', '+', '*', '@'} // ascii fallback (no mojibake)
+	fwGlyphsUnicode = []rune{'·', '░', '▒', '▓', '█'} // dot · light/medium/dark shade · full block
+	fwGlyphsASCII   = []rune{'.', ':', '+', '#', '@'}
+
+	// Option A (sparkle -> solid block): delicate sparkle embers with a solid
+	// core. Kept as a documented alternative. We chose B (shade gradient)
+	// because the ░▒▓█ density falloff reads as a glowing BLOOM rather than a
+	// hard pixel, and the block elements are the most universally-supported and
+	// uniformly single-width glyphs (no rendering gamble, no alignment risk).
+	// fwGlyphsUnicode = []rune{'·', '✦', '❋', '▓', '█'}
+	// fwGlyphsASCII   = []rune{'.', '+', '*', '#', '@'}
 )
 
 // glyphSet gates the glyph vocabulary on emoji capability (5x1e is stricter than
