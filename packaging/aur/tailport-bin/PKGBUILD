@@ -1,6 +1,6 @@
 # Maintainer: Michael E. Gruen <contact@michaelgruen.com>
 pkgname=tailport-bin
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="TUI to expose local ports across your tailnet via tailscale serve (prebuilt binary)"
 arch=('x86_64' 'aarch64')
@@ -18,11 +18,11 @@ source=("LICENSE-$pkgver::https://raw.githubusercontent.com/gruen/tailport/v$pkg
 source_x86_64=("tailport-$pkgver-x86_64::https://github.com/gruen/tailport/releases/download/v$pkgver/tailport-linux-amd64")
 source_aarch64=("tailport-$pkgver-aarch64::https://github.com/gruen/tailport/releases/download/v$pkgver/tailport-linux-arm64")
 
-# TODO(release): fill all four digests once the v0.1.0 release assets exist.
+# TODO(release): fill all four digests once the v0.1.1 release assets exist.
 # The per-arch binary digests are published alongside the assets as
 # tailport-linux-amd64.sha256 / tailport-linux-arm64.sha256 (see build.yml).
-sha256sums=('REPLACE_WITH_SHA256_OF_v0.1.0_LICENSE'
-            'REPLACE_WITH_SHA256_OF_v0.1.0_README_md')
+sha256sums=('REPLACE_WITH_SHA256_OF_v0.1.1_LICENSE'
+            'REPLACE_WITH_SHA256_OF_v0.1.1_README_md')
 sha256sums_x86_64=('REPLACE_WITH_SHA256_OF_tailport-linux-amd64')
 sha256sums_aarch64=('REPLACE_WITH_SHA256_OF_tailport-linux-arm64')
 

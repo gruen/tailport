@@ -33,7 +33,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          # Strip the leading "v" from the tag (v0.1.0 -> 0.1.0) so
+          # Strip the leading "v" from the tag (v0.1.1 -> 0.1.1) so
           # `tailport --version` matches the AUR pkgver.
           version="${GITHUB_REF_NAME#v}"
           out="tailport-${{ matrix.goos }}-${{ matrix.goarch }}"

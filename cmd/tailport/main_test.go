@@ -21,8 +21,8 @@ func TestVersionLine(t *testing.T) {
 	// surface in the printed line.
 	orig := version
 	t.Cleanup(func() { version = orig })
-	version = "0.1.0"
-	if got := versionLine(); got != "tailport 0.1.0" {
-		t.Errorf("with injected version, versionLine() = %q, want %q", got, "tailport 0.1.0")
+	version = "0.1.1"
+	if got := versionLine(); got != "tailport 0.1.1" {
+		t.Errorf("with injected version, versionLine() = %q, want %q", got, "tailport 0.1.1")
 	}
 }

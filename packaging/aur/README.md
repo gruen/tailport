@@ -28,7 +28,7 @@ below).
 - Both PKGBUILDs + `.SRCINFO` (generated with `makepkg --printsrcinfo`).
 
 The four `sha256sums*` entries are placeholders (`REPLACE_WITH_SHA256_…`) —
-they can only be filled once the v0.1.0 tag and its release assets exist
+they can only be filled once the v0.1.1 tag and its release assets exist
 (steps 2–3).
 
 ## Steps only you (the maintainer) can do
@@ -38,11 +38,11 @@ they can only be filled once the v0.1.0 tag and its release assets exist
 Create an account at <https://aur.archlinux.org> and add your SSH public key
 under **My Account**. Required to push to `ssh://aur@aur.archlinux.org/<pkg>.git`.
 
-### 2. Cut the v0.1.0 tag + GitHub release
+### 2. Cut the v0.1.1 tag + GitHub release
 
 ```sh
-git tag -a v0.1.0 -m "tailport 0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "tailport 0.1.1"
+git push origin v0.1.1
 ```
 
 The tag push triggers `build.yml`, which builds the three targets and creates
@@ -60,13 +60,13 @@ cd packaging/aur/tailport
 # either:
 makepkg -g >> PKGBUILD        # then delete the old placeholder line
 # or compute directly:
-curl -sL https://github.com/gruen/tailport/archive/refs/tags/v0.1.0.tar.gz | sha256sum
+curl -sL https://github.com/gruen/tailport/archive/refs/tags/v0.1.1.tar.gz | sha256sum
 ```
 
 **Binary PKGBUILD** (`tailport-bin/PKGBUILD`) — four hashes:
 
 - `sha256sums` (LICENSE, README): from the raw files at the tag, e.g.
-  `curl -sL https://raw.githubusercontent.com/gruen/tailport/v0.1.0/LICENSE | sha256sum`
+  `curl -sL https://raw.githubusercontent.com/gruen/tailport/v0.1.1/LICENSE | sha256sum`
 - `sha256sums_x86_64` / `sha256sums_aarch64`: published as
   `tailport-linux-amd64.sha256` / `tailport-linux-arm64.sha256` on the release
   (or `makepkg -g` will fetch and hash them).
@@ -105,7 +105,7 @@ git clone ssh://aur@aur.archlinux.org/<pkg>.git aur-<pkg>
 cp packaging/aur/<pkg>/PKGBUILD packaging/aur/<pkg>/.SRCINFO aur-<pkg>/
 cd aur-<pkg>
 git add PKGBUILD .SRCINFO
-git commit -m "Initial import: <pkg> 0.1.0"
+git commit -m "Initial import: <pkg> 0.1.1"
 git push
 ```
 
