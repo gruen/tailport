@@ -301,16 +301,18 @@ func TestHelpViewAndLegendReflectTheme(t *testing.T) {
 
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
 
+	// Assert on helpContent (the full overlay text); helpView windows it to the
+	// terminal height (v10j), which would clip the styled body text this checks.
 	lipgloss.SetHasDarkBackground(false)
-	lightHelp := m.helpView()
+	lightHelp := m.helpContent()
 	lightBar := m.renderLegend()
 
 	lipgloss.SetHasDarkBackground(true)
-	darkHelp := m.helpView()
+	darkHelp := m.helpContent()
 	darkBar := m.renderLegend()
 
 	if lightHelp == darkHelp {
-		t.Error("helpView() rendered identically under light and dark background")
+		t.Error("helpContent() rendered identically under light and dark background")
 	}
 	if lightBar == darkBar {
 		t.Error("renderLegend() (bottom bar) rendered identically under light and dark background")
@@ -319,7 +321,7 @@ func TestHelpViewAndLegendReflectTheme(t *testing.T) {
 	// helpTextStyle's Light hex (#303030 = 48,48,48) should show up in the
 	// light-mode help overlay body text.
 	if !strings.Contains(lightHelp, "38;2;48;48;48") {
-		t.Error("helpView() under a forced light background doesn't contain helpTextStyle's Light truecolor sequence (38;2;48;48;48)")
+		t.Error("helpContent() under a forced light background doesn't contain helpTextStyle's Light truecolor sequence (38;2;48;48;48)")
 	}
 	// helpTitleStyle's Dark ANSI-256 index (42) should show up in the
 	// dark-mode bottom bar (renderLegendGrid's group-name header).

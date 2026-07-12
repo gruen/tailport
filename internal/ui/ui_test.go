@@ -379,7 +379,7 @@ func TestFilterDiscoverable(t *testing.T) {
 	if legend := m.renderLegend(); !strings.Contains(legend, "filter") {
 		t.Errorf("legend should advertise the filter binding; got %q", legend)
 	}
-	if help := m.helpView(); !strings.Contains(help, "Filter by port number") {
+	if help := m.helpContent(); !strings.Contains(help, "Filter by port number") {
 		t.Errorf("help overlay should describe '/' filter; got %q", help)
 	}
 }
@@ -389,7 +389,11 @@ func TestFilterDiscoverable(t *testing.T) {
 // exactly RenderKeyLegendGroups(KeyLegendGroups(m.emoji)) -- not a hand-copied
 // duplicate -- so it and `tailport quickstart` (cmd/tailport, which calls the
 // same two functions) can never drift apart. Checked in both marker modes,
-// since the space/p/C rows quote the mode-specific exposure glyph.
+// since the space/p/C rows quote the mode-specific exposure glyph. Asserted on
+// helpContent (the full overlay text) with width unset, where the legend is a
+// single vertical column so the shared block appears verbatim; helpView windows
+// that content to the terminal height (v10j) and the wide-terminal layout re-
+// flows the same shared rows into side-by-side columns.
 func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -398,8 +402,8 @@ func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
 		m.emoji = emoji
 
 		want := RenderKeyLegendGroups(KeyLegendGroups(emoji))
-		if got := m.helpView(); !strings.Contains(got, want) {
-			t.Errorf("helpView() (emoji=%v) does not contain RenderKeyLegendGroups(KeyLegendGroups(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
+		if got := m.helpContent(); !strings.Contains(got, want) {
+			t.Errorf("helpContent() (emoji=%v) does not contain RenderKeyLegendGroups(KeyLegendGroups(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
 		}
 	}
 }
@@ -1465,8 +1469,10 @@ func TestHelpConfigPath(t *testing.T) {
 		t.Fatalf("resolved path %q should sit under XDG_CONFIG_HOME %q", want, xdg)
 	}
 
-	// The overlay names where settings save and shows that exact path.
-	view := stripANSI(m.helpView())
+	// The overlay names where settings save and shows that exact path. Assert
+	// on helpContent (the full, unclipped overlay text) rather than helpView,
+	// which windows the content to the terminal height (v10j).
+	view := stripANSI(m.helpContent())
 	if !strings.Contains(view, "saved to") {
 		t.Errorf("help overlay should state where settings are saved; got:\n%s", view)
 	}
@@ -2637,7 +2643,10 @@ func TestHelpOverlayGroupedSections(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{})
 
-	help := stripANSI(m.helpView())
+	// helpContent is the full overlay text; helpView windows it to the terminal
+	// height (v10j). With width unset here, the key legend stays a single
+	// vertical column so the sections keep their top-to-bottom order.
+	help := stripANSI(m.helpContent())
 
 	// Sections appear in the approved order.
 	prev := -1
@@ -2679,9 +2688,11 @@ func TestHelpOverlaySetupPrerequisites(t *testing.T) {
 	m := New(config.Config{})
 	m.operatorUser = "alice"
 
-	help := stripANSI(m.helpView())
+	// Assert on helpContent (the full overlay text); helpView windows it to the
+	// terminal height (v10j).
+	help := stripANSI(m.helpContent())
 	if !strings.Contains(help, "Setup / prerequisites") {
-		t.Fatalf("helpView missing 'Setup / prerequisites' section:\n%s", help)
+		t.Fatalf("help overlay missing 'Setup / prerequisites' section:\n%s", help)
 	}
 	if !strings.Contains(help, "sudo tailscale set --operator=alice") {
 		t.Errorf("helpView's prerequisites section should show the $USER-expanded fix command; got:\n%s", help)
@@ -2690,6 +2701,101 @@ func TestHelpOverlaySetupPrerequisites(t *testing.T) {
 	// after everything else, and not inside the grouped keybinding legend.
 	if at, expose := strings.Index(help, "Setup / prerequisites"), strings.Index(help, "Expose"); at < 0 || expose < 0 || at > expose {
 		t.Errorf("'Setup / prerequisites' (at %d) should appear before the 'Expose' keybinding group (at %d)", at, expose)
+	}
+}
+
+// TestHelpOverlayScrolls covers v10j: the "?" overlay is taller than most
+// terminals and alt-screen mode clips rather than scrolls, so helpView windows
+// helpContent to m.height with a persistent footer, and the scroll keys pan it.
+// The whole point is that content clipped off the bottom stays REACHABLE.
+func TestHelpOverlayScrolls(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// A short, ordinary-width terminal: the overlay can't fit at once.
+	const h = 12
+	m := New(config.Config{})
+	m = mustUpdate(t, m, tea.WindowSizeMsg{Width: 100, Height: h})
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	if !m.showHelp {
+		t.Fatal("'?' should open the help overlay")
+	}
+	if m.helpScroll != 0 {
+		t.Fatalf("opening the overlay should reset helpScroll to 0; got %d", m.helpScroll)
+	}
+	if m.helpMaxScroll() <= 0 {
+		t.Fatalf("test premise broken: overlay should overflow height %d (maxScroll=%d)", h, m.helpMaxScroll())
+	}
+
+	// The drawn view never exceeds the terminal height, and its last row is
+	// always the footer with the close hint -- no matter the scroll offset.
+	fits := func(label string) string {
+		view := m.helpView()
+		if got := lipgloss.Height(view); got != h {
+			t.Fatalf("%s: helpView height = %d, want exactly terminal height %d:\n%s", label, got, h, stripANSI(view))
+		}
+		plain := stripANSI(view)
+		if !strings.Contains(plain, "esc") || !strings.Contains(plain, "close") {
+			t.Errorf("%s: footer close hint missing from view:\n%s", label, plain)
+		}
+		return plain
+	}
+
+	// At the top: the title shows, the tail (config path) is clipped off, and
+	// the footer advertises more below.
+	top := fits("top")
+	if !strings.Contains(top, "expose local ports across your tailnet") {
+		t.Errorf("top of overlay should show the title:\n%s", top)
+	}
+	if strings.Contains(top, "saved to:") {
+		t.Errorf("config path should be clipped below the fold at the top:\n%s", top)
+	}
+	if !strings.Contains(top, "more below") {
+		t.Errorf("footer should advertise content below at the top:\n%s", top)
+	}
+
+	// Jump to the end: the previously-clipped tail is now reachable, and the
+	// footer flips to "more above".
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	if m.helpScroll != m.helpMaxScroll() {
+		t.Errorf("End should scroll to the bottom (%d); got %d", m.helpMaxScroll(), m.helpScroll)
+	}
+	end := fits("end")
+	if !strings.Contains(end, "saved to:") {
+		t.Errorf("End should reveal the config path clipped at the top:\n%s", end)
+	}
+	if !strings.Contains(end, "more above") {
+		t.Errorf("footer should advertise content above at the end:\n%s", end)
+	}
+
+	// Paging past the bottom clamps (no runaway offset), and Home returns to 0.
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.helpScroll != m.helpMaxScroll() {
+		t.Errorf("scrolling past the end should clamp to maxScroll %d; got %d", m.helpMaxScroll(), m.helpScroll)
+	}
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	if m.helpScroll != 0 {
+		t.Errorf("Home should scroll back to the top; got %d", m.helpScroll)
+	}
+
+	// One line down then up returns to the top and clamps (never negative).
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.helpScroll != 1 {
+		t.Errorf("Down should advance one line; got %d", m.helpScroll)
+	}
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	if m.helpScroll != 0 {
+		t.Errorf("scrolling up past the top should clamp at 0; got %d", m.helpScroll)
+	}
+
+	// Closing resets the offset so a reopen starts at the top.
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showHelp {
+		t.Fatal("esc should close the overlay")
+	}
+	if m.helpScroll != 0 {
+		t.Errorf("closing should reset helpScroll to 0; got %d", m.helpScroll)
 	}
 }
 

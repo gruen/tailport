@@ -438,8 +438,15 @@ type model struct {
 	filtering bool
 	// showHelp gates the full-screen "?" help overlay (see helpView). While
 	// it's open the overlay replaces the whole view and swallows every key
-	// except the ?/esc/q that dismiss it.
+	// except the ?/esc/q that dismiss it (and the scroll keys below).
 	showHelp bool
+	// helpScroll is the top-line offset of the "?" overlay's scrollable body
+	// (v10j). The overlay's content is taller than most terminals, and
+	// alt-screen mode clips rather than scrolls, so helpView slices the
+	// content to the viewport and up/down/pgup/pgdn/home/end pan it. Reset to
+	// 0 each time the overlay opens; clamped to [0, helpMaxScroll()] on every
+	// adjustment and at render.
+	helpScroll int
 	// showEgg gates the hidden "E" Easter-egg overlay (eggView); eggFrame is
 	// its animation counter, advanced by an eggTickMsg that STOPS rescheduling
 	// the moment showEgg goes false (no leaked ticker). Like showHelp it's
@@ -1285,12 +1292,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// The help overlay is modal: while it's open, only ?/esc/q close it
-		// and every other key is swallowed (so nothing happens "behind" it).
+		// The help overlay is modal: while it's open, ?/esc/q close it, the
+		// scroll keys pan its (viewport-clipped) body, and every other key is
+		// swallowed (so nothing happens "behind" it).
 		if m.showHelp {
 			switch msg.String() {
 			case "?", "esc", "q", "ctrl+c":
 				m.showHelp = false
+				m.helpScroll = 0
+			case "up", "k":
+				m.helpScroll--
+			case "down", "j":
+				m.helpScroll++
+			case "pgup", "b":
+				m.helpScroll -= m.helpPageStep()
+			case "pgdown", " ", "f":
+				m.helpScroll += m.helpPageStep()
+			case "home", "g":
+				m.helpScroll = 0
+			case "end", "G":
+				m.helpScroll = m.helpMaxScroll()
+			}
+			// Clamp after every adjustment: content height depends on width and
+			// marker mode, either of which can change between presses.
+			if max := m.helpMaxScroll(); m.helpScroll > max {
+				m.helpScroll = max
+			}
+			if m.helpScroll < 0 {
+				m.helpScroll = 0
 			}
 			return m, nil
 		}
@@ -1464,6 +1493,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// break above), so "?" opens help normally but is typed into the
 			// "/" filter query while a filter is active.
 			m.showHelp = true
+			m.helpScroll = 0
 			return m, nil
 		case "E":
 			// Hidden Easter egg (28mv): deliberately NOT in the legend or help.
@@ -3186,7 +3216,11 @@ func (m model) operatorSetupText() string {
 	return OperatorSetupText(m.operatorUser)
 }
 
-func (m model) helpView() string {
+// helpContent builds the FULL "?" overlay text (title, intro, markers, setup,
+// the grouped keybinding legend, warnings, and where config saves) as one
+// string, with NO viewport clipping and NO close/scroll footer -- helpView
+// owns those. It's taller than most terminals; helpView slices it to m.height.
+func (m model) helpContent() string {
 	var b strings.Builder
 
 	b.WriteString(helpTitleStyle.Render("tailport — expose local ports across your tailnet"))
@@ -3214,7 +3248,9 @@ func (m model) helpView() string {
 	// Keys, grouped into the same five sections/order as the bottom-bar grid
 	// (Expose, Favorites, Protect, View, App) -- each section's own header stands
 	// in for the old flat "Keys" title -- but keeping the rich per-key prose.
-	b.WriteString(RenderKeyLegendGroups(KeyLegendGroups(m.emoji)))
+	// Laid out side by side when the terminal is wide enough (v10j) to shorten
+	// the overlay; falls back to a single column otherwise.
+	b.WriteString(m.renderKeyLegendColumns())
 
 	b.WriteString("\n")
 	b.WriteString(warnStyle.Render(
@@ -3239,9 +3275,120 @@ func (m model) helpView() string {
 		b.WriteString(helpTextStyle.Render(line) + "\n")
 	}
 
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("press ? / esc / q to close"))
 	return b.String()
+}
+
+// renderKeyLegendColumns renders the grouped keybinding legend for the "?"
+// overlay (v10j). On a wide-enough terminal it splits the groups into two
+// side-by-side columns to roughly halve the section's height; on a narrow
+// terminal (or before the first WindowSizeMsg) it falls back to the single
+// vertical column and lets helpView's scroll handle the height. Content is
+// unchanged either way -- same groups, same rich per-key prose -- so the
+// shared-with-quickstart legend text never diverges; only the layout differs.
+func (m model) renderKeyLegendColumns() string {
+	groups := KeyLegendGroups(m.emoji)
+	single := RenderKeyLegendGroups(groups)
+	if m.width <= 0 || len(groups) < 2 {
+		return single
+	}
+	const gutter = 4
+	gap := strings.Repeat(" ", gutter)
+	best, bestH := single, lipgloss.Height(single)
+	// Try every in-order split point (groups stay in reading order, first half
+	// over the left column) and keep the shortest layout that fits the width.
+	for k := 1; k < len(groups); k++ {
+		left := RenderKeyLegendGroups(groups[:k])
+		right := RenderKeyLegendGroups(groups[k:])
+		if lipgloss.Width(left)+gutter+lipgloss.Width(right) > m.width {
+			continue
+		}
+		joined := lipgloss.JoinHorizontal(lipgloss.Top, left, gap, right)
+		if h := lipgloss.Height(joined); h < bestH {
+			best, bestH = joined, h
+		}
+	}
+	return best
+}
+
+// helpContentLines splits helpContent into display lines, dropping the trailing
+// blank so it doesn't inflate the scroll range by a row.
+func (m model) helpContentLines() []string {
+	return strings.Split(strings.TrimRight(m.helpContent(), "\n"), "\n")
+}
+
+// helpBodyRows is how many rows of the overlay body are visible: the whole
+// viewport minus the one persistent footer row. Guards m.height == 0 (pre
+// first WindowSizeMsg) to at least one row.
+func (m model) helpBodyRows() int {
+	if rows := m.height - 1; rows >= 1 {
+		return rows
+	}
+	return 1
+}
+
+// helpMaxScroll is the largest valid helpScroll offset: content height minus
+// the visible body height, floored at 0 (content shorter than the viewport
+// never scrolls).
+func (m model) helpMaxScroll() int {
+	if max := len(m.helpContentLines()) - m.helpBodyRows(); max > 0 {
+		return max
+	}
+	return 0
+}
+
+// helpPageStep is the pgup/pgdn jump: a viewport of body rows less one line of
+// overlap for continuity, at least one.
+func (m model) helpPageStep() int {
+	if step := m.helpBodyRows() - 1; step >= 1 {
+		return step
+	}
+	return 1
+}
+
+// helpView is the "?" overlay as actually drawn: helpContent sliced to a
+// scrolled window of m.height, with a persistent footer showing the close
+// hint and the scroll position. It replaces the whole View while showHelp is
+// set. Alt-screen mode clips overflow instead of scrolling natively, so this
+// in-app windowing is what makes the (taller-than-terminal) overlay reachable.
+func (m model) helpView() string {
+	lines := m.helpContentLines()
+	bodyRows := m.helpBodyRows()
+	max := m.helpMaxScroll()
+	off := m.helpScroll
+	if off > max {
+		off = max
+	}
+	if off < 0 {
+		off = 0
+	}
+	end := off + bodyRows
+	if end > len(lines) {
+		end = len(lines)
+	}
+	visible := lines[off:end]
+	// Pad so the footer pins to the last row even when the content (or its
+	// tail) is shorter than the viewport -- mirrors View's bottom-bar gap.
+	for len(visible) < bodyRows {
+		visible = append(visible, "")
+	}
+	return strings.Join(visible, "\n") + "\n" + m.helpFooter(off, max)
+}
+
+// helpFooter is the overlay's always-visible bottom row: the close/scroll hint
+// plus a position indicator so the user knows there's more above or below.
+func (m model) helpFooter(off, max int) string {
+	pos := "all shown"
+	switch {
+	case max == 0:
+		// content fits; leave "all shown"
+	case off <= 0:
+		pos = "more below ▼"
+	case off >= max:
+		pos = "▲ more above"
+	default:
+		pos = "▲ more · more ▼"
+	}
+	return helpStyle.Render("↑/↓ scroll · ? esc q close   " + pos)
 }
 
 // emptyStateMessage explains the current (empty) view: why it's empty and
