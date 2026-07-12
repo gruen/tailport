@@ -42,12 +42,13 @@ func TestParseLsof(t *testing.T) {
 		port  int
 		proc  string
 		scope BindScope
+		host  string
 	}{
-		{3000, "launchd", ScopeWildcard},  // *:3000 -> Wildcard
-		{5173, "node", ScopeLoopback},     // 127.0.0.1 + [::1] collapse; loopback-only stays Loopback
-		{17600, "Dropbox", ScopeLoopback}, // loopback
-		{8080, "nginx", ScopeLAN},         // a specific LAN IP -> LAN
-		{4000, "vite", ScopeWildcard},     // 127.0.0.1 + * aggregates UP to Wildcard
+		{3000, "launchd", ScopeWildcard, "*"},          // *:3000 -> Wildcard
+		{5173, "node", ScopeLoopback, "127.0.0.1"},     // 127.0.0.1 + [::1] collapse; loopback-only stays Loopback; tie keeps first-seen host
+		{17600, "Dropbox", ScopeLoopback, "127.0.0.1"}, // loopback
+		{8080, "nginx", ScopeLAN, "192.168.1.5"},       // a specific LAN IP -> LAN
+		{4000, "vite", ScopeWildcard, "*"},             // 127.0.0.1 + * aggregates UP to Wildcard; host follows the wider bind
 	} {
 		p, ok := got[tc.port]
 		if !ok {
@@ -59,6 +60,9 @@ func TestParseLsof(t *testing.T) {
 		}
 		if p.BindScope != tc.scope {
 			t.Errorf("port %d scope = %v, want %v", tc.port, p.BindScope, tc.scope)
+		}
+		if p.BindHost != tc.host {
+			t.Errorf("port %d bindhost = %q, want %q", tc.port, p.BindHost, tc.host)
 		}
 	}
 

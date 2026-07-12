@@ -1155,20 +1155,56 @@ func inlineCopyFits(descWidth, availWidth int) bool {
 	return descWidth+lipgloss.Width(copiedSuffix) <= availWidth
 }
 
-// copyURL copies the selected port's TAILNET URL to the clipboard and
-// confirms the copy. The URL is always the tailnet form
-// (http://<host>:<port>), regardless of any public funnel. State C
-// (reachServed: served, listening, not funnelled) is the one case where the
-// row's description IS that exact URL, so -- provided the annotation fits
-// the terminal width (inlineCopyFits) -- the confirmation goes inline as a
-// transient "✓ copied" on the row instead of the bottom-bar toast (py5b).
-// Every other case keeps the toast, unchanged: it's the only place that can
-// name a MISMATCH between the shown URL and the copied one (funnelled), flag
-// a dangling forward (no URL shown at all), or carry "serve it first"
-// guidance (localhost/LAN-only or offline) -- and it's also the fallback
-// when a state-C copy wouldn't fit inline.
+// httpURL builds an http:// URL for host:port, bracketing an IPv6 literal host
+// (a bare "fe80::1" would otherwise make the trailing :port ambiguous).
+func httpURL(host string, port int) string {
+	if strings.Contains(host, ":") { // IPv6 literal needs brackets
+		return fmt.Sprintf("http://[%s]:%d", host, port)
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// copyTargetURL returns the clipboard URL for sel, chosen to actually resolve
+// for the port's reach state: a tailnet-reachable port (reachTailnet) and every
+// served/funnelled/stale (active) port copy the tailnet host URL; a LAN-only
+// bind copies its real http://<lan-ip>:PORT; a localhost-only port or an
+// offline favorite copies http://localhost:PORT instead of a dead tailnet URL.
+// (Funnelled ports deliberately keep the tailnet form -- the toast names the
+// public-vs-tailnet mismatch.)
+func (m *model) copyTargetURL(sel portItem) string {
+	tailnetURL := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
+	switch sel.reach() {
+	case reachLAN:
+		if sel.port.BindHost == "" { // no real LAN address to offer; stay honest
+			return tailnetURL
+		}
+		return httpURL(sel.port.BindHost, sel.port.Number)
+	case reachLocalhost, reachOffline:
+		return fmt.Sprintf("http://localhost:%d", sel.port.Number)
+	default: // reachTailnet, reachServed, reachFunnel, reachStale
+		return tailnetURL
+	}
+}
+
+// copyURL copies the selected port's URL to the clipboard and confirms the
+// copy. The copied URL is reach-aware (copyTargetURL): the tailnet host form
+// (http://<host>:<port>) for a tailnet-reachable, served, funnelled, or stale
+// port; the real http://<lan-ip>:<port> for a LAN-only bind; and
+// http://localhost:<port> for a localhost-only port or an offline favorite --
+// never a dead tailnet URL for a port that can't actually be reached that way.
+// A funnelled port still copies the tailnet form on purpose (the toast names
+// the public-vs-tailnet mismatch). State C (reachServed: served, listening,
+// not funnelled) is the one case where the row's description IS that exact
+// URL, so -- provided the annotation fits the terminal width (inlineCopyFits)
+// -- the confirmation goes inline as a transient "✓ copied" on the row
+// instead of the bottom-bar toast (py5b). Every other case keeps the toast,
+// unchanged: it's the only place that can name a MISMATCH between the shown
+// URL and the copied one (funnelled), flag a dangling forward (no URL shown
+// at all), or carry "serve it first" guidance (localhost/LAN-only or
+// offline) -- and it's also the fallback when a state-C copy wouldn't fit
+// inline.
 func (m *model) copyURL(sel portItem) tea.Cmd {
-	url := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
+	url := m.copyTargetURL(sel)
 
 	if sel.reach() == reachServed && inlineCopyFits(lipgloss.Width(sel.servedDescPlain()), m.availableDescriptionWidth()) {
 		m.copiedID++
@@ -1198,8 +1234,9 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		flash = m.setFlash(fmt.Sprintf("copied — :%d is reachable on your tailnet at this URL", sel.port.Number), flashInfo)
 	case reachLAN:
 		// Bound to a specific LAN IP, not the tailnet: mirrors the space guard's
-		// reachLAN message (ui.go ~2019) so c and space agree.
-		flash = m.setFlash(fmt.Sprintf("copied — :%d is bound to your LAN only; serve can't reach this bind", sel.port.Number), flashWarn)
+		// reachLAN message (ui.go ~2019) so c and space agree. Name the copied
+		// URL so it's clear it's the real LAN address, not a dead tailnet one.
+		flash = m.setFlash(fmt.Sprintf("copied %s — LAN only; serve can't reach this bind", url), flashWarn)
 	default:
 		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
 		// favorite) -- "press space to serve it" is TRUE here. reachServed
@@ -1208,7 +1245,7 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		if sel.active {
 			flash = m.setFlash("copied ✓  "+url, flashInfo)
 		} else {
-			flash = m.setFlash(fmt.Sprintf("copied — :%d is localhost only; press space to serve it", sel.port.Number), flashWarn)
+			flash = m.setFlash(fmt.Sprintf("copied %s — localhost only; press space to serve it", url), flashWarn)
 		}
 	}
 	return tea.Batch(copyCmd(url), flash)

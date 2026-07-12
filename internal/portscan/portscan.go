@@ -14,6 +14,13 @@ type Port struct {
 	// server from something already reachable by tailnet peers (a wildcard
 	// bind), which `tailscale serve` has no bearing on.
 	BindScope BindScope
+	// BindHost is the bare bind address (no brackets, no port) of the
+	// WIDEST-scope bind row -- the same row BindScope was taken from. It lets a
+	// caller build a URL that actually resolves for that scope: a LAN-only port
+	// (ScopeLAN) copies http://<BindHost>:<port>. For loopback/wildcard binds
+	// the UI substitutes "localhost"/the tailnet host instead, so BindHost
+	// matters chiefly for the LAN case. Empty if unset.
+	BindHost string
 }
 
 // BindScope classifies how far a listening socket's bind address reaches. It

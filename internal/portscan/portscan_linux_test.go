@@ -66,11 +66,12 @@ func TestParseSS(t *testing.T) {
 		port  int
 		proc  string
 		scope BindScope
+		host  string
 	}{
-		{22, "sshd", ScopeWildcard},       // 0.0.0.0 + [::] -> Wildcard
-		{5432, "postgres", ScopeLoopback}, // loopback-only stays Loopback
-		{8080, "nginx", ScopeLAN},         // a specific LAN IP -> LAN
-		{3000, "node", ScopeWildcard},     // 127.0.0.1 + 0.0.0.0 aggregates UP to Wildcard
+		{22, "sshd", ScopeWildcard, "0.0.0.0"},         // 0.0.0.0 + [::] -> Wildcard
+		{5432, "postgres", ScopeLoopback, "127.0.0.1"}, // loopback-only stays Loopback
+		{8080, "nginx", ScopeLAN, "192.168.1.5"},       // a specific LAN IP -> LAN
+		{3000, "node", ScopeWildcard, "0.0.0.0"},       // 127.0.0.1 + 0.0.0.0 aggregates UP to Wildcard; host follows the wider bind
 	} {
 		p, ok := byPort[tc.port]
 		if !ok {
@@ -82,6 +83,9 @@ func TestParseSS(t *testing.T) {
 		}
 		if p.BindScope != tc.scope {
 			t.Errorf("port %d scope = %v, want %v", tc.port, p.BindScope, tc.scope)
+		}
+		if p.BindHost != tc.host {
+			t.Errorf("port %d bindhost = %q, want %q", tc.port, p.BindHost, tc.host)
 		}
 	}
 

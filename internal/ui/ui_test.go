@@ -1343,12 +1343,12 @@ func TestCopyURLInlineVsToast(t *testing.T) {
 func TestCopyURLReachAware(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	newModel := func(port int, scope portscan.BindScope, active, listening bool) model {
+	newModel := func(port int, scope portscan.BindScope, active, listening bool, bindHost string) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
 		m.host = "host"
 		m.width = 80 // wide enough that a state-C copy would go inline
 		if listening {
-			m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope}}
+			m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope, BindHost: bindHost}}
 		}
 		if active {
 			m.active = map[int]bool{port: true}
@@ -1370,7 +1370,7 @@ func TestCopyURLReachAware(t *testing.T) {
 	// only" and must NOT say "press space" -- pressing space on this exact
 	// state is the "already on tailnet — nothing to serve" no-op asserted by
 	// TestSpaceGuardForReachablePorts, so the two toasts must now agree.
-	m := press(newModel(8080, portscan.ScopeWildcard, false, true))
+	m := press(newModel(8080, portscan.ScopeWildcard, false, true, ""))
 	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "reachable on your tailnet") {
 		t.Errorf("reachTailnet copy flash = %q (level=%v), want an info 'reachable on your tailnet' toast", m.flash, m.flashLevel)
 	}
@@ -1379,32 +1379,33 @@ func TestCopyURLReachAware(t *testing.T) {
 	}
 
 	// B': reachLAN (specific LAN IP, listening, unserved). Mirrors the space
-	// guard's own reachLAN wording (ui.go ~2036) so c and space agree.
-	m = press(newModel(3000, portscan.ScopeLAN, false, true))
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "bound to your LAN only") || !strings.Contains(m.flash, "serve can't reach this bind") {
-		t.Errorf("reachLAN copy flash = %q (level=%v), want a warn 'bound to your LAN only; serve can't reach this bind' toast", m.flash, m.flashLevel)
+	// guard's own reachLAN wording (ui.go ~2036) so c and space agree, and
+	// names the real LAN URL that was actually copied.
+	m = press(newModel(3000, portscan.ScopeLAN, false, true, "192.168.1.50"))
+	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "serve can't reach this bind") || !strings.Contains(m.flash, "http://192.168.1.50:3000") {
+		t.Errorf("reachLAN copy flash = %q (level=%v), want a warn toast naming http://192.168.1.50:3000 and 'serve can't reach this bind'", m.flash, m.flashLevel)
 	}
-	if strings.Contains(m.flash, "localhost only") {
-		t.Errorf("reachLAN copy flash = %q must not say localhost only", m.flash)
+	if strings.Contains(m.flash, "localhost") {
+		t.Errorf("reachLAN copy flash = %q must not say localhost", m.flash)
 	}
 
 	// A: reachLocalhost (loopback bind, listening, unserved). Unchanged --
 	// "press space to serve it" is genuinely true here.
-	m = press(newModel(9000, portscan.ScopeLoopback, false, true))
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") {
-		t.Errorf("reachLocalhost copy flash = %q (level=%v), want the localhost-only press-space toast", m.flash, m.flashLevel)
+	m = press(newModel(9000, portscan.ScopeLoopback, false, true, ""))
+	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") || !strings.Contains(m.flash, "http://localhost:9000") {
+		t.Errorf("reachLocalhost copy flash = %q (level=%v), want the localhost-only press-space toast naming http://localhost:9000", m.flash, m.flashLevel)
 	}
 
 	// F: reachOffline (down favorite, unserved). Falls through the same
 	// default !active arm as reachLocalhost.
-	m = press(newModel(8025, portscan.ScopeLoopback, false, false))
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") {
-		t.Errorf("reachOffline copy flash = %q (level=%v), want the localhost-only press-space toast", m.flash, m.flashLevel)
+	m = press(newModel(8025, portscan.ScopeLoopback, false, false, ""))
+	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") || !strings.Contains(m.flash, "http://localhost:8025") {
+		t.Errorf("reachOffline copy flash = %q (level=%v), want the localhost-only press-space toast naming http://localhost:8025", m.flash, m.flashLevel)
 	}
 
 	// E: reachStale (served, but nothing listening). Unchanged plain
 	// "copied ✓ url" confirmation -- the default branch's active arm.
-	m = press(newModel(8025, portscan.ScopeLoopback, true, false))
+	m = press(newModel(8025, portscan.ScopeLoopback, true, false, ""))
 	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
 		t.Errorf("reachStale copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
 	}
@@ -1412,7 +1413,7 @@ func TestCopyURLReachAware(t *testing.T) {
 	// D: reachFunnel. Still active, so it takes the same default active arm
 	// -- unchanged plain "copied ✓ url" toast (the funnel/tailnet URL
 	// mismatch is why it can't go inline, per TestCopyURLInlineVsToast).
-	fm := newModel(8080, portscan.ScopeWildcard, true, true)
+	fm := newModel(8080, portscan.ScopeWildcard, true, true, "")
 	fm.funnel = map[int]int{8080: 443}
 	fm.rebuildItems()
 	m = press(fm)
@@ -1422,12 +1423,73 @@ func TestCopyURLReachAware(t *testing.T) {
 
 	// C: reachServed, but too narrow to inline. Unchanged plain
 	// "copied ✓ url" toast fallback.
-	nm := newModel(8080, portscan.ScopeWildcard, true, true)
+	nm := newModel(8080, portscan.ScopeWildcard, true, true, "")
 	nm.width = 5
 	nm.rebuildItems()
 	m = press(nm)
 	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
 		t.Errorf("narrow reachServed copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
+	}
+}
+
+// TestCopyTargetURL is the direct check on copyTargetURL, the single source
+// of truth for what "c" writes to the clipboard (83wv): it asserts the exact
+// URL string per reach state, independent of the toast wording covered by
+// TestCopyURLReachAware.
+func TestCopyTargetURL(t *testing.T) {
+	m := model{host: "host"}
+
+	for _, tc := range []struct {
+		name string
+		item portItem
+		want string
+	}{
+		{
+			name: "reachLocalhost",
+			item: portItem{port: portscan.Port{Number: 9000, BindScope: portscan.ScopeLoopback}, listening: true},
+			want: "http://localhost:9000",
+		},
+		{
+			name: "reachOffline",
+			item: portItem{port: portscan.Port{Number: 8025, BindScope: portscan.ScopeLoopback}},
+			want: "http://localhost:8025",
+		},
+		{
+			name: "reachLAN/v4",
+			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "192.168.1.50"}, listening: true},
+			want: "http://192.168.1.50:3000",
+		},
+		{
+			name: "reachLAN/ipv6",
+			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "fe80::1"}, listening: true},
+			want: "http://[fe80::1]:3000",
+		},
+		{
+			name: "reachLAN/emptyBindHost",
+			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: ""}, listening: true},
+			want: "http://host:3000",
+		},
+		{
+			name: "reachTailnet",
+			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true},
+			want: "http://host:8080",
+		},
+		{
+			name: "reachServed",
+			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true},
+			want: "http://host:8080",
+		},
+		{
+			name: "reachFunnel",
+			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true, funnelPublic: 443},
+			want: "http://host:8080",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := m.copyTargetURL(tc.item); got != tc.want {
+				t.Errorf("copyTargetURL(%+v) = %q, want %q", tc.item, got, tc.want)
+			}
+		})
 	}
 }
 

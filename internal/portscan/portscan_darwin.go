@@ -85,12 +85,15 @@ func parseLsof(out []byte) ([]Port, error) {
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, BindScope: scope}
+			agg[port] = &Port{Number: port, Process: proc, BindScope: scope, BindHost: host}
 			order = append(order, port)
 			continue
 		}
-		p.BindScope = widerScope(p.BindScope, scope) // widen to the most-reachable bind
-		if p.Process == "" {                         // keep the first non-empty process name
+		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
+			p.BindScope = scope
+			p.BindHost = host
+		}
+		if p.Process == "" { // keep the first non-empty process name
 			p.Process = proc
 		}
 	}
