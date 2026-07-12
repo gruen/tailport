@@ -587,6 +587,15 @@ type model struct {
 	// or the overlay closes. Kept adjacent to showEgg/eggFrame on purpose.
 	fireworks []firework
 	fwTicking bool
+	// (3e8b) adaptive intake clutch: lastFwTick is the wall-clock time of the
+	// previous fwTickMsg (zero when idle/warming up); fwLagEWMA is the EWMA
+	// (ms) of the OBSERVED inter-tick interval, our proxy for event-loop /
+	// terminal-write backpressure; fwClutch is the hysteresis-gated verdict
+	// that throttles NEW 'f' launches (never kills in-flight fireworks) when
+	// the EWMA says we're falling behind. See fwClutchNext/fwLagNext.
+	lastFwTick time.Time
+	fwLagEWMA  float64
+	fwClutch   bool
 	// width and height are the terminal dimensions from the last
 	// WindowSizeMsg. height pins the bottom bar (status, shortcuts) to the
 	// last rows of the viewport regardless of how short the body is; width
@@ -894,8 +903,20 @@ const (
 	// animate smoothly (~20fps) without also speeding the egg's shimmer/spin.
 	fwInterval = 50 * time.Millisecond
 	// fwCap bounds simultaneous in-flight fireworks; 'f' presses beyond it are
-	// ignored (perf-safe under mashing).
-	fwCap = 25
+	// ignored (perf-safe under mashing). This is now a SAFETY BACKSTOP (never
+	// unbounded) -- the adaptive intake clutch (fwClutch, below) is the
+	// effective limiter under load; 60 is just a taste choice for the
+	// unthrottled ceiling (3e8b).
+	fwCap = 60
+	// fwClutchOnMs/fwClutchOffMs bound the hysteresis band the intake clutch
+	// gates on: engage (refuse new launches) once the observed inter-tick EWMA
+	// climbs above fwClutchOnMs (~1.6x fwInterval), release once it recovers
+	// below fwClutchOffMs (~1.2x fwInterval). The gap between the two keeps the
+	// clutch from flapping frame-to-frame near the threshold. fwLagAlpha is the
+	// EWMA smoothing factor applied in fwLagNext. (3e8b)
+	fwClutchOnMs  = 80.0
+	fwClutchOffMs = 62.0
+	fwLagAlpha    = 0.3
 )
 
 // eggTick schedules the next Easter-egg animation frame. It is only ever
@@ -910,6 +931,33 @@ func eggTick() tea.Cmd {
 // fwTickMsg handler), so an idle overlay and a closed overlay both stop it.
 func fwTick() tea.Cmd {
 	return tea.Tick(fwInterval, func(time.Time) tea.Msg { return fwTickMsg{} })
+}
+
+// fwClutchNext is the adaptive intake clutch's hysteresis gate (3e8b): engage
+// (refuse new 'f' launches) once ewma climbs above fwClutchOnMs, release once
+// it drops below fwClutchOffMs, and hold the current state inside the band so
+// it doesn't flap frame-to-frame near the threshold. Pure and clock-free so it
+// unit-tests with synthetic EWMA sequences.
+func fwClutchNext(engaged bool, ewma float64) bool {
+	if ewma > fwClutchOnMs {
+		return true
+	}
+	if ewma < fwClutchOffMs {
+		return false
+	}
+	return engaged
+}
+
+// fwLagNext folds one observed inter-tick interval (ms) into the running EWMA
+// used by the intake clutch (3e8b). A zero prior -- fresh state, or just after
+// an idle reset -- SEEDS the EWMA to obs directly rather than smoothing toward
+// 0, so a single observation after a gap isn't misread as a lag spike. Pure
+// and clock-free: callers own the only time.Now() read.
+func fwLagNext(ewma, obs float64) float64 {
+	if ewma == 0 {
+		return obs
+	}
+	return ewma + fwLagAlpha*(obs-ewma)
 }
 
 func refresh() tea.Msg {
@@ -1354,11 +1402,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.showEgg {
 			m.fwTicking = false
 			m.fireworks = nil
+			// (3e8b) reset the clutch's lag state so a gap between egg
+			// sessions is never later read as a giant lag spike.
+			m.lastFwTick, m.fwLagEWMA, m.fwClutch = time.Time{}, 0, false
 			return m, nil
 		}
+		// (3e8b) sensor: fold the observed inter-tick interval into the lag
+		// EWMA and re-derive the clutch verdict. The first tick after warmup
+		// only stamps lastFwTick (nothing to measure yet); the EWMA seeds on
+		// the second. time.Now() is the only wall-clock read -- everything
+		// else (fwLagNext/fwClutchNext) is pure.
+		now := time.Now()
+		if !m.lastFwTick.IsZero() {
+			obs := float64(now.Sub(m.lastFwTick).Milliseconds())
+			m.fwLagEWMA = fwLagNext(m.fwLagEWMA, obs)
+			m.fwClutch = fwClutchNext(m.fwClutch, m.fwLagEWMA)
+		}
+		m.lastFwTick = now
 		m.fireworks = stepFireworks(m.fireworks)
 		if len(m.fireworks) == 0 {
 			m.fwTicking = false
+			// (3e8b) idle reset: same rationale as the overlay-closed path
+			// above -- don't let a quiet sky masquerade as future lag.
+			m.lastFwTick, m.fwLagEWMA, m.fwClutch = time.Time{}, 0, false
 			return m, nil
 		}
 		return m, fwTick()
@@ -1425,7 +1491,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// instantly. Beyond the cap, ignore the press. Start the
 				// decoupled fireworks ticker only if it isn't already running
 				// (fwTicking) so ticks never stack under mashing.
-				if len(m.fireworks) < fwCap {
+				// (3e8b) intake is also gated on the adaptive clutch: when
+				// fwClutch is engaged (observed tick lag says we're falling
+				// behind), refuse new launches even under the cap -- in-flight
+				// fireworks are never killed to recover, only throttled at the
+				// intake.
+				if len(m.fireworks) < fwCap && !m.fwClutch {
 					m.fireworks = append(m.fireworks, newFirework(m.width, m.height, m.emoji))
 				}
 				if !m.fwTicking && len(m.fireworks) > 0 {

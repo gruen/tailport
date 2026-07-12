@@ -2398,8 +2398,10 @@ func TestFireworkDraw(t *testing.T) {
 	}
 }
 
-// TestFireworkCap covers the ~25 concurrency cap: 'f' presses beyond the cap
-// (while 25 are live) are ignored, and no ticker is stacked.
+// TestFireworkCap covers the fwCap concurrency backstop: 'f' presses beyond
+// the cap (while fwCap are live) are ignored, and no ticker is stacked. Press
+// count is comfortably above fwCap (60) so the loop still actually saturates
+// the cap regardless of its exact value (3e8b).
 func TestFireworkCap(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{})
@@ -2409,7 +2411,7 @@ func TestFireworkCap(t *testing.T) {
 	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
 
 	firstCmd := true
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 100; i++ {
 		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 		m = res.(model)
 		if !m.showEgg {
@@ -2479,6 +2481,179 @@ func TestFireworkKeyLifecycle(t *testing.T) {
 	m = res.(model)
 	if cmd != nil || m.fwTicking {
 		t.Error("a fireworks tick after close must stop (no reschedule, fwTicking false)")
+	}
+}
+
+// TestFwClutchNext covers the intake clutch's hysteresis gate (3e8b): engage
+// strictly above fwClutchOnMs, disengage strictly below fwClutchOffMs, and
+// HOLD the passed-in state unchanged (both true and false) inside the band so
+// it doesn't flap frame-to-frame.
+func TestFwClutchNext(t *testing.T) {
+	if got := fwClutchNext(false, fwClutchOnMs+0.01); !got {
+		t.Errorf("engage: ewma just above fwClutchOnMs should engage, got %v", got)
+	}
+	if got := fwClutchNext(true, fwClutchOffMs-0.01); got {
+		t.Errorf("disengage: ewma just below fwClutchOffMs should disengage, got %v", got)
+	}
+	mid := (fwClutchOnMs + fwClutchOffMs) / 2
+	if got := fwClutchNext(true, mid); !got {
+		t.Errorf("hysteresis-hold: engaged=true inside the band should stay true, got %v", got)
+	}
+	if got := fwClutchNext(false, mid); got {
+		t.Errorf("hysteresis-hold: engaged=false inside the band should stay false, got %v", got)
+	}
+	// Boundary values themselves fall inside the (inclusive) hold band since
+	// the gate uses strict >/< comparisons.
+	if got := fwClutchNext(true, fwClutchOnMs); !got {
+		t.Errorf("hysteresis-hold at the ON boundary: engaged=true should stay true, got %v", got)
+	}
+	if got := fwClutchNext(false, fwClutchOffMs); got {
+		t.Errorf("hysteresis-hold at the OFF boundary: engaged=false should stay false, got %v", got)
+	}
+}
+
+// TestFwLagNext covers the EWMA fold (3e8b): a zero prior seeds directly to
+// the observation, a converging sequence of steady observations moves the
+// EWMA toward that steady value by fwLagAlpha each step, and a lag spike
+// followed by recovery rises then falls back down.
+func TestFwLagNext(t *testing.T) {
+	// Seed: zero prior takes the observation as-is, regardless of magnitude.
+	if got := fwLagNext(0, 250); got != 250 {
+		t.Errorf("seed: fwLagNext(0, 250) = %v, want 250", got)
+	}
+	if got := fwLagNext(0, 0); got != 0 {
+		t.Errorf("seed: fwLagNext(0, 0) = %v, want 0", got)
+	}
+
+	// Convergence: starting away from a steady observed interval, repeated
+	// folds move monotonically toward it and land within a small tolerance.
+	ewma := fwLagNext(0, 100) // seed at 100ms
+	const steady = 50.0
+	prev := ewma
+	for i := 0; i < 30; i++ {
+		ewma = fwLagNext(ewma, steady)
+		if ewma > prev {
+			t.Fatalf("convergence: EWMA should move monotonically toward %v, went %v -> %v", steady, prev, ewma)
+		}
+		prev = ewma
+	}
+	if diff := ewma - steady; diff > 0.5 || diff < -0.5 {
+		t.Errorf("convergence: EWMA %v did not converge near steady %v", ewma, steady)
+	}
+	// A single fold step size matches the fwLagAlpha smoothing factor exactly.
+	if got := fwLagNext(100, 50); got != 100+fwLagAlpha*(50-100) {
+		t.Errorf("fold: fwLagNext(100, 50) = %v, want %v", got, 100+fwLagAlpha*(50-100))
+	}
+
+	// Spike then recovery: a steady EWMA jumps on a lag spike, then falls
+	// back down across subsequent normal observations.
+	ewma = fwLagNext(0, 50) // seed at a healthy 50ms cadence
+	spiked := fwLagNext(ewma, 500)
+	if spiked <= ewma {
+		t.Fatalf("spike: EWMA should rise on a lag spike, %v -> %v", ewma, spiked)
+	}
+	recovering := spiked
+	for i := 0; i < 20; i++ {
+		next := fwLagNext(recovering, 50)
+		if next > recovering {
+			t.Fatalf("recovery: EWMA should fall monotonically back toward 50, went %v -> %v", recovering, next)
+		}
+		recovering = next
+	}
+	if recovering >= spiked {
+		t.Errorf("recovery: EWMA %v should have dropped well below the post-spike value %v", recovering, spiked)
+	}
+}
+
+// TestFwLagWarmupIdleReset covers the warmup/idle-reset contract (3e8b) at
+// both levels: the pure fwLagNext seed behavior, and a focused Update test
+// confirming the fwTickMsg handler actually resets fwLagEWMA/fwClutch/
+// lastFwTick when the sky goes idle, and that the immediately-following tick
+// only stamps lastFwTick without measuring (guarded by the IsZero check, so
+// this holds regardless of real elapsed wall-clock time in the test).
+func TestFwLagWarmupIdleReset(t *testing.T) {
+	// Pure level: a first observation after a reset (ewma==0) seeds directly
+	// rather than smoothing toward 0.
+	if got := fwLagNext(0, 37); got != 37 {
+		t.Errorf("warmup seed: fwLagNext(0, 37) = %v, want 37", got)
+	}
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.width, m.height = 100, 40
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+
+	// Simulate mid-session lag state, then let the sky go idle: a single
+	// already-spent firework reaps to empty on the next step (mirrors
+	// TestStepFireworksReaps), which should trigger the idle reset.
+	m.fwLagEWMA = 123
+	m.fwClutch = true
+	m.lastFwTick = time.Now().Add(-time.Second)
+	m.fwTicking = true
+	m.fireworks = []firework{{stage: fwBurst}}
+
+	res, cmd := m.Update(fwTickMsg{})
+	m = res.(model)
+	if cmd != nil {
+		t.Error("idle reset: an idle fireworks tick must not reschedule")
+	}
+	if m.fwTicking {
+		t.Error("idle reset: fwTicking should be false once the sky is empty")
+	}
+	if m.fwLagEWMA != 0 {
+		t.Errorf("idle reset: fwLagEWMA should reset to 0, got %v", m.fwLagEWMA)
+	}
+	if m.fwClutch {
+		t.Error("idle reset: fwClutch should reset to false")
+	}
+	if !m.lastFwTick.IsZero() {
+		t.Error("idle reset: lastFwTick should reset to the zero time")
+	}
+
+	// The very next tick, after a fresh launch, must only stamp lastFwTick --
+	// not measure -- since lastFwTick is zero coming in.
+	m.fireworks = []firework{newFirework(m.width, m.height, m.emoji)}
+	m.fwTicking = true
+	res, _ = m.Update(fwTickMsg{})
+	m = res.(model)
+	if m.fwLagEWMA != 0 {
+		t.Errorf("warmup: the tick right after an idle reset must not measure, fwLagEWMA = %v, want 0", m.fwLagEWMA)
+	}
+	if m.lastFwTick.IsZero() {
+		t.Error("warmup: the tick right after an idle reset should still stamp lastFwTick")
+	}
+}
+
+// TestFireworkClutchGating covers the 'f' handler's clutch gate (3e8b): when
+// fwClutch is engaged, new launches are refused outright even though the
+// slice is well under fwCap (in-flight fireworks are never touched); when
+// disengaged, launches proceed normally up to fwCap.
+func TestFireworkClutchGating(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.width, m.height = 120, 45
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+
+	m.fwClutch = true
+	for i := 0; i < 5; i++ {
+		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+		m = res.(model)
+	}
+	if len(m.fireworks) != 0 {
+		t.Errorf("clutch engaged: intake should be refused entirely, got %d fireworks", len(m.fireworks))
+	}
+
+	m.fwClutch = false
+	for i := 0; i < fwCap+10; i++ {
+		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+		m = res.(model)
+	}
+	if len(m.fireworks) != fwCap {
+		t.Errorf("clutch disengaged: launches should proceed up to fwCap, got %d, want %d", len(m.fireworks), fwCap)
 	}
 }
 
