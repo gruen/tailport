@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"os/user"
 	"regexp"
 	"sort"
 	"strconv"
@@ -203,6 +205,43 @@ func portSuffix(s string) int {
 	return 0
 }
 
+// ErrOperatorNotSet is returned when `tailscale serve`/`funnel` refuses a
+// command because the invoking OS user isn't tailscale's configured
+// operator. This is tailscale's OWN permission model (not a tailport bug):
+// controlling `tailscale serve` as a non-root user requires `sudo tailscale
+// set --operator=$USER` once (or running the command with sudo every time).
+// classifyServeErr recognizes tailscale's own remedy text in the CLI's
+// output and maps it to this sentinel, so callers (the UI) can react to a
+// TYPED error instead of string-matching tailscale's stderr themselves
+// (kata tapv).
+var ErrOperatorNotSet = errors.New("tailscale operator is not set for this user -- run 'sudo tailscale set --operator=$USER' once, or run tailport with sudo")
+
+// isOperatorNotSet reports whether out (a failed `tailscale serve`/`funnel`
+// invocation's combined output) is tailscale's Access-denied/operator
+// refusal. It matches on "tailscale set --operator", the exact remedy
+// tailscale's own CLI prints -- e.g.:
+//
+//	sending serve config: Access denied: ...
+//	Use 'sudo tailscale serve --bg --http=1025 1025'.
+//	To not require root, use 'sudo tailscale set --operator=$USER' once.
+//
+// That's a stable, CLI-owned string (tailscale suggests it as the fix, not
+// as incidental phrasing) and more specific than "access denied" alone,
+// which could plausibly appear for unrelated permission failures.
+func isOperatorNotSet(out []byte) bool {
+	return strings.Contains(strings.ToLower(string(out)), "tailscale set --operator")
+}
+
+// classifyServeErr turns a failed `tailscale serve` invocation into
+// ErrOperatorNotSet when recognizable, else wraps it with its command and
+// output verbatim (the previous, un-typed behavior).
+func classifyServeErr(cmd string, err error, out []byte) error {
+	if isOperatorNotSet(out) {
+		return ErrOperatorNotSet
+	}
+	return fmt.Errorf("%s: %w: %s", cmd, err, strings.TrimSpace(string(out)))
+}
+
 // On exposes localPort tailnet-wide over plain HTTP at the same port
 // number (1:1 mapping only, never funnel).
 func On(port int) error {
@@ -210,7 +249,7 @@ func On(port int) error {
 	target := strconv.Itoa(port)
 	out, err := exec.Command("tailscale", "serve", "--bg", arg, target).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("tailscale serve --bg %s %s: %w: %s", arg, target, err, out)
+		return classifyServeErr(fmt.Sprintf("tailscale serve --bg %s %s", arg, target), err, out)
 	}
 	return nil
 }
@@ -224,7 +263,7 @@ func Off(port int) error {
 	arg := fmt.Sprintf("--http=%d", port)
 	out, err := exec.Command("tailscale", "serve", arg, "off").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("tailscale serve %s off: %w: %s", arg, err, out)
+		return classifyServeErr(fmt.Sprintf("tailscale serve %s off", arg), err, out)
 	}
 	return nil
 }
@@ -300,6 +339,12 @@ func funnelError(cmd string, err error, out []byte) error {
 	if errors.Is(err, errFunnelNotEnabled) {
 		return errFunnelNotEnabled
 	}
+	// The operator requirement gates `tailscale funnel` the same way it
+	// gates `tailscale serve` (see classifyServeErr) -- share the check so
+	// funnel toggles get the same typed error and sticky UI hint.
+	if isOperatorNotSet(out) {
+		return ErrOperatorNotSet
+	}
 	low := strings.ToLower(string(out))
 	if strings.Contains(low, "funnel") && (strings.Contains(low, "not enabled") ||
 		strings.Contains(low, "not available") || strings.Contains(low, "node attribute")) {
@@ -335,4 +380,68 @@ func PublicURL(fqdn string, publicPort int) string {
 		return "https://" + fqdn
 	}
 	return fmt.Sprintf("https://%s:%d", fqdn, publicPort)
+}
+
+// CurrentUsername returns the OS username tailport is running as. It backs
+// both DetectOperatorNotSet's comparison and the UI's persistent operator
+// hint, which needs $USER EXPANDED so its "sudo tailscale set --operator=…"
+// fix is directly copy-pasteable rather than a template the user has to
+// edit. os/user.Current is preferred (works even when $USER isn't exported
+// in the process environment); the env var is a fallback for the rare case
+// os/user fails (e.g. no matching /etc/passwd entry in a minimal
+// container). Returns "" if both fail -- callers should substitute a
+// placeholder like "<you>" rather than print an empty operator name.
+func CurrentUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
+}
+
+// operatorMismatch is the pure comparison DetectOperatorNotSet builds on: it
+// takes the JSON `tailscale debug prefs` prints and decides whether its
+// OperatorUser field matches currentUser. Split out so it's testable
+// against a fixture without shelling out or touching the real OS user.
+// ok is false when prefsJSON can't be parsed (unexpected shape), meaning the
+// caller has no opinion -- NOT that the operator is fine.
+func operatorMismatch(prefsJSON []byte, currentUser string) (mismatch bool, ok bool) {
+	var prefs struct {
+		OperatorUser string `json:"OperatorUser"`
+	}
+	if err := json.Unmarshal(prefsJSON, &prefs); err != nil {
+		return false, false
+	}
+	return prefs.OperatorUser != currentUser, true
+}
+
+// DetectOperatorNotSet is a best-effort, READ-ONLY proactive check for
+// whether the CURRENT user can run `tailscale serve`/`funnel` without sudo
+// -- i.e. whether tailscale's --operator is set to this user (or the
+// process already runs as root, which needs no operator at all). It never
+// mutates any state, so it's safe to run at startup, before the user ever
+// presses space, and again on a manual refresh.
+//
+// There is no stable, documented `tailscale status --json` field for this
+// (Status's Prefs aren't included). The one read-only signal found is
+// `tailscale debug prefs`, an UNDOCUMENTED/UNSTABLE subcommand (per
+// tailscale's own `tailscale debug --help`: "not a stable interface") that
+// prints the local daemon's Prefs, including OperatorUser -- confirmed live
+// against tailscaled 1.98.8. Because it's unstable, every failure mode
+// (missing subcommand on an older/future tailscale, tailscaled not running,
+// unexpected JSON shape) degrades to ok=false ("no opinion") rather than a
+// guess, so callers should fall back to catch-on-first-failure (via
+// ErrOperatorNotSet from On/FunnelOn) whenever ok is false.
+func DetectOperatorNotSet() (notSet bool, ok bool) {
+	if os.Geteuid() == 0 {
+		return false, true // root never needs an operator set
+	}
+	out, err := exec.Command("tailscale", "debug", "prefs").Output()
+	if err != nil {
+		return false, false
+	}
+	me := CurrentUsername()
+	if me == "" {
+		return false, false
+	}
+	return operatorMismatch(out, me)
 }

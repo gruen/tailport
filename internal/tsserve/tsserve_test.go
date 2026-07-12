@@ -2,7 +2,10 @@ package tsserve
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -150,5 +153,110 @@ func TestPublicURL(t *testing.T) {
 		if got := PublicURL("host.example.ts.net", port); got != want {
 			t.Errorf("PublicURL(port=%d) = %q, want %q", port, got, want)
 		}
+	}
+}
+
+// operatorDeniedOutput is tailscale's real combined output (1.98.8) when the
+// invoking user isn't the configured operator, quoted verbatim from kata
+// tapv's issue body -- the fixture classifyServeErr must recognize.
+const operatorDeniedOutput = `sending serve config: Access denied: over-a-loop
+Use 'sudo tailscale serve --bg --http=1025 1025'.
+To not require root, use 'sudo tailscale set --operator=$USER' once.
+`
+
+// TestClassifyServeErr covers kata tapv's typed-error requirement: a
+// representative Access-denied/operator stderr maps to ErrOperatorNotSet
+// (via errors.Is, since it's returned as the bare sentinel), while an
+// unrelated failure is wrapped verbatim as before and must NOT be
+// misclassified.
+func TestClassifyServeErr(t *testing.T) {
+	underlying := errors.New("exit status 1")
+
+	got := classifyServeErr("tailscale serve --bg --http=1025 1025", underlying, []byte(operatorDeniedOutput))
+	if !errors.Is(got, ErrOperatorNotSet) {
+		t.Errorf("classifyServeErr(operator-denied output) = %v, want ErrOperatorNotSet", got)
+	}
+
+	// Unrelated failure: a normal "address already in use"-style error must
+	// NOT be misclassified as the operator error, and must still carry the
+	// command/output context (previous un-typed behavior).
+	other := classifyServeErr("tailscale serve --bg --http=8080 8080", underlying,
+		[]byte("serve: address already in use"))
+	if errors.Is(other, ErrOperatorNotSet) {
+		t.Errorf("classifyServeErr(unrelated output) = %v, must not be ErrOperatorNotSet", other)
+	}
+	if !errors.Is(other, underlying) {
+		t.Errorf("classifyServeErr(unrelated output) = %v, want it to wrap the underlying error", other)
+	}
+	if got, want := other.Error(), "address already in use"; !strings.Contains(got, want) {
+		t.Errorf("classifyServeErr(unrelated output) = %q, want it to contain %q", got, want)
+	}
+}
+
+// TestFunnelErrorOperatorNotSet covers the funnel path sharing the same
+// operator classification as serve (funnelError), ahead of its existing
+// "funnel isn't enabled" and generic-wrap branches.
+func TestFunnelErrorOperatorNotSet(t *testing.T) {
+	underlying := errors.New("exit status 1")
+	got := funnelError("tailscale funnel --bg --https=443 3000", underlying, []byte(operatorDeniedOutput))
+	if !errors.Is(got, ErrOperatorNotSet) {
+		t.Errorf("funnelError(operator-denied output) = %v, want ErrOperatorNotSet", got)
+	}
+
+	// The pre-existing "funnel not enabled" classification must still work
+	// (unaffected by the new operator check ahead of it).
+	notEnabled := funnelError("tailscale funnel --bg --https=443 3000", underlying,
+		[]byte("Funnel not available; HTTPS is not enabled for your tailnet."))
+	if !errors.Is(notEnabled, errFunnelNotEnabled) {
+		t.Errorf("funnelError(not-enabled output) = %v, want errFunnelNotEnabled", notEnabled)
+	}
+}
+
+// TestOperatorMismatch covers the pure comparison DetectOperatorNotSet
+// builds on, against `tailscale debug prefs` JSON fixtures: operator set to
+// the current user (no mismatch), unset (empty string -- mismatch), and set
+// to a DIFFERENT user (mismatch). Malformed JSON degrades to ok=false ("no
+// opinion"), never a guessed answer.
+func TestOperatorMismatch(t *testing.T) {
+	prefsJSON := func(operator string) []byte {
+		return []byte(fmt.Sprintf(`{"ControlURL":"https://controlplane.tailscale.com","OperatorUser":%q,"WantRunning":true}`, operator))
+	}
+
+	cases := []struct {
+		name         string
+		json         []byte
+		currentUser  string
+		wantMismatch bool
+		wantOK       bool
+	}{
+		{"operator matches current user", prefsJSON("mg"), "mg", false, true},
+		{"operator unset (empty string)", prefsJSON(""), "mg", true, true},
+		{"operator set to a different user", prefsJSON("root"), "mg", true, true},
+		{"malformed JSON is inconclusive, not a guess", []byte("not json"), "mg", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mismatch, ok := operatorMismatch(c.json, c.currentUser)
+			if mismatch != c.wantMismatch || ok != c.wantOK {
+				t.Errorf("operatorMismatch(%s, %q) = (%v, %v), want (%v, %v)",
+					c.json, c.currentUser, mismatch, ok, c.wantMismatch, c.wantOK)
+			}
+		})
+	}
+}
+
+// TestIsOperatorNotSet is a narrower unit check on the substring match
+// classifyServeErr/funnelError share, confirming it's anchored on
+// tailscale's specific remedy text rather than firing on any "access
+// denied"-shaped output.
+func TestIsOperatorNotSet(t *testing.T) {
+	if !isOperatorNotSet([]byte(operatorDeniedOutput)) {
+		t.Error("isOperatorNotSet(operator-denied output) = false, want true")
+	}
+	if isOperatorNotSet([]byte("Access denied: some other permission issue entirely")) {
+		t.Error(`isOperatorNotSet("Access denied" without the operator remedy) = true, want false`)
+	}
+	if isOperatorNotSet(nil) {
+		t.Error("isOperatorNotSet(nil) = true, want false")
 	}
 }
