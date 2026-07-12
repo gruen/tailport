@@ -752,7 +752,17 @@ func (m model) Init() tea.Cmd {
 	// detectOperator is the best-effort proactive check (kata tapv): it runs
 	// once here so the sticky hint can appear before the user's first
 	// space-press, without waiting on a failed toggle.
-	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick())
+	//
+	// tea.SetWindowTitle emits OSC 2 through Bubble Tea's own renderer, so
+	// (unlike clip.go's OSC 52 clipboard write) there's no manual /dev/tty
+	// dance needed here. We never restore the previous title on exit --
+	// terminals and tmux reset the pane title on the next shell prompt
+	// anyway, and it's not a convention other TUIs bother with either.
+	title := "tailport"
+	if m.host != "" {
+		title = "tailport — " + m.host
+	}
+	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
