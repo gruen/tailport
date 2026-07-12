@@ -87,6 +87,26 @@ accepted too) instead of taking the latest. Release binaries are built by
 `.github/workflows/build.yml` on tagged pushes (`v*`); if that workflow's
 build matrix doesn't cover your platform, use `go install` instead.
 
+Re-running the script is version-aware and safe to script into a cron job or
+dotfiles bootstrap:
+
+- If the version already installed matches the target, it prints
+  `already up to date` and does nothing.
+- If the upgrade (or downgrade) isn't breaking, it backs up the previous
+  binary to `tailport.bak` next to the install, installs the new one, and
+  prints the old → new version.
+- If the transition **is** breaking — a major version change, or, while
+  tailport is still pre-1.0, a minor version change — the script refuses to
+  install and exits non-zero, leaving the existing binary untouched. Review
+  the release notes, then opt in explicitly with `TAILPORT_ALLOW_BREAKING=1`
+  to install anyway (this also backs up the old binary first). This gate is
+  skipped, with a note, only when the currently-installed binary's version
+  can't be determined (e.g. it predates `--version` support).
+
+A rolling backup (`~/.local/bin/tailport.bak`, or `$TAILPORT_INSTALL_DIR/tailport.bak`)
+is kept whenever the script replaces an existing install; roll back with
+`mv ~/.local/bin/tailport.bak ~/.local/bin/tailport`.
+
 The default install directory, `~/.local/bin`, isn't on every system's
 `PATH`. If the `tailport` command isn't found after installing, add it to
 your shell's rc file (`~/.bashrc`, `~/.zshrc`, …):
