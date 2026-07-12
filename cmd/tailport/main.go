@@ -38,6 +38,7 @@ type cliFlags struct {
 	configPath  string // -c/--config override; "" means "resolve normally" (y4gt)
 	noColor     bool   // --no-color (63c6); NO_COLOR env is handled separately, see applyNoColor
 	markers     string // --markers value, unvalidated; "" means "not passed" (zn2x)
+	theme       string // --theme value, unvalidated; "" means "not passed" (n7gc)
 }
 
 // newFlagSet builds tailport's shared flag.FlagSet: the same flags, in the
@@ -58,6 +59,7 @@ func newFlagSet(name string) (*flag.FlagSet, *cliFlags) {
 	fs.StringVar(&cf.configPath, "c", "", "shorthand for --config")
 	fs.BoolVar(&cf.noColor, "no-color", false, "disable ANSI color output (also honors NO_COLOR)")
 	fs.StringVar(&cf.markers, "markers", "", "exposure-glyph style override: auto, emoji, or ascii")
+	fs.StringVar(&cf.theme, "theme", "", "color-scheme override: auto, light, or dark")
 	return fs, cf
 }
 
@@ -102,6 +104,7 @@ func printUsage(w io.Writer, configOverride string) {
 	fmt.Fprintln(w, "  -c, --config <path>   config file path (default: $XDG_CONFIG_HOME/tailport/config.yaml, else ~/.config/tailport/config.yaml)")
 	fmt.Fprintln(w, "      --no-color        disable ANSI color output (also honors NO_COLOR)")
 	fmt.Fprintln(w, "      --markers <mode>  exposure-glyph style: auto, emoji, or ascii (default: auto)")
+	fmt.Fprintln(w, "      --theme <mode>    color scheme: auto, light, or dark (default: auto)")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  quickstart   non-interactive onboarding and keybinding legend")
@@ -130,6 +133,40 @@ func validateMarkers(v string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid --markers %q: want one of auto, emoji, ascii", v)
+}
+
+// validThemeModes are the only values --theme/theme (kata n7gc) accept,
+// matching what internal/ui.resolveTheme understands: "auto" (or empty)
+// defers to lipgloss/termenv's own background detection, "light"/"dark"
+// force it. Mirrors validMarkersModes exactly.
+var validThemeModes = map[string]bool{"": true, "auto": true, "light": true, "dark": true}
+
+// validateTheme rejects any --theme value other than "" (not passed),
+// "auto", "light", or "dark" (case-insensitive, trimmed), returning a clean
+// error for the caller to report on one stderr line -- never a panic/stack
+// trace. Mirrors validateMarkers exactly.
+func validateTheme(v string) error {
+	if validThemeModes[strings.ToLower(strings.TrimSpace(v))] {
+		return nil
+	}
+	return fmt.Errorf("invalid --theme %q: want one of auto, light, dark", v)
+}
+
+// resolveThemeMode applies n7gc's theme precedence: an explicit --theme flag
+// value wins outright; otherwise the persisted cfg.Theme; otherwise "" (which
+// internal/ui.ApplyTheme/resolveTheme treats as "auto" -- leave lipgloss's
+// own detection alone). Mirrors the inline markersMode precedence used for
+// --markers (see runQuickstart, and ui.New's doc comment) but factored into
+// a named, directly-testable function: unlike markers, the resolved theme
+// isn't threaded through ui.New's return value -- it's applied via a
+// package-level side effect (ui.ApplyTheme, called once at startup below),
+// so the precedence itself needs a seam a test can call without also
+// launching the TUI.
+func resolveThemeMode(flagVal, cfgVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return cfgVal
 }
 
 // applyNoColor forces lipgloss/termenv to the Ascii (no-color) profile when
@@ -187,6 +224,10 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tailport:", err)
 		return 2
 	}
+	if err := validateTheme(cf.theme); err != nil {
+		fmt.Fprintln(stderr, "tailport:", err)
+		return 2
+	}
 
 	// config.Load only reads -- unlike the default TUI path, quickstart never
 	// calls config.WriteDefault, so merely running `tailport quickstart` has
@@ -207,6 +248,14 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 	if markersMode == "" {
 		markersMode = cfg.Markers
 	}
+
+	// Theme precedence mirrors markers above (n7gc): flag > cfg.Theme > auto.
+	// Applied here too (not just the default TUI path in run()) since
+	// quickstart's legend is rendered through the exact same colored styles
+	// (ui.RenderKeyLegendGroups -> helpKeyStyle/helpTextStyle/etc.) the "?"
+	// overlay uses, so a light-terminal user piping quickstart's output
+	// should see the same legible colors --theme light gives the TUI.
+	ui.ApplyTheme(resolveThemeMode(cf.theme, cfg.Theme))
 
 	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveEmoji(markersMode)))
 	return 0
@@ -365,6 +414,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tailport:", err)
 		return 2
 	}
+	if err := validateTheme(cf.theme); err != nil {
+		fmt.Fprintln(stderr, "tailport:", err)
+		return 2
+	}
 
 	if err := config.WriteDefault(cf.configPath); err != nil {
 		fmt.Fprintln(stderr, "tailport: writing default config:", err)
@@ -375,6 +428,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tailport: loading config:", err)
 		return 1
 	}
+
+	// Theme override hook (n7gc): applied once, here, before the TUI's first
+	// render -- flag > cfg.Theme > auto (resolveThemeMode). "auto" (or an
+	// unrecognized cfg.Theme) leaves lipgloss's own background detection, and
+	// its dark fallback, alone; see ui.ApplyTheme/resolveTheme's doc comment
+	// for why that fallback already satisfies "undetectable -> treat as dark"
+	// with no extra code here. Unlike cf.markers (below), this is a
+	// process-global lipgloss side effect, not per-model state, so it's
+	// applied directly rather than threaded through ui.Run/ui.New.
+	ui.ApplyTheme(resolveThemeMode(cf.theme, cfg.Theme))
 
 	// cf.markers is passed through as a separate, run-only override (zn2x)
 	// rather than written into cfg.Markers here: cfg is the exact value the

@@ -35,6 +35,14 @@ type Config struct {
 	// lifecycle 🥚/🐣/🐦/🪹), or "ascii" (force ○/●/◉/▲). Empty means auto.
 	Markers string `yaml:"markers,omitempty"`
 
+	// Theme selects the color-scheme mode (kata n7gc): "auto" (default;
+	// detect the terminal's background via lipgloss/termenv, falling back to
+	// dark if it can't be detected), "light" (force light-background
+	// colors), or "dark" (force dark-background colors -- tailport's
+	// original, pre-n7gc look). Empty means auto. See internal/ui's
+	// ApplyTheme for how this is applied.
+	Theme string `yaml:"theme,omitempty"`
+
 	// path is the file this Config was resolved against by Load/WriteDefault
 	// (see Path), and what Save writes back to. Unexported so it never
 	// round-trips into the YAML file itself. Zero value ("") means "not yet

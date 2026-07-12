@@ -26,33 +26,74 @@ import (
 	"github.com/gruen/tailport/internal/tsserve"
 )
 
+// Style colors (kata n7gc): the must-fix set below use
+// lipgloss.AdaptiveColor{Light, Dark} rather than a single fixed
+// lipgloss.Color, so the TUI stays legible on both dark and light terminal
+// backgrounds -- the app was originally designed white-on-black only. Each
+// Dark value is the exact original ANSI-256 index string this app shipped
+// with pre-n7gc (never a hex re-encoding of it), so an existing dark-terminal
+// user sees byte-identical rendered output, not just "a similar shade" --
+// see TestNoDarkRegression in theme_test.go, which asserts this directly
+// against a forced dark background. Each Light value is a hand-picked truecolor hex
+// chosen to clear a WCAG contrast bar against white -- see
+// TestAdaptiveColorContrast, which computes the actual ratio rather than
+// eyeballing it: >=4.5:1 (WCAG AA "normal text") for anything that carries
+// information a user must read correctly, which here is every must-fix style
+// including both AGENTS.md's safety-critical markers (publicStyle's
+// public-funnel indicator, warnStyle's caution/dangling indicator) and
+// ordinary body/label/title text; >=3:1 (WCAG AA "large text"/non-text) would
+// suffice for purely decorative accents (e.g. favStyle's ★, viewInactiveStyle's
+// muted chip label), but every value chosen here clears 4.5:1 anyway, so the
+// lower bar is documented intent, not a color that's actually that close to
+// the line.
+//
+// lockStyle, errStyle, helpStyle, and viewActiveStyle are deliberately left
+// as plain lipgloss.Color: the audit (kata n7gc) found their existing
+// contrast already fine on both backgrounds (viewActiveStyle paints its own
+// Background(), so it never depends on the terminal's at all). The bubbles
+// list.DefaultDelegate and help.Model widgets already use AdaptiveColor
+// internally and are untouched here.
 var (
-	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
-	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
-	favStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	lockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	// activeStyle marks the ◉ tailnet-served row and doubles as the info
+	// flash/toast color -- >=4.5:1 bar (informational text).
+	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#006644", Dark: "42"}).Bold(true)
+	// warnStyle marks the ▲ dangling-forward row, the warn flash, and the
+	// :22/funnel caution text. Safety-critical (AGENTS.md tailnet-vs-public):
+	// the Light variant is a strong, high-contrast amber/brown, not a token
+	// nudge -- >=4.5:1 bar, same as publicStyle below.
+	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8a4500", Dark: "214"}).Bold(true)
+	// favStyle marks the ★ favorite indicator -- decorative/accent, >=3:1
+	// bar would suffice, but the chosen Light value clears >=4.5:1.
+	favStyle  = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8b6500", Dark: "220"}).Bold(true)
+	lockStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	errStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	// wasStyle renders a remembered-but-gone process name ("was mailpit") as a
-	// muted italic, so it reads as a memory rather than a live label.
-	wasStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Italic(true)
+	// muted italic, so it reads as a memory rather than a live label -- still
+	// >=4.5:1 so "muted" doesn't slide into "illegible".
+	wasStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#4b4b4b", Dark: "245"}).Italic(true)
 	// publicStyle marks a port funnelled to the public internet -- deliberately
 	// a hot magenta ● (ASCII mode), distinct from the green ◉ tailnet-serve and
-	// amber ▲ dangling markers, so "this is on the public internet" reads at a glance.
-	publicStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("201")).Bold(true)
+	// amber ▲ dangling markers, so "this is on the public internet" reads at a
+	// glance. Safety-critical (AGENTS.md tailnet-vs-public): the Light variant
+	// is a strong, high-contrast magenta (>=4.5:1), not a token nudge -- this
+	// marker must be unambiguous on both backgrounds.
+	publicStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8b008b", Dark: "201"}).Bold(true)
 
-	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
-	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
-	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#006644", Dark: "42"}).Bold(true)
+	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
+	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#303030", Dark: "252"})
 
 	// logoStyle draws the persistent cyan "tailport" wordmark pinned to the
 	// top-left of every view (list and empty-state alike); see renderHeader.
-	logoStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
+	logoStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#005f5f", Dark: "51"}).Bold(true)
 
 	// The two segments of the Favorites|All-ports view indicator: the active
 	// view is a filled green chip, the inactive one is dim.
-	viewActiveStyle   = lipgloss.NewStyle().Background(lipgloss.Color("42")).Foreground(lipgloss.Color("233")).Bold(true)
-	viewInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	viewActiveStyle = lipgloss.NewStyle().Background(lipgloss.Color("42")).Foreground(lipgloss.Color("233")).Bold(true)
+	// viewInactiveStyle labels the inactive view chip -- decorative/accent,
+	// >=3:1 bar would suffice, but the chosen Light value clears >=4.5:1.
+	viewInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#6a6a6a", Dark: "245"})
 )
 
 // keyMap describes every keybinding the TUI responds to, for the bubbles/help
@@ -507,6 +548,48 @@ func emojiCapable() bool {
 // overlay would for the same markers mode, not just the same key text.
 func ResolveEmoji(mode string) bool {
 	return resolveEmoji(mode)
+}
+
+// resolveTheme applies the "theme" manual override (kata n7gc) to lipgloss's
+// shared default renderer: "light"/"dark" force lipgloss's notion of the
+// terminal background for the rest of the process, so every package-level
+// AdaptiveColor style in this file -- and the bubbles list/help widgets'
+// own AdaptiveColor values -- render through that same forced choice.
+// Anything else ("auto", "", or an unrecognized value -- mirrors
+// resolveEmoji's handling of an unrecognized markers mode) leaves lipgloss's
+// own auto-detection alone.
+//
+// No extra fallback code is needed here for "undetectable -> treat as dark"
+// (the no-regression requirement for existing dark-terminal users):
+// termenv's own HasDarkBackground already resolves that way on its own --
+// when it can't query a background color at all (no TTY, unsupported
+// terminal) it falls back to NoColor, which converts to RGB black, whose
+// lightness is 0 (<0.5), so termenv itself reports "dark" with no help from
+// this package. See TestResolveThemeAutoLeavesDetectionAlone.
+func resolveTheme(mode string) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "light":
+		lipgloss.SetHasDarkBackground(false)
+	case "dark":
+		lipgloss.SetHasDarkBackground(true)
+	}
+}
+
+// ApplyTheme exports resolveTheme for cmd/tailport/main.go: call it once at
+// startup, before the first render, after main.go has already resolved
+// --theme/config precedence (flag > cfg.Theme > auto; see resolveThemeMode
+// in main.go and applyTheme's call sites in run/runQuickstart).
+//
+// It's a standalone function rather than threaded through New's
+// markersOverride-style variadic parameter because, unlike the marker-glyph
+// choice, "theme" is not per-model state: it's a one-time side effect on
+// lipgloss's shared package-level renderer that every package-level style
+// (and the bubbles widgets) already reads from on every render, so it only
+// needs to be applied once, early -- it doesn't need to be carried on the
+// model, and doing so would risk a second call site (e.g. a future
+// non-model render path) forgetting to apply it.
+func ApplyTheme(mode string) {
+	resolveTheme(mode)
 }
 
 // New builds the initial model from a loaded Config. markersOverride is an
