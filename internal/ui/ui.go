@@ -3125,6 +3125,14 @@ func (f *firework) draw(grid [][]styledCell, w, h int) {
 		launch := math.Max(0, 1-frac/0.15) // 1 at ignition, ->0 by ~15% up
 		const ember = 0.25                 // faint coast brightness
 		headBr := ember + launch*(0.45-ember)
+		// (w9sh) Pin the ascent glyph to the block (last in the active set)
+		// regardless of brightness. a2vq muted headBr down to ~0.25-0.45, and
+		// since the glyph used to track brightness too, the rising shell was
+		// rendering as a faint dot/`░` instead of a shell. Color still fades
+		// with br below, so it reads as a dim/gold-tinted BLOCK streak, not a
+		// dot ramping through the whole glyph set.
+		set := f.glyphSet()
+		block := set[len(set)-1]
 		for k := 0; k < fwTrailLen; k++ {
 			tt := f.t - float64(k)
 			if tt < 0 {
@@ -3145,7 +3153,7 @@ func (f *firework) draw(grid [][]styledCell, w, h int) {
 				// (fwSmoke*) at the launch point.
 				col = lipgloss.Color("#ffb454")
 			}
-			f.plot(grid, w, h, f.posX(tt), f.posY(tt), f.glyph(br), col)
+			f.plot(grid, w, h, f.posX(tt), f.posY(tt), block, col)
 		}
 	case fwBurst:
 		set := f.glyphSet()
