@@ -1,0 +1,42 @@
+name: install-script
+
+# Verifies install.sh is a safe `curl ... | sh` one-liner (kata 4nas). This
+# runs on ubuntu-latest specifically because its /bin/sh IS dash and it ships
+# shellcheck -- the two things a typical dev box (bash-as-sh, no shellcheck)
+# can't provide, so this is where "runs under dash + shellcheck clean" is
+# actually proven.
+on:
+  push:
+    paths:
+      - "install.sh"
+      - "scripts/test-install.sh"
+      - ".github/workflows/install-test.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: shellcheck (lints install.sh as POSIX sh via its directive)
+        run: |
+          command -v shellcheck >/dev/null 2>&1 || {
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          }
+          shellcheck --version
+          shellcheck install.sh scripts/test-install.sh
+
+      - name: confirm /bin/sh is really dash
+        run: |
+          ls -l /bin/sh
+          case "$(readlink -f /bin/sh)" in
+            *dash) echo "/bin/sh -> dash (real POSIX-sh coverage below)" ;;
+            *) echo "::warning::/bin/sh is not dash on this runner; dash coverage weakened" ;;
+          esac
+
+      - name: run harness under dash (/bin/sh) and bash
+        # `sh` here is dash, and the harness itself re-invokes `sh install.sh`,
+        # `bash install.sh`, plus `dash -n`/`bash -n` -- so install.sh is
+        # exercised under a real dash, which is the whole point.
+        run: sh scripts/test-install.sh

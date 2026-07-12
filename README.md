@@ -75,15 +75,25 @@ bundled install script. Either run it after cloning:
 or fetch and run it directly:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gruen/tailport/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gruen/tailport/main/install.sh | sh
 ```
 
 The script detects your OS and architecture, downloads the matching binary
-from the latest release, and installs it to `~/.local/bin/tailport` (override
-the destination directory with `TAILPORT_INSTALL_DIR`). Release binaries are
-built by `.github/workflows/build.yml` on tagged pushes (`v*`); if that
-workflow's build matrix doesn't cover your platform, use `go install`
-instead.
+from the latest release, verifies it against the release's published
+`sha256` checksum, and installs it to `~/.local/bin/tailport`. Override the
+destination directory with `TAILPORT_INSTALL_DIR`, or pin a specific release
+with `TAILPORT_VERSION` (e.g. `TAILPORT_VERSION=0.1.1`; a leading `v` is
+accepted too) instead of taking the latest. Release binaries are built by
+`.github/workflows/build.yml` on tagged pushes (`v*`); if that workflow's
+build matrix doesn't cover your platform, use `go install` instead.
+
+The default install directory, `~/.local/bin`, isn't on every system's
+`PATH`. If the `tailport` command isn't found after installing, add it to
+your shell's rc file (`~/.bashrc`, `~/.zshrc`, …):
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## Usage
 
