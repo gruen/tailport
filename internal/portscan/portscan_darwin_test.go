@@ -5,9 +5,11 @@ package portscan
 import "testing"
 
 // Sample `lsof -iTCP -sTCP:LISTEN -n -P` output covering the cases the parser
-// must get right: wildcard bind, IPv4/IPv6 loopback for the same port (dedup),
-// a tailscaled serve-proxy socket on a tailnet IP (must be skipped), and a
-// short/garbage line (must be ignored). Device columns are elided with 0x....
+// must get right, mirroring the Linux ssFixture scenarios: a wildcard bind, a
+// loopback-only port on dual-stack v4+v6 rows (aggregates to Loopback), a
+// LAN-IP port, a port bound on BOTH loopback and wildcard (aggregates up to
+// Wildcard), tailscaled serve-proxy sockets on tailnet IPs (must be skipped),
+// and a short/garbage line (must be ignored). Device columns are elided.
 const lsofFixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 launchd       1 root    7u  IPv4 0x1111111111111111      0t0  TCP *:3000 (LISTEN)
 node        501   mg   23u  IPv4 0x2222222222222222      0t0  TCP 127.0.0.1:5173 (LISTEN)
@@ -15,6 +17,9 @@ node        501   mg   24u  IPv6 0x3333333333333333      0t0  TCP [::1]:5173 (LI
 tailscaled  310 root   12u  IPv4 0x4444444444444444      0t0  TCP 100.101.102.103:8808 (LISTEN)
 tailscaled  310 root   13u  IPv6 0x5555555555555555      0t0  TCP [fd7a:115c:a1e0::1]:8808 (LISTEN)
 Dropbox     720   mg   30u  IPv4 0x6666666666666666      0t0  TCP 127.0.0.1:17600 (LISTEN)
+nginx       800 root   40u  IPv4 0x7777777777777777      0t0  TCP 192.168.1.5:8080 (LISTEN)
+vite        900   mg   50u  IPv4 0x8888888888888888      0t0  TCP 127.0.0.1:4000 (LISTEN)
+vite        900   mg   51u  IPv4 0x9999999999999999      0t0  TCP *:4000 (LISTEN)
 garbage line
 `
 
@@ -24,27 +29,36 @@ func TestParseLsof(t *testing.T) {
 		t.Fatalf("parseLsof error: %v", err)
 	}
 
-	got := map[int]string{}
+	got := map[int]Port{}
 	for _, p := range ports {
 		if _, dup := got[p.Number]; dup {
 			t.Errorf("port %d reported more than once (dedup failed): %+v", p.Number, ports)
 		}
-		got[p.Number] = p.Process
+		got[p.Number] = p
 	}
 
-	// Wildcard + loopback app sockets are kept, with their process names.
+	// Kept app sockets, with process names AND the widest-scope classification.
 	for _, tc := range []struct {
-		port int
-		proc string
+		port  int
+		proc  string
+		scope BindScope
 	}{
-		{3000, "launchd"},
-		{5173, "node"}, // IPv4 + IPv6 lines collapse to one entry
-		{17600, "Dropbox"},
+		{3000, "launchd", ScopeWildcard},  // *:3000 -> Wildcard
+		{5173, "node", ScopeLoopback},     // 127.0.0.1 + [::1] collapse; loopback-only stays Loopback
+		{17600, "Dropbox", ScopeLoopback}, // loopback
+		{8080, "nginx", ScopeLAN},         // a specific LAN IP -> LAN
+		{4000, "vite", ScopeWildcard},     // 127.0.0.1 + * aggregates UP to Wildcard
 	} {
-		if proc, ok := got[tc.port]; !ok {
+		p, ok := got[tc.port]
+		if !ok {
 			t.Errorf("expected port %d in %+v", tc.port, ports)
-		} else if proc != tc.proc {
-			t.Errorf("port %d process = %q, want %q", tc.port, proc, tc.proc)
+			continue
+		}
+		if p.Process != tc.proc {
+			t.Errorf("port %d process = %q, want %q", tc.port, p.Process, tc.proc)
+		}
+		if p.BindScope != tc.scope {
+			t.Errorf("port %d scope = %v, want %v", tc.port, p.BindScope, tc.scope)
 		}
 	}
 
@@ -55,8 +69,8 @@ func TestParseLsof(t *testing.T) {
 	}
 
 	// Header and the short "garbage line" must not be parsed as ports.
-	if len(ports) != 3 {
-		t.Errorf("parsed %d ports, want 3 (3000, 5173, 17600); got %+v", len(ports), ports)
+	if len(ports) != 5 {
+		t.Errorf("parsed %d ports, want 5 (3000, 5173, 17600, 8080, 4000); got %+v", len(ports), ports)
 	}
 }
 
