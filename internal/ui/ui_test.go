@@ -2802,6 +2802,54 @@ func TestBottomBarGridFolds(t *testing.T) {
 	}
 }
 
+// TestBottomBarGridFoldedSubColAligned covers kata xqdk: a folded group's
+// SECOND sub-column must begin at the same display column on every row, not
+// hug the previous row's (possibly shorter) sub-col-1 content. Favorites
+// folds at width 100 (see TestBottomBarGridFolds) into a top-heavy 3/2 split:
+// f/u/n down sub-col 1, c/l down sub-col 2. Sub-col 1's rendered content width
+// varies by row -- "f favorite" is 10 wide, "u unfavorite" is 12, "n add
+// favorite" is 14 (the widest, setting subWidth[0]) -- which is exactly the
+// shape that exposed the bug: sub-col 2 used to start right after each row's
+// OWN sub-col-1 content instead of at the fixed subWidth[0] edge, so "c copy
+// URL" (behind the short "f favorite") landed left of where "l label" (behind
+// the longer "u unfavorite") landed, instead of both landing on the same
+// column.
+func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
+	m := New(config.Config{})
+	m.help.Width, m.width = 100, 100
+
+	grid := stripANSI(m.renderLegend())
+	lines := strings.Split(grid, "\n")
+
+	col := func(needle string) int {
+		for _, ln := range lines {
+			if c := strings.Index(ln, needle); c >= 0 {
+				return c
+			}
+		}
+		t.Fatalf("grid missing %q:\n%s", needle, grid)
+		return -1
+	}
+
+	// Sub-col 2's two cells ("c copy URL" on the "f favorite" row, "l label" on
+	// the "u unfavorite" row) must start at the SAME column -- the fixed
+	// subWidth[0] edge -- regardless of how much shorter sub-col 1's own
+	// content is on either row.
+	cCol, lCol := col("c copy URL"), col("l label")
+	if cCol != lCol {
+		t.Errorf("Favorites sub-col 2 misaligned across rows: 'c copy URL' at %d, 'l label' at %d (should match):\n%s", cCol, lCol, grid)
+	}
+
+	// A short sub-col-1 cell doesn't shift sub-col 2 left: "n add favorite" is
+	// sub-col 1's widest row (14 wide, == subWidth[0]), so sub-col 2's fixed
+	// edge must sit exactly one sub-column gap past where that row's content
+	// ends -- not past the shorter "f favorite"/"u unfavorite" rows' content.
+	nEnd := col("n add favorite") + len("n add favorite")
+	if want := nEnd + legendSubColGap; cCol != want {
+		t.Errorf("Favorites sub-col 2 should start at %d (widest sub-col-1 row %q ends at %d, + %d-wide gap); got %d:\n%s", want, "n add favorite", nEnd, legendSubColGap, cCol, grid)
+	}
+}
+
 // TestBottomBarNarrowFallback covers the responsive fallback: below the
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.

@@ -2200,7 +2200,9 @@ func renderLegendRows(styles help.Styles, layouts []legendGroupLayout) string {
 					rb.WriteString(strings.Repeat(" ", l.keyGutter[sc]-lipgloss.Width(cl.key)))
 					rb.WriteString(" ")
 					rb.WriteString(styles.ShortDesc.Inline(true).Render(cl.desc))
-					used += l.keyGutter[sc] + 1 + lipgloss.Width(cl.desc)
+					content := l.keyGutter[sc] + 1 + lipgloss.Width(cl.desc)
+					rb.WriteString(strings.Repeat(" ", l.subWidth[sc]-content)) // (xqdk) pad desc out to the sub-column's full width, symmetric with the empty branch below
+					used += l.subWidth[sc]
 				} else {
 					rb.WriteString(strings.Repeat(" ", l.subWidth[sc]))
 					used += l.subWidth[sc]
