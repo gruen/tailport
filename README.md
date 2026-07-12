@@ -13,24 +13,30 @@ about working outside that kind of setup.
 
 ## Security model
 
-tailport only ever exposes ports to your **tailnet** — the private network
-of devices you've authenticated into Tailscale. It does this by shelling
-out to `tailscale serve`.
+By default, tailport exposes ports only to your **tailnet** — the private
+network of devices you've authenticated into Tailscale — by shelling out to
+`tailscale serve` (plain HTTP, tailnet-only).
 
-It **never** invokes `tailscale funnel`, which would expose a port to the
-public internet. There is no flag, mode, or code path in tailport that does
-this. If you want public exposure, use the `tailscale` CLI directly and
-funnel is not something tailport will do for you.
+It can also expose a port to the **public internet**, but only as an explicit
+opt-in: the `p` key funnels the selected port via `tailscale funnel`, behind
+a strong y/n confirmation. Funnel is HTTPS-only and uses one of Tailscale's
+three public ingress ports (443, 8443, 10000), so a funnelled port is
+reachable by anyone on the internet — not just your tailnet. Public exposure
+is never automatic; it happens only when you press `p` and confirm, `:22`
+(SSH) is refused outright, and funnelled ports are drawn with a distinct
+marker (`●` / 🐦).
 
-Two other constraints, both deliberate:
+Two deliberate constraints on the tailnet-`serve` path:
 
-- **Plain HTTP only** (`tailscale serve --http=<port>`), never HTTPS/TLS
-  serve mode. Tailscale's WireGuard tunnel already encrypts traffic between
-  tailnet peers, so app-layer TLS on top wouldn't add real confidentiality
-  here — it would just add certificate handling for no benefit.
-- **1:1 port mapping only.** The port exposed on your tailnet is always the
-  same number as the local port. tailport does not support remapping a
-  local port to a different public-facing port.
+- **Plain HTTP** (`tailscale serve --http=<port>`), never HTTPS/TLS serve
+  mode. Tailscale's WireGuard tunnel already encrypts traffic between tailnet
+  peers, so app-layer TLS on top wouldn't add real confidentiality here — it
+  would just add certificate handling for no benefit. (Funnel is necessarily
+  HTTPS, since it faces the public internet.)
+- **1:1 port mapping.** A tailnet-served port always keeps its own number
+  (same port in and out); serve never remaps to a different number. Funnel is
+  the deliberate exception — it maps your local port onto one of the public
+  ingress ports (443/8443/10000), which won't match the local number.
 
 ## Requirements
 
@@ -44,8 +50,8 @@ Two other constraints, both deliberate:
   ```
 - Linux (uses `ss` for port discovery) or macOS (uses `lsof`). Other
   platforms aren't supported.
-- Prebuilt release binaries are currently only published for
-  `linux/amd64` and `darwin/arm64` (see Install below). Other
+- Prebuilt release binaries are published for `linux/amd64`,
+  `linux/arm64`, and `darwin/arm64` (see Install below). Other
   OS/architecture combinations require building from source with `go
   install`.
 
@@ -57,9 +63,10 @@ Two other constraints, both deliberate:
 go install github.com/gruen/tailport/cmd/tailport@latest
 ```
 
-**Without Go**, on `linux/amd64` or `darwin/arm64`, fetch a prebuilt binary
-from this repo's [GitHub Releases](https://github.com/gruen/tailport/releases)
-using the bundled install script. Either run it after cloning:
+**Without Go**, on Linux (`amd64`/`arm64`) or macOS (`arm64`), fetch a
+prebuilt binary from this repo's
+[GitHub Releases](https://github.com/gruen/tailport/releases) using the
+bundled install script. Either run it after cloning:
 
 ```sh
 ./install.sh
@@ -85,22 +92,32 @@ are currently exposed on your tailnet.
 
 | Key | Action |
 | --- | --- |
-| `enter` / `space` | Toggle `tailscale serve` on/off for the selected port |
-| `n` | Open a text-input to type a port number (even one nothing is listening on yet) and toggle it on |
-| `l` | Label the selected port with custom text (prefilled with its resolved process name) |
+| `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port |
+| `p` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
+| `c` | Copy the selected port's tailnet URL to the clipboard (via OSC 52, so it works over SSH) |
+| `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
+| `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
+| `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to expose it once its service is up |
+| `l` | Label the selected port with custom text (prefilled with its current label if set, else the process name) |
 | `f` | Favorite the selected port, pinning it to the default view |
 | `u` | Unfavorite the selected port |
 | `a` | Toggle between the default view and showing every listening port |
+| `/` | Filter by port number, process, or label (fuzzy) |
 | `r` | Refresh the port list and serve status |
+| `?` | Toggle the full help overlay |
 | `q` / `ctrl+c` | Quit |
 
-An exposed port shows a filled marker (●) and the `http://<hostname>:<port>`
-URL it's reachable at from other tailnet devices; an unexposed one shows a
-hollow marker (○). A favorited port additionally shows a star (★). The name
-shown next to a port is its custom label if you've set one, otherwise its
-resolved process name — or `?` if that can't be determined, which happens
-when the port belongs to a process owned by a different user (most
-commonly `root`) than the one running tailport.
+Each row's leading marker encodes the port's exposure state — idle,
+tailnet-served, public (funnel), or served-but-nothing-listening; see
+[Status markers](#status-markers) below for the exact glyphs. A
+tailnet-served port shows the `http://<hostname>:<port>` URL it's reachable
+at from other tailnet devices; a funnelled port shows its public HTTPS URL
+instead. A favorited port additionally shows a star (★). The name shown next
+to a port is its custom label if you've set one, otherwise its resolved
+process name (or `was <name>` for a favorite whose process has since exited)
+— or `?` if that can't be determined, which happens when the port belongs to
+a process owned by a different user (most commonly `root`) than the one
+running tailport.
 
 ### Default view and the port registry
 
@@ -113,12 +130,12 @@ shows the union of:
   favorited.
 
 A port earns a place in the registry the moment you interact with it —
-toggling it on (via `enter`/`space` or `n`), labeling it (`l`), or
-favoriting it (`f`) all add it. Once a port is in the registry it keeps
-showing up, marked inactive, even after you toggle it off — and that
-persists across restarts, not just for the current session. `u` on a port
-that has no label reverses this: it's dropped from the registry and
-disappears from the default view (unless it's currently active).
+serving it (`space`), adding it by number (`n`), labeling it (`l`),
+favoriting it (`f`), or locking it (`x`) all add it. Once a port is in the
+registry it keeps showing up, marked inactive, even after you toggle it off —
+and that persists across restarts, not just for the current session. `u` on a
+port that has no label and isn't locked reverses this: it's dropped from the
+registry and disappears from the default view (unless it's currently active).
 
 Press `a` to bypass the registry entirely and see every port currently
 listening on the machine, whether known to tailport or not — useful for
@@ -126,7 +143,7 @@ finding something new to expose, label, or favorite.
 
 ## Configuration
 
-On first run, tailport writes an empty registry (`ports: {}`) to:
+On first run, tailport writes a registry seeded with `:22` (SSH) locked to:
 
 ```
 $XDG_CONFIG_HOME/tailport/config.yaml
@@ -134,23 +151,28 @@ $XDG_CONFIG_HOME/tailport/config.yaml
 
 or, if `XDG_CONFIG_HOME` isn't set, `~/.config/tailport/config.yaml`. It
 won't overwrite an existing file. This is the port registry described
-above — labels and favorites, keyed by port number — and it's rewritten
-automatically every time you toggle, label, or favorite/unfavorite a port
-from within the app. You generally shouldn't need to hand-edit it, but the
-format is plain YAML if you want to:
+above — labels, favorites, and locks, keyed by port number — and it's
+rewritten automatically every time you toggle, label, favorite/unfavorite, or
+lock a port from within the app. You generally shouldn't need to hand-edit
+it, but the format is plain YAML if you want to:
 
 ```yaml
 ports:
+    22:
+        locked: true
     3000:
         label: dev server
         favorite: true
     9000: {}
 ```
 
-An entry can have a `label`, be marked `favorite`, or both. An empty entry
-(`{}`, as for `9000` above) means "keep this in the default view" without
-a custom label or favorite status — the state left behind by toggling a
-port on without labeling or favoriting it.
+An entry can have a `label`, be marked `favorite`, and/or be `locked` (a
+locked port can't be served until you unlock it — `:22` ships locked by
+default). An empty entry (`{}`, as for `9000` above) means "keep this in the
+default view" without any of those — the state left behind by serving a port
+without labeling or favoriting it. tailport also records a `last_process` key
+per port automatically (the name it last saw listening, used for the
+`was <name>` display); you don't set that by hand.
 
 ### Status markers
 
@@ -187,10 +209,11 @@ yourself.
 
 ## Troubleshooting
 
-### "exposed, nothing listening" (a dangling forward)
+### Dangling forward (`▲` / `🪹`, "bound to tailscale")
 
-A row marked `▲` / `🪹` means the `serve` mapping is up but no local process
-holds the port. Two common cases:
+A row marked `▲` / `🪹` — whose description reads *"bound to tailscale, press
+space to release/unbind"* — means the `serve` mapping is up but no local
+process holds the port. Two common cases:
 
 - **The app just isn't running** (it died, or hasn't started). Start it, or
   un-expose the port — `space` on the row, or `C` to clear all stale forwards.
