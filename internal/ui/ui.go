@@ -397,8 +397,9 @@ type model struct {
 	flashID    int
 	// configPath is the resolved absolute path where preferences (the port
 	// registry: favorites, labels, locks) are persisted, captured once at
-	// New() from config.Path() so the help overlay can state it exactly --
-	// honoring XDG_CONFIG_HOME rather than guessing (gahj). Empty if
+	// New() from config.Path(cfg.ResolvedPath()) so the help overlay can
+	// state it exactly -- honoring an explicit -c/--config override or
+	// XDG_CONFIG_HOME rather than guessing (gahj, y4gt). Empty if
 	// config.Path() errored, in which case helpView describes the rule instead.
 	configPath string
 	// emoji selects the egg-lifecycle exposure markers over the ASCII fallback,
@@ -452,7 +453,21 @@ func emojiCapable() bool {
 	return strings.Contains(loc, "utf-8") || strings.Contains(loc, "utf8")
 }
 
-func New(cfg config.Config) model {
+// New builds the initial model from a loaded Config. markersOverride is an
+// optional, run-only "--markers" value (zn2x): the caller (main.go, after
+// its own validation) passes at most one string. When it's non-empty it
+// wins for THIS session's glyph choice (m.emoji, resolved once below), but
+// it deliberately never touches cfg.Markers itself -- cfg is stored as-is
+// into m.cfg, which is what any later Save() (triggered by an unrelated
+// mutation: favorite/label/lock/etc.) writes back to disk. Mutating
+// cfg.Markers here would leak the run-only override into the persisted
+// config on the next unrelated save, which is exactly what "applies to the
+// current run only; never rewrites config" rules out.
+//
+// It's variadic rather than a plain second parameter so every existing
+// New(cfg) call site (there are dozens across ui_test.go) keeps compiling
+// unchanged; only ui.Run passes an override today.
+func New(cfg config.Config, markersOverride ...string) model {
 	host, _ := os.Hostname()
 
 	l := list.New(nil, newPortDelegate(), 0, 0)
@@ -506,15 +521,29 @@ func New(cfg config.Config) model {
 	h := help.New()
 
 	// Resolve the config path once here (best-effort) so the help overlay can
-	// show exactly where settings live, XDG override and all. On error we leave
-	// it empty and helpView falls back to describing the rule.
-	configPath, _ := config.Path()
+	// show exactly where settings live, -c/--config and XDG overrides all. If
+	// cfg came from config.Load, ResolvedPath() already pins the exact file;
+	// otherwise (e.g. a literal built directly by a test) this falls back to
+	// normal XDG/~/.config resolution. On error we leave it empty and
+	// helpView falls back to describing the rule.
+	configPath, _ := config.Path(cfg.ResolvedPath())
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(cfg.Markers)}
+	// Run-only markers override (zn2x): flag > cfg.Markers > terminal
+	// auto-detect. Only the resolved emoji bool below is affected; cfg
+	// itself (and thus what a later Save() persists) is untouched.
+	markersMode := cfg.Markers
+	if len(markersOverride) > 0 && markersOverride[0] != "" {
+		markersMode = markersOverride[0]
+	}
+
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(markersMode)}
 }
 
-func Run(cfg config.Config) error {
-	_, err := tea.NewProgram(New(cfg), tea.WithAltScreen()).Run()
+// Run launches the interactive TUI. markersOverride is an optional, run-only
+// "--markers" value (zn2x); see New for why it's kept separate from
+// cfg.Markers rather than overwriting it.
+func Run(cfg config.Config, markersOverride string) error {
+	_, err := tea.NewProgram(New(cfg, markersOverride), tea.WithAltScreen()).Run()
 	return err
 }
 

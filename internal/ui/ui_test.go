@@ -430,7 +430,7 @@ func TestAddPortFavorites(t *testing.T) {
 	}
 
 	// (4) Persisted to disk so it survives a restart.
-	loaded, err := config.Load()
+	loaded, err := config.Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,7 +956,7 @@ func TestUnlockSSHConfirm(t *testing.T) {
 	if m.mode != entryNone {
 		t.Errorf("mode should reset after unlock; got %v", m.mode)
 	}
-	if loaded, err := config.Load(); err != nil {
+	if loaded, err := config.Load(""); err != nil {
 		t.Fatal(err)
 	} else if loaded.Ports[22].Locked {
 		t.Error("the unlock should persist to disk")
@@ -1428,7 +1428,7 @@ func TestHelpConfigPath(t *testing.T) {
 
 	// New() captures the resolved path; it must reflect the XDG override.
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
-	want, err := config.Path()
+	want, err := config.Path("")
 	if err != nil {
 		t.Fatalf("config.Path() error: %v", err)
 	}
@@ -1455,7 +1455,7 @@ func TestHelpConfigPath(t *testing.T) {
 func TestConfigSaveLines(t *testing.T) {
 	// Default rule: with XDG unset the resolved path ends at the ~/.config leaf.
 	t.Setenv("XDG_CONFIG_HOME", "")
-	def, err := config.Path()
+	def, err := config.Path("")
 	if err != nil {
 		t.Fatalf("config.Path() error: %v", err)
 	}
@@ -1694,5 +1694,78 @@ func TestResolveEmoji(t *testing.T) {
 	t.Setenv("LANG", "C")
 	if resolveEmoji("auto") {
 		t.Error("auto with a non-UTF-8 locale should resolve ascii")
+	}
+}
+
+// TestNewMarkersOverride covers zn2x's precedence and persistence contract
+// at the New()/model level (the CLI-flag validation itself is covered in
+// cmd/tailport): the override passed to New wins for rendering (m.emoji),
+// but must never leak into cfg.Markers -- and therefore never into what a
+// later, unrelated Save() (e.g. from favoriting a port) writes to disk.
+func TestNewMarkersOverride(t *testing.T) {
+	// Override wins over the persisted config value.
+	m := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"}, "ascii")
+	if m.emoji {
+		t.Error("New(cfg{Markers:emoji}, \"ascii\") should resolve ascii (flag beats config)")
+	}
+	if m.cfg.Markers != "emoji" {
+		t.Errorf("New should not mutate cfg.Markers: got %q, want the original %q", m.cfg.Markers, "emoji")
+	}
+
+	// No override (variadic omitted) falls back to cfg.Markers, exactly as
+	// before zn2x -- the common existing-call-site case stays unaffected.
+	m2 := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"})
+	if !m2.emoji {
+		t.Error("New(cfg{Markers:emoji}) with no override should still resolve emoji")
+	}
+
+	// An empty override (as when --markers wasn't passed at all) must not
+	// clobber a real config value either.
+	m3 := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"}, "")
+	if !m3.emoji {
+		t.Error("New(cfg{Markers:emoji}, \"\") should still resolve emoji (empty override = no override)")
+	}
+}
+
+// TestMarkersOverrideNeverPersisted is the end-to-end regression for the bug
+// this scaffolding guards against: launching with a --markers override, then
+// triggering an unrelated Save() (favoriting a port, exactly as "n" does),
+// must NOT write the override into the on-disk config's markers field.
+// Caught during manual verification of zn2x: an earlier implementation
+// mutated cfg.Markers directly before calling New, which looked correct in
+// isolation but leaked into every subsequent save for the rest of the
+// session.
+func TestMarkersOverrideNeverPersisted(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// Config on disk has no markers preference set (the common case).
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Markers != "" {
+		t.Fatalf("precondition: expected a fresh config with no Markers set, got %q", cfg.Markers)
+	}
+
+	m := New(cfg, "ascii")
+	if m.emoji {
+		t.Fatal("--markers ascii override should resolve ascii for this session")
+	}
+
+	// An unrelated mutation (favoriting a port, as the "n" key does) saves
+	// m.cfg to disk.
+	if cmd := m.favorite(4242); cmd != nil {
+		cmd() // saveConfig's returned cmd is only non-nil on a Save() error
+	}
+
+	reloaded, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Markers != "" {
+		t.Errorf("the run-only --markers override leaked into the persisted config: Markers = %q, want empty", reloaded.Markers)
+	}
+	if !reloaded.Ports[4242].Favorite {
+		t.Fatal("sanity check: the favorite mutation itself should have persisted")
 	}
 }

@@ -1,19 +1,34 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestPathHonorsXDGConfigHome(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdgtest")
-	got, err := Path()
+	got, err := Path("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := filepath.Join("/tmp/xdgtest", "tailport", "config.yaml")
 	if got != want {
-		t.Errorf("Path() = %q, want %q", got, want)
+		t.Errorf("Path(\"\") = %q, want %q", got, want)
+	}
+}
+
+// TestPathOverrideWinsOverXDG covers y4gt's precedence rule: an explicit
+// override (as -c/--config passes) always wins, even when XDG_CONFIG_HOME is
+// also set.
+func TestPathOverrideWinsOverXDG(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdgtest")
+	got, err := Path("/tmp/explicit-override.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/tmp/explicit-override.yaml"; got != want {
+		t.Errorf("Path(override) = %q, want %q", got, want)
 	}
 }
 
@@ -62,7 +77,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("Save() error: %v", err)
 	}
 
-	got, err := Load()
+	got, err := Load("")
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -92,7 +107,7 @@ func TestMarkersRoundTrip(t *testing.T) {
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
-	got, err := Load()
+	got, err := Load("")
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -104,7 +119,7 @@ func TestMarkersRoundTrip(t *testing.T) {
 func TestLoadReturnsDefaultWhenAbsent(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	got, err := Load()
+	got, err := Load("")
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -114,5 +129,55 @@ func TestLoadReturnsDefaultWhenAbsent(t *testing.T) {
 	}
 	if meta, ok := got.Ports[22]; !ok || !meta.Locked {
 		t.Errorf("expected port 22 to be present and locked when no config file exists, got %+v (ok=%v)", meta, ok)
+	}
+}
+
+// TestOverridePathIsolatesFromXDGDefault covers y4gt's acceptance bar
+// directly: an explicit override path seeds, loads, and saves at that exact
+// file, and never touches the XDG-resolved default -- even when a mutation
+// (Save, via the round-tripped Config) happens afterward.
+func TestOverridePathIsolatesFromXDGDefault(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	overridePath := filepath.Join(t.TempDir(), "profile-a.yaml")
+
+	// WriteDefault seeds only the override path.
+	if err := WriteDefault(overridePath); err != nil {
+		t.Fatalf("WriteDefault(override) error: %v", err)
+	}
+	if _, err := os.Stat(overridePath); err != nil {
+		t.Fatalf("expected override path to be seeded: %v", err)
+	}
+	xdgDefault, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+	if _, err := os.Stat(xdgDefault); !os.IsNotExist(err) {
+		t.Fatalf("WriteDefault(override) must not touch the XDG default; stat err = %v", err)
+	}
+
+	// Load reads back from the override path and binds ResolvedPath to it.
+	cfg, err := Load(overridePath)
+	if err != nil {
+		t.Fatalf("Load(override) error: %v", err)
+	}
+	if cfg.ResolvedPath() != overridePath {
+		t.Errorf("cfg.ResolvedPath() = %q, want %q", cfg.ResolvedPath(), overridePath)
+	}
+
+	// A mutation + Save persists back to the override path only.
+	cfg.Ports[3000] = PortMeta{Label: "profile-a"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	reloaded, err := Load(overridePath)
+	if err != nil {
+		t.Fatalf("Load(override) after save error: %v", err)
+	}
+	if reloaded.Ports[3000].Label != "profile-a" {
+		t.Errorf("expected the mutation to persist at the override path, got %+v", reloaded.Ports[3000])
+	}
+	if _, err := os.Stat(xdgDefault); !os.IsNotExist(err) {
+		t.Fatalf("Save() after Load(override) must not create the XDG default; stat err = %v", err)
 	}
 }
