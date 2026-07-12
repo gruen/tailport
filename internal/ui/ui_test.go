@@ -2449,15 +2449,21 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	}
 }
 
-// TestBottomBarGridAligned drives the real model at a wide width and asserts
-// the bar renders the four grouped columns with a header row and aligned
-// gutters: descriptions line up within a column and columns line up across
-// rows. With no dangling, Expose is space/p/x (lock last, clean dropped) and
-// Favorites is the tallest column (f/u/n/c/l), so the grid is a header + 5 rows.
+// TestBottomBarGridAligned drives the real model at a width just below the
+// 04rb fold threshold (~70, the width Favorites' fold needs to fit -- see
+// TestBottomBarGridFolds) and asserts the bar renders the four grouped
+// columns UNFOLDED, at their exact packed floor width, with a header row and
+// aligned gutters: descriptions line up within a column and columns line up
+// across rows. With no dangling, Expose is space/p/x (lock last, clean
+// dropped) and Favorites is the tallest column (f/u/n/c/l), so the grid is a
+// header + 5 rows. (Previously this used width=100, which now has enough
+// surplus to fold Favorites/Expose/View -- see TestBottomBarGridFolds for
+// that behavior instead.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
-	m.help.Width = 100
-	m.width = 100
+	const width = 65 // packed floor is 58 wide; Favorites' fold needs >=70
+	m.help.Width = width
+	m.width = width
 
 	grid := stripANSI(m.renderLegend())
 	lines := strings.Split(grid, "\n")
@@ -2538,6 +2544,111 @@ func TestBottomBarGridAligned(t *testing.T) {
 	_, funnelCol := at("funnel")
 	if serveCol != funnelCol {
 		t.Errorf("Expose gutter misaligned: serve at %d, funnel at %d", serveCol, funnelCol)
+	}
+}
+
+// TestBottomBarGridFolds covers 04rb's width-driven fold: once the terminal
+// has more room than the packed grid needs, a tall group's single body
+// sub-column splits into 2 column-major sub-columns instead of the groups
+// spreading apart with bigger gutters -- which SHORTENS the bar (its height
+// is set by the tallest group's row count), tallest group first, never past
+// 2 sub-columns per group, and stops folding as soon as a candidate no
+// longer fits.
+func TestBottomBarGridFolds(t *testing.T) {
+	lineOf := func(lines []string, needle string) int {
+		for i, ln := range lines {
+			if strings.Contains(ln, needle) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	m := New(config.Config{})
+
+	// Floor: below the fold threshold (Favorites' fold needs total width
+	// >=70; see the 58-wide packed floor in TestBottomBarNarrowFallback), the
+	// grid is the exact packed layout -- header + 5 rows (Favorites, the
+	// tallest group unfolded, is f/u/n/c/l).
+	m.help.Width, m.width = 65, 65
+	floor := stripANSI(m.renderLegend())
+	floorLines := strings.Split(floor, "\n")
+	if len(floorLines) != 6 {
+		t.Fatalf("floor (width 65) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
+	}
+
+	// Wide: 100 cols is enough surplus to fold Favorites (tallest, 5 rows),
+	// then Expose and View (tied at 3, Expose first since it's earlier in
+	// group order), but not App (2 rows, tried last) -- folding it would push
+	// the grid past 100. Folding SHORTENS the bar: Favorites' fold (ceil(5/2)
+	// = 3 rows) is now the tallest group, so header+3 = 4 lines, fewer than
+	// the floor's 6 -- not just wider-gapped.
+	m.help.Width, m.width = 100, 100
+	wide := stripANSI(m.renderLegend())
+	wideLines := strings.Split(wide, "\n")
+	if len(wideLines) >= len(floorLines) {
+		t.Errorf("wide (100) grid (%d lines) should be shorter than the floor grid (%d lines) once tall groups fold:\nfloor:\n%s\nwide:\n%s",
+			len(wideLines), len(floorLines), floor, wide)
+	}
+
+	// Favorites folded: top-heavy column-major split -- f/u/n down the first
+	// sub-column, c/l down the second (never a dangling item left stranded
+	// atop an empty second sub-column). "c copy URL" now sits beside
+	// "f favorite" on the SAME row, not two rows below it as in the floor.
+	if r1, r2 := lineOf(wideLines, "f favorite"), lineOf(wideLines, "c copy URL"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold f favorite/c copy URL onto the same row; f favorite row %d, c copy URL row %d:\n%s", r1, r2, wide)
+	}
+	if r1, r2 := lineOf(wideLines, "u unfavorite"), lineOf(wideLines, "l label"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold u unfavorite/l label onto the same row; u unfavorite row %d, l label row %d:\n%s", r1, r2, wide)
+	}
+	if r := lineOf(wideLines, "n add favorite"); r < 0 {
+		t.Errorf("n add favorite missing from wide grid:\n%s", wide)
+	} else if strings.Contains(wideLines[r], "l label") {
+		t.Errorf("n add favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+	}
+
+	// Expose folded too (tied at 3 with View, but earlier in group order so
+	// tried first): space serve | x lock/unlock on one row.
+	if r1, r2 := lineOf(wideLines, "space serve"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
+		t.Errorf("Expose should fold space serve/x lock/unlock onto the same row; space serve row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+	}
+
+	// App (only 2 bindings, tried last) doesn't fit the fold at width 100 --
+	// it stays a single unfolded column: help and quit on SEPARATE rows.
+	if r1, r2 := lineOf(wideLines, "? help"), lineOf(wideLines, "q quit"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("App should NOT fold at width 100 (no surplus left after the other 3 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
+	}
+
+	// Ceiling: a very wide terminal folds ALL FOUR groups, App included,
+	// never past 2 sub-columns per group. Past that point extra width just
+	// sits blank on the right -- no re-growing, no gutter-stretching.
+	m.help.Width, m.width = 200, 200
+	ceiling := stripANSI(m.renderLegend())
+	m.help.Width, m.width = 400, 400
+	pastCeiling := stripANSI(m.renderLegend())
+	if ceiling != pastCeiling {
+		t.Errorf("grid should stop changing once every group is folded; width=200 and width=400 rendered differently:\n200:\n%s\n400:\n%s", ceiling, pastCeiling)
+	}
+	ceilingLines := strings.Split(ceiling, "\n")
+	if r1, r2 := lineOf(ceilingLines, "? help"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold at the ceiling width (? help | q quit on one row); ? help row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	}
+
+	// Still no truncation/ellipsis at the ceiling: every hint present. ("p
+	// funnel public" isn't checked as a single-space literal here: unlike the
+	// wrapped fallback, the grid pads keys to their sub-column's gutter --
+	// Expose's folded left sub-col gutter is 5 (from "space"), so "p" renders
+	// padded ("p     funnel public") -- checking the description alone
+	// sidesteps that padding.)
+	for _, want := range []string{
+		"space serve", "funnel public", "x lock/unlock",
+		"f favorite", "u unfavorite", "n add favorite", "c copy URL", "l label",
+		"/ filter", "a switch view", "r refresh",
+		"? help", "q quit",
+	} {
+		if !strings.Contains(ceiling, want) {
+			t.Errorf("ceiling grid dropped %q; got:\n%s", want, ceiling)
+		}
 	}
 }
 
@@ -2695,6 +2806,40 @@ func TestLegendSizingNoClip(t *testing.T) {
 				t.Errorf("bottom bar clipped: %q not found in View:\n%s", "q quit", plain)
 			}
 		})
+	}
+}
+
+// TestLegendReservationDominatesLive pins the invariant TestLegendSizingNoClip
+// depends on, across every width rather than a handful of samples: the
+// WindowSizeMsg height reservation (ui.go's Update, renderLegendWith(true) --
+// worst case, as if a dangling forward existed) must never be SHORTER than
+// the live render with no dangling (renderLegendWith(false), which drops "C
+// clean stale" and so renders Expose with one fewer binding).
+//
+// Before 04rb this held trivially: maxRows was always Favorites' fixed 5
+// bindings, independent of width or the Clean row. After 04rb, bar height is
+// width- and fold-dependent, and folding is keyed off each group's
+// UNFOLDED binding count, which differs between the two calls (Expose: 4
+// bindings reserved vs 3 live). It still holds today, but only because
+// ceil(4/2) == ceil(3/2) == 2 and "clean stale"/"lock/unlock" happen to be
+// the same length (11 chars), so Expose's rendered width AND row count come
+// out identical either way, and every other group's fold decision (driven by
+// the shared total-width budget) is therefore unaffected by cleanEnabled too.
+// That's an incidental tie in today's copy, not something the code enforces
+// -- a future edit to keyLegendDescs/newKeyMap's Expose text or binding count
+// could silently break it and reintroduce the exact clipping bug the
+// reservation exists to prevent. Brute-forcing width here (rather than
+// TestLegendSizingNoClip's few sampled widths) is what would actually catch
+// that regression.
+func TestLegendReservationDominatesLive(t *testing.T) {
+	m := New(config.Config{})
+	for w := 1; w <= 300; w++ {
+		m.help.Width = w
+		reserved := strings.Count(m.renderLegendWith(true), "\n") + 1
+		live := strings.Count(m.renderLegendWith(false), "\n") + 1
+		if reserved < live {
+			t.Fatalf("width %d: reserved height %d < live height %d -- the worst-case reservation no longer dominates, WindowSizeMsg would under-reserve and clip the list", w, reserved, live)
+		}
 	}
 }
 

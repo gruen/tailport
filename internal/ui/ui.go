@@ -85,16 +85,32 @@ var (
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
 	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#303030", Dark: "252"})
 
+	// barHintColor (04rb) is the muted grey shared by both the bottom-bar key
+	// and description. It is the EXACT same hex pair bubbles/list's
+	// DefaultDelegate uses for its own idle-row description foreground
+	// (list.NewDefaultItemStyles().NormalDesc, charmbracelet/bubbles
+	// list/defaultitem.go) -- the grey behind this app's "not exposed" text
+	// (Description(), see portItem) -- so the bar's hints read at the same
+	// muted level as the rest of the app's secondary text instead of standing
+	// out as a brighter accent. Duplicated here as a literal (rather than
+	// derived via a type assertion on bubbles' returned style at init time)
+	// so a future bubbles upgrade can't panic tailport's startup over a
+	// cosmetic color; TestBottomBarHintStylesContrast pins the value.
+	barHintColor = lipgloss.AdaptiveColor{Light: "#A49FA5", Dark: "#777777"}
+
 	// barKeyStyle colors the KEY of each bottom-bar hint (the "space" in "space
-	// serve"). It replaces bubbles/help's built-in ShortKey default, which is a
-	// deliberately faint gray (#909090 light / #626262 dark) that washed out
-	// against the terminal background; the descriptions use helpTextStyle
-	// (#303030 / 252). Both are wired onto m.help.Styles in newModel. This is a
-	// monochrome, no-new-hue contrast bump (bold near-white key over light-gray
-	// desc), so the reorganized grouped hints (p39s) read clearly without pulling
-	// the overlay's blue key color down into the bar. Verified against both
-	// backgrounds by TestBottomBarHintStylesContrast.
-	barKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "255"}).Bold(true)
+	// serve"); barDescStyle colors its description. Both replace bubbles/help's
+	// built-in ShortKey/ShortDesc defaults and share barHintColor -- the same
+	// muted grey as the list's idle description -- so the bar doesn't outshine
+	// the rest of the app's secondary text. Keys stay BOLD so they still anchor
+	// the row without needing a brighter hue; descriptions are plain weight.
+	// Both are wired onto m.help.Styles in newModel. Group headers keep their
+	// own accent (helpTitleStyle, green) -- the bar's only non-muted color.
+	// This walks back part of kata c5n8's "brighter monochrome key hints" --
+	// see TestBottomBarHintStylesContrast for the (lower, but still
+	// app-wide-accepted) contrast floor this now targets.
+	barKeyStyle  = lipgloss.NewStyle().Foreground(barHintColor).Bold(true)
+	barDescStyle = lipgloss.NewStyle().Foreground(barHintColor)
 
 	// logoStyle draws the persistent cyan "tailport" wordmark pinned to the
 	// top-left of every view (list and empty-state alike); see renderHeader.
@@ -706,12 +722,13 @@ func New(cfg config.Config, markersOverride ...string) model {
 
 	h := help.New()
 	// Swap bubbles/help's faint default key/desc colors for tailport's own
-	// higher-contrast pair so the bottom-bar hints read clearly against the
-	// terminal background (see barKeyStyle). renderLegendGrid / renderGroupedBar
-	// pull ShortKey/ShortDesc straight off m.help.Styles, so this is the single
+	// muted-grey pair (barHintColor, 04rb) so the bottom-bar hints read at the
+	// same secondary level as the rest of the app instead of standing out (see
+	// barKeyStyle / barDescStyle). renderLegendGrid / renderGroupedBar pull
+	// ShortKey/ShortDesc straight off m.help.Styles, so this is the single
 	// wiring point; the header row keeps its green helpTitleStyle.
 	h.Styles.ShortKey = barKeyStyle
-	h.Styles.ShortDesc = helpTextStyle
+	h.Styles.ShortDesc = barDescStyle
 
 	// Resolve the config path once here (best-effort) so the help overlay can
 	// show exactly where settings live, -c/--config and XDG overrides all. If
@@ -1827,17 +1844,19 @@ func (m model) renderLegend() string {
 }
 
 // renderLegendWith renders the grouped keybinding legend (kata p39s). When the
-// aligned column grid fits the width it renders that; otherwise it falls back to
-// a wrapped grouped bar. Neither ever truncates or ellipsizes a hint -- narrow
-// terminals wrap, they never clip. The width source is m.help.Width (set from
-// each WindowSizeMsg); width <= 0 means unbounded, so the full grid renders.
+// aligned column grid fits the width it renders that -- folding tall groups
+// into 2 sub-columns to spend any surplus width (04rb, see renderLegendGrid);
+// otherwise it falls back to a wrapped grouped bar. Neither ever truncates or
+// ellipsizes a hint -- narrow terminals wrap, they never clip. The width
+// source is m.help.Width (set from each WindowSizeMsg); width <= 0 means
+// unbounded, so the full (unfolded) grid renders.
 //
 // cleanEnabled controls the contextual "C clean stale" hint (shown only when
 // dangling forwards exist). WindowSizeMsg passes true to reserve the worst-case
 // height; the live render passes m.hasDangling().
 func (m model) renderLegendWith(cleanEnabled bool) string {
 	groups := m.barGroups(cleanEnabled)
-	grid, gridWidth := renderLegendGrid(m.help.Styles, groups)
+	grid, gridWidth := renderLegendGrid(m.help.Styles, groups, m.help.Width)
 	if m.help.Width > 0 && m.help.Width < gridWidth {
 		return renderGroupedBar(m.help.Styles, groups, m.help.Width)
 	}
@@ -1870,83 +1889,235 @@ func (m model) barGroups(cleanEnabled bool) []keyGroup {
 	return out
 }
 
+// legendSubColGap (04rb) is the gutter between a folded group's two
+// sub-columns -- kept the same tight width as legendColGap so a folded group
+// reads consistently with the inter-group gutter, per the issue's locked
+// "no gutter-stretching" decision.
+const legendSubColGap = legendColGap
+
+// legendCell is one "key desc" hint, the smallest unit renderLegendGrid lays
+// out.
+type legendCell struct{ key, desc string }
+
+// legendGroupLayout is one group's column-grid rendering plan: either a
+// single body sub-column (unfolded) or, when folded, two column-major
+// sub-columns (04rb). subcols/keyGutter/subWidth are parallel per-sub-column
+// slices (len 1 or 2); width is the group's total column width (including any
+// inter-sub-col gutter), used for the header cell and the inter-group gutter;
+// rows is the number of body rows this group occupies, which is what makes
+// folding shorten the bar -- the grid's overall height is the max rows across
+// every group.
+type legendGroupLayout struct {
+	name      string
+	subcols   [][]legendCell
+	keyGutter []int
+	subWidth  []int
+	width     int
+	rows      int
+}
+
+// legendSubColMetrics returns a sub-column's key gutter (widest key) and
+// content width (keyGutter + 1 + widest desc) for the given cells.
+func legendSubColMetrics(cells []legendCell) (keyGutter, width int) {
+	for _, c := range cells {
+		if w := lipgloss.Width(c.key); w > keyGutter {
+			keyGutter = w
+		}
+	}
+	for _, c := range cells {
+		if w := keyGutter + 1 + lipgloss.Width(c.desc); w > width {
+			width = w
+		}
+	}
+	return keyGutter, width
+}
+
+// legendUnfoldedLayout lays out a group as a single body sub-column -- today's
+// exact packed shape (the fold floor).
+func legendUnfoldedLayout(name string, cells []legendCell) legendGroupLayout {
+	keyGutter, contentWidth := legendSubColMetrics(cells)
+	groupWidth := contentWidth
+	if w := lipgloss.Width(name); w > groupWidth {
+		groupWidth = w
+	}
+	return legendGroupLayout{
+		name:      name,
+		subcols:   [][]legendCell{cells},
+		keyGutter: []int{keyGutter},
+		subWidth:  []int{contentWidth},
+		width:     groupWidth,
+		rows:      len(cells),
+	}
+}
+
+// legendFoldedLayout lays out a group as 2 column-major sub-columns (04rb,
+// max 2 -- never 3+, a locked decision): the first sub-column is top-heavy,
+// taking ceil(n/2) cells so it never leaves a dangling single item stranded
+// atop an otherwise-empty second sub-column (e.g. Favorites' f/u/n over
+// c/l). Rows within a sub-column keep read order; the two sub-columns render
+// side by side on the SAME row indices (sub-column 2's first cell sits beside
+// sub-column 1's first cell, not shifted down).
+// legendFoldedLayout requires len(cells) >= 2 (its only caller, renderLegendGrid,
+// never folds a group with fewer bindings than that -- see its "nothing to
+// gain" guard), so the ceil(n/2) split below always leaves right non-empty.
+func legendFoldedLayout(name string, cells []legendCell) legendGroupLayout {
+	split := (len(cells) + 1) / 2 // ceil(n/2)
+	left, right := cells[:split], cells[split:]
+	kg1, w1 := legendSubColMetrics(left)
+	kg2, w2 := legendSubColMetrics(right)
+	contentWidth := w1 + legendSubColGap + w2
+	groupWidth := contentWidth
+	if w := lipgloss.Width(name); w > groupWidth {
+		groupWidth = w
+	}
+	rows := len(left) // top-heavy split: left is always >= right in length
+	return legendGroupLayout{
+		name:      name,
+		subcols:   [][]legendCell{left, right},
+		keyGutter: []int{kg1, kg2},
+		subWidth:  []int{w1, w2},
+		width:     groupWidth,
+		rows:      rows,
+	}
+}
+
 // renderLegendGrid lays the groups out as an aligned column grid: a styled
 // header row over, per group, a left-aligned key gutter + description. Column
 // widths are computed from content (header vs the widest "key desc"), and every
 // cell is padded so the columns line up. It returns the rendered grid and its
 // total display width, which renderLegendWith uses as the responsive threshold.
-func renderLegendGrid(styles help.Styles, groups []keyGroup) (string, int) {
+//
+// (04rb) Bar height is set by the tallest group (today, Favorites' 5
+// bindings). When width leaves surplus room past the packed (unfolded) grid,
+// that surplus is spent folding a group's single body sub-column into 2
+// column-major sub-columns instead -- which SHORTENS the bar, rather than
+// spreading the groups apart with bigger gutters (explicitly rejected: it
+// just looks empty). The algorithm is greedy and tallest-group-first: sort
+// groups by (unfolded) row count descending, then try folding each in turn,
+// keeping a fold only if the grid still fits width and stopping at the first
+// fold that doesn't -- no backtracking to try a smaller group afterward. A
+// group with fewer than 2 bindings is never folded (splitting a single row
+// can't shorten anything). The floor is today's exact packed layout (no
+// folds fit, or width <= 0/unbounded); the ceiling is all four groups folded,
+// with any leftover width past that left as trailing space on the right --
+// per the issue's locked decision, no justification/stretching to fill it.
+func renderLegendGrid(styles help.Styles, groups []keyGroup, width int) (string, int) {
 	n := len(groups)
 	if n == 0 {
 		return "", 0
 	}
-	type cell struct{ key, desc string }
-	cols := make([][]cell, n)
-	keyGutter := make([]int, n)
-	colWidth := make([]int, n)
-	maxRows := 0
-	for c, g := range groups {
-		for _, b := range g.bindings {
+
+	layouts := make([]legendGroupLayout, n)
+	for i, g := range groups {
+		cells := make([]legendCell, len(g.bindings))
+		for j, b := range g.bindings {
 			h := b.Help()
-			cols[c] = append(cols[c], cell{h.Key, h.Desc})
-			if w := lipgloss.Width(h.Key); w > keyGutter[c] {
-				keyGutter[c] = w
+			cells[j] = legendCell{h.Key, h.Desc}
+		}
+		layouts[i] = legendUnfoldedLayout(g.name, cells)
+	}
+
+	totalWidth := func() int {
+		total := 0
+		for i, l := range layouts {
+			total += l.width
+			if i < n-1 {
+				total += legendColGap
 			}
 		}
-		if len(cols[c]) > maxRows {
-			maxRows = len(cols[c])
+		return total
+	}
+
+	if width > 0 {
+		order := make([]int, n)
+		for i := range order {
+			order[i] = i
 		}
-		colWidth[c] = lipgloss.Width(g.name)
-		for _, cl := range cols[c] {
-			if w := keyGutter[c] + 1 + lipgloss.Width(cl.desc); w > colWidth[c] {
-				colWidth[c] = w
+		sort.SliceStable(order, func(a, b int) bool {
+			// layouts are still all-unfolded here, so .rows == len(bindings) --
+			// reuse it rather than re-deriving the same count from groups.
+			return layouts[order[a]].rows > layouts[order[b]].rows
+		})
+		for _, idx := range order {
+			if layouts[idx].rows < 2 {
+				continue
 			}
+			cells := layouts[idx].subcols[0]
+			prev := layouts[idx]
+			layouts[idx] = legendFoldedLayout(groups[idx].name, cells)
+			if totalWidth() <= width {
+				continue // keep the fold, move to the next-tallest candidate
+			}
+			layouts[idx] = prev // didn't fit -- revert and stop entirely
+			break
 		}
 	}
 
-	total := 0
-	for c, w := range colWidth {
-		total += w
-		if c < n-1 {
-			total += legendColGap
+	return renderLegendRows(styles, layouts), totalWidth()
+}
+
+// renderLegendRows renders a computed set of group layouts (renderLegendGrid)
+// into the final header + data-row grid string: the header row carries each
+// group's name padded to its total column width, and each data row walks
+// every group's sub-column(s) left to right, padding short/empty cells so
+// every column -- and, within a folded group, every sub-column -- lines up
+// across rows.
+func renderLegendRows(styles help.Styles, layouts []legendGroupLayout) string {
+	n := len(layouts)
+	maxRows := 0
+	for _, l := range layouts {
+		if l.rows > maxRows {
+			maxRows = l.rows
 		}
 	}
 
 	gap := strings.Repeat(" ", legendColGap)
+	subGap := strings.Repeat(" ", legendSubColGap)
 	var lines []string
 
-	// Header row: the group names, each padded to its column width.
+	// Header row: the group names, each padded to its total column width.
 	var hb strings.Builder
-	for c, g := range groups {
-		hb.WriteString(helpTitleStyle.Render(g.name))
-		hb.WriteString(strings.Repeat(" ", colWidth[c]-lipgloss.Width(g.name)))
+	for c, l := range layouts {
+		hb.WriteString(helpTitleStyle.Render(l.name))
+		hb.WriteString(strings.Repeat(" ", l.width-lipgloss.Width(l.name)))
 		if c < n-1 {
 			hb.WriteString(gap)
 		}
 	}
 	lines = append(lines, strings.TrimRight(hb.String(), " "))
 
-	// Data rows: key gutter + description, padded to align.
+	// Data rows: each group's sub-column(s), key gutter + description, padded
+	// to align both across groups and, within a folded group, across its two
+	// sub-columns.
 	for r := 0; r < maxRows; r++ {
 		var rb strings.Builder
-		for c := range groups {
-			plainW := 0
-			if r < len(cols[c]) {
-				cl := cols[c][r]
-				rb.WriteString(styles.ShortKey.Inline(true).Render(cl.key))
-				rb.WriteString(strings.Repeat(" ", keyGutter[c]-lipgloss.Width(cl.key)))
-				rb.WriteString(" ")
-				rb.WriteString(styles.ShortDesc.Inline(true).Render(cl.desc))
-				plainW = keyGutter[c] + 1 + lipgloss.Width(cl.desc)
+		for c, l := range layouts {
+			used := 0
+			for sc, cells := range l.subcols {
+				if sc > 0 {
+					rb.WriteString(subGap)
+					used += legendSubColGap
+				}
+				if r < len(cells) {
+					cl := cells[r]
+					rb.WriteString(styles.ShortKey.Inline(true).Render(cl.key))
+					rb.WriteString(strings.Repeat(" ", l.keyGutter[sc]-lipgloss.Width(cl.key)))
+					rb.WriteString(" ")
+					rb.WriteString(styles.ShortDesc.Inline(true).Render(cl.desc))
+					used += l.keyGutter[sc] + 1 + lipgloss.Width(cl.desc)
+				} else {
+					rb.WriteString(strings.Repeat(" ", l.subWidth[sc]))
+					used += l.subWidth[sc]
+				}
 			}
-			rb.WriteString(strings.Repeat(" ", colWidth[c]-plainW))
+			rb.WriteString(strings.Repeat(" ", l.width-used))
 			if c < n-1 {
 				rb.WriteString(gap)
 			}
 		}
 		lines = append(lines, strings.TrimRight(rb.String(), " "))
 	}
-	return strings.Join(lines, "\n"), total
+	return strings.Join(lines, "\n")
 }
 
 // renderGroupedBar is the narrow-terminal fallback: it flows every group's

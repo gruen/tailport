@@ -331,18 +331,23 @@ func TestHelpViewAndLegendReflectTheme(t *testing.T) {
 	}
 }
 
-// TestBottomBarHintStylesContrast covers the follow-up to p39s's grouped
-// bottom bar: its hint rows must NOT inherit bubbles/help's faint default
-// key/desc colors (#909090/#626262 key, #B2B2B2/#4A4A4A desc -- the latter
-// nearly invisible on a dark terminal). newModel wires ShortKey -> barKeyStyle
-// (bold, high-contrast, monochrome) and ShortDesc -> helpTextStyle instead, and
-// barKeyStyle clears the same 4.5:1 WCAG bar on both backgrounds as the rest of
-// the palette. Asserted at the style level (wiring + contrast) and the
-// rendered-bytes level (the dark bar carries the bright key sequence, not the
-// faint bubbles defaults).
+// TestBottomBarHintStylesContrast covers the bottom bar's hint shading (04rb,
+// walking back part of c5n8's "brighter monochrome key hints"). The bar's key
+// AND desc now share barHintColor -- the EXACT muted grey
+// (#A49FA5 light / #777777 dark) bubbles/list's DefaultDelegate already uses
+// for this app's own idle "not exposed" row description -- with the key kept
+// BOLD so it still anchors the row without a brighter hue. That grey is
+// deliberately below the app's 4.5:1 must-fix WCAG bar (this is secondary,
+// not must-read, text -- same tier as the list's idle description), so this
+// test targets the LOWER floor that grey actually clears rather than
+// asserting the old 4.5:1 bar it was never going to meet. Asserted at the
+// style level (wiring + contrast) and the rendered-bytes level (the dark bar
+// carries barHintColor's truecolor sequence, not bubbles/help's faint
+// defaults or c5n8's old bright key sequence).
 func TestBottomBarHintStylesContrast(t *testing.T) {
-	// Wiring: the help model the TUI actually renders uses tailport's styles,
-	// not bubbles/help's faint defaults.
+	// Wiring: the help model the TUI actually renders uses tailport's muted
+	// bar styles, not bubbles/help's faint defaults -- and key/desc share the
+	// same color, with only the key bold.
 	m := New(config.Config{})
 	if got, want := m.help.Styles.ShortKey.GetForeground(), barKeyStyle.GetForeground(); got != want {
 		t.Errorf("m.help.Styles.ShortKey foreground = %v, want barKeyStyle's %v (bar still using bubbles' faint default?)", got, want)
@@ -350,33 +355,49 @@ func TestBottomBarHintStylesContrast(t *testing.T) {
 	if !m.help.Styles.ShortKey.GetBold() {
 		t.Error("m.help.Styles.ShortKey should be bold (barKeyStyle)")
 	}
-	if got, want := m.help.Styles.ShortDesc.GetForeground(), helpTextStyle.GetForeground(); got != want {
-		t.Errorf("m.help.Styles.ShortDesc foreground = %v, want helpTextStyle's %v", got, want)
+	if got, want := m.help.Styles.ShortDesc.GetForeground(), barDescStyle.GetForeground(); got != want {
+		t.Errorf("m.help.Styles.ShortDesc foreground = %v, want barDescStyle's %v", got, want)
+	}
+	if m.help.Styles.ShortDesc.GetBold() {
+		t.Error("m.help.Styles.ShortDesc should NOT be bold -- only the key anchors the row")
+	}
+	if got, want := barKeyStyle.GetForeground(), barDescStyle.GetForeground(); got != want {
+		t.Errorf("barKeyStyle/barDescStyle foreground mismatch: key %v, desc %v (both should be barHintColor)", got, want)
 	}
 
-	// Contrast: barKeyStyle clears 4.5:1 against white (light) and black (dark),
-	// the same bar as every must-fix style.
+	// Contrast: barHintColor is the SAME grey as bubbles/list's NormalDesc
+	// (list.NewDefaultItemStyles), an already-accepted app-wide muted level --
+	// computed directly rather than eyeballed: Light #A49FA5 vs white ~=
+	// 2.60:1, Dark #777777 vs black ~= 4.69:1. mutedFloor is pinned at 2.5,
+	// just below the weaker (Light) side, so this still catches an accidental
+	// slide toward invisibility without re-imposing the 4.5:1 must-fix bar
+	// this intentionally-secondary grey doesn't (and isn't meant to) clear.
+	const mutedFloor = 2.5
 	fg, ok := barKeyStyle.GetForeground().(lipgloss.AdaptiveColor)
 	if !ok {
 		t.Fatalf("barKeyStyle foreground is %T, not AdaptiveColor", barKeyStyle.GetForeground())
 	}
+	if fg != barHintColor {
+		t.Errorf("barKeyStyle foreground = %v, want barHintColor %v", fg, barHintColor)
+	}
 	if r, err := contrastRatio(fg.Light, "#ffffff"); err != nil {
 		t.Fatal(err)
-	} else if r < 4.5 {
-		t.Errorf("barKeyStyle Light %s vs white = %.2f:1, want >= 4.5:1", fg.Light, r)
+	} else if r < mutedFloor {
+		t.Errorf("barHintColor Light %s vs white = %.2f:1, want >= %.1f:1", fg.Light, r, mutedFloor)
 	}
-	darkHex, ok := ansiHexByIndex[fg.Dark]
-	if !ok {
-		t.Fatalf("no known hex for ANSI-256 index %q -- add it to ansiHexByIndex", fg.Dark)
-	}
-	if r, err := contrastRatio(darkHex, "#000000"); err != nil {
+	// barHintColor.Dark is already a truecolor hex (#777777), unlike most of
+	// this package's other AdaptiveColors, which pin an ANSI-256 index for
+	// dark-terminal byte-identity (see ansiHexByIndex) -- it needs no
+	// index->hex lookup here.
+	if r, err := contrastRatio(fg.Dark, "#000000"); err != nil {
 		t.Fatal(err)
-	} else if r < 4.5 {
-		t.Errorf("barKeyStyle Dark %s (ANSI %s) vs black = %.2f:1, want >= 4.5:1", darkHex, fg.Dark, r)
+	} else if r < mutedFloor {
+		t.Errorf("barHintColor Dark %s vs black = %.2f:1, want >= %.1f:1", fg.Dark, r, mutedFloor)
 	}
 
-	// Rendered-bytes: the dark bottom bar carries barKeyStyle's bright key
-	// sequence (38;5;255) and none of the faint bubbles/help defaults.
+	// Rendered-bytes: the dark bottom bar carries barHintColor's truecolor
+	// sequence (38;2;119;119;119, i.e. #777777) and none of bubbles/help's
+	// faint defaults or c5n8's old bright key sequence (38;5;255).
 	origProfile := lipgloss.ColorProfile()
 	origDark := lipgloss.HasDarkBackground()
 	t.Cleanup(func() {
@@ -389,12 +410,12 @@ func TestBottomBarHintStylesContrast(t *testing.T) {
 	m.help.Width = 100
 	m.width = 100
 	darkBar := m.renderLegend()
-	if !strings.Contains(darkBar, "38;5;255") {
-		t.Errorf("dark bottom bar missing barKeyStyle's bright key sequence (38;5;255):\n%q", darkBar)
+	if !strings.Contains(darkBar, "38;2;119;119;119") {
+		t.Errorf("dark bottom bar missing barHintColor's truecolor sequence (38;2;119;119;119, #777777):\n%q", darkBar)
 	}
-	for _, faint := range []string{"38;2;98;98;98", "38;2;74;74;74"} { // bubbles key/desc dark defaults
-		if strings.Contains(darkBar, faint) {
-			t.Errorf("dark bottom bar still contains bubbles/help's faint default sequence %q", faint)
+	for _, stale := range []string{"38;5;255", "38;2;98;98;98", "38;2;74;74;74"} { // c5n8's bright key + bubbles' faint defaults
+		if strings.Contains(darkBar, stale) {
+			t.Errorf("dark bottom bar still contains a stale/faint sequence %q", stale)
 		}
 	}
 }
