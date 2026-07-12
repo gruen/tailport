@@ -1585,25 +1585,77 @@ func TestConfigSaveLines(t *testing.T) {
 	}
 }
 
-// TestMarkerGlyph covers sqvm: the exposure-state marker resolves to the egg
-// lifecycle in emoji mode and the styled ASCII fallback otherwise, with funnel
-// outranking a dangling forward, which outranks a healthy serve.
+// TestMarkerGlyph covers 1exs: the exposure-state marker resolves to the
+// moon-phase reach ramp in emoji mode and the styled ASCII fallback
+// otherwise, one case per reachState (79xb), with the SAME field
+// combinations TestReachStateDescriptions/TestFunnelItemRender use to reach
+// each state -- so a glyph and its state can never quietly drift apart.
+// Every emoji case pads to a stable 2-cell column, including the naturally
+// 1-cell ✕ (reachOffline) and the VS16-bearing 🌫️ (reachStale).
 func TestMarkerGlyph(t *testing.T) {
 	cases := []struct {
 		name                 string
-		active, listening    bool
-		funnel               int
+		item                 portItem
+		wantState            reachState
 		wantEmoji, wantASCII string
 	}{
-		{"idle", false, false, 0, "🥚", "○"},
-		{"tailnet", true, true, 0, "🐣", "◉"},
-		{"dangling", true, false, 0, "🪹", "▲"},
-		{"funnel", true, true, 443, "🐦", "●"},
-		{"funnel outranks dangling", true, false, 443, "🐦", "●"},
+		{
+			name:      "A reachLocalhost",
+			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLoopback}, listening: true},
+			wantState: reachLocalhost,
+			wantEmoji: "🌑", wantASCII: "○",
+		},
+		{
+			name:      "B' reachLAN",
+			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN}, listening: true},
+			wantState: reachLAN,
+			wantEmoji: "🌒", wantASCII: "◔",
+		},
+		{
+			name:      "B reachTailnet",
+			item:      portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true},
+			wantState: reachTailnet,
+			wantEmoji: "🌓", wantASCII: "◑",
+		},
+		{
+			name:      "C reachServed",
+			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true},
+			wantState: reachServed,
+			wantEmoji: "🌔", wantASCII: "◉",
+		},
+		{
+			name:      "D reachFunnel",
+			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, funnelPublic: 443},
+			wantState: reachFunnel,
+			wantEmoji: "🌕", wantASCII: "●",
+		},
+		{
+			name:      "D reachFunnel outranks a dangling forward",
+			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: false, funnelPublic: 443},
+			wantState: reachFunnel,
+			wantEmoji: "🌕", wantASCII: "●",
+		},
+		{
+			name:      "E reachStale",
+			item:      portItem{port: portscan.Port{Number: 8025}, active: true, listening: false},
+			wantState: reachStale,
+			wantEmoji: "🌫️", wantASCII: "▲",
+		},
+		{
+			name:      "F reachOffline",
+			item:      portItem{port: portscan.Port{Number: 8025}, active: false, listening: false, meta: config.PortMeta{Favorite: true, LastProcess: "mailpit"}},
+			wantState: reachOffline,
+			wantEmoji: "✕", wantASCII: "✕",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			em := portItem{active: c.active, listening: c.listening, funnelPublic: c.funnel, emoji: true}
+			if got := c.item.reach(); got != c.wantState {
+				t.Fatalf("reach() = %v, want %v (fix the test fixture, not the glyph mapping)", got, c.wantState)
+			}
+
+			em := c.item
+			em.emoji = true
 			got := em.markerGlyph()
 			if !strings.Contains(got, c.wantEmoji) {
 				t.Errorf("emoji marker = %q, want to contain %q", got, c.wantEmoji)
@@ -1611,7 +1663,9 @@ func TestMarkerGlyph(t *testing.T) {
 			if lipgloss.Width(got) < 2 {
 				t.Errorf("emoji marker %q should pad to a 2-cell column, width=%d", got, lipgloss.Width(got))
 			}
-			as := portItem{active: c.active, listening: c.listening, funnelPublic: c.funnel, emoji: false}
+
+			as := c.item
+			as.emoji = false
 			if got := stripANSI(as.markerGlyph()); got != c.wantASCII {
 				t.Errorf("ascii marker = %q, want %q", got, c.wantASCII)
 			}

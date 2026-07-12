@@ -237,8 +237,9 @@ type portItem struct {
 	// stand out among the wider search results. See portDelegate.Render.
 	dimmed bool
 	meta   config.PortMeta
-	// emoji selects the egg-lifecycle marker set (🥚/🐣/🐦/🪹) over the ASCII
-	// fallback (○/●/◉/▲). Resolved once for the model and copied onto each item.
+	// emoji selects the moon-phase reach-ramp marker set
+	// (🌑/🌒/🌓/🌔/🌕/🌫️/✕) over the ASCII fallback (○/◔/◑/◉/●/▲/✕). Resolved
+	// once for the model and copied onto each item.
 	emoji bool
 }
 
@@ -267,39 +268,72 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 	d.DefaultDelegate.Render(w, m, index, item)
 }
 
-// markerGlyph is the port's exposure-state marker. In emoji mode it's the egg
-// life cycle (🥚 idle → 🐣 tailnet → 🐦 public, 🪹 empty nest for a dead
-// forward); otherwise the styled ASCII fallback. Funnel outranks serve state,
-// which outranks a dangling forward, which outranks idle. Emoji markers are
-// padded to a stable 2-cell width so the :port column stays aligned even if a
-// terminal renders a given emoji narrow.
+// markerGlyph is the port's reachability marker: a moon-phase "fill ramp"
+// (1exs) tracking i.reach()'s 7-state classification (79xb) from least
+// exposed to most -- 🌑/○ localhost only, 🌒/◔ local network only, 🌓/◑ on
+// tailnet, 🌔/◉ served (a notch more established than merely reachable),
+// 🌕/● funnelled to the public internet. The two BROKEN states sit OFF the
+// ramp as plain glyphs, not moons: 🌫️/▲ a stale dangling forward, ✕/✕ a
+// favorite whose process is down. It switches on the SAME i.reach() resolver
+// Description() uses, so the glyph and the row's text can never disagree
+// about a port's state. Emoji markers are padded to a stable 2-cell width so
+// the :port column stays aligned even if a terminal renders a given emoji
+// (or the naturally 1-cell ✕) narrow.
 func (i portItem) markerGlyph() string {
 	var m string
-	switch {
-	case i.funnelPublic != 0:
-		// Reachable from the open internet -- outranks tailnet-serve state.
+	switch i.reach() {
+	case reachFunnel:
+		// Reachable from the open internet -- outranks every other state.
+		// Public is safety-critical (AGENTS.md): keep the hot-magenta ●.
 		if i.emoji {
-			m = "🐦"
+			m = "🌕"
 		} else {
 			m = publicStyle.Render("●")
 		}
-	case i.active && !i.listening:
-		// Dangling forward: served, but nothing is bound locally, so a tailnet
-		// peer hitting the URL gets connection refused. An empty nest.
+	case reachServed:
 		if i.emoji {
-			m = "🪹"
-		} else {
-			m = warnStyle.Render("▲")
-		}
-	case i.active:
-		if i.emoji {
-			m = "🐣"
+			m = "🌔"
 		} else {
 			m = activeStyle.Render("◉")
 		}
-	default:
+	case reachStale:
+		// Dangling forward: served, but nothing is bound locally, so a tailnet
+		// peer hitting the URL gets connection refused. Off the moon ramp --
+		// this reads as "something's wrong", not just "less reachable".
 		if i.emoji {
-			m = "🥚"
+			m = "🌫️"
+		} else {
+			m = warnStyle.Render("▲")
+		}
+	case reachTailnet:
+		// Already tailnet-reachable by IP (wildcard/tailnet bind), unserved.
+		// Same plain, unstyled tier as reachLocalhost/reachLAN below -- these
+		// three are healthy ramp states, not warnings.
+		if i.emoji {
+			m = "🌓"
+		} else {
+			m = "◑"
+		}
+	case reachLAN:
+		if i.emoji {
+			m = "🌒"
+		} else {
+			m = "◔"
+		}
+	case reachOffline:
+		// A favorite whose process is down -- off the moon ramp, same as
+		// reachStale, but styled distinctly so the two broken states don't
+		// read as the same problem: wasStyle is the exact "remembered but
+		// gone" muted treatment the row's own "was mailpit" label already
+		// uses for this precise situation (a down favorite).
+		if i.emoji {
+			m = "✕"
+		} else {
+			m = wasStyle.Render("✕")
+		}
+	default: // reachLocalhost
+		if i.emoji {
+			m = "🌑"
 		} else {
 			m = "○"
 		}
@@ -3366,12 +3400,12 @@ type KeyLegendGroup struct {
 
 // keyLegendDescs maps a binding's display key to its rich "?"/quickstart prose
 // (deliberately fuller than the terse bottom-bar labels). emoji picks which
-// exposure glyph (🐣/🐦/🪹 vs ◉/●/▲) is quoted inline in the space/p/C rows,
+// exposure glyph (🌔/🌕/🌫️ vs ◉/●/▲) is quoted inline in the space/p/C rows,
 // matching whichever marker set the caller is using (see resolveEmoji).
 func keyLegendDescs(emoji bool) map[string]string {
 	served, funneled, dangling := "◉", "●", "▲"
 	if emoji {
-		served, funneled, dangling = "🐣", "🐦", "🪹"
+		served, funneled, dangling = "🌔", "🌕", "🌫️"
 	}
 	return map[string]string{
 		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
@@ -3479,14 +3513,19 @@ func configSaveLines(path string) []string {
 	return []string{head, "  " + loc}
 }
 
-// markerLegend describes the exposure-state glyph column, using whichever
-// marker set (emoji or ASCII) is active, plus the always-present lock/favorite.
+// markerLegend describes the exposure-state glyph column: the 7-state
+// moon-phase reach ramp (1exs/79xb), using whichever marker set (emoji or
+// ASCII) is active, plus the always-present lock/favorite. Wrapped onto three
+// lines -- the ramp states, the two off-ramp broken states, then the
+// decorations -- so it stays readable rather than one very long line.
 func (m model) markerLegend() string {
 	if m.emoji {
-		return "🥚 listening   🐣 served on tailnet   🐦 public (funnel)   🪹 served, nothing listening\n" +
+		return "🌑 localhost   🌒 local network   🌓 on tailnet   🌔 served\n" +
+			"🌕 internet (funnel)   🌫️ stale   ✕ offline\n" +
 			"🔒 locked   ★ favorite"
 	}
-	return "○ listening   ◉ served on tailnet   ● public (funnel)   ▲ served, nothing listening\n" +
+	return "○ localhost   ◔ local network   ◑ on tailnet   ◉ served\n" +
+		"● internet (funnel)   ▲ stale   ✕ offline\n" +
 		"🔒 locked   ★ favorite"
 }
 
@@ -3565,7 +3604,7 @@ func (m model) helpContent() string {
 	// glyph, quoted again here since this paragraph sits outside that legend.
 	dangling := "▲"
 	if m.emoji {
-		dangling = "🪹"
+		dangling = "🌫️"
 	}
 	b.WriteString(helpTextStyle.Render(
 		"A port marked " + dangling + " (its row reads \"bound to tailnet, but stale …\")\n" +
