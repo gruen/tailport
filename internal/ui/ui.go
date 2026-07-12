@@ -251,7 +251,10 @@ func (i portItem) Description() string {
 }
 
 func (i portItem) FilterValue() string {
-	return fmt.Sprintf("%d %s %s", i.port.Number, i.port.Process, i.meta.Label)
+	// Number, live process, user label, AND the remembered process name -- so a
+	// down favorite showing "was mailpit" is still found by filtering "mail",
+	// which is exactly when you're hunting for a service that's gone.
+	return fmt.Sprintf("%d %s %s %s", i.port.Number, i.port.Process, i.meta.Label, i.meta.LastProcess)
 }
 
 type refreshMsg struct {

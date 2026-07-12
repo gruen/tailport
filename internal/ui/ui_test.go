@@ -1511,6 +1511,36 @@ func TestMarkerGlyph(t *testing.T) {
 	}
 }
 
+// TestFilterValue covers e518: the filter string includes the port number,
+// live process, user label, AND the remembered process -- so a down favorite
+// showing "was mailpit" is still matched by filtering "mail".
+func TestFilterValue(t *testing.T) {
+	// A down favorite: no live process, no label, but LastProcess remembered.
+	down := portItem{
+		port: portscan.Port{Number: 8025},
+		meta: config.PortMeta{Favorite: true, LastProcess: "mailpit"},
+	}
+	fv := down.FilterValue()
+	if !strings.Contains(fv, "mailpit") {
+		t.Errorf("FilterValue %q should include the remembered process for filtering", fv)
+	}
+	if !strings.Contains(fv, "8025") {
+		t.Errorf("FilterValue %q should include the port number", fv)
+	}
+
+	// Live + labelled: process and label both filterable.
+	live := portItem{
+		port: portscan.Port{Number: 3000, Process: "node"},
+		meta: config.PortMeta{Label: "dev server"},
+	}
+	fv = live.FilterValue()
+	for _, want := range []string{"3000", "node", "dev server"} {
+		if !strings.Contains(fv, want) {
+			t.Errorf("FilterValue %q should include %q", fv, want)
+		}
+	}
+}
+
 // TestDanglingDescription covers km8x: a served-but-not-listening row explains
 // itself -- names the loopback target and the un-expose key -- while healthy and
 // not-exposed rows keep their plain descriptions.
