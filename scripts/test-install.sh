@@ -76,21 +76,42 @@ arm64 | aarch64) mgoarch="arm64" ;;
 esac
 ASSET="tailport-${mgoos}-${mgoarch}"
 
-# build_mock <root> <latest|pinned> <version-or-empty> <printed-text>
+# build_mock <root> <latest|pinned> <version-or-empty> <printed-text> [report-version]
 # Lays out a release tree matching install.sh's URL scheme, where
-# TAILPORT_BASE_URL stands in for ".../<repo>/releases".
+# TAILPORT_BASE_URL stands in for ".../<repo>/releases". The mock binary
+# always echoes <printed-text> for a no-arg run (what assert_installed
+# checks). If report-version is given, it ALSO responds to `--version` with
+# a parseable "tailport <report-version>" line, so install.sh's version-gate
+# logic can read it; if omitted, the mock has no real --version support (an
+# old-build stand-in -- `--version` just falls through to <printed-text>).
 build_mock() {
 	root="$1"
 	mode="$2"
 	ver="$3"
 	text="$4"
+	rver="${5:-}"
 	if [ "$mode" = latest ]; then
 		dir="$root/latest/download"
 	else
 		dir="$root/download/v${ver#v}"
 	fi
 	mkdir -p "$dir"
-	printf '#!/bin/sh\necho %s\n' "$text" >"$dir/$ASSET"
+	if [ -n "$rver" ]; then
+		# A heredoc (rather than a single-quoted printf format string
+		# containing a literal "$1") sidesteps shellcheck SC2016: "\$1" here
+		# is deliberately unexpanded in build_mock's own shell and becomes
+		# literal "$1" in the generated mock script, evaluated later by that
+		# script's own /bin/sh.
+		cat >"$dir/$ASSET" <<-EOF
+		#!/bin/sh
+		case "\$1" in
+		--version) echo "tailport $rver" ;;
+		*) echo $text ;;
+		esac
+		EOF
+	else
+		printf '#!/bin/sh\necho %s\n' "$text" >"$dir/$ASSET"
+	fi
 	chmod +x "$dir/$ASSET"
 	printf '%s  %s\n' "$(sha256_of "$dir/$ASSET")" "$ASSET" >"$dir/$ASSET.sha256"
 }
@@ -137,12 +158,29 @@ fi
 echo "== mocks =="
 GOOD="$WORKDIR/good"
 BAD="$WORKDIR/bad"
-build_mock "$GOOD" latest "" tailport-fake
-build_mock "$GOOD" pinned 9.9.9 tailport-fake-pinned
-build_mock "$BAD" latest "" tailport-fake
+build_mock "$GOOD" latest "" tailport-fake 0.1.0
+build_mock "$GOOD" pinned 9.9.9 tailport-fake-pinned 9.9.9
+build_mock "$BAD" latest "" tailport-fake 0.1.0
 # Corrupt the bad binary but leave its now-stale .sha256, forcing a mismatch.
 printf '#!/bin/sh\necho corrupted\n' >"$BAD/latest/download/$ASSET"
 pass "built good + bad + pinned mocks for $ASSET"
+
+echo "== version-gate mocks =="
+REL010="$WORKDIR/rel-0.1.0"
+REL011="$WORKDIR/rel-0.1.1"
+REL020="$WORKDIR/rel-0.2.0"
+REL110="$WORKDIR/rel-1.1.0"
+REL120="$WORKDIR/rel-1.2.0"
+REL200="$WORKDIR/rel-2.0.0"
+RELNOV="$WORKDIR/rel-noversion"
+build_mock "$REL010" latest "" tailport-v0.1.0 0.1.0
+build_mock "$REL011" latest "" tailport-v0.1.1 0.1.1
+build_mock "$REL020" latest "" tailport-v0.2.0 0.2.0
+build_mock "$REL110" latest "" tailport-v1.1.0 1.1.0
+build_mock "$REL120" latest "" tailport-v1.2.0 1.2.0
+build_mock "$REL200" latest "" tailport-v2.0.0 2.0.0
+build_mock "$RELNOV" latest "" tailport-noversion
+pass "built version-gate mocks: 0.1.0, 0.1.1, 0.2.0, 1.1.0, 1.2.0, 2.0.0, no-version"
 
 assert_installed() {
 	dest="$1"
@@ -158,6 +196,62 @@ assert_installed() {
 		pass "runs and prints '$want'"
 	else
 		fail "output mismatch: got '$got' want '$want'"
+	fi
+}
+
+# capture_install <shell> <mock-root> [extra env assignments...] -- runs
+# run_install, capturing its combined stdout+stderr into $OUT and its exit
+# code into $RC (globals; there's no `local` in POSIX sh, and every caller
+# uses OUT/RC immediately, so this mirrors the file's existing top-level `rc`
+# pattern rather than inventing a new idiom).
+capture_install() {
+	set +e
+	OUT="$(run_install "$@" 2>&1)"
+	RC=$?
+	set -e
+}
+
+assert_rc_zero() {
+	if [ "$RC" -eq 0 ]; then pass "$1"; else fail "$1 (rc=$RC): $OUT"; fi
+}
+
+assert_rc_nonzero() {
+	if [ "$RC" -ne 0 ]; then pass "$1"; else fail "$1 (rc=0): $OUT"; fi
+}
+
+# assert_out_contains <substring> <label> -- checks $OUT (set by capture_install).
+assert_out_contains() {
+	case "$OUT" in
+	*"$1"*) pass "$2" ;;
+	*) fail "$2 -- output was: $OUT" ;;
+	esac
+}
+
+# assert_no_bak <dest> -- checks that <dest>.bak was NOT created.
+assert_no_bak() {
+	if [ ! -e "$1.bak" ]; then
+		pass "no .bak at $1.bak"
+	else
+		fail ".bak unexpectedly present at $1.bak"
+	fi
+}
+
+# assert_bak_matches <dest> <want-sha256> <label> -- checks that <dest>.bak
+# exists and holds the binary with the given hash (i.e. the pre-upgrade one).
+assert_bak_matches() {
+	if [ -e "$1" ] && [ "$(sha256_of "$1")" = "$2" ]; then
+		pass "$3"
+	else
+		fail "$3 (bak missing or hash mismatch)"
+	fi
+}
+
+# assert_hash_unchanged <path> <want-sha256> <label>
+assert_hash_unchanged() {
+	if [ "$(sha256_of "$1")" = "$2" ]; then
+		pass "$3"
+	else
+		fail "$3 (hash changed)"
 	fi
 }
 
@@ -221,6 +315,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then pass "mismatch exit nonzero ($rc)"; else fail "mismatch exit 0"; fi
 if [ ! -e "$H5/.local/bin/tailport" ]; then pass "no dest created on mismatch"; else fail "dest created on mismatch"; fi
+assert_no_bak "$H5/.local/bin/tailport"
 
 echo "== mismatch does not clobber an existing good install =="
 H6="$WORKDIR/home6"
@@ -234,6 +329,110 @@ set -e
 if [ "$rc" -ne 0 ]; then pass "corrupt re-run exit nonzero"; else fail "corrupt re-run exit 0"; fi
 after_hash="$(sha256_of "$H6/.local/bin/tailport")"
 if [ "$good_hash" = "$after_hash" ]; then pass "existing install left intact"; else fail "existing install clobbered"; fi
+assert_no_bak "$H6/.local/bin/tailport"
+
+echo "== (a) fresh install: no .bak =="
+HA="$WORKDIR/homeA"
+mkdir -p "$HA"
+capture_install sh "$REL010" "HOME=$HA"
+assert_rc_zero "fresh install exit 0"
+assert_installed "$HA/.local/bin/tailport" tailport-v0.1.0
+assert_no_bak "$HA/.local/bin/tailport"
+
+echo "== (b) same-version re-run: byte-identical, exit 0, 'already up to date' =="
+before_b="$(sha256_of "$HA/.local/bin/tailport")"
+capture_install sh "$REL010" "HOME=$HA"
+assert_rc_zero "same-version re-run exit 0"
+after_b="$(sha256_of "$HA/.local/bin/tailport")"
+if [ "$before_b" = "$after_b" ]; then pass "same-version re-run byte-identical"; else fail "same-version re-run changed dest"; fi
+assert_out_contains "already up to date" "prints 'already up to date'"
+assert_no_bak "$HA/.local/bin/tailport"
+
+echo "== (c) non-breaking patch upgrade: 0.1.0 -> 0.1.1 =="
+HC1="$WORKDIR/homeC1"
+mkdir -p "$HC1"
+run_install sh "$REL010" "HOME=$HC1" >/dev/null 2>&1 || fail "seed 0.1.0 failed (c1)"
+old_c1="$(sha256_of "$HC1/.local/bin/tailport")"
+capture_install sh "$REL011" "HOME=$HC1"
+assert_rc_zero "patch upgrade exit 0"
+assert_installed "$HC1/.local/bin/tailport" tailport-v0.1.1
+assert_bak_matches "$HC1/.local/bin/tailport.bak" "$old_c1" ".bak holds old 0.1.0 binary"
+assert_out_contains "v0.1.0 -> v0.1.1" "prints old -> new (0.1.0 -> 0.1.1)"
+
+echo "== (c) non-breaking minor upgrade: 1.1.0 -> 1.2.0 =="
+HC2="$WORKDIR/homeC2"
+mkdir -p "$HC2"
+run_install sh "$REL110" "HOME=$HC2" >/dev/null 2>&1 || fail "seed 1.1.0 failed (c2)"
+old_c2="$(sha256_of "$HC2/.local/bin/tailport")"
+capture_install sh "$REL120" "HOME=$HC2"
+assert_rc_zero "minor upgrade exit 0"
+assert_installed "$HC2/.local/bin/tailport" tailport-v1.2.0
+assert_bak_matches "$HC2/.local/bin/tailport.bak" "$old_c2" ".bak holds old 1.1.0 binary"
+assert_out_contains "v1.1.0 -> v1.2.0" "prints old -> new (1.1.0 -> 1.2.0)"
+
+echo "== (d) 0.x-minor breaking upgrade refused without opt-in: 0.1.0 -> 0.2.0 =="
+HD="$WORKDIR/homeD"
+mkdir -p "$HD"
+run_install sh "$REL010" "HOME=$HD" >/dev/null 2>&1 || fail "seed 0.1.0 failed (d)"
+old_d="$(sha256_of "$HD/.local/bin/tailport")"
+capture_install sh "$REL020" "HOME=$HD"
+assert_rc_nonzero "breaking 0.x-minor refused (exit nonzero)"
+assert_hash_unchanged "$HD/.local/bin/tailport" "$old_d" "dest unchanged after refusal"
+assert_no_bak "$HD/.local/bin/tailport"
+assert_out_contains "BREAKING" "refusal message mentions BREAKING"
+
+echo "== (e) same, WITH TAILPORT_ALLOW_BREAKING=1: 0.1.0 -> 0.2.0 =="
+capture_install sh "$REL020" "HOME=$HD" "TAILPORT_ALLOW_BREAKING=1"
+assert_rc_zero "breaking 0.x-minor allowed with opt-in"
+assert_installed "$HD/.local/bin/tailport" tailport-v0.2.0
+assert_bak_matches "$HD/.local/bin/tailport.bak" "$old_d" ".bak holds pre-breaking 0.1.0 binary"
+assert_out_contains "v0.1.0 -> v0.2.0" "prints old -> new for opted-in breaking upgrade"
+
+echo "== (f) major breaking upgrade refused, then allowed: 1.2.0 -> 2.0.0 =="
+HF="$WORKDIR/homeF"
+mkdir -p "$HF"
+run_install sh "$REL120" "HOME=$HF" >/dev/null 2>&1 || fail "seed 1.2.0 failed (f)"
+old_f="$(sha256_of "$HF/.local/bin/tailport")"
+capture_install sh "$REL200" "HOME=$HF"
+assert_rc_nonzero "major breaking refused (exit nonzero)"
+assert_hash_unchanged "$HF/.local/bin/tailport" "$old_f" "dest unchanged after major refusal"
+assert_no_bak "$HF/.local/bin/tailport"
+capture_install sh "$REL200" "HOME=$HF" "TAILPORT_ALLOW_BREAKING=1"
+assert_rc_zero "major breaking allowed with opt-in"
+assert_installed "$HF/.local/bin/tailport" tailport-v2.0.0
+assert_bak_matches "$HF/.local/bin/tailport.bak" "$old_f" ".bak holds pre-breaking 1.2.0 binary"
+
+echo "== (g) downgrade across a breaking boundary is gated: 0.2.0 -> 0.1.0 =="
+HG1="$WORKDIR/homeG1"
+mkdir -p "$HG1"
+run_install sh "$REL020" "HOME=$HG1" >/dev/null 2>&1 || fail "seed 0.2.0 failed (g1)"
+old_g1="$(sha256_of "$HG1/.local/bin/tailport")"
+capture_install sh "$REL010" "HOME=$HG1"
+assert_rc_nonzero "breaking downgrade refused (exit nonzero)"
+assert_hash_unchanged "$HG1/.local/bin/tailport" "$old_g1" "dest unchanged after breaking-downgrade refusal"
+assert_no_bak "$HG1/.local/bin/tailport"
+
+echo "== (g) non-breaking downgrade is noted: 0.1.1 -> 0.1.0 =="
+HG2="$WORKDIR/homeG2"
+mkdir -p "$HG2"
+run_install sh "$REL011" "HOME=$HG2" >/dev/null 2>&1 || fail "seed 0.1.1 failed (g2)"
+old_g2="$(sha256_of "$HG2/.local/bin/tailport")"
+capture_install sh "$REL010" "HOME=$HG2"
+assert_rc_zero "non-breaking downgrade exit 0"
+assert_installed "$HG2/.local/bin/tailport" tailport-v0.1.0
+assert_bak_matches "$HG2/.local/bin/tailport.bak" "$old_g2" ".bak holds pre-downgrade 0.1.1 binary"
+assert_out_contains "v0.1.1 -> v0.1.0 (downgrade)" "downgrade explicitly noted"
+
+echo "== (h) existing binary with no --version: graceful proceed-with-note =="
+HH="$WORKDIR/homeH"
+mkdir -p "$HH"
+run_install sh "$RELNOV" "HOME=$HH" >/dev/null 2>&1 || fail "seed no-version binary failed (h)"
+old_h="$(sha256_of "$HH/.local/bin/tailport")"
+capture_install sh "$REL010" "HOME=$HH"
+assert_rc_zero "install over unknown-version binary exit 0"
+assert_installed "$HH/.local/bin/tailport" tailport-v0.1.0
+assert_bak_matches "$HH/.local/bin/tailport.bak" "$old_h" ".bak holds pre-upgrade no-version binary"
+assert_out_contains "unknown" "notes that installed version is unknown"
 
 echo
 echo "================ SUMMARY ================"
