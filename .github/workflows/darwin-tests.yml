@@ -23,7 +23,11 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          # Read the exact version from go.mod (currently 1.26.5) rather than a
+          # bare "1.26": setup-go's default check-latest:false would otherwise
+          # reuse the runner's preinstalled lower 1.26.x, which fails go.mod's
+          # `go 1.26.5` requirement and rejects `go build` before it compiles.
+          go-version-file: go.mod
 
       - name: build
         run: go build ./...
