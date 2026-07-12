@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/gruen/tailport/internal/statusreport"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -121,14 +124,15 @@ func TestRunUnknownSubcommand(t *testing.T) {
 	}
 }
 
-// TestRunReservedSubcommands covers the two reserved-but-not-yet-implemented
-// subcommand names left in the dispatch scaffold (quickstart, kata x4cg, is
-// implemented -- see TestRunQuickstart below): each is recognized (distinct
-// from an unknown subcommand -- no "unknown subcommand" message, no usage
-// dump) but reports plainly that it isn't implemented yet, on stderr, with a
-// non-zero exit.
+// TestRunReservedSubcommands covers the still-reserved-but-not-yet-
+// implemented subcommand name(s) from the dispatch scaffold. quickstart
+// (kata x4cg) and status (kata m7jc) now have real handlers -- see
+// TestRunQuickstart / TestRunStatus* below -- so only update (kata prh1)
+// remains: it's recognized (distinct from an unknown subcommand -- no
+// "unknown subcommand" message, no usage dump) but reports plainly that it
+// isn't implemented yet, on stderr, with a non-zero exit.
 func TestRunReservedSubcommands(t *testing.T) {
-	for _, name := range []string{"status", "update"} {
+	for _, name := range []string{"update"} {
 		var out, errOut bytes.Buffer
 		code := run([]string{name}, &out, &errOut)
 		if code == 0 {
@@ -285,5 +289,177 @@ func TestApplyNoColorForcesAsciiProfile(t *testing.T) {
 	styled := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render("x")
 	if strings.Contains(styled, "\x1b[") {
 		t.Errorf("styled render under the forced no-color profile = %q, want no ANSI escapes", styled)
+	}
+}
+
+// stubStatusGather swaps statusGather for a fixed fake result and restores
+// the original (statusreport.Gather, which shells to live tailscaled/ss/
+// lsof) via t.Cleanup. This is the seam that lets TestRunStatus* exercise
+// runStatus's flag parsing, JSON/table output, and exit codes without a live
+// tailscaled -- see statusGather's doc comment in main.go.
+func stubStatusGather(t *testing.T, rows []statusreport.Row, err error) {
+	t.Helper()
+	orig := statusGather
+	t.Cleanup(func() { statusGather = orig })
+	statusGather = func() ([]statusreport.Row, error) { return rows, err }
+}
+
+// fakeStatusRows is a fixed two-row fixture shared by the TestRunStatus*
+// cases below: one tailnet-served port, one funnelled (public) port.
+func fakeStatusRows() []statusreport.Row {
+	return []statusreport.Row{
+		{Port: 3000, Process: "node", Mode: statusreport.ModeServe, URL: "http://host-a:3000"},
+		{Port: 8080, Process: "python3", Mode: statusreport.ModeFunnel, URL: "https://host-a.tailnet.ts.net:8443"},
+	}
+}
+
+// TestRunStatusTable covers m7jc's default (human-readable) output: both an
+// exposed serve port and an exposed funnel port appear, the funnel row is
+// visually distinct (upper-case "FUNNEL (public)", never confusable with
+// "serve" even with color disabled by the test environment), exit is 0, and
+// stderr stays empty.
+func TestRunStatusTable(t *testing.T) {
+	stubStatusGather(t, fakeStatusRows(), nil)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"status"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run([status]) code = %d, want 0", code)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("run([status]) stderr = %q, want empty", errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"MODE", "PORT", "PROCESS", "URL", "3000", "node", "http://host-a:3000", "8080", "python3", "FUNNEL (public)", "https://host-a.tailnet.ts.net:8443", "serve (tailnet)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("run([status]) stdout missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunStatusJSON covers --json: valid, parseable JSON matching
+// statusreport's stable Document schema, exit 0, empty stderr.
+func TestRunStatusJSON(t *testing.T) {
+	stubStatusGather(t, fakeStatusRows(), nil)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"status", "--json"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run([status --json]) code = %d, want 0", code)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("run([status --json]) stderr = %q, want empty", errOut.String())
+	}
+
+	var doc statusreport.Document
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("run([status --json]) stdout did not parse as JSON: %v; got:\n%s", err, out.String())
+	}
+	if len(doc.Ports) != 2 {
+		t.Fatalf("doc.Ports has %d entries, want 2; got %+v", len(doc.Ports), doc.Ports)
+	}
+	want := fakeStatusRows()
+	for i, row := range doc.Ports {
+		if row != want[i] {
+			t.Errorf("doc.Ports[%d] = %+v, want %+v", i, row, want[i])
+		}
+	}
+}
+
+// TestRunStatusEmptyJSONIsEmptyArrayNotNull covers WriteJSON's documented
+// contract at the CLI level: no exposed ports still emits a "ports" array,
+// [], never a JSON null, so a consumer never needs a null check.
+func TestRunStatusEmptyJSONIsEmptyArrayNotNull(t *testing.T) {
+	stubStatusGather(t, nil, nil)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"status", "--json"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run([status --json]) code = %d, want 0", code)
+	}
+	if !strings.Contains(out.String(), `"ports": []`) {
+		t.Errorf("run([status --json]) stdout = %q, want a \"ports\": [] array", out.String())
+	}
+}
+
+// TestRunStatusEmptyTable covers the human-readable empty case: a plain
+// sentence, not an empty/blank table.
+func TestRunStatusEmptyTable(t *testing.T) {
+	stubStatusGather(t, nil, nil)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"status"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run([status]) code = %d, want 0", code)
+	}
+	if !strings.Contains(out.String(), "No ports currently exposed") {
+		t.Errorf("run([status]) stdout = %q, want a no-ports-exposed message", out.String())
+	}
+}
+
+// TestRunStatusGatherError covers a failed read (e.g. tailscaled
+// unreachable): a clean one-line-ish stderr message, exit 1, and -- since
+// this is a READ-ONLY report -- nothing on stdout.
+func TestRunStatusGatherError(t *testing.T) {
+	stubStatusGather(t, nil, errors.New("reading tailscale serve status: exit status 1"))
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"status"}, &out, &errOut)
+	if code != 1 {
+		t.Errorf("run([status]) code = %d, want 1", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("run([status]) stdout = %q, want empty", out.String())
+	}
+	if !strings.Contains(errOut.String(), "reading tailscale serve status") {
+		t.Errorf("run([status]) stderr = %q, want it to surface the gather error", errOut.String())
+	}
+}
+
+// TestRunStatusHelp covers -h/--help for the status subcommand: usage on
+// stdout, exit 0, empty stderr -- and never touches statusGather (a bogus
+// gather that would panic on GatherError proves --help returns before any
+// data read).
+func TestRunStatusHelp(t *testing.T) {
+	orig := statusGather
+	t.Cleanup(func() { statusGather = orig })
+	statusGather = func() ([]statusreport.Row, error) {
+		t.Fatal("statusGather should not be called for --help")
+		return nil, nil
+	}
+
+	for _, args := range [][]string{{"status", "-h"}, {"status", "--help"}} {
+		var out, errOut bytes.Buffer
+		code := run(args, &out, &errOut)
+		if code != 0 {
+			t.Errorf("run(%v) code = %d, want 0", args, code)
+		}
+		if errOut.Len() != 0 {
+			t.Errorf("run(%v) stderr = %q, want empty", args, errOut.String())
+		}
+		got := out.String()
+		for _, want := range []string{"tailport status", "Usage:", "--json", "--no-color", "READ-ONLY"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("run(%v) stdout missing %q; got:\n%s", args, want, got)
+			}
+		}
+	}
+}
+
+// TestRunStatusBadFlag covers an unknown flag: usage/error to stderr, empty
+// stdout, exit 2 -- mirroring TestRunUnknownFlag's contract for the
+// top-level flag set.
+func TestRunStatusBadFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"status", "--bogus"}, &out, &errOut)
+	if code != 2 {
+		t.Errorf("run([status --bogus]) code = %d, want 2", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("run([status --bogus]) stdout = %q, want empty", out.String())
+	}
+	got := errOut.String()
+	if !strings.Contains(got, "bogus") || !strings.Contains(got, "Usage:") {
+		t.Errorf("run([status --bogus]) stderr = %q, want it to mention the bad flag and usage", got)
 	}
 }

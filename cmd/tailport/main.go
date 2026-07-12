@@ -14,6 +14,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/gruen/tailport/internal/config"
+	"github.com/gruen/tailport/internal/statusreport"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -144,21 +145,18 @@ func applyNoColor(flagSet bool) {
 }
 
 // runSubcommand handles a recognized os.Args[1] that doesn't look like a
-// flag (see run). status/update are reserved names, each with its own kata
-// issue; until those land this just says so plainly instead of silently
-// falling through to the TUI or pretending to work. quickstart (kata x4cg)
-// is implemented -- see runQuickstart -- and is the model for how little a
-// future issue's diff should need to touch here: one case, one handler
-// function, done.
+// flag (see run). quickstart (kata x4cg) and status (kata m7jc) are
+// implemented -- see runQuickstart/runStatus. update (kata prh1) is still
+// reserved and just says so plainly instead of silently falling through to
+// the TUI or pretending to work. It should replace its case with a real
+// handler the same way -- see the dispatch scaffold note in run() for how
+// little that diff should need to touch here.
 func runSubcommand(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "quickstart":
 		return runQuickstart(args[1:], stdout, stderr)
 	case "status":
-		// case "status": … implemented under kata m7jc (headless read-only
-		// exposure report, optionally --json).
-		fmt.Fprintln(stderr, "tailport: status is not implemented yet (kata m7jc)")
-		return 1
+		return runStatus(args[1:], stdout, stderr)
 	case "update":
 		// case "update": … implemented under kata prh1 (built-in self-updater).
 		fmt.Fprintln(stderr, "tailport: update is not implemented yet (kata prh1)")
@@ -258,6 +256,78 @@ func quickstartText(configPath string, emoji bool) string {
 	b.WriteString(ui.RenderKeyLegend(ui.KeyLegendRows(emoji)))
 
 	return b.String()
+}
+
+// statusGather is the data source runStatus reads from. It's a package-level
+// var -- not a hardcoded statusreport.Gather() call -- purely so tests can
+// substitute a fake without touching live tailscaled/portscan; see
+// main_test.go's TestRunStatus*. Production code never reassigns it.
+var statusGather = statusreport.Gather
+
+// newStatusFlagSet builds the flag.FlagSet for `tailport status`: --json
+// plus --no-color, reusing 5dgj's ContinueOnError/io.Discard-output/silent-
+// Usage pattern (see newFlagSet) so parse errors and -h/--help are handled
+// the same way as the top-level flags. Deliberately narrower than the
+// shared cliFlags set: --version/--config/--markers don't mean anything for
+// a one-shot, config-free status report, so they're left undefined here
+// rather than silently accepted and ignored.
+func newStatusFlagSet() (fs *flag.FlagSet, jsonOut, noColor *bool) {
+	fs = flag.NewFlagSet("tailport status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
+	jsonOut = fs.Bool("json", false, "emit machine-readable JSON (stable schema) instead of a table")
+	noColor = fs.Bool("no-color", false, "disable ANSI color output (also honors NO_COLOR)")
+	return fs, jsonOut, noColor
+}
+
+// printStatusUsage writes `tailport status`'s help text.
+func printStatusUsage(w io.Writer) {
+	fmt.Fprintln(w, "tailport status -- headless, READ-ONLY report of ports currently exposed")
+	fmt.Fprintln(w, "via tailscale serve (tailnet) or funnel (public internet). Never launches")
+	fmt.Fprintln(w, "the TUI and never mutates serve/funnel state.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  tailport status [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "      --json        emit machine-readable JSON (stable schema) instead of a table")
+	fmt.Fprintln(w, "      --no-color    disable ANSI color output (also honors NO_COLOR)")
+}
+
+// runStatus implements `tailport status [--json]`: kata m7jc, tailport's
+// first non-interactive mode. It is strictly READ-ONLY (it never calls
+// tsserve.On/Off/FunnelOn/FunnelOff) and reuses the exact same status
+// functions the TUI's own refresh reads, via statusGather -- see
+// internal/statusreport's package doc for why that matters (drift
+// prevention between the TUI and this report).
+func runStatus(args []string, stdout, stderr io.Writer) int {
+	fs, jsonOut, noColor := newStatusFlagSet()
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printStatusUsage(stdout)
+			return 0
+		}
+		fmt.Fprintln(stderr, "tailport status:", err)
+		printStatusUsage(stderr)
+		return 2
+	}
+	applyNoColor(*noColor)
+
+	rows, err := statusGather()
+	if err != nil {
+		fmt.Fprintln(stderr, "tailport status:", err)
+		return 1
+	}
+
+	if *jsonOut {
+		if err := statusreport.WriteJSON(stdout, rows); err != nil {
+			fmt.Fprintln(stderr, "tailport status:", err)
+			return 1
+		}
+		return 0
+	}
+	statusreport.WriteTable(stdout, rows)
+	return 0
 }
 
 // run implements tailport's entire CLI behavior, returning the process exit
