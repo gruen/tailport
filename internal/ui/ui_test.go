@@ -1148,14 +1148,17 @@ func TestCopyKeymap(t *testing.T) {
 	}
 }
 
-// TestCopyURL covers vnq7's copy action and toast: "c" copies the tailnet URL
-// (with a success toast when exposed, an amber caveat when not), and the toast
-// clears on the next keypress.
+// TestCopyURL covers vnq7's copy action, updated for py5b: state C (served +
+// listening, not funnelled) now goes INLINE -- the row's own "✓ copied"
+// annotation, no toast -- since the row already shows the copied URL.
+// Every other case (here: not served) keeps the toast, with an amber caveat
+// when the port isn't served yet.
 func TestCopyURL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	newModel := func(active bool) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
 		m.host = "host"
+		m.width = 80 // wide enough that inlineCopyFits always succeeds here
 		m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
 		if active {
 			m.active = map[int]bool{8080: true}
@@ -1167,31 +1170,142 @@ func TestCopyURL(t *testing.T) {
 		return m
 	}
 
-	// Exposed: success toast naming the tailnet URL, not amber, with a cmd.
+	// State C: inline "✓ copied" on the row, copiedPort set, NO toast.
 	m := newModel(true)
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
 	if cmd == nil {
-		t.Error("c should return a copy/flash cmd")
+		t.Error("c should return a copy/rebuild/expire cmd")
 	}
-	if !strings.Contains(m.flash, "copied") || !strings.Contains(m.flash, "http://host:8080") {
-		t.Errorf("flash = %q, want a copied-URL toast", m.flash)
+	if m.flash != "" {
+		t.Errorf("state-C copy should NOT toast; flash = %q", m.flash)
 	}
-	if m.flashLevel != flashInfo {
-		t.Errorf("exposed copy should be an info toast; level = %v", m.flashLevel)
+	if m.copiedPort != 8080 {
+		t.Errorf("copiedPort = %d, want 8080", m.copiedPort)
 	}
-	// The next keypress dismisses the toast.
+	sel, ok := m.list.SelectedItem().(portItem)
+	if !ok || !sel.justCopied {
+		t.Errorf("selected item justCopied = %v, want true", ok && sel.justCopied)
+	}
+	if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://host:8080") {
+		t.Errorf("Description() = %q, want the tailnet URL plus the ✓ copied suffix", got)
+	}
+	// Unlike the toast, the inline annotation is NOT cleared by the next
+	// keypress -- it fades only via copiedExpireMsg's id-guarded timer.
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
-	if got := res.(model); got.flash != "" {
-		t.Errorf("toast should clear on the next key; got %q", got.flash)
+	if got := res.(model); got.copiedPort != 8080 {
+		t.Errorf("copiedPort should survive an unrelated keypress; got %d", got.copiedPort)
 	}
 
-	// Not served: still copies, but the toast warns it won't resolve yet.
+	// Not served: still copies, but the toast warns it won't resolve yet
+	// (no inline annotation -- copiedPort stays 0).
 	m = newModel(false)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
 	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only") {
 		t.Errorf("not-served copy flash = %q (level=%v), want a warn localhost-only caveat", m.flash, m.flashLevel)
+	}
+	if m.copiedPort != 0 {
+		t.Errorf("not-served copy should not set copiedPort; got %d", m.copiedPort)
+	}
+}
+
+// TestInlineCopyFits covers py5b's width-fit boundary: the "✓ copied"
+// annotation fits exactly at its required width, and is one cell too wide
+// just below it -- the rule that keeps a narrow terminal from silently
+// dropping the confirmation off the end-truncated row.
+func TestInlineCopyFits(t *testing.T) {
+	suffixWidth := lipgloss.Width(copiedSuffix)
+	const descWidth = 30
+	avail := descWidth + suffixWidth
+	if !inlineCopyFits(descWidth, avail) {
+		t.Errorf("inlineCopyFits(%d, %d) = false, want true (exact fit)", descWidth, avail)
+	}
+	if inlineCopyFits(descWidth, avail-1) {
+		t.Errorf("inlineCopyFits(%d, %d) = true, want false (one cell too narrow)", descWidth, avail-1)
+	}
+}
+
+// TestCopiedExpire covers the inline annotation's timed clear (py5b),
+// mirroring TestFlashExpire: a matching copiedExpireMsg clears m.copiedPort,
+// a stale one (an id superseded by a later copy) does not.
+func TestCopiedExpire(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	m.width = 80
+	m.allPorts = []portscan.Port{{Number: 8080}}
+	m.active = map[int]bool{8080: true}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if m.copiedPort != 8080 {
+		t.Fatalf("copiedPort = %d, want 8080 (state C should go inline)", m.copiedPort)
+	}
+	id := m.copiedID
+
+	res, _ = m.Update(copiedExpireMsg{id: id - 1})
+	if got := res.(model); got.copiedPort == 0 {
+		t.Error("a stale copiedExpireMsg should not clear a newer annotation")
+	}
+	res, _ = m.Update(copiedExpireMsg{id: id})
+	if got := res.(model); got.copiedPort != 0 {
+		t.Errorf("a matching copiedExpireMsg should clear copiedPort; got %d", got.copiedPort)
+	}
+}
+
+// TestCopyURLInlineVsToast covers py5b's precise inline-vs-toast boundary:
+// only state C (served + listening + not funnelled), and only when the
+// annotation actually fits, goes inline. Funnelled, dangling, and a state-C
+// copy too wide for the terminal all keep the toast with copiedPort staying
+// 0 -- see AGENTS.md's "When to go inline vs toast".
+func TestCopyURLInlineVsToast(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := func() model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+		m.host = "host"
+		m.width = 80
+		m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+		m.active = map[int]bool{8080: true}
+		m.showAllPorts = true
+		return m
+	}
+
+	// Funnelled: the row shows the PUBLIC url but "c" copies the TAILNET
+	// url -- a mismatch, so the toast (which names what was copied) stays,
+	// no inline.
+	m := base()
+	m.funnel = map[int]int{8080: 443}
+	m.rebuildItems()
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if m.copiedPort != 0 || m.flash == "" {
+		t.Errorf("funnelled copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast", m.copiedPort, m.flash)
+	}
+
+	// Dangling (active, but nothing listening): the row shows the stale
+	// warning, no URL at all -- toast, no inline.
+	m = base()
+	m.allPorts = nil // nothing listening locally -> the active favorite is dangling
+	m.rebuildItems()
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if m.copiedPort != 0 || m.flash == "" {
+		t.Errorf("dangling copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast", m.copiedPort, m.flash)
+	}
+
+	// State C, but the terminal is too narrow for the suffix to fit: falls
+	// back to the toast rather than silently truncating the confirmation
+	// off the row.
+	m = base()
+	m.width = 5
+	m.rebuildItems()
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if m.copiedPort != 0 || m.flash == "" {
+		t.Errorf("narrow state-C copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast fallback", m.copiedPort, m.flash)
 	}
 }
 

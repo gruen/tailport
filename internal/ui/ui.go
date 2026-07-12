@@ -241,6 +241,13 @@ type portItem struct {
 	// (🌕/🌔/🌓/🌒/🌑/🌫️/✕) over the ASCII fallback (○/◔/◑/◉/●/▲/✕). Resolved
 	// once for the model and copied onto each item.
 	emoji bool
+	// justCopied marks the port most recently copied via "c" while its
+	// description was the bare tailnet URL (state C: reachServed), set in
+	// rebuildItems from m.copiedPort (py5b). Description() appends the
+	// styled "✓ copied" suffix when it's set; it fades on its own via
+	// copiedExpireMsg/copiedID (mirroring flashExpireMsg/flashID) rather
+	// than being cleared by selection changes.
+	justCopied bool
 }
 
 // portDelegate is the list's item renderer: the stock DefaultDelegate, except
@@ -436,7 +443,16 @@ func (i portItem) Description() string {
 		// in ? help and the README, where there's room to explain it.
 		return warnStyle.Render("bound to tailnet, but stale — space to unbind")
 	case reachServed:
-		return fmt.Sprintf("on tailnet · http://%s:%d", i.host, i.port.Number)
+		desc := i.servedDescPlain()
+		if i.justCopied {
+			// Pre-styled bold-green suffix (py5b): the delegate's rune
+			// highlighter is ANSI-unaware, but filterNoHighlight (see New)
+			// already strips the per-char match highlight from every row,
+			// so embedding raw ANSI here is safe -- confirmed by the tmux
+			// capture in the close message.
+			desc += activeStyle.Render(copiedSuffix)
+		}
+		return desc
 	case reachTailnet:
 		if i.port.Number == 22 {
 			// sshd on a wildcard bind is the canonical case: already
@@ -453,6 +469,15 @@ func (i portItem) Description() string {
 	default: // reachLocalhost
 		return "localhost only"
 	}
+}
+
+// servedDescPlain returns the UNSTYLED state-C description text ("on
+// tailnet · http://host:port") -- the row text Description() renders for
+// reachServed, and the exact string whose URL copyURL copies. Shared by
+// Description() and copyURL's inlineCopyFits width check (py5b) so the two
+// can never drift out of sync about what the row actually shows.
+func (i portItem) servedDescPlain() string {
+	return fmt.Sprintf("on tailnet · http://%s:%d", i.host, i.port.Number)
 }
 
 func (i portItem) FilterValue() string {
@@ -507,6 +532,13 @@ type cleanupDoneMsg struct{ err error }
 // flashExpireMsg clears the transient toast if it's still the one that
 // scheduled this expiry (matched by id), so a newer toast isn't cut short.
 type flashExpireMsg struct{ id int }
+
+// copiedExpireMsg clears the inline row "✓ copied" annotation (m.copiedPort)
+// if it's still the one that scheduled this expiry (matched by id), mirroring
+// flashExpireMsg/flashID (py5b): copying a second port before the first
+// annotation fades bumps copiedID, so the first port's stale timer is ignored
+// rather than clearing the newer annotation out from under it.
+type copiedExpireMsg struct{ id int }
 
 // flashLevel is the severity of a toast, driving its colour: info (green),
 // warn (amber), error (red). It unifies what used to be a bare success toast
@@ -639,6 +671,15 @@ type model struct {
 	flash      string
 	flashLevel flashLevel
 	flashID    int
+	// copiedPort is the port number showing the inline "✓ copied" row
+	// annotation (py5b), or 0 for none -- set by copyURL's state-C fast path
+	// instead of the toast, and read back in rebuildItems to flag that one
+	// port's item justCopied. copiedID is copiedPort's flashID-style guard:
+	// bumped on every inline copy so a matching copiedExpireMsg clears it,
+	// while a stale one (superseded by a newer copy) is ignored -- see
+	// copiedExpireMsg.
+	copiedPort int
+	copiedID   int
 	// operatorNotSet is the STICKY counterpart to flash (kata tapv): a
 	// deliberate exception to the auto-dismiss toast, because tailscale's
 	// operator requirement is required-setup guidance, not a fleeting
@@ -1035,13 +1076,77 @@ func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
 	}
 }
 
-// copyURL copies the selected port's TAILNET URL to the clipboard and returns
-// a command that runs the copy and shows a confirmation toast. The URL is
-// always the tailnet form (http://<host>:<port>), matching the row
-// description, regardless of any public funnel. When the port isn't served on
-// the tailnet the toast warns that the URL won't resolve until it's toggled on.
+// copiedSuffix is the plain (unstyled) text of the inline copy confirmation
+// (py5b), appended -- pre-styled bold-green via activeStyle -- to a state-C
+// row's description when its portItem.justCopied is set. Kept as one
+// constant so the width-fit check (inlineCopyFits) and the styled render
+// (portItem.Description) can never drift out of sync about its width.
+const copiedSuffix = "  ✓ copied"
+
+// descTruncateStyle mirrors the style bubbles/list's DefaultDelegate.Render
+// uses to compute its available text width (vendored
+// github.com/charmbracelet/bubbles/list@v1.0.0, defaultitem.go: textwidth =
+// list width - NormalTitle's left+right padding, applied to BOTH title and
+// description). portDelegate never overrides Styles.NormalTitle (only swaps
+// NormalTitle/NormalDesc for a dimmed row on a throwaway copy inside
+// Render), so a freshly resolved list.NewDefaultDelegate()'s style is always
+// the one actually in effect -- resolved once here rather than reconstructed
+// on every call.
+var descTruncateStyle = list.NewDefaultDelegate().Styles.NormalTitle
+
+// availableDescriptionWidth returns the width (in cells) the list delegate
+// truncates a row's title/description to, given the model's current
+// terminal width -- the same budget bubbles/list enforces at render time, so
+// inlineCopyFits can decide whether the "✓ copied" suffix will actually be
+// visible before copyURL appends it.
+func (m *model) availableDescriptionWidth() int {
+	return m.width - descTruncateStyle.GetPaddingLeft() - descTruncateStyle.GetPaddingRight()
+}
+
+// inlineCopyFits reports whether appending copiedSuffix to a description of
+// descWidth (its PLAIN, unstyled rendered width) would still fit within
+// availWidth, the delegate's available title/description budget
+// (availableDescriptionWidth). Pure and side-effect free so it's directly
+// unit-testable: bubbles/list truncates descriptions END-first, so on a
+// narrow terminal / long URL the appended suffix would be the FIRST thing
+// clipped -- silently dropping the confirmation -- unless copyURL checks
+// this first and falls back to the toast.
+func inlineCopyFits(descWidth, availWidth int) bool {
+	return descWidth+lipgloss.Width(copiedSuffix) <= availWidth
+}
+
+// copyURL copies the selected port's TAILNET URL to the clipboard and
+// confirms the copy. The URL is always the tailnet form
+// (http://<host>:<port>), regardless of any public funnel. State C
+// (reachServed: served, listening, not funnelled) is the one case where the
+// row's description IS that exact URL, so -- provided the annotation fits
+// the terminal width (inlineCopyFits) -- the confirmation goes inline as a
+// transient "✓ copied" on the row instead of the bottom-bar toast (py5b).
+// Every other case keeps the toast, unchanged: it's the only place that can
+// name a MISMATCH between the shown URL and the copied one (funnelled), flag
+// a dangling forward (no URL shown at all), or carry "serve it first"
+// guidance (localhost/LAN-only or offline) -- and it's also the fallback
+// when a state-C copy wouldn't fit inline.
 func (m *model) copyURL(sel portItem) tea.Cmd {
 	url := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
+
+	if sel.reach() == reachServed && inlineCopyFits(lipgloss.Width(sel.servedDescPlain()), m.availableDescriptionWidth()) {
+		m.copiedID++
+		id := m.copiedID
+		m.copiedPort = sel.port.Number
+		// Clear any lingering toast so the two confirmation channels never
+		// show at once (the KeyMsg handler already does this on every
+		// keypress before dispatch, but copyURL is the one place that
+		// decides inline-vs-toast, so it's made explicit here too).
+		m.flash = ""
+		m.flashLevel = flashInfo
+		return tea.Batch(
+			copyCmd(url),
+			m.rebuildItems(), // immediate render of the new annotation
+			tea.Tick(3*time.Second, func(time.Time) tea.Msg { return copiedExpireMsg{id: id} }),
+		)
+	}
+
 	var flash tea.Cmd
 	if sel.active {
 		flash = m.setFlash("copied ✓  "+url, flashInfo)
@@ -1465,6 +1570,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id == m.flashID {
 			m.flash = ""
 			m.flashLevel = flashInfo
+		}
+		return m, nil
+
+	case copiedExpireMsg:
+		// Only clear if no newer inline copy has replaced this one (see
+		// copiedID) -- copying a different port moves the annotation via a
+		// fresh copiedID, so this stale timer is a no-op.
+		if msg.id == m.copiedID {
+			m.copiedPort = 0
+			return m, m.rebuildItems()
 		}
 		return m, nil
 
@@ -1942,7 +2057,7 @@ func (m *model) rebuildItems() tea.Cmd {
 				p = portscan.Port{Number: n}
 			}
 			meta := m.cfg.Ports[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.emoji})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.emoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -1965,7 +2080,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		}
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.emoji})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.emoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
