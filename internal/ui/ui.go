@@ -1180,6 +1180,7 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		// decides inline-vs-toast, so it's made explicit here too).
 		m.flash = ""
 		m.flashLevel = flashInfo
+		m.resizeList() // the toast may have been wrapped multi-line; give the list its rows back
 		return tea.Batch(
 			copyCmd(url),
 			m.rebuildItems(), // immediate render of the new annotation
@@ -1239,6 +1240,9 @@ func (m *model) setFlash(text string, level flashLevel) tea.Cmd {
 	m.flashID++
 	m.flash = text
 	m.flashLevel = level
+	// A long toast can wrap across multiple lines at the current width
+	// (83wv pt2); re-reserve the list's height now so it never overlaps.
+	m.resizeList()
 	id := m.flashID
 	d := 3 * time.Second
 	if level != flashInfo {
@@ -1477,30 +1481,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.Width = msg.Width
 		m.width = msg.Width
 		m.height = msg.Height
-		// Reserve the WORST-CASE legend height -- render it as if a dangling
-		// forward were present (cleanEnabled=true) so the grouped grid/bar always
-		// fits. That way the list never overlaps the bar when a dangling appears
-		// (or vanishes) between resizes: the grid is a constant 5 rows regardless,
-		// and the wrapped fallback is measured with the extra "C" hint included.
-		legendLines := 1
-		if legend := m.renderLegendWith(true); legend != "" {
-			legendLines = strings.Count(legend, "\n") + 1
-		}
-		// Reserve the WORST-CASE operator-hint banner height too (kata tapv),
-		// unconditionally -- like cleanEnabled=true above, NOT gated on the
-		// CURRENT m.operatorNotSet. The banner can appear asynchronously (a
-		// failed toggle's toggleDoneMsg, or the startup detectOperatorMsg)
-		// with no fresh WindowSizeMsg in between, so sizing done here has to
-		// already assume the worst case or a later appearance would clip the
-		// list by one row. operatorHintText() is always exactly one line (no
-		// embedded newlines), so the reservation is a constant 1.
-		const bannerLines = 1
-		// Reserve the persistent top header (one row) plus the bottom bar: one
-		// blank separator, the status line, and the grouped shortcuts legend.
-		// View then pads the gap so the bar lands on the last rows (see
-		// renderHeader / renderBottom).
-		headerLines := lipgloss.Height(m.renderHeader())
-		m.list.SetSize(msg.Width, msg.Height-headerLines-legendLines-bannerLines-2)
+		m.resizeList()
 		return m, nil
 
 	case refreshMsg:
@@ -1627,6 +1608,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id == m.flashID {
 			m.flash = ""
 			m.flashLevel = flashInfo
+			m.resizeList() // give the list back any rows a wrapped toast held
 		}
 		return m, nil
 
@@ -1645,6 +1627,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// this key produces it), so notifications never stick around stale.
 		m.flash = ""
 		m.flashLevel = flashInfo
+		// Give the list back any rows a wrapped toast held; a fresh flash set
+		// below (via setFlash) re-reserves on top of this.
+		m.resizeList()
 		// The Easter-egg overlay (28mv) is modal like help: esc/q/E close it,
 		// "c" copies the site link (with a toast, staying open), ctrl+c quits
 		// the app entirely, and every other key is swallowed. It never traps.
@@ -4204,6 +4189,95 @@ func (m model) operatorHintText() string {
 	return fmt.Sprintf("⚠ tailscale operator not set — run once: sudo tailscale set --operator=%s  (then press r)  — or run tailport with sudo", you)
 }
 
+// resizeList recomputes the bubbles/list viewport height from the current
+// terminal size and every reservation the bottom bar makes below it, then
+// applies it via list.SetSize. It's called from the WindowSizeMsg handler
+// (m.width/m.height just changed) and again from every site that mutates
+// m.flash (set or clear), because a wrapped multi-line toast changes
+// renderStatusLine's height without any resize -- so the list's reserved
+// height has to track it live, shrinking while a wrapped toast shows and
+// growing back the moment it clears, or the two would either overlap or
+// leave a stale gap. A no-op before the first WindowSizeMsg (m.width/height
+// still zero).
+func (m *model) resizeList() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	// Reserve the WORST-CASE legend height -- render it as if a dangling
+	// forward were present (cleanEnabled=true) so the grouped grid/bar always
+	// fits. That way the list never overlaps the bar when a dangling appears
+	// (or vanishes) between resizes: the grid is a constant 5 rows regardless,
+	// and the wrapped fallback is measured with the extra "C" hint included.
+	legendLines := 1
+	if legend := m.renderLegendWith(true); legend != "" {
+		legendLines = strings.Count(legend, "\n") + 1
+	}
+	// Reserve the WORST-CASE operator-hint banner height too (kata tapv),
+	// unconditionally -- like cleanEnabled=true above, NOT gated on the
+	// CURRENT m.operatorNotSet. The banner can appear asynchronously (a
+	// failed toggle's toggleDoneMsg, or the startup detectOperatorMsg)
+	// with no fresh WindowSizeMsg in between, so sizing done here has to
+	// already assume the worst case or a later appearance would clip the
+	// list by one row. operatorHintText() is always exactly one line (no
+	// embedded newlines), so the reservation is a constant 1.
+	const bannerLines = 1
+	// Reserve the persistent top header (one row) plus the bottom bar: one
+	// blank separator, the status line (now measured live -- see below,
+	// rather than a flat 1, since a wrapped flash toast can span multiple
+	// rows), and the grouped shortcuts legend. View then pads the gap so the
+	// bar lands on the last rows (see renderHeader / renderBottom).
+	headerLines := lipgloss.Height(m.renderHeader())
+	// statusLines is the CURRENT height of renderStatusLine -- >=1, and >1
+	// while a long flash toast is wrapped across lines (83wv pt2). Unlike the
+	// legend/banner reservations above, this one is NOT worst-cased to some
+	// fixed maximum: it tracks the live flash text exactly, and every m.flash
+	// mutation site calls resizeList so the reservation is always current by
+	// the next render.
+	statusLines := lipgloss.Height(m.renderStatusLine())
+	h := m.height - headerLines - legendLines - bannerLines - 1 - statusLines
+	if h < 1 {
+		h = 1
+	}
+	m.list.SetSize(m.width, h)
+}
+
+// renderStatusLine renders the bottom bar's status portion: a transient toast
+// (copy confirmation, refusal, or error) when one is showing, else the plain
+// statusText(). The severity colours the toast: info green, warn amber, error
+// red (q89g).
+//
+// The toast is WRAPPED to m.width rather than left as a single line, because
+// bubbletea's renderer hard-truncates any line that exceeds the terminal
+// width with no ellipsis -- and the honest, actionable guard-toast strings
+// (83wv pt2) can run well past 80 columns. lipgloss.Style.Width word-wraps
+// content that exceeds the set width instead of clipping it, so setting it
+// here makes the full message visible on any terminal, at the cost of the
+// toast (and the bar) growing to multiple lines -- resizeList reserves for
+// that. None of activeStyle/warnStyle/errStyle/helpStyle set a Background, so
+// the padding Width() adds to fill short wrapped lines is invisible (no
+// visible block behind the text).
+//
+// Before the first WindowSizeMsg, m.width is 0; Width(0) would collapse the
+// render to nothing, so that case falls back to the unwrapped render (still
+// only reachable pre-resize, when there's no real terminal width to wrap to
+// anyway).
+func (m model) renderStatusLine() string {
+	if m.flash == "" {
+		return helpStyle.Render(m.statusText())
+	}
+	toast := activeStyle
+	switch m.flashLevel {
+	case flashWarn:
+		toast = warnStyle
+	case flashError:
+		toast = errStyle
+	}
+	if m.width <= 0 {
+		return toast.Render(m.flash)
+	}
+	return toast.Width(m.width).Render(m.flash)
+}
+
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
 // for that flow; otherwise it's the status line, with the shortcuts legend on
 // the last row(s). The Favorites|All-ports toggle lives in the top header
@@ -4244,21 +4318,7 @@ func (m model) renderBottom() string {
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
 	}
-	// A transient toast (copy confirmation, refusal, or error) takes the
-	// status line's spot while it's showing; otherwise the normal breakdown.
-	// The severity colours it: info green, warn amber, error red (q89g).
-	statusLine := helpStyle.Render(m.statusText())
-	if m.flash != "" {
-		toast := activeStyle
-		switch m.flashLevel {
-		case flashWarn:
-			toast = warnStyle
-		case flashError:
-			toast = errStyle
-		}
-		statusLine = toast.Render(m.flash)
-	}
-	bar := statusLine
+	bar := m.renderStatusLine()
 	// The sticky operator hint (kata tapv), when active, sits ABOVE the
 	// status line -- unlike the transient toast it never auto-dismisses, so
 	// it stays put through refreshes and keypresses that would otherwise

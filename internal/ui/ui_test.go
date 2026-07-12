@@ -3576,6 +3576,132 @@ func TestLegendReservationDominatesLive(t *testing.T) {
 	}
 }
 
+// TestRenderStatusLineWrapsLongFlash covers 83wv pt2: bubbletea's renderer
+// hard-truncates any bottom-bar line wider than the terminal with no
+// ellipsis, so the honest (and long) guard-toast strings from e2f44d6 would
+// clip mid-word on a normal 80-column terminal unless the status line wraps.
+// At a narrow width the full message must still be present -- nothing
+// dropped -- just spread across more than one line; at a wide width the same
+// text should fit on one line, unchanged.
+func TestRenderStatusLineWrapsLongFlash(t *testing.T) {
+	// The general reachTailnet guard toast (ui.go ~2045) -- 123 chars, the
+	// longest of the reworded strings and the one the kata prompt cites as
+	// clipping on an 80-col terminal.
+	const longFlash = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
+
+	t.Run("narrow width wraps without dropping text", func(t *testing.T) {
+		m := New(config.Config{})
+		m.width = 80
+		m.flash = longFlash
+		m.flashLevel = flashInfo
+
+		out := m.renderStatusLine()
+		if h := lipgloss.Height(out); h < 2 {
+			t.Fatalf("renderStatusLine height %d at width 80 -- want >=2 (wrapped), got a single line: %q", h, stripANSI(out))
+		}
+		plain := stripANSI(out)
+		// Wrapping inserts newlines (and lipgloss may re-flow whitespace at
+		// the break), so compare word-by-word rather than requiring the
+		// exact substring.
+		joined := strings.Join(strings.Fields(plain), " ")
+		wantWords := strings.Join(strings.Fields(longFlash), " ")
+		if joined != wantWords {
+			t.Errorf("wrapped status line lost or altered text:\n got: %q\nwant: %q", joined, wantWords)
+		}
+		for _, want := range []string{"app bound wide", "make serve toggleable"} {
+			if !strings.Contains(plain, want) {
+				t.Errorf("wrapped status line missing %q:\n%s", want, plain)
+			}
+		}
+		// No line should exceed the requested width (that's the whole point
+		// of wrapping instead of truncating).
+		for _, ln := range strings.Split(out, "\n") {
+			if w := lipgloss.Width(ln); w > 80 {
+				t.Errorf("wrapped line exceeds width 80 (got %d): %q", w, stripANSI(ln))
+			}
+		}
+	})
+
+	t.Run("wide width stays a single line", func(t *testing.T) {
+		m := New(config.Config{})
+		m.width = 200
+		m.flash = longFlash
+		m.flashLevel = flashInfo
+
+		out := m.renderStatusLine()
+		if h := lipgloss.Height(out); h != 1 {
+			t.Errorf("renderStatusLine height %d at width 200 -- want 1 (fits on one line)", h)
+		}
+		if plain := stripANSI(out); !strings.Contains(plain, longFlash) {
+			t.Errorf("status line at width 200 = %q, want it to contain the full flash text", plain)
+		}
+	})
+
+	t.Run("before first WindowSizeMsg falls back to unwrapped render", func(t *testing.T) {
+		m := New(config.Config{}) // m.width is the zero value here
+		m.flash = longFlash
+		m.flashLevel = flashInfo
+
+		out := m.renderStatusLine()
+		if plain := stripANSI(out); plain != longFlash {
+			t.Errorf("pre-resize status line = %q, want the raw flash text unwrapped", plain)
+		}
+	})
+}
+
+// TestResizeListReservesWrappedFlashHeight covers the other half of 83wv
+// pt2: a wrapped multi-line flash must shrink the list's reserved height by
+// exactly the extra lines it occupies (so the list never overlaps the
+// wrapped toast), and the list must grow back to its original height the
+// moment the flash clears -- exercised through the real Update path
+// (WindowSizeMsg then a KeyMsg-driven setFlash/clear), not by calling
+// resizeList directly, so it also proves every m.flash mutation site wires
+// the reservation up.
+func TestResizeListReservesWrappedFlashHeight(t *testing.T) {
+	const longFlash = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
+
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	r, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	m = r.(model)
+	baseline := m.list.Height()
+	if baseline <= 0 {
+		t.Fatalf("baseline list height = %d, want > 0", baseline)
+	}
+
+	setCmd := m.setFlash(longFlash, flashInfo)
+	if setCmd == nil {
+		t.Fatal("setFlash returned a nil expiry cmd")
+	}
+	statusLines := lipgloss.Height(m.renderStatusLine())
+	if statusLines < 2 {
+		t.Fatalf("expected the flash to wrap to >=2 lines at width 80, got %d", statusLines)
+	}
+	withFlash := m.list.Height()
+	if want := baseline - (statusLines - 1); withFlash != want {
+		t.Errorf("list height with wrapped flash = %d, want %d (baseline %d minus %d extra status lines)", withFlash, want, baseline, statusLines-1)
+	}
+	if withFlash >= baseline {
+		t.Errorf("list height %d did not shrink below baseline %d while a wrapped flash is showing", withFlash, baseline)
+	}
+
+	// Feed the expiry message directly rather than invoking setCmd (a real
+	// tea.Tick that blocks for the flash's multi-second duration) -- deterministic,
+	// no real clock, and exercises the exact same flashID-guarded path
+	// (m.flashID was bumped by setFlash above, so this id matches).
+	r, _ = m.Update(flashExpireMsg{id: m.flashID})
+	m = r.(model)
+	if m.flash != "" {
+		t.Fatalf("flash still set after its expiry message: %q", m.flash)
+	}
+	if got := m.list.Height(); got != baseline {
+		t.Errorf("list height after flash cleared = %d, want back to baseline %d", got, baseline)
+	}
+}
+
 // TestHelpOverlayGroupedSections covers the "?" overlay reorg: the same four
 // sections in the same order as the bar, each with an aligned key gutter, but
 // keeping the RICH per-key prose and the surrounding Markers/warnings/config
