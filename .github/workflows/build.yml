@@ -66,4 +66,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          # Auto-generate the release body from commits/PRs since the previous tag.
+          generate_release_notes: true
           files: dist/*
