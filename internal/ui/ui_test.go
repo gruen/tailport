@@ -2273,8 +2273,9 @@ func TestFireworkKeyLifecycle(t *testing.T) {
 }
 
 // TestEggViewGrid covers full-screen grid composition: exact dimensions, the
-// egg block placed at its offset with the fanfare on its recorded rows, credits
-// present, and fireworks overlaid without overflow.
+// egg block placed at its offset with the fanfare rows blank (43xw) on their
+// recorded rows, credits present (sans Fable), and fireworks overlaid without
+// overflow.
 func TestEggViewGrid(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{Markers: "emoji"})
@@ -2296,11 +2297,13 @@ func TestEggViewGrid(t *testing.T) {
 		}
 	}
 	lay := eggLayout(100, 40)
-	if strings.TrimSpace(stripANSI(lines[lay.topFanfareRow])) == "" {
-		t.Error("the top fanfare row should carry sparkles")
+	// 43xw: the fanfare rows are now blank spacers -- sparkles removed, but the
+	// row still exists (occupies the grid) so the burst band anchors hold.
+	if s := strings.TrimSpace(stripANSI(lines[lay.topFanfareRow])); s != "" {
+		t.Errorf("the top fanfare row should be blank (spacer only), got %q", s)
 	}
-	if strings.TrimSpace(stripANSI(lines[lay.botFanfareRow])) == "" {
-		t.Error("the bottom fanfare row should carry sparkles")
+	if s := strings.TrimSpace(stripANSI(lines[lay.botFanfareRow])); s != "" {
+		t.Errorf("the bottom fanfare row should be blank (spacer only), got %q", s)
 	}
 	if strings.TrimSpace(stripANSI(lines[lay.topFanfareRow+lay.eggRows/2])) == "" {
 		t.Error("an egg body row should be non-empty")
@@ -2308,6 +2311,10 @@ func TestEggViewGrid(t *testing.T) {
 	plain := stripANSI(view)
 	if !strings.Contains(plain, "Michael E. Gruen") || !strings.Contains(plain, "LLM Agent Fleet") {
 		t.Error("egg credits should render inside the grid")
+	}
+	// 43xw: Fable was dropped from the fleet credit line.
+	if strings.Contains(plain, "Fable") {
+		t.Error("egg credits should no longer mention Fable")
 	}
 
 	// With fireworks overlaid, the grid must still be exactly 40x100 (the

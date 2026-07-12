@@ -1950,11 +1950,14 @@ func renderGroupedBar(styles help.Styles, groups []keyGroup, width int) string {
 // desync the pty (critical: the app is often run over SSH).
 
 var (
-	eggGold         = []string{"220", "214", "178", "226", "184"}
-	eggSparks       = []rune("✦✧⋆∗✺❋✸•*")
-	eggSparkColors  = []string{"196", "202", "226", "46", "51", "201", "213", "129"}
-	eggCreditColors = []string{"213", "219", "225", "51", "45", "87"}
-	eggZalgoMarks   = []rune{'́', '҉', '̴', '͓', 'ͯ'}
+	eggGold        = []string{"220", "214", "178", "226", "184"}
+	eggSparkColors = []string{"196", "202", "226", "46", "51", "201", "213", "129"} // KEEP vivid: also feeds fw scheme #7 (full rainbow) below -- do not mutate for 43xw
+	// eggMutedColors is a SEPARATE near-monochrome grey ramp (43xw) for the
+	// title + credits: a soft grey progression with one faintly-tinted step,
+	// cycled per-frame like eggSparkColors was, just desaturated. Kept apart
+	// from eggSparkColors so the fireworks stay vivid.
+	eggMutedColors = []string{"245", "247", "250", "252", "103"}
+	eggZalgoMarks  = []rune{'́', '҉', '̴', '͓', 'ͯ'}
 )
 
 // styledCell is one column of the egg-overlay compositing grid: a single
@@ -1974,6 +1977,17 @@ type styledCell struct {
 
 // blankCell is a bare space -- the grid's default fill.
 func blankCell() styledCell { return styledCell{s: " "} }
+
+// blankRow returns w blank cells -- used for the fanfare spacer rows (43xw):
+// the rainbow sparkles were removed, but each row still needs exactly w cells
+// so it occupies one full grid row (see eggView's fanfare rows).
+func blankRow(w int) []styledCell {
+	row := make([]styledCell, w)
+	for i := range row {
+		row[i] = blankCell()
+	}
+	return row
+}
 
 // render turns one cell into terminal output: styled when it carries a colour,
 // bare otherwise. Under the Ascii colour profile (NO_COLOR / --no-color) the
@@ -2319,37 +2333,6 @@ func maxInts(v []int) int {
 		}
 	}
 	return m
-}
-
-// eggSparkleLine builds one row of fireworks: mostly spaces with a few
-// deterministically-placed coloured sparkles (varying per frame). Width is
-// clamped so it never overflows the screen.
-func eggSparkleLine(w, frame, salt int) string {
-	var b strings.Builder
-	for _, c := range eggSparkleCells(w, frame, salt) {
-		b.WriteString(c.render())
-	}
-	return b.String()
-}
-
-// eggSparkleCells is eggSparkleLine's compositing core: the same deterministic
-// sparkle pattern as styledCells, so the FLOATING rainbow fanfare can be laid
-// into the fireworks grid (and its absolute row recorded for the burst band).
-func eggSparkleCells(w, frame, salt int) []styledCell {
-	if w > 56 {
-		w = 56
-	}
-	out := make([]styledCell, w)
-	for x := 0; x < w; x++ {
-		if (x*29+frame*13+salt*7)%9 == 0 {
-			c := eggSparkColors[(x+frame+salt)%len(eggSparkColors)]
-			s := eggSparks[(x*3+frame)%len(eggSparks)]
-			out[x] = styledCell{s: string(s), color: lipgloss.Color(c)}
-		} else {
-			out[x] = blankCell()
-		}
-	}
-	return out
 }
 
 // eggZalgo sprinkles zero-width combining marks over s for a light glitch
@@ -2935,9 +2918,9 @@ func (m model) eggView() string {
 	}
 	f := m.eggFrame
 
-	// The full art needs room for a ~7+ row egg plus ~9 rows of sparkles/
-	// credits/hint (eggLayout's gate: w >= 52, h >= 17). Below it, a bounded
-	// fallback and no fireworks (nowhere safe to place them).
+	// The full art needs room for a ~7+ row egg plus ~9 rows of fanfare
+	// spacers/title/credits/hint (eggLayout's gate: w >= 52, h >= 17). Below
+	// it, a bounded fallback and no fireworks (nowhere safe to place them).
 	lay := eggLayout(w, h)
 	if !lay.ok {
 		msg := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[f%len(eggGold)])).Bold(true).
@@ -2950,26 +2933,32 @@ func (m model) eggView() string {
 	// Compose the egg block as ROWS OF CELLS (never pre-styled strings) so the
 	// fireworks share the grid. Row order fixes the fanfare rows the burst band
 	// keys off (top fanfare, eggRows body, bottom fanfare, title, 6 credits).
+	// The fanfare rows are BLANK spacers (43xw): rainbow sparkles were removed,
+	// but each row still occupies exactly one grid row so topFanfareRow/
+	// botFanfareRow keep anchoring the fireworks burst band (mm5g) unchanged.
 	var block [][]styledCell
-	block = append(block, centerCells(eggSparkleCells(sw, f, 1), sw)) // top fanfare
+	block = append(block, centerCells(blankRow(sw), sw)) // top fanfare (blank spacer, burst-band anchor)
 	for _, row := range eggSpinCells(f, lay.eggCols, lay.eggRows) {
 		block = append(block, centerCells(row, sw)) // egg body
 	}
-	block = append(block, centerCells(eggSparkleCells(sw, f, 2), sw)) // bottom fanfare
+	block = append(block, centerCells(blankRow(sw), sw)) // bottom fanfare (blank spacer, burst-band anchor)
 
-	titleColor := lipgloss.Color(eggSparkColors[f%len(eggSparkColors)])
+	// Title + credits are muted near-monochrome grey (43xw): eggMutedColors is
+	// a SEPARATE palette from eggSparkColors, which must stay vivid for fw
+	// scheme #7 (full rainbow).
+	titleColor := lipgloss.Color(eggMutedColors[f%len(eggMutedColors)])
 	block = append(block, centerCells(plainCells("✦ "+eggZalgo("tailport", f)+" ✦", titleColor, true), sw))
 
 	credits := []string{
 		"Michael E. Gruen",
 		"· The LLM Agent Fleet ·",
-		"Claude Opus 4.8 · Sonnet 5 · Haiku 4.5 · Fable 5",
+		"Claude Opus 4.8 · Sonnet 5 · Haiku 4.5",
 		eggURL,
 		eggRepoURL,
 		"c: copy site · g: copy repo · esc / q: back",
 	}
 	for i, s := range credits {
-		color := lipgloss.Color(eggCreditColors[(f/2+i)%len(eggCreditColors)])
+		color := lipgloss.Color(eggMutedColors[(f/2+i)%len(eggMutedColors)])
 		if i == len(credits)-1 {
 			color = lipgloss.Color("241") // the muted hint line
 		}
