@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+
+	"github.com/gruen/tailport/internal/ui"
 )
 
 // TestVersionLine covers the --version output (jtpx). The default build stamps
@@ -117,13 +121,14 @@ func TestRunUnknownSubcommand(t *testing.T) {
 	}
 }
 
-// TestRunReservedSubcommands covers the three reserved-but-not-yet-
-// implemented subcommand names from the dispatch scaffold: each is
-// recognized (distinct from an unknown subcommand -- no "unknown
-// subcommand" message, no usage dump) but reports plainly that it isn't
-// implemented yet, on stderr, with a non-zero exit.
+// TestRunReservedSubcommands covers the two reserved-but-not-yet-implemented
+// subcommand names left in the dispatch scaffold (quickstart, kata x4cg, is
+// implemented -- see TestRunQuickstart below): each is recognized (distinct
+// from an unknown subcommand -- no "unknown subcommand" message, no usage
+// dump) but reports plainly that it isn't implemented yet, on stderr, with a
+// non-zero exit.
 func TestRunReservedSubcommands(t *testing.T) {
-	for _, name := range []string{"quickstart", "status", "update"} {
+	for _, name := range []string{"status", "update"} {
 		var out, errOut bytes.Buffer
 		code := run([]string{name}, &out, &errOut)
 		if code == 0 {
@@ -138,6 +143,75 @@ func TestRunReservedSubcommands(t *testing.T) {
 		}
 		if strings.Contains(got, "unknown subcommand") {
 			t.Errorf("run([%s]) should be a recognized (reserved) name, not an unknown subcommand; got:\n%s", name, got)
+		}
+	}
+}
+
+// TestRunQuickstart covers kata x4cg's acceptance bar: `tailport quickstart`
+// prints its onboarding text (what tailport does, its safety model, the
+// resolved config path, the full keybinding legend) to stdout, touches
+// stderr not at all, and exits 0 -- no TUI, no side effects (it must not
+// create a config file that didn't already exist: quickstart only reads).
+func TestRunQuickstart(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"quickstart", "--markers", "ascii"}, &out, &errOut)
+	if code != 0 {
+		t.Errorf("run([quickstart]) code = %d, want 0; stderr:\n%s", code, errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("run([quickstart]) stderr = %q, want empty", errOut.String())
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		// What tailport does.
+		"tailport exposes", "tailscale serve",
+		// Safety model wording (AGENTS.md's design constraints).
+		"tailnet-only", "tailscale funnel", "public", "deliberate",
+		"p` key", "y/n confirm", ":22", "hard-blocked",
+		// Resolved config path.
+		"Config path:", filepath.Join(xdg, "tailport", "config.yaml"),
+		// The keybinding legend (spot-check a few rows).
+		"space", "Toggle tailscale serve", "Quit.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("run([quickstart]) stdout missing %q; got:\n%s", want, got)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(xdg, "tailport", "config.yaml")); !os.IsNotExist(err) {
+		t.Errorf("run([quickstart]) must not create a config file as a side effect; os.Stat err = %v", err)
+	}
+}
+
+// TestRunQuickstartLegendMatchesOverlay proves the SINGLE SOURCE OF TRUTH
+// requirement for kata x4cg directly: `tailport quickstart`'s printed
+// keybinding legend is byte-identical to ui.RenderKeyLegend(ui.KeyLegendRows(...)),
+// the exact same call the in-TUI "?" overlay (internal/ui.helpView) makes.
+// Run with both --markers ascii and --markers emoji so the glyph-dependent
+// rows (space/p/C) are checked in both marker modes, not just the default.
+func TestRunQuickstartLegendMatchesOverlay(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	for _, tc := range []struct {
+		markers string
+		emoji   bool
+	}{
+		{"ascii", false},
+		{"emoji", true},
+	} {
+		var out, errOut bytes.Buffer
+		code := run([]string{"quickstart", "--markers", tc.markers}, &out, &errOut)
+		if code != 0 {
+			t.Fatalf("run([quickstart --markers %s]) code = %d, want 0; stderr:\n%s", tc.markers, code, errOut.String())
+		}
+
+		want := ui.RenderKeyLegend(ui.KeyLegendRows(tc.emoji))
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("run([quickstart --markers %s]) stdout does not contain the shared legend verbatim.\nwant substring:\n%s\ngot:\n%s", tc.markers, want, out.String())
 		}
 	}
 }

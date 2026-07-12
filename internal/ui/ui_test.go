@@ -381,6 +381,26 @@ func TestFilterDiscoverable(t *testing.T) {
 	}
 }
 
+// TestHelpViewUsesSharedKeyLegend covers kata x4cg's single-source-of-truth
+// requirement: the in-TUI "?" overlay's Keys section is exactly
+// RenderKeyLegend(KeyLegendRows(m.emoji)) -- not a hand-copied duplicate --
+// so it and `tailport quickstart` (cmd/tailport, which calls the same two
+// functions) can never drift apart. Checked in both marker modes, since the
+// legend's space/p/C rows quote the mode-specific exposure glyph.
+func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	for _, emoji := range []bool{false, true} {
+		m := New(config.Config{})
+		m.emoji = emoji
+
+		want := RenderKeyLegend(KeyLegendRows(emoji))
+		if got := m.helpView(); !strings.Contains(got, want) {
+			t.Errorf("helpView() (emoji=%v) does not contain RenderKeyLegend(KeyLegendRows(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
+		}
+	}
+}
+
 // addPort drives the "n" flow: open the input, type digits, submit.
 func addPort(m model, digits string) model {
 	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})

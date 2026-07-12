@@ -144,19 +144,16 @@ func applyNoColor(flagSet bool) {
 }
 
 // runSubcommand handles a recognized os.Args[1] that doesn't look like a
-// flag (see run). quickstart/status/update are reserved names, each with
-// its own kata issue; until those land this just says so plainly instead of
-// silently falling through to the TUI or pretending to work. Whichever
-// issue lands first should replace its case with a real handler -- see the
-// dispatch scaffold note in run() for how little that diff should need to
-// touch here.
+// flag (see run). status/update are reserved names, each with its own kata
+// issue; until those land this just says so plainly instead of silently
+// falling through to the TUI or pretending to work. quickstart (kata x4cg)
+// is implemented -- see runQuickstart -- and is the model for how little a
+// future issue's diff should need to touch here: one case, one handler
+// function, done.
 func runSubcommand(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "quickstart":
-		// case "quickstart": … implemented under kata x4cg (non-interactive
-		// onboarding + the keybinding legend, printed to stdout).
-		fmt.Fprintln(stderr, "tailport: quickstart is not implemented yet (kata x4cg)")
-		return 1
+		return runQuickstart(args[1:], stdout, stderr)
 	case "status":
 		// case "status": … implemented under kata m7jc (headless read-only
 		// exposure report, optionally --json).
@@ -171,6 +168,96 @@ func runSubcommand(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr, "")
 		return 2
 	}
+}
+
+// runQuickstart implements `tailport quickstart` (kata x4cg): non-interactive
+// onboarding printed straight to stdout, then exit -- no TUI is launched. It
+// parses the same shared flags every subcommand gets (parseFlags: -c/--config,
+// --no-color, --markers, -v/--version), so e.g. `tailport quickstart -c
+// other.yaml` or `tailport quickstart --markers ascii` behave exactly like
+// the equivalent flags do everywhere else.
+func runQuickstart(args []string, stdout, stderr io.Writer) int {
+	cf, code, handled := parseFlags(args, stdout, stderr)
+	if handled {
+		return code
+	}
+	applyNoColor(cf.noColor)
+
+	if cf.showVersion {
+		fmt.Fprintln(stdout, versionLine())
+		return 0
+	}
+	if err := validateMarkers(cf.markers); err != nil {
+		fmt.Fprintln(stderr, "tailport:", err)
+		return 2
+	}
+
+	// config.Load only reads -- unlike the default TUI path, quickstart never
+	// calls config.WriteDefault, so merely running `tailport quickstart` has
+	// no side effect on a machine that's never run tailport before. Load
+	// still resolves and returns the exact path (honoring -c/--config and
+	// XDG_CONFIG_HOME) and, if a config already exists, its persisted
+	// Markers preference -- both needed so this output matches what the TUI
+	// would actually show.
+	cfg, err := config.Load(cf.configPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "tailport: resolving config:", err)
+		return 1
+	}
+
+	// Marker-glyph precedence mirrors ui.New: this run's --markers flag wins,
+	// else the persisted cfg.Markers, else auto-detect (ui.ResolveEmoji).
+	markersMode := cf.markers
+	if markersMode == "" {
+		markersMode = cfg.Markers
+	}
+
+	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveEmoji(markersMode)))
+	return 0
+}
+
+// quickstartText builds `tailport quickstart`'s entire stdout output: a short
+// paragraph on what tailport does, its safety model (serve is tailnet-only
+// and the only automatic path; funnel is public and opt-in ONLY via the `p`
+// key behind a strong confirm; :22 is hard-blocked from funnel -- see
+// AGENTS.md's "Design constraints" section, which this wording tracks
+// closely), the resolved config path, and the full keybinding legend.
+//
+// SINGLE SOURCE OF TRUTH: the legend rows come from ui.KeyLegendRows,
+// rendered by ui.RenderKeyLegend -- the exact same function calls
+// internal/ui.helpView uses for the in-TUI "?" overlay. Nothing here
+// hand-copies a key or a description, so quickstart's legend cannot drift
+// from what "?" shows; a future edit to a binding's help text only has one
+// place to change.
+//
+// Kept as a pure string builder (like versionLine) rather than writing
+// straight to an io.Writer, so it's testable without stdout/exit-code
+// plumbing.
+func quickstartText(configPath string, emoji bool) string {
+	var b strings.Builder
+
+	fmt.Fprintln(&b, "tailport exposes your machine's locally listening TCP ports across your")
+	fmt.Fprintln(&b, "tailnet. It discovers what's listening with `ss` (Linux) / `lsof` (macOS)")
+	fmt.Fprintln(&b, "and toggles `tailscale serve` on and off per port -- from an interactive")
+	fmt.Fprintln(&b, "list (run `tailport` with no arguments) or headlessly via its subcommands.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Safety model:")
+	fmt.Fprintln(&b, "  Tailnet-first. `tailscale serve` (tailnet-only exposure) is the default")
+	fmt.Fprintln(&b, "  path for every port you expose: plain HTTP, reachable only by your other")
+	fmt.Fprintln(&b, "  tailnet devices at http://<host>:<port>, always a 1:1 port mapping (same")
+	fmt.Fprintln(&b, "  port in and out).")
+	fmt.Fprintln(&b, "  `tailscale funnel` (public internet exposure) IS supported, but only as")
+	fmt.Fprintln(&b, "  a deliberate, per-service opt-in via the `p` key behind a strong y/n")
+	fmt.Fprintln(&b, "  confirm that names the port and shows the resulting public URL. tailport")
+	fmt.Fprintln(&b, "  never funnels implicitly, in bulk, or without that confirm.")
+	fmt.Fprintln(&b, "  `:22` (SSH) is hard-blocked from funnel.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Config path:", configPath)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Keybinding legend (interactive TUI; run `tailport` with no arguments):")
+	b.WriteString(ui.RenderKeyLegend(ui.KeyLegendRows(emoji)))
+
+	return b.String()
 }
 
 // run implements tailport's entire CLI behavior, returning the process exit

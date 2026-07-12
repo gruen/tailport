@@ -453,6 +453,14 @@ func emojiCapable() bool {
 	return strings.Contains(loc, "utf-8") || strings.Contains(loc, "utf8")
 }
 
+// ResolveEmoji exports resolveEmoji's marker-glyph resolution for callers
+// outside this package. `tailport quickstart` (kata x4cg) uses it so its
+// printed legend picks the same glyph set (see KeyLegendRows) the "?"
+// overlay would for the same markers mode, not just the same key text.
+func ResolveEmoji(mode string) bool {
+	return resolveEmoji(mode)
+}
+
 // New builds the initial model from a loaded Config. markersOverride is an
 // optional, run-only "--markers" value (zn2x): the caller (main.go, after
 // its own validation) passes at most one string. When it's non-empty it
@@ -1926,6 +1934,62 @@ func (m model) eggView() string {
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
 }
 
+// KeyLegendRow is one row of tailport's full keybinding legend: a key label
+// and its (possibly multi-line, "\n"-joined) description.
+type KeyLegendRow struct {
+	Key  string
+	Desc string
+}
+
+// KeyLegendRows returns tailport's full keybinding legend -- one row per
+// binding, with the same wording the in-TUI "?" overlay (helpView) shows.
+// It is the SINGLE SOURCE OF TRUTH for that legend: helpView and `tailport
+// quickstart` (kata x4cg) both render off this one definition, so they can
+// never drift apart. emoji picks which exposure glyph (🐣/🐦/🪹 vs ◉/●/▲) is
+// quoted inline in the space/p/C rows, matching whichever marker set the
+// caller is using (see resolveEmoji).
+func KeyLegendRows(emoji bool) []KeyLegendRow {
+	served, funneled, dangling := "◉", "●", "▲"
+	if emoji {
+		served, funneled, dangling = "🐣", "🐦", "🪹"
+	}
+
+	return []KeyLegendRow{
+		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it."},
+		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
+		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
+		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
+		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
+		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access)."},
+		{"n", "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up."},
+		{"l", "Set a text label for the selected port."},
+		{"r", "Refresh the port list and serve status."},
+		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
+		{"c", "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so."},
+		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist."},
+		{"?", "Toggle this help. esc or q also close it."},
+		{"q", "Quit."},
+	}
+}
+
+// RenderKeyLegend formats rows (from KeyLegendRows) as tailport's standard
+// legend block: a bold, left-padded key column followed by its description,
+// with any continuation lines indented to align beneath the description
+// column. Shared verbatim by helpView (the in-TUI "?" overlay) and
+// `tailport quickstart` (kata x4cg) so the two can never render different
+// text for the same rows.
+func RenderKeyLegend(rows []KeyLegendRow) string {
+	var b strings.Builder
+	for _, r := range rows {
+		lines := strings.Split(r.Desc, "\n")
+		b.WriteString("  " + helpKeyStyle.Render(fmt.Sprintf("%-6s", r.Key)) + "  " + helpTextStyle.Render(lines[0]) + "\n")
+		for _, extra := range lines[1:] {
+			b.WriteString("          " + helpTextStyle.Render(extra) + "\n")
+		}
+	}
+	return b.String()
+}
+
 // helpView renders the full-screen "?" overlay: a short intro to what
 // tailport is, then a real explanation of every key (not the terse legend).
 // It replaces the whole View while m.showHelp is set.
@@ -1981,43 +2045,19 @@ func (m model) helpView() string {
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Keys"))
 	b.WriteString("\n")
-
-	// Exposure glyph shown inline in the key descriptions below, matching the
-	// active marker set so "exposed (X)" reads correctly in either mode.
-	served, funneled, dangling := "◉", "●", "▲"
-	if m.emoji {
-		served, funneled, dangling = "🐣", "🐦", "🪹"
-	}
-
-	rows := []struct{ key, desc string }{
-		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it."},
-		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
-		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
-		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
-		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
-		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access)."},
-		{"n", "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up."},
-		{"l", "Set a text label for the selected port."},
-		{"r", "Refresh the port list and serve status."},
-		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
-		{"c", "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so."},
-		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist."},
-		{"?", "Toggle this help. esc or q also close it."},
-		{"q", "Quit."},
-	}
-	for _, r := range rows {
-		lines := strings.Split(r.desc, "\n")
-		b.WriteString("  " + helpKeyStyle.Render(fmt.Sprintf("%-6s", r.key)) + "  " + helpTextStyle.Render(lines[0]) + "\n")
-		for _, extra := range lines[1:] {
-			b.WriteString("          " + helpTextStyle.Render(extra) + "\n")
-		}
-	}
+	b.WriteString(RenderKeyLegend(KeyLegendRows(m.emoji)))
 
 	b.WriteString("\n")
 	b.WriteString(warnStyle.Render(
 		"Toggling port :22 (SSH) asks for a y/n confirmation first, in both\n" +
 			"directions — turning serve off for :22 can drop your live SSH session."))
 	b.WriteString("\n\n")
+	// Dangling-forward glyph, same resolution as KeyLegendRows' inline "C" row
+	// glyph, quoted again here since this paragraph sits outside that legend.
+	dangling := "▲"
+	if m.emoji {
+		dangling = "🪹"
+	}
 	b.WriteString(helpTextStyle.Render(
 		"A port marked " + dangling + " (its row reads \"bound to tailscale …\") is a\n" +
 			"dangling forward: served, but no local process holds it. If your app\n" +
