@@ -2404,20 +2404,20 @@ func TestEggViewTinyNoPanic(t *testing.T) {
 // --- p39s: grouped key hints (bottom-bar grid + unified overlay) ---
 
 // TestKeyGroupsAndFullHelp covers the single grouping source: keyMap.groups()
-// yields the five approved columns in order, and FullHelp() mirrors them one
-// inner slice per column.
+// yields the four approved columns in order, and FullHelp() mirrors them one
+// inner slice per column. Expose ends in the contextual C then x (lock always
+// last); Copy (c) sits under NewPort (n) in Favorites.
 func TestKeyGroupsAndFullHelp(t *testing.T) {
 	k := newKeyMap()
 	groups := k.groups()
 
-	wantNames := []string{"Expose", "Favorites", "Protect", "View", "App"}
+	wantNames := []string{"Expose", "Favorites", "View", "App"}
 	if len(groups) != len(wantNames) {
 		t.Fatalf("groups() = %d columns, want %d", len(groups), len(wantNames))
 	}
 	wantKeys := [][]string{
-		{"space", "p", "c"},
-		{"f", "u", "n", "l"},
-		{"x", "C"},
+		{"space", "p", "C", "x"},
+		{"f", "u", "n", "c", "l"},
 		{"/", "a", "r"},
 		{"?", "q"},
 	}
@@ -2450,9 +2450,10 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 }
 
 // TestBottomBarGridAligned drives the real model at a wide width and asserts
-// the bar renders the five grouped columns with a header row and aligned
+// the bar renders the four grouped columns with a header row and aligned
 // gutters: descriptions line up within a column and columns line up across
-// rows.
+// rows. With no dangling, Expose is space/p/x (lock last, clean dropped) and
+// Favorites is the tallest column (f/u/n/c/l), so the grid is a header + 5 rows.
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
 	m.help.Width = 100
@@ -2460,47 +2461,92 @@ func TestBottomBarGridAligned(t *testing.T) {
 
 	grid := stripANSI(m.renderLegend())
 	lines := strings.Split(grid, "\n")
-	if len(lines) < 5 {
-		t.Fatalf("grid should be a header + up to 4 rows (>=5 lines); got %d:\n%s", len(lines), grid)
+	if len(lines) < 6 {
+		t.Fatalf("grid should be a header + up to 5 rows (>=6 lines); got %d:\n%s", len(lines), grid)
 	}
-	hdr, r1, r2 := lines[0], lines[1], lines[2]
+	hdr := lines[0]
 
-	// Header row carries all five section names, in order, on one line.
+	// at returns the (row, col) of needle within the data rows (row 0 == the
+	// first data line, i.e. lines[1]); fails if it appears in no data row.
+	at := func(needle string) (row, col int) {
+		for i, ln := range lines[1:] {
+			if c := strings.Index(ln, needle); c >= 0 {
+				return i, c
+			}
+		}
+		t.Fatalf("no data row contains %q; got:\n%s", needle, grid)
+		return -1, -1
+	}
+
+	// Header row carries all four section names, in order, on one line.
 	prev := -1
-	for _, name := range []string{"Expose", "Favorites", "Protect", "View", "App"} {
-		at := strings.Index(hdr, name)
-		if at < 0 {
+	for _, name := range []string{"Expose", "Favorites", "View", "App"} {
+		i := strings.Index(hdr, name)
+		if i < 0 {
 			t.Fatalf("header row missing %q; got %q", name, hdr)
 		}
-		if at <= prev {
-			t.Errorf("header %q out of order (at %d, prev %d): %q", name, at, prev, hdr)
+		if i <= prev {
+			t.Errorf("header %q out of order (at %d, prev %d): %q", name, i, prev, hdr)
 		}
-		prev = at
+		prev = i
 	}
 
-	// Columns line up across rows: each header's start == its cells' start.
-	eq := func(label string, a, b int) {
-		if a != b {
-			t.Errorf("%s misaligned: %d vs %d\nhdr: %q\nr1:  %q\nr2:  %q", label, a, b, hdr, r1, r2)
+	// Columns line up: each header's start == the start of every cell in its
+	// column, wherever that cell falls (Expose's lock is on the 3rd data row,
+	// Favorites' label on the 5th).
+	col := func(label string, header, needle string) {
+		_, c := at(needle)
+		if h := strings.Index(hdr, header); c != h {
+			t.Errorf("%s misaligned: %q header at %d, cell %q at %d", label, header, h, needle, c)
 		}
 	}
-	eq("Favorites/r1", strings.Index(hdr, "Favorites"), strings.Index(r1, "f favorite"))
-	eq("Favorites/r2", strings.Index(hdr, "Favorites"), strings.Index(r2, "u unfavorite"))
-	eq("Protect/r1", strings.Index(hdr, "Protect"), strings.Index(r1, "x lock/unlock"))
-	eq("View/r1", strings.Index(hdr, "View"), strings.Index(r1, "/ filter"))
-	eq("App/r1", strings.Index(hdr, "App"), strings.Index(r1, "? help"))
-	eq("App/r2", strings.Index(hdr, "App"), strings.Index(r2, "q quit"))
+	// Expose's key gutter is 5 wide (from "space"), so its cells render like
+	// "x     lock/unlock"; anchor its column on "space serve" (which starts flush
+	// at the column) rather than a padded cell.
+	col("Expose/serve", "Expose", "space serve")
+	col("Favorites/favorite", "Favorites", "f favorite")
+	col("Favorites/label", "Favorites", "l label")
+	col("View/filter", "View", "/ filter")
+	col("App/help", "App", "? help")
+	col("App/quit", "App", "q quit")
+
+	// Copy sits directly under "n add favorite": same column, next row down.
+	nRow, nCol := at("n add favorite")
+	cRow, cCol := at("c copy URL")
+	if cCol != nCol || cRow != nRow+1 {
+		t.Errorf("c copy URL should be the row directly under n add favorite; n at (%d,%d), c at (%d,%d)", nRow, nCol, cRow, cCol)
+	}
+
+	// Lock is the LAST Expose row, and its key sits flush at the Expose column
+	// start. (Match the desc "lock/unlock" since the padded "x     lock/unlock"
+	// cell isn't a single-space substring; lockRow indexes lines[1:].)
+	lockRow, _ := at("lock/unlock")
+	lockLine := lines[lockRow+1]
+	exposeCol := strings.Index(hdr, "Expose")
+	if exposeCol >= len(lockLine) || lockLine[exposeCol] != 'x' {
+		t.Errorf("lock's key should sit flush at the Expose column start (col %d); line: %q", exposeCol, lockLine)
+	}
+	for li := lockRow + 2; li < len(lines); li++ {
+		if ln := lines[li]; len(ln) > exposeCol && ln[exposeCol] != ' ' {
+			t.Errorf("Expose column has content below lock (line %d): %q", li, ln)
+		}
+	}
 
 	// Within the Expose column the key gutter aligns the descriptions: "serve"
 	// (after "space ") and "funnel" (after "p     ") start at the same offset.
-	eq("Expose gutter", strings.Index(r1, "serve"), strings.Index(r2, "funnel"))
+	_, serveCol := at("serve")
+	_, funnelCol := at("funnel")
+	if serveCol != funnelCol {
+		t.Errorf("Expose gutter misaligned: serve at %d, funnel at %d", serveCol, funnelCol)
+	}
 }
 
 // TestBottomBarNarrowFallback covers the responsive fallback: below the
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	const width = 60
+	// The 4-column grid is 58 cells wide; 50 forces the wrapped fallback.
+	const width = 50
 	m := New(config.Config{})
 	m.help.Width = width
 	m.width = width
@@ -2508,7 +2554,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	bar := stripANSI(m.renderLegend())
 	lines := strings.Split(bar, "\n")
 
-	// Not the grid: the five headers are no longer all on the first line.
+	// Not the grid: the four headers are no longer all on the first line.
 	if all := strings.Contains(lines[0], "Expose") && strings.Contains(lines[0], "App"); all {
 		t.Errorf("narrow width should fall back, not render the single-row grid header; got %q", lines[0])
 	}
@@ -2523,7 +2569,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	// Every hint is still present -- no truncation, no elision. (C is contextual
 	// and absent with no dangling.)
 	for _, want := range []string{
-		"Expose", "Favorites", "Protect", "View", "App",
+		"Expose", "Favorites", "View", "App",
 		"space serve", "p funnel public", "c copy URL",
 		"f favorite", "u unfavorite", "n add favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
@@ -2538,43 +2584,59 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	}
 }
 
-// TestProtectColumnContextualClean covers the contextual "C clean stale": the
-// Protect column collapses to just "x lock/unlock" (no reserved blank slot)
-// when nothing is dangling, and expands to add "C clean stale" when a dangling
-// forward exists.
-func TestProtectColumnContextualClean(t *testing.T) {
+// TestExposeContextualClean covers the contextual "C clean stale" now that
+// Protect is folded into Expose: with no dangling the Expose column ends at
+// "x lock/unlock" (space/p/x, no clean, no reserved blank slot); when a
+// dangling forward exists it gains "C clean stale" -- inserted just ABOVE lock
+// so "x lock/unlock" stays the last item in the column in either state.
+func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.help.Width = 100
 	m.width = 100
 
-	protect := func(groups []keyGroup) keyGroup {
+	expose := func(groups []keyGroup) keyGroup {
 		for _, g := range groups {
-			if g.name == "Protect" {
+			if g.name == "Expose" {
 				return g
 			}
 		}
-		t.Fatal("no Protect group")
+		t.Fatal("no Expose group")
 		return keyGroup{}
 	}
+	lastKey := func(g keyGroup) string {
+		if len(g.bindings) == 0 {
+			return ""
+		}
+		return g.bindings[len(g.bindings)-1].Help().Key
+	}
 
-	// No dangling -> Protect has exactly the lock binding, and the rendered bar
-	// omits "clean".
-	if got := len(protect(m.barGroups(false)).bindings); got != 1 {
-		t.Errorf("Protect should collapse to 1 binding (x) with no dangling; got %d", got)
+	// No dangling -> Expose is space/p/x (clean dropped), lock last, and the
+	// rendered bar omits "clean".
+	noClean := expose(m.barGroups(false))
+	if got := len(noClean.bindings); got != 3 {
+		t.Errorf("Expose should be 3 bindings (space/p/x) with no dangling; got %d", got)
+	}
+	if k := lastKey(noClean); k != "x" {
+		t.Errorf("lock (x) should be the last Expose binding with no dangling; got %q", k)
 	}
 	if noDangle := stripANSI(m.renderLegend()); strings.Contains(noDangle, "clean") {
 		t.Errorf("bar should not show 'clean' with no dangling:\n%s", noDangle)
 	}
 
-	// A served-but-not-listening port is dangling -> Protect gains "C clean".
+	// A served-but-not-listening port is dangling -> Expose gains "C clean",
+	// still with lock (x) last.
 	m.active = map[int]bool{9999: true}
 	if !m.hasDangling() {
 		t.Fatal("setup: expected a dangling forward")
 	}
-	if got := len(protect(m.barGroups(true)).bindings); got != 2 {
-		t.Errorf("Protect should expand to 2 bindings (x, C) with a dangling; got %d", got)
+	withClean := expose(m.barGroups(true))
+	if got := len(withClean.bindings); got != 4 {
+		t.Errorf("Expose should be 4 bindings (space/p/C/x) with a dangling; got %d", got)
 	}
-	if dangle := stripANSI(m.renderLegend()); !strings.Contains(dangle, "C clean stale") {
+	if k := lastKey(withClean); k != "x" {
+		t.Errorf("lock (x) should STILL be the last Expose binding with a dangling; got %q", k)
+	}
+	if dangle := stripANSI(m.renderLegend()); !strings.Contains(dangle, "clean stale") {
 		t.Errorf("bar should show 'C clean stale' with a dangling:\n%s", dangle)
 	}
 }
@@ -2616,9 +2678,10 @@ func TestLegendSizingNoClip(t *testing.T) {
 		{"wide/no-dangling", 100, 24, false, false},
 		{"wide/dangling", 100, 24, true, true},
 		{"wide/dangling-appears-after-resize", 100, 24, false, true},
-		{"narrow/no-dangling", 58, 24, false, false},
-		{"narrow/dangling", 58, 24, true, true},
-		{"narrow/dangling-appears-after-resize", 58, 24, false, true},
+		// Below the 58-wide grid threshold, so these exercise the wrapped fallback.
+		{"narrow/no-dangling", 50, 24, false, false},
+		{"narrow/dangling", 50, 24, true, true},
+		{"narrow/dangling-appears-after-resize", 50, 24, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := build(tc.w, tc.h, tc.sizeDangling, tc.renderDangling)
@@ -2635,7 +2698,7 @@ func TestLegendSizingNoClip(t *testing.T) {
 	}
 }
 
-// TestHelpOverlayGroupedSections covers the "?" overlay reorg: the same five
+// TestHelpOverlayGroupedSections covers the "?" overlay reorg: the same four
 // sections in the same order as the bar, each with an aligned key gutter, but
 // keeping the RICH per-key prose and the surrounding Markers/warnings/config
 // prose.
@@ -2650,7 +2713,7 @@ func TestHelpOverlayGroupedSections(t *testing.T) {
 
 	// Sections appear in the approved order.
 	prev := -1
-	for _, name := range []string{"Expose", "Favorites", "Protect", "View", "App"} {
+	for _, name := range []string{"Expose", "Favorites", "View", "App"} {
 		at := strings.Index(help, name)
 		if at < 0 {
 			t.Fatalf("overlay missing section %q", name)

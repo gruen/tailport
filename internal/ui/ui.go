@@ -85,6 +85,17 @@ var (
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
 	helpTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#303030", Dark: "252"})
 
+	// barKeyStyle colors the KEY of each bottom-bar hint (the "space" in "space
+	// serve"). It replaces bubbles/help's built-in ShortKey default, which is a
+	// deliberately faint gray (#909090 light / #626262 dark) that washed out
+	// against the terminal background; the descriptions use helpTextStyle
+	// (#303030 / 252). Both are wired onto m.help.Styles in newModel. This is a
+	// monochrome, no-new-hue contrast bump (bold near-white key over light-gray
+	// desc), so the reorganized grouped hints (p39s) read clearly without pulling
+	// the overlay's blue key color down into the bar. Verified against both
+	// backgrounds by TestBottomBarHintStylesContrast.
+	barKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "255"}).Bold(true)
+
 	// logoStyle draws the persistent cyan "tailport" wordmark pinned to the
 	// top-left of every view (list and empty-state alike); see renderHeader.
 	logoStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#005f5f", Dark: "51"}).Bold(true)
@@ -122,20 +133,24 @@ type keyMap struct {
 // display name and the bindings under it, in order. keyMap.groups() is the
 // SINGLE grouping source -- the bottom-bar grid (renderLegend), the "?" overlay
 // and `tailport quickstart` (both via KeyLegendGroups), and FullHelp() all
-// derive from it, so the five columns can never drift apart.
+// derive from it, so the four columns can never drift apart.
 type keyGroup struct {
 	name     string
 	bindings []key.Binding
 }
 
-// groups returns the approved like-for-like grouping (kata p39s): Expose,
-// Favorites, Protect, View, App -- in display order, one group per bottom-bar
-// column and one "?"-overlay section.
+// groups returns the approved like-for-like grouping: Expose, Favorites, View,
+// App -- in display order, one group per bottom-bar column and one "?"-overlay
+// section. (p39s introduced this grouping with a separate Protect column;
+// folded into Expose here -- lock/unlock and the contextual clean-stale are
+// exposure guards, so they live at the end of Expose with x lock/unlock always
+// the last item. Clean is contextual: barGroups drops it unless a dangling
+// forward exists, so ordering it before Lock keeps Lock last in every state.
+// Copy moved from Expose to sit under "n add favorite" in Favorites.)
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Copy}},
-		{"Favorites", []key.Binding{k.Favorite, k.Unfavorite, k.NewPort, k.Label}},
-		{"Protect", []key.Binding{k.Lock, k.Clean}},
+		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Clean, k.Lock}},
+		{"Favorites", []key.Binding{k.Favorite, k.Unfavorite, k.NewPort, k.Copy, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		{"App", []key.Binding{k.Help, k.Quit}},
 	}
@@ -690,6 +705,13 @@ func New(cfg config.Config, markersOverride ...string) model {
 	}
 
 	h := help.New()
+	// Swap bubbles/help's faint default key/desc colors for tailport's own
+	// higher-contrast pair so the bottom-bar hints read clearly against the
+	// terminal background (see barKeyStyle). renderLegendGrid / renderGroupedBar
+	// pull ShortKey/ShortDesc straight off m.help.Styles, so this is the single
+	// wiring point; the header row keeps its green helpTitleStyle.
+	h.Styles.ShortKey = barKeyStyle
+	h.Styles.ShortDesc = helpTextStyle
 
 	// Resolve the config path once here (best-effort) so the help overlay can
 	// show exactly where settings live, -c/--config and XDG overrides all. If
@@ -1815,8 +1837,9 @@ func (m model) renderLegendWith(cleanEnabled bool) string {
 // barGroups adapts keyMap.groups() for the bottom bar: it relabels "a" to
 // "switch view" (its keymap help is "filtered"; the active view is shown by the
 // header indicator, renderViewIndicator) and drops the contextual "C clean
-// stale" unless cleanEnabled. The Protect column therefore collapses to just
-// "x lock/unlock" when nothing is dangling, with no reserved blank slot.
+// stale" unless cleanEnabled. The Expose column therefore ends at "x
+// lock/unlock" (no reserved blank slot) when nothing is dangling, and gains
+// "C clean stale" just above lock when a dangling forward exists.
 func (m model) barGroups(cleanEnabled bool) []keyGroup {
 	keys := m.keys
 	keys.ShowAll.SetHelp("a", "switch view")
@@ -3089,12 +3112,11 @@ func keyLegendDescs(emoji bool) map[string]string {
 	}
 }
 
-// KeyLegendGroups returns the full keybinding legend grouped into the same five
+// KeyLegendGroups returns the full keybinding legend grouped into the same four
 // sections, in the same order, as the bottom-bar grid -- Expose, Favorites,
-// Protect, View, App -- each row carrying the RICH prose (keyLegendDescs), not
-// the terse bar label. The sections and their membership are taken from
-// keyMap.groups(), the one grouping source, so the "?" overlay and the bar
-// cannot diverge.
+// View, App -- each row carrying the RICH prose (keyLegendDescs), not the terse
+// bar label. The sections and their membership are taken from keyMap.groups(),
+// the one grouping source, so the "?" overlay and the bar cannot diverge.
 func KeyLegendGroups(emoji bool) []KeyLegendGroup {
 	descs := keyLegendDescs(emoji)
 	src := newKeyMap().groups()
@@ -3245,9 +3267,9 @@ func (m model) helpContent() string {
 	b.WriteString("\n")
 	b.WriteString(helpTextStyle.Render(m.operatorSetupText()))
 	b.WriteString("\n\n")
-	// Keys, grouped into the same five sections/order as the bottom-bar grid
-	// (Expose, Favorites, Protect, View, App) -- each section's own header stands
-	// in for the old flat "Keys" title -- but keeping the rich per-key prose.
+	// Keys, grouped into the same four sections/order as the bottom-bar grid
+	// (Expose, Favorites, View, App) -- each section's own header stands in for
+	// the old flat "Keys" title -- but keeping the rich per-key prose.
 	// Laid out side by side when the terminal is wide enough (v10j) to shorten
 	// the overlay; falls back to a single column otherwise.
 	b.WriteString(m.renderKeyLegendColumns())

@@ -57,6 +57,7 @@ var ansiHexByIndex = map[string]string{
 	"220": "#ffd700",
 	"245": "#8a8a8a",
 	"252": "#d0d0d0",
+	"255": "#eeeeee",
 }
 
 // srgbToLinear, relativeLuminance, and contrastRatio implement the WCAG 2.x
@@ -327,6 +328,74 @@ func TestHelpViewAndLegendReflectTheme(t *testing.T) {
 	// dark-mode bottom bar (renderLegendGrid's group-name header).
 	if !strings.Contains(darkBar, "38;5;42") {
 		t.Error("renderLegend() (bottom bar) under a forced dark background doesn't contain helpTitleStyle's Dark ANSI-256 sequence (38;5;42)")
+	}
+}
+
+// TestBottomBarHintStylesContrast covers the follow-up to p39s's grouped
+// bottom bar: its hint rows must NOT inherit bubbles/help's faint default
+// key/desc colors (#909090/#626262 key, #B2B2B2/#4A4A4A desc -- the latter
+// nearly invisible on a dark terminal). newModel wires ShortKey -> barKeyStyle
+// (bold, high-contrast, monochrome) and ShortDesc -> helpTextStyle instead, and
+// barKeyStyle clears the same 4.5:1 WCAG bar on both backgrounds as the rest of
+// the palette. Asserted at the style level (wiring + contrast) and the
+// rendered-bytes level (the dark bar carries the bright key sequence, not the
+// faint bubbles defaults).
+func TestBottomBarHintStylesContrast(t *testing.T) {
+	// Wiring: the help model the TUI actually renders uses tailport's styles,
+	// not bubbles/help's faint defaults.
+	m := New(config.Config{})
+	if got, want := m.help.Styles.ShortKey.GetForeground(), barKeyStyle.GetForeground(); got != want {
+		t.Errorf("m.help.Styles.ShortKey foreground = %v, want barKeyStyle's %v (bar still using bubbles' faint default?)", got, want)
+	}
+	if !m.help.Styles.ShortKey.GetBold() {
+		t.Error("m.help.Styles.ShortKey should be bold (barKeyStyle)")
+	}
+	if got, want := m.help.Styles.ShortDesc.GetForeground(), helpTextStyle.GetForeground(); got != want {
+		t.Errorf("m.help.Styles.ShortDesc foreground = %v, want helpTextStyle's %v", got, want)
+	}
+
+	// Contrast: barKeyStyle clears 4.5:1 against white (light) and black (dark),
+	// the same bar as every must-fix style.
+	fg, ok := barKeyStyle.GetForeground().(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("barKeyStyle foreground is %T, not AdaptiveColor", barKeyStyle.GetForeground())
+	}
+	if r, err := contrastRatio(fg.Light, "#ffffff"); err != nil {
+		t.Fatal(err)
+	} else if r < 4.5 {
+		t.Errorf("barKeyStyle Light %s vs white = %.2f:1, want >= 4.5:1", fg.Light, r)
+	}
+	darkHex, ok := ansiHexByIndex[fg.Dark]
+	if !ok {
+		t.Fatalf("no known hex for ANSI-256 index %q -- add it to ansiHexByIndex", fg.Dark)
+	}
+	if r, err := contrastRatio(darkHex, "#000000"); err != nil {
+		t.Fatal(err)
+	} else if r < 4.5 {
+		t.Errorf("barKeyStyle Dark %s (ANSI %s) vs black = %.2f:1, want >= 4.5:1", darkHex, fg.Dark, r)
+	}
+
+	// Rendered-bytes: the dark bottom bar carries barKeyStyle's bright key
+	// sequence (38;5;255) and none of the faint bubbles/help defaults.
+	origProfile := lipgloss.ColorProfile()
+	origDark := lipgloss.HasDarkBackground()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(origProfile)
+		lipgloss.SetHasDarkBackground(origDark)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	lipgloss.SetHasDarkBackground(true)
+
+	m.help.Width = 100
+	m.width = 100
+	darkBar := m.renderLegend()
+	if !strings.Contains(darkBar, "38;5;255") {
+		t.Errorf("dark bottom bar missing barKeyStyle's bright key sequence (38;5;255):\n%q", darkBar)
+	}
+	for _, faint := range []string{"38;2;98;98;98", "38;2;74;74;74"} { // bubbles key/desc dark defaults
+		if strings.Contains(darkBar, faint) {
+			t.Errorf("dark bottom bar still contains bubbles/help's faint default sequence %q", faint)
+		}
 	}
 }
 
