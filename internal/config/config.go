@@ -31,14 +31,14 @@ type PortMeta struct {
 type Config struct {
 	Ports map[int]PortMeta `yaml:"ports"`
 	// Markers selects the EXPOSURE-marker glyph style (qwcw): the port-state
-	// moon-phase ramp 🌕 localhost/🌔 local network/🌓 on tailnet/🌒 served/
-	// 🌑 funnelled to the internet (plus the off-ramp 🌫️ stale/✕ offline), or
-	// its mono fallback ○/◔/◑/◉/●/▲/✕. Empty (the default, "" -- not set)
-	// means MONO/ASCII; "auto" opts into detecting a UTF-8-capable terminal
-	// and picking emoji there; "emoji"/"ascii" force a set outright
-	// regardless of the terminal. This governs the exposure markers ONLY --
-	// the hidden Easter-egg overlay and its fireworks always auto-detect
-	// their own glyph style independently of this setting.
+	// moon-phase ramp 🌕 localhost/🌔 local network/🌒 on tailnet (served or
+	// bound wide)/🌑 funnelled to the internet (plus the off-ramp 🌫️ stale/
+	// ✕ offline), or its mono fallback ○/◔/◉/●/▲/✕. Empty (the default, ""
+	// -- not set) means MONO/ASCII; "auto" opts into detecting a
+	// UTF-8-capable terminal and picking emoji there; "emoji"/"ascii" force
+	// a set outright regardless of the terminal. This governs the exposure
+	// markers ONLY -- the hidden Easter-egg overlay and its fireworks always
+	// auto-detect their own glyph style independently of this setting.
 	Markers string `yaml:"markers,omitempty"`
 
 	// Theme selects the color-scheme mode (kata n7gc): "auto" (default;

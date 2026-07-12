@@ -267,7 +267,7 @@ func TestSpaceGuardForReachablePorts(t *testing.T) {
 	// "app bound wide (0.0.0.0)" info toast (83wv pt2 -- reworded from the
 	// old "nothing to serve" line to be honest about WHY and actionable
 	// about how to make it toggleable), no toggle begun.
-	const wantGeneralWildcard = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
+	const wantGeneralWildcard = "on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable"
 	m := newModel(8080, portscan.ScopeWildcard, false)
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	got := res.(model)
@@ -285,7 +285,7 @@ func TestSpaceGuardForReachablePorts(t *testing.T) {
 	// space no-ops with the DEDICATED SSH variant, not the general
 	// "rebind to localhost" line, which would be nonsensical (and
 	// self-locking) advice for sshd (83wv pt2).
-	const wantSSHVariant = "already on tailnet as SSH — this is how you're connected; nothing for tailport to serve"
+	const wantSSHVariant = "on tailnet as SSH — this is how you're connected; nothing for tailport to serve"
 	m = newModel(22, portscan.ScopeWildcard, false)
 	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	got = res.(model)
@@ -2059,7 +2059,7 @@ func TestMarkerGlyph(t *testing.T) {
 			name:      "B reachTailnet",
 			item:      portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true},
 			wantState: reachTailnet,
-			wantEmoji: "🌓", wantASCII: "◑",
+			wantEmoji: "🌒", wantASCII: "◉",
 		},
 		{
 			name:      "C reachServed",
@@ -2228,7 +2228,7 @@ func TestReachStateDescriptions(t *testing.T) {
 			name:  "B wildcard unserved -> on tailnet",
 			item:  portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
 			state: reachTailnet,
-			desc:  "on tailnet",
+			desc:  "on tailnet · http://host:8080",
 		},
 		{
 			name:  "B :22 on a wildcard bind -> on tailnet, reachable via SSH",
@@ -2271,6 +2271,84 @@ func TestReachStateDescriptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBindPrefix covers qptn: the netstat-style host prefix shown left of
+// ":PORT" on the row title is now the ONLY channel that distinguishes a
+// bound-wide-on-tailnet port from a served one, since both share the green
+// ◉ glyph and an identical description (Change 1/2). Wildcard -> "*", a
+// specific LAN bind -> its bare host, everything else (loopback, served,
+// unclassified) -> "" (quiet).
+func TestBindPrefix(t *testing.T) {
+	cases := []struct {
+		name  string
+		scope portscan.BindScope
+		host  string
+		want  string
+	}{
+		{"wildcard -> *", portscan.ScopeWildcard, "0.0.0.0", "*"},
+		{"LAN -> bare host", portscan.ScopeLAN, "192.168.1.5", "192.168.1.5"},
+		{"loopback -> quiet", portscan.ScopeLoopback, "127.0.0.1", ""},
+		{"unknown/unclassified -> quiet", portscan.ScopeUnknown, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			it := portItem{port: portscan.Port{Number: 3000, BindScope: c.scope, BindHost: c.host}}
+			if got := it.bindPrefix(); got != c.want {
+				t.Errorf("bindPrefix() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestTitleBindPrefix covers the other half of qptn: Title() actually
+// renders bindPrefix() left of ":PORT" -- "*:3000" for a wildcard-bound
+// (bound-wide) port, ":3000" (no host, unchanged) for a loopback/served
+// port, and "192.168.1.5:3000" for a LAN-bound port. A wildcard FAVORITE row
+// must show BOTH the "*" prefix and the "★" favorite marker without
+// collision, since the star sits to the right of the port, not the left.
+func TestTitleBindPrefix(t *testing.T) {
+	t.Run("wildcard bound-wide shows * prefix", func(t *testing.T) {
+		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard}, listening: true}
+		got := stripANSI(it.Title())
+		if !strings.Contains(got, "*:3000") {
+			t.Errorf("Title() = %q, want to contain %q", got, "*:3000")
+		}
+	})
+
+	t.Run("loopback/served shows no host prefix", func(t *testing.T) {
+		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeLoopback}, listening: true}
+		got := stripANSI(it.Title())
+		if !strings.Contains(got, " :3000") {
+			t.Errorf("Title() = %q, want to contain %q", got, " :3000")
+		}
+		if strings.Contains(got, "*:3000") {
+			t.Errorf("Title() = %q, should not contain the wildcard prefix", got)
+		}
+	})
+
+	t.Run("LAN bind shows the bare LAN IP prefix", func(t *testing.T) {
+		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeLAN, BindHost: "192.168.1.5"}, listening: true}
+		got := stripANSI(it.Title())
+		if !strings.Contains(got, "192.168.1.5:3000") {
+			t.Errorf("Title() = %q, want to contain %q", got, "192.168.1.5:3000")
+		}
+	})
+
+	t.Run("wildcard favorite shows both * prefix and star without collision", func(t *testing.T) {
+		it := portItem{
+			port:      portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard},
+			listening: true,
+			meta:      config.PortMeta{Favorite: true},
+		}
+		got := stripANSI(it.Title())
+		if !strings.Contains(got, "*:3000") {
+			t.Errorf("Title() = %q, want to contain %q", got, "*:3000")
+		}
+		if !strings.Contains(got, "★") {
+			t.Errorf("Title() = %q, want to contain the favorite star %q", got, "★")
+		}
+	})
 }
 
 // TestWasName covers znrg: the Title name precedence -- label > live process >
@@ -3792,10 +3870,10 @@ func TestLegendReservationDominatesLive(t *testing.T) {
 // dropped -- just spread across more than one line; at a wide width the same
 // text should fit on one line, unchanged.
 func TestRenderStatusLineWrapsLongFlash(t *testing.T) {
-	// The general reachTailnet guard toast (ui.go ~2045) -- 123 chars, the
-	// longest of the reworded strings and the one the kata prompt cites as
-	// clipping on an 80-col terminal.
-	const longFlash = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
+	// The general reachTailnet guard toast (ui.go ~2045) -- 92 chars (qptn:
+	// reworded shorter, dropping "already"/"not tailport"/"serve"), still
+	// long enough to clip mid-word on an 80-col terminal without wrapping.
+	const longFlash = "on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable"
 
 	t.Run("narrow width wraps without dropping text", func(t *testing.T) {
 		m := New(config.Config{})
@@ -3816,7 +3894,7 @@ func TestRenderStatusLineWrapsLongFlash(t *testing.T) {
 		if joined != wantWords {
 			t.Errorf("wrapped status line lost or altered text:\n got: %q\nwant: %q", joined, wantWords)
 		}
-		for _, want := range []string{"app bound wide", "make serve toggleable"} {
+		for _, want := range []string{"app bound wide", "make toggleable"} {
 			if !strings.Contains(plain, want) {
 				t.Errorf("wrapped status line missing %q:\n%s", want, plain)
 			}
@@ -3866,7 +3944,7 @@ func TestRenderStatusLineWrapsLongFlash(t *testing.T) {
 // resizeList directly, so it also proves every m.flash mutation site wires
 // the reservation up.
 func TestResizeListReservesWrappedFlashHeight(t *testing.T) {
-	const longFlash = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
+	const longFlash = "on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable"
 
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
 	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}}

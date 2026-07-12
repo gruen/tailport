@@ -238,8 +238,9 @@ type portItem struct {
 	dimmed bool
 	meta   config.PortMeta
 	// emoji selects the moon-phase reach-ramp marker set
-	// (🌕/🌔/🌓/🌒/🌑/🌫️/✕) over the ASCII fallback (○/◔/◑/◉/●/▲/✕). Resolved
-	// once for the model and copied onto each item.
+	// (🌕/🌔/🌒/🌑/🌫️/✕) over the ASCII fallback (○/◔/◉/●/▲/✕) -- on tailnet
+	// and served share 🌒/◉ (qptn). Resolved once for the model and copied
+	// onto each item.
 	emoji bool
 	// justCopied marks the port most recently copied via "c" while its
 	// description was the bare tailnet URL (state C: reachServed), set in
@@ -280,14 +281,14 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 // (79xb) from least exposed to most -- both channels go open/light at
 // localhost and filled/dark at the public internet, so the emoji ramp reads
 // consistently with the mono ramp: 🌕/○ localhost only, 🌔/◔ local network
-// only, 🌓/◑ on tailnet, 🌒/◉ served (a notch more established than merely
-// reachable), 🌑/● funnelled to the public internet. The two BROKEN states
-// sit OFF the ramp as plain glyphs, not moons: 🌫️/▲ a stale dangling
-// forward, ✕/✕ a favorite whose process is down. It switches on the SAME
-// i.reach() resolver Description() uses, so the glyph and the row's text can
-// never disagree about a port's state. Emoji markers are padded to a stable
-// 2-cell width so the :port column stays aligned even if a terminal renders
-// a given emoji (or the naturally 1-cell ✕) narrow.
+// only, 🌒/◉ on tailnet (served or bound wide), 🌑/● funnelled to the public
+// internet. The two BROKEN states sit OFF the ramp as plain glyphs, not
+// moons: 🌫️/▲ a stale dangling forward, ✕/✕ a favorite whose process is
+// down. It switches on the SAME i.reach() resolver Description() uses, so
+// the glyph and the row's text can never disagree about a port's state.
+// Emoji markers are padded to a stable 2-cell width so the :port column
+// stays aligned even if a terminal renders a given emoji (or the naturally
+// 1-cell ✕) narrow.
 func (i portItem) markerGlyph() string {
 	var m string
 	switch i.reach() {
@@ -299,7 +300,12 @@ func (i portItem) markerGlyph() string {
 		} else {
 			m = publicStyle.Render("●")
 		}
-	case reachServed:
+	case reachServed, reachTailnet:
+		// Served AND already-tailnet-reachable-by-IP (wildcard/tailnet bind)
+		// share this glyph (qptn): both answer at the SAME http://host:port,
+		// so they're the same reachability tier from a peer's perspective.
+		// The bind-scope distinction (served vs. bound wide) now lives on
+		// the title's bindPrefix() instead of a separate marker tier.
 		if i.emoji {
 			m = "🌒"
 		} else {
@@ -313,15 +319,6 @@ func (i portItem) markerGlyph() string {
 			m = "🌫️"
 		} else {
 			m = warnStyle.Render("▲")
-		}
-	case reachTailnet:
-		// Already tailnet-reachable by IP (wildcard/tailnet bind), unserved.
-		// Same plain, unstyled tier as reachLocalhost/reachLAN below -- these
-		// three are healthy ramp states, not warnings.
-		if i.emoji {
-			m = "🌓"
-		} else {
-			m = "◑"
 		}
 	case reachLAN:
 		if i.emoji {
@@ -355,6 +352,24 @@ func (i portItem) markerGlyph() string {
 	return m
 }
 
+// bindPrefix is the netstat-style host prefix shown left of ":PORT" on the row
+// title, the differentiator now that a bound-wide tailnet port and a served
+// port share the green ◉ glyph and the same URL (qptn): "*" for a wildcard
+// bind (0.0.0.0/::), the LAN IP for a specific LAN bind, and "" (quiet) for a
+// loopback/served port. So "*:3000" (bound wide) vs ":3000" (served) read alike
+// but stay distinguishable, and a LAN row's "<ip>:3000" self-explains why it is
+// NOT on the tailnet.
+func (i portItem) bindPrefix() string {
+	switch i.port.BindScope {
+	case portscan.ScopeWildcard:
+		return "*"
+	case portscan.ScopeLAN:
+		return i.port.BindHost // e.g. "192.168.1.5"; may be "" in the odd unclassified case
+	default: // loopback / tailnet-ip / unknown -> quiet
+		return ""
+	}
+}
+
 func (i portItem) Title() string {
 	marker := i.markerGlyph()
 	lock := ""
@@ -379,7 +394,7 @@ func (i portItem) Title() string {
 	default:
 		name = "?"
 	}
-	return fmt.Sprintf("%s%s :%d  %s%s", marker, lock, i.port.Number, star, name)
+	return fmt.Sprintf("%s%s %s:%d  %s%s", marker, lock, i.bindPrefix(), i.port.Number, star, name)
 }
 
 // reachState is the honest 7-state reachability lexicon (79xb): who can
@@ -457,10 +472,18 @@ func (i portItem) plainDescription() string {
 	case reachServed:
 		return i.servedDescPlain()
 	case reachTailnet:
+		// :22 (SSH) isn't HTTP, so it keeps its own line rather than a
+		// served-style URL. A leading guard like this makes room for future
+		// non-HTTP special-cases without disturbing the common path below.
 		if i.port.Number == 22 {
 			return "on tailnet · reachable via SSH"
 		}
-		return "on tailnet"
+		// qptn: a wildcard-bound port is already reachable at the SAME
+		// http://host:port a served port answers at (post-83wv, `c` copies
+		// this exact URL for both) -- so its description now reads
+		// IDENTICALLY to reachServed's. The bind-scope distinction moves to
+		// the title's bindPrefix() instead (netstat-style "*:port").
+		return i.servedDescPlain()
 	case reachLAN:
 		return "local network only"
 	case reachOffline:
@@ -738,8 +761,8 @@ type model struct {
 	// choice.
 	emoji bool
 	// markerEmoji selects the port-state EXPOSURE markers' moon-phase glyph
-	// ramp (🌕🌔🌓🌒🌑🌫️✕) over the mono ASCII/Unicode-symbol fallback
-	// (○◔◑◉●▲✕), resolved once at New() from resolveMarkerEmoji(markersMode)
+	// ramp (🌕🌔🌒🌑🌫️✕) over the mono ASCII/Unicode-symbol fallback
+	// (○◔◉●▲✕), resolved once at New() from resolveMarkerEmoji(markersMode)
 	// -- i.e. cfg.Markers, overridden by --markers for this run only (zn2x).
 	// Unlike emoji above, an unset/unrecognized mode resolves to MONO (qwcw):
 	// the exposure markers default to ascii/mono, only opting into
@@ -761,7 +784,7 @@ func filterNoHighlight(term string, targets []string) []list.Rank {
 }
 
 // resolveMarkerEmoji picks the EXPOSURE-marker glyph set (the port-state moon
-// ramp 🌕🌔🌓🌒🌑🌫️✕ vs its mono fallback ○◔◑◉●▲✕) from the configured
+// ramp 🌕🌔🌒🌑🌫️✕ vs its mono fallback ○◔◉●▲✕) from the configured
 // --markers/cfg.Markers mode (qwcw, splitting this from the egg/fireworks'
 // own always-auto-detecting resolution -- see the model.emoji field doc):
 // "emoji"/"ascii" force it; "auto" is an explicit opt-in to the terminal's
@@ -2091,13 +2114,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// connected over it right now). "rebind to localhost" is
 						// nonsense for sshd (you don't HTTP-serve SSH) and would
 						// lock them out -- so a dedicated, non-actionable line.
-						return m, m.setFlash("already on tailnet as SSH — this is how you're connected; nothing for tailport to serve", flashInfo)
+						return m, m.setFlash("on tailnet as SSH — this is how you're connected; nothing for tailport to serve", flashInfo)
 					}
 					// Wildcard bind owned by the APP (0.0.0.0), not a tailport
 					// serve, so there's no mapping to toggle. Honest about WHY,
 					// and actionable: rebinding to loopback -> reach()==reachLocalhost,
 					// which the guard does NOT block -> space then serves it.
-					return m, m.setFlash("already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable", flashInfo)
+					return m, m.setFlash("on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable", flashInfo)
 				case reachLAN:
 					return m, m.setFlash("on your LAN only; serve can't reach this bind", flashInfo)
 				}
@@ -3898,11 +3921,11 @@ func configSaveLines(path string) []string {
 // decorations -- so it stays readable rather than one very long line.
 func (m model) markerLegend() string {
 	if m.markerEmoji {
-		return "🌕 localhost   🌔 local network   🌓 on tailnet   🌒 served\n" +
+		return "🌕 localhost   🌔 local network   🌒 on tailnet (served or bound wide)\n" +
 			"🌑 internet (funnel)   🌫️ stale   ✕ offline\n" +
 			"🔒 locked   ★ favorite"
 	}
-	return "○ localhost   ◔ local network   ◑ on tailnet   ◉ served\n" +
+	return "○ localhost   ◔ local network   ◉ on tailnet (served or bound wide)\n" +
 		"● internet (funnel)   ▲ stale   ✕ offline\n" +
 		"🔒 locked   ★ favorite"
 }
