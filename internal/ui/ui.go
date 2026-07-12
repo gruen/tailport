@@ -3321,17 +3321,23 @@ func (f *firework) glyphSet() []rune {
 	return fwGlyphsASCII
 }
 
-// glyph picks a spark by brightness (dim -> bright) from the active set.
-func (f *firework) glyph(br float64) rune {
+// glyphFloor is glyph() with a minimum index, so callers that must never render
+// the faintest glyph (e.g. the rising trail, whose lone '·' over the egg text
+// punches a whitespace hole -- jkbp) can floor at 1 (░ / ':').
+func (f *firework) glyphFloor(br float64, floor int) rune {
 	set := f.glyphSet()
 	i := int(br * float64(len(set)))
-	if i < 0 {
-		i = 0
-	} else if i > len(set)-1 {
+	if i < floor {
+		i = floor
+	}
+	if i > len(set)-1 {
 		i = len(set) - 1
 	}
 	return set[i]
 }
+
+// glyph picks a spark by brightness (dim -> bright) from the active set.
+func (f *firework) glyph(br float64) rune { return f.glyphFloor(br, 0) }
 
 // draw renders a firework into the grid at its current frame. Fireworks are
 // drawn last (in eggView), so they sit ON TOP of the egg/fanfare/credits.
@@ -3392,7 +3398,9 @@ func (f *firework) draw(grid [][]styledCell, w, h int) {
 			}
 			glyph := block
 			if k > 0 {
-				glyph = f.glyph(br)
+				// Floor at index 1 (░/':') -- never the bare '·', which would
+				// punch a whitespace hole through the egg text (jkbp).
+				glyph = f.glyphFloor(br, 1)
 			}
 			f.plot(grid, w, h, f.posX(tt), f.posY(tt), glyph, col)
 		}

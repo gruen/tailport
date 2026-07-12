@@ -2532,6 +2532,34 @@ func TestFireworkGlyphs(t *testing.T) {
 	}
 }
 
+// TestFireworkGlyphFloor covers glyphFloor (jkbp): the rising trail must floor
+// at index 1 (░ / ascii ':') so a bare '·'/'.' never punches a whitespace hole
+// through the egg text, while plain glyph() (floor 0, delegating to
+// glyphFloor) keeps the old unfloored behavior for the burst.
+func TestFireworkGlyphFloor(t *testing.T) {
+	uni := firework{emoji: true}
+	if g := uni.glyphFloor(0, 1); g != '░' {
+		t.Errorf("uni.glyphFloor(0, 1) = %q, want '░' (floored, not the bare dot)", g)
+	}
+	if g := uni.glyphFloor(0, 0); g != '·' {
+		t.Errorf("uni.glyphFloor(0, 0) = %q, want '·' (unfloored = old glyph behavior)", g)
+	}
+	if g := uni.glyphFloor(1, 1); g != '█' {
+		t.Errorf("uni.glyphFloor(1, 1) = %q, want '█' (high brightness still tops out)", g)
+	}
+
+	ascii := firework{emoji: false}
+	if g := ascii.glyphFloor(0, 1); g != ':' {
+		t.Errorf("ascii.glyphFloor(0, 1) = %q, want ':' (floored, not the bare dot)", g)
+	}
+
+	for _, br := range []float64{0, 0.3, 0.6, 1} {
+		if got, want := uni.glyph(br), uni.glyphFloor(br, 0); got != want {
+			t.Errorf("uni.glyph(%.2f) = %q, want %q (glyph must delegate to glyphFloor(br, 0))", br, got, want)
+		}
+	}
+}
+
 // TestFireworkDraw covers compositing sparks into the grid, with edge clipping
 // (no panic, no overflow) for out-of-bounds particles.
 func TestFireworkDraw(t *testing.T) {
