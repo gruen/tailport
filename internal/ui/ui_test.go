@@ -1511,6 +1511,31 @@ func TestMarkerGlyph(t *testing.T) {
 	}
 }
 
+// TestFilterNoHighlight covers ykxh: the custom filter ranks exactly like the
+// default (so filtering still works) but returns no matched indices, so the
+// delegate's ANSI-unaware highlighter never mangles our styled titles.
+func TestFilterNoHighlight(t *testing.T) {
+	targets := []string{"8025  was mailpit", "3000  node", "8808  agentsview"}
+	def := list.DefaultFilter("mail", targets)
+	got := filterNoHighlight("mail", targets)
+
+	if len(got) != len(def) {
+		t.Fatalf("ranking differs: got %d ranks, default %d", len(got), len(def))
+	}
+	for i := range got {
+		if got[i].Index != def[i].Index {
+			t.Errorf("rank %d index = %d, want %d (ranking must match DefaultFilter)", i, got[i].Index, def[i].Index)
+		}
+		if got[i].MatchedIndexes != nil {
+			t.Errorf("rank %d should carry no matched indices, got %v", i, got[i].MatchedIndexes)
+		}
+	}
+	// Sanity: "mail" still selects the mailpit row.
+	if len(got) == 0 || got[0].Index != 0 {
+		t.Errorf("'mail' should rank the mailpit row first; got %+v", got)
+	}
+}
+
 // TestFilterValue covers e518: the filter string includes the port number,
 // live process, user label, AND the remembered process -- so a down favorite
 // showing "was mailpit" is still matched by filtering "mail".

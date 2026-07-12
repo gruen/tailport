@@ -406,6 +406,18 @@ type model struct {
 	emoji bool
 }
 
+// filterNoHighlight ranks items with the list's default fuzzy filter but clears
+// the matched-rune indices, so the delegate's ANSI-unaware highlighter never
+// runs over our styled titles (ykxh). Filtering/ranking behaviour is identical
+// to the default; only the per-character match highlight is dropped.
+func filterNoHighlight(term string, targets []string) []list.Rank {
+	ranks := list.DefaultFilter(term, targets)
+	for i := range ranks {
+		ranks[i].MatchedIndexes = nil
+	}
+	return ranks
+}
+
 // resolveEmoji picks the marker set from the configured mode: "emoji"/"ascii"
 // force it; anything else ("auto" or empty) defers to the terminal's apparent
 // UTF-8 capability.
@@ -454,6 +466,15 @@ func New(cfg config.Config) model {
 	// the list's title area, which would stack awkwardly beneath the header.
 	l.SetShowFilter(false)
 	l.FilterInput.Prompt = "filter: "
+	// Rank with the default fuzzy filter, but drop the per-character match
+	// highlighting: our row titles embed ANSI (coloured marker, gold ★, italic
+	// "was …"), and the delegate's highlighter (lipgloss.StyleRunes) is not
+	// ANSI-aware -- it splices styling into the middle of those escape sequences
+	// and prints garbage like "[1;38;5;220m" (ykxh). Nil MatchedIndexes -> the
+	// highlighter is a no-op and the coloured title renders intact; ranking is
+	// unchanged. (The old highlight was misaligned anyway, since it indexed the
+	// FilterValue string, not the styled Title.)
+	l.Filter = filterNoHighlight
 
 	ti := textinput.New()
 	ti.Placeholder = "port"
