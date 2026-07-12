@@ -1861,12 +1861,12 @@ func TestEggLayout(t *testing.T) {
 }
 
 // TestNewFireworkGeometry covers the launch/burst sampling: launch is
-// centre-bottom within +/-15% of width, and every explosion lands inside the
-// band (a few rows around the floating fanfare).
+// centre-bottom within +/-8% of width, and every explosion lands inside the
+// band (viewport top down to a few rows below the floating bottom fanfare).
 func TestNewFireworkGeometry(t *testing.T) {
 	const w, h = 100, 40
 	lay := eggLayout(w, h)
-	bandTop := float64(lay.topFanfareRow - 3)
+	bandTop := float64(fwTopMargin)
 	bandBot := float64(lay.botFanfareRow + 3)
 	maxOff := fwLaunchSpreadPct * float64(w)
 	const eps = 1e-6
@@ -1876,13 +1876,206 @@ func TestNewFireworkGeometry(t *testing.T) {
 			t.Fatalf("launch row %.1f want center-bottom %d", fw.y0, h-1)
 		}
 		if fw.x0 < float64(w)/2-maxOff-eps || fw.x0 > float64(w)/2+maxOff+eps {
-			t.Fatalf("launch col %.3f outside +/-15%% of centre", fw.x0)
+			t.Fatalf("launch col %.3f outside +/-8%% of centre", fw.x0)
 		}
 		if fw.yExp < bandTop-eps || fw.yExp > bandBot+eps {
 			t.Fatalf("explosion row %.3f outside band [%.0f,%.0f]", fw.yExp, bandTop, bandBot)
 		}
 		if fw.count < 1 || fw.v0 <= 0 || fw.tExp <= 0 {
 			t.Fatalf("degenerate firework: count=%d v0=%.3f tExp=%.3f", fw.count, fw.v0, fw.tExp)
+		}
+	}
+}
+
+// TestFireworkBurstReachesTopButClusters covers part 2: the raised ceiling lets
+// a burst reach near the viewport top (row ~1), but the bell distribution is
+// UNCHANGED -- most bursts still cluster centrally near the egg and hitting the
+// very top is the rare exception (NOT a flatten toward uniform/top).
+func TestFireworkBurstReachesTopButClusters(t *testing.T) {
+	const w, h = 100, 40
+	lay := eggLayout(w, h)
+	const n = 30000
+	var sum, minY float64
+	minY = math.Inf(1)
+	topHits := 0 // bursts up in the rare very-top region (rows <= 3)
+	for i := 0; i < n; i++ {
+		fw := newFirework(w, h, i%2 == 0)
+		sum += fw.yExp
+		if fw.yExp < minY {
+			minY = fw.yExp
+		}
+		if fw.yExp <= 3 {
+			topHits++
+		}
+	}
+	// CAN reach near the top: the ceiling is fwTopMargin(=1), so some shot lands
+	// well above the top fanfare (row lay.topFanfareRow).
+	if minY > 3 {
+		t.Errorf("no burst reached near the top (min yExp %.2f); ceiling should permit row ~%d", minY, fwTopMargin)
+	}
+	if minY >= float64(lay.topFanfareRow) {
+		t.Errorf("min burst row %.2f never cleared the top fanfare row %d", minY, lay.topFanfareRow)
+	}
+	// STILL clusters centrally: mean near the band midpoint, nowhere near the top.
+	mean := sum / n
+	mid := (float64(fwTopMargin) + float64(lay.botFanfareRow+3)) / 2
+	if math.Abs(mean-mid) > 2.5 {
+		t.Errorf("burst rows should cluster near band midpoint %.1f, got mean %.2f (flattened?)", mid, mean)
+	}
+	if mean <= float64(lay.topFanfareRow) {
+		t.Errorf("mean burst row %.2f sits at/above the fanfare %d -- distribution flattened toward the top", mean, lay.topFanfareRow)
+	}
+	// Very-top bursts are the RARE exception, not the norm.
+	if frac := float64(topHits) / n; frac > 0.15 {
+		t.Errorf("too many very-top bursts (%.1f%%); tall shots should be the rare exception, not uniform", frac*100)
+	}
+}
+
+// TestFireworkBurstStaysOnScreen covers part 3's clamp: with the aggressive
+// +/-0.9 lean, the predicted burst centre xExp=posX(tExp) must stay a couple
+// cells inside the viewport on a NARROW terminal (where long-tExp top shots
+// would otherwise drift off-screen and burst half-clipped) -- while a WIDE
+// terminal still lets most shots keep the full lean (clamp is a safety net,
+// not a general flattening).
+func TestFireworkBurstStaysOnScreen(t *testing.T) {
+	const margin = 2.0
+	const eps = 1e-6
+	// Narrow width where the clamp actually binds: the invariant must hold for
+	// EVERY sample, including the tallest (largest tExp) shots.
+	for _, w := range []int{52, 60} {
+		const h = 40
+		clamped := false
+		for i := 0; i < 20000; i++ {
+			fw := newFirework(w, h, i%2 == 0)
+			xExp := fw.posX(fw.tExp)
+			if xExp < margin-eps || xExp > float64(w-1)-margin+eps {
+				t.Fatalf("w=%d: burst centre xExp=%.3f left the viewport [%.1f,%.1f] (half-clipped)",
+					w, xExp, margin, float64(w-1)-margin)
+			}
+			// Did the clamp bite? An unclamped |vx| could be up to 0.9; if the
+			// realised drift sits hard against the on-screen edge, it was clamped.
+			if fw.tExp > 0 {
+				hi := (float64(w-1) - margin - fw.x0) / fw.tExp
+				lo := (margin - fw.x0) / fw.tExp
+				if math.Abs(fw.vx-hi) < 1e-9 || math.Abs(fw.vx-lo) < 1e-9 {
+					clamped = true
+				}
+			}
+		}
+		if !clamped {
+			t.Errorf("w=%d: expected the on-screen clamp to bind on at least one narrow-width shot", w)
+		}
+	}
+	// Wide terminal: the clamp should NOT generally flatten the lean -- plenty of
+	// shots keep a strong horizontal sweep (|vx| well past the old +/-0.3).
+	strong := 0
+	for i := 0; i < 20000; i++ {
+		fw := newFirework(240, 40, i%2 == 0)
+		if math.Abs(fw.vx) > 0.5 {
+			strong++
+		}
+	}
+	if strong == 0 {
+		t.Error("wide terminal: no strong-lean shots survived; clamp is over-flattening the arcs")
+	}
+}
+
+// TestFireworkBiggerBursts covers part 4: the widened INDEPENDENT ranges let a
+// burst be bigger (more particles, wider radius, longer ember life) than the old
+// caps allowed, while the small mins still exist (dim pops remain possible).
+func TestFireworkBiggerBursts(t *testing.T) {
+	const oldCountMax, oldRadiusMax = 34, 1.25
+	maxCount, minCount := 0, 1<<30
+	maxRadius, minRadius := 0.0, math.Inf(1)
+	maxTTL := 0
+	for i := 0; i < 30000; i++ {
+		fw := newFirework(120, 45, i%2 == 0)
+		if fw.count > maxCount {
+			maxCount = fw.count
+		}
+		if fw.count < minCount {
+			minCount = fw.count
+		}
+		if fw.radius > maxRadius {
+			maxRadius = fw.radius
+		}
+		if fw.radius < minRadius {
+			minRadius = fw.radius
+		}
+		fw.explode()
+		for _, p := range fw.particles {
+			if p.ttl > maxTTL {
+				maxTTL = p.ttl
+			}
+		}
+	}
+	if maxCount <= oldCountMax {
+		t.Errorf("bursts no bigger: max count %d should exceed the old cap %d", maxCount, oldCountMax)
+	}
+	if maxRadius <= oldRadiusMax {
+		t.Errorf("bursts no wider: max radius %.2f should exceed the old cap %.2f", maxRadius, oldRadiusMax)
+	}
+	if maxTTL <= 18 {
+		t.Errorf("embers no longer-lived: max ttl %d should exceed the old cap 18", maxTTL)
+	}
+	// Small dim pops still exist (mins unchanged).
+	if minCount > int(fwCountMin)+2 {
+		t.Errorf("small bursts vanished: min count %d, want near fwCountMin %.0f", minCount, fwCountMin)
+	}
+	if minRadius > fwRadiusMin+0.15 {
+		t.Errorf("tight bursts vanished: min radius %.2f, want near fwRadiusMin %.2f", minRadius, fwRadiusMin)
+	}
+}
+
+// TestMuzzleSmoke covers part 5: newFirework seeds a puff that ages out, and --
+// the core requirement -- overlapping puffs from simultaneous launches COMPOUND
+// (density adds) rather than last-write-wins.
+func TestMuzzleSmoke(t *testing.T) {
+	// (a) Seeding + decay: a fresh shell carries smoke that fully expires.
+	fw := newFirework(100, 40, true)
+	if len(fw.smoke) == 0 {
+		t.Fatal("newFirework should seed muzzle smoke")
+	}
+	for _, p := range fw.smoke {
+		if p.ttl < fwSmokeLifeMin || p.ttl > fwSmokeLifeMax {
+			t.Errorf("smoke ttl %d outside [%d,%d]", p.ttl, fwSmokeLifeMin, fwSmokeLifeMax)
+		}
+	}
+	for i := 0; i <= fwSmokeLifeMax; i++ {
+		fw.step()
+	}
+	if len(fw.smoke) != 0 {
+		t.Errorf("smoke should fully expire after %d frames, still %d left", fwSmokeLifeMax, len(fw.smoke))
+	}
+
+	// (b) Compounding: two shells whose smoke shares a cell must sum to strictly
+	// more density there than one -- and additively (not max/last-write-wins).
+	proto := firework{smoke: []fwParticle{{x: 12, y: 20, ttl: 10, age: 2}}}
+	one := smokeDensity([]firework{proto}, 40, 30)
+	two := smokeDensity([]firework{proto, proto}, 40, 30)
+	if one == nil || two == nil {
+		t.Fatal("smokeDensity should return a buffer when smoke is present")
+	}
+	d1, d2 := one[20][12], two[20][12]
+	if !(d2 > d1) {
+		t.Errorf("compounding failed: two overlapping puffs (%.3f) must exceed one (%.3f)", d2, d1)
+	}
+	if math.Abs(d2-2*d1) > 1e-9 {
+		t.Errorf("smoke must ADD, not last-write-wins: one=%.3f two=%.3f (want ~2x)", d1, d2)
+	}
+
+	// (c) Density -> heavier glyph/brighter gray as puffs pile up.
+	light := smokeCell(0.3, true)
+	heavy := smokeCell(2.4, true)
+	if light.s == heavy.s {
+		t.Errorf("smoke glyph should thicken with density: light=%q heavy=%q", light.s, heavy.s)
+	}
+	// ASCII path stays ASCII (no mojibake under non-emoji terminals).
+	for _, c := range []styledCell{smokeCell(0.3, false), smokeCell(2.4, false)} {
+		for _, r := range c.s {
+			if r > 127 {
+				t.Errorf("ascii smoke glyph %q is non-ASCII", c.s)
+			}
 		}
 	}
 }

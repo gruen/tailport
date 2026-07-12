@@ -2423,13 +2423,22 @@ const (
 	fwEmberGravity    = 0.035 // downward pull on burst embers -> they arch and fall
 	fwTrailLen        = 4     // rising-trail samples (bright head + fading tail)
 	fwCountMin        = 10.0  // burst particle count (bell)
-	fwCountMax        = 34.0
+	fwCountMax        = 52.0
 	fwRadiusMin       = 0.45 // burst expansion speed (bell) -> radius
-	fwRadiusMax       = 1.25
+	fwRadiusMax       = 2.1
 	fwBurstLifeMin    = 8.0 // per-particle life in frames (bell)
-	fwBurstLifeMax    = 18.0
+	fwBurstLifeMax    = 24.0
 	fwFlourishChance  = 0.4  // fraction of fireworks that get a secondary crackle
-	fwLaunchSpreadPct = 0.15 // horizontal launch offset: +/-15% of viewport width
+	fwLaunchSpreadPct = 0.08 // horizontal launch offset: +/-8% of viewport width
+	fwTopMargin       = 1    // burst-band ceiling: bursts can reach the viewport top (row 1)
+
+	// Muzzle smoke: a few gray particles puffed at the launch point that drift
+	// up and fade. Overlapping puffs from simultaneous launches COMPOUND into a
+	// denser plume (see smokeDensity) rather than last-write-wins.
+	fwSmokeMin     = 4  // particles per puff (inclusive lo)
+	fwSmokeMax     = 7  // particles per puff (inclusive hi)
+	fwSmokeLifeMin = 6  // puff-particle life in frames (inclusive lo)
+	fwSmokeLifeMax = 12 // puff-particle life in frames (inclusive hi)
 )
 
 type fwStage int
@@ -2472,6 +2481,12 @@ type firework struct {
 	flourishAt int
 	flourished bool
 
+	// Muzzle smoke: a gray puff at the launch point, aged every frame
+	// INDEPENDENT of stage (keeps drifting/fading while the shell climbs).
+	// Accumulated across shells in smokeDensity so simultaneous launches
+	// compound into a denser plume.
+	smoke []fwParticle
+
 	emoji bool // glyph set captured at spawn (ascii-safe)
 }
 
@@ -2498,14 +2513,16 @@ func newFirework(w, h int, emoji bool) firework {
 	}
 	lay := eggLayout(w, h)
 
-	// Launch: centre-bottom, horizontal offset bell within +/-15% of width.
+	// Launch: centre-bottom, horizontal offset bell within +/-8% of width.
 	x0 := float64(w)/2 + bellRange(-fwLaunchSpreadPct*float64(w), fwLaunchSpreadPct*float64(w))
 	y0 := float64(h - 1)
 
-	// Explosion band: a few rows above the top fanfare to a few below the
-	// bottom fanfare -- against the FLOATING rows, not fixed lines. Degenerate
-	// (tiny) layouts fall back to the mid-viewport so nothing panics.
-	bandTop := float64(lay.topFanfareRow - 3)
+	// Explosion band: from the viewport top (fwTopMargin) down to a few rows
+	// below the bottom fanfare -- keyed off the FLOATING fanfare rows. yExp is
+	// still bell-sampled (central bias), so most bursts cluster near the egg and
+	// reaching the very top is the rare, exciting exception. Degenerate (tiny)
+	// layouts fall back to the mid-viewport so nothing panics.
+	bandTop := float64(fwTopMargin)
 	bandBot := float64(lay.botFanfareRow + 3)
 	if !lay.ok {
 		bandTop = float64(h) * 0.25
@@ -2540,12 +2557,47 @@ func newFirework(w, h int, emoji bool) firework {
 	v0 := math.Sqrt(fwGravity * reach)
 	tExp := alpha * (v0 / fwGravity)
 
+	// Horizontal lean: an aggressive sweep (~31 deg off vertical) from the tight
+	// base. But the tallest shots have a long tExp, so an unclamped +/-0.9 drift
+	// would carry the burst centre x0+vx*tExp off-screen and burst half-clipped.
+	// Clamp vx so the predicted centre stays a couple cells inside the viewport;
+	// on a wide terminal hi is typically >0.9, so most shots keep the full lean --
+	// the clamp is a safety net (narrow terminals / tallest shots), not a general
+	// flattening of tall arcs.
+	vx := bellRange(-0.9, 0.9)
+	margin := 2.0
+	if tExp > 0 {
+		lo := (margin - x0) / tExp
+		hi := (float64(w-1) - margin - x0) / tExp
+		if vx < lo {
+			vx = lo
+		}
+		if vx > hi {
+			vx = hi
+		}
+	}
+
+	// Muzzle smoke: a few gray particles at the launch point with small
+	// upward+outward velocity and a short life. Origins are all within +/-8% of
+	// centre, so simultaneous puffs overlap heavily and compound (smokeDensity).
+	nSmoke := fwSmokeMin + rand.Intn(fwSmokeMax-fwSmokeMin+1)
+	smoke := make([]fwParticle, 0, nSmoke)
+	for i := 0; i < nSmoke; i++ {
+		smoke = append(smoke, fwParticle{
+			x:   x0 + bellRange(-0.75, 0.75),
+			y:   y0,
+			vx:  bellRange(-0.2, 0.2),
+			vy:  bellRange(-0.35, -0.1),
+			ttl: fwSmokeLifeMin + rand.Intn(fwSmokeLifeMax-fwSmokeLifeMin+1),
+		})
+	}
+
 	return firework{
 		x0:         x0,
 		y0:         y0,
 		v0:         v0,
 		g:          fwGravity,
-		vx:         bellRange(-0.3, 0.3),
+		vx:         vx,
 		tExp:       tExp,
 		yExp:       yExp,
 		stage:      fwRising,
@@ -2554,6 +2606,7 @@ func newFirework(w, h int, emoji bool) firework {
 		scheme:     rand.Intn(len(fwSchemes)),
 		flourish:   rand.Float64() < fwFlourishChance,
 		flourishAt: 3 + rand.Intn(4),
+		smoke:      smoke,
 		emoji:      emoji,
 	}
 }
@@ -2565,6 +2618,20 @@ func (f *firework) posX(t float64) float64 { return f.x0 + f.vx*t }
 // embers (with gravity) and, once, add a flourish crackle.
 func (f *firework) step() {
 	f.t++
+	// Muzzle smoke ages every frame, INDEPENDENT of stage, so a shell's puff
+	// keeps drifting/fading while it climbs (and outlives a short shot's burst).
+	if len(f.smoke) > 0 {
+		alive := f.smoke[:0]
+		for _, p := range f.smoke {
+			p.x += p.vx
+			p.y += p.vy
+			p.age++
+			if p.age < p.ttl {
+				alive = append(alive, p)
+			}
+		}
+		f.smoke = alive
+	}
 	switch f.stage {
 	case fwRising:
 		if f.t >= f.tExp {
@@ -2590,10 +2657,14 @@ func (f *firework) step() {
 	}
 }
 
-// done reports a spent firework: burst, all embers expired, and any flourish
-// already emitted (so we don't reap it before the secondary crackle fires).
+// done reports a spent firework: burst, all embers expired, any flourish already
+// emitted (so we don't reap it before the secondary crackle fires), AND its
+// muzzle smoke fully faded. The smoke clause is load-bearing: a minimal-rise
+// shot explodes at tExp ~4 frames while smoke ttl runs to ~12, so without it a
+// short shot could be reaped mid-puff (a dead heat) -- the extra check is cheap
+// and removes that fragile timing coupling entirely.
 func (f *firework) done() bool {
-	return f.stage == fwBurst && len(f.particles) == 0 && (!f.flourish || f.flourished)
+	return f.stage == fwBurst && len(f.particles) == 0 && len(f.smoke) == 0 && (!f.flourish || f.flourished)
 }
 
 // explode converts the rising shell into a radial burst at the arch's current
@@ -2783,6 +2854,71 @@ func fwMonoColor(base [3]float64, br float64) lipgloss.Color {
 	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", int(c[0]+0.5), int(c[1]+0.5), int(c[2]+0.5)))
 }
 
+// smokeDensity accumulates every live shell's muzzle smoke into a w x h buffer:
+// each particle adds its remaining-life fraction into its rounded cell, summed
+// ACROSS all fireworks. That summation is the compounding requirement -- two
+// puffs overlapping a cell make it denser than one (NOT last-write-wins), so
+// simultaneous launches (all within +/-8% of centre) build a thicker plume.
+// Returns nil when no smoke is on-screen. Bounds-clipped like plot, so the
+// caller's grid stays exactly w x h.
+func smokeDensity(fws []firework, w, h int) [][]float64 {
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	var dens [][]float64
+	for i := range fws {
+		for _, p := range fws[i].smoke {
+			if p.ttl <= 0 {
+				continue
+			}
+			frac := 1 - float64(p.age)/float64(p.ttl)
+			if frac <= 0 {
+				continue
+			}
+			gx := int(math.Round(p.x))
+			gy := int(math.Round(p.y))
+			if gx < 0 || gx >= w || gy < 0 || gy >= h {
+				continue
+			}
+			if dens == nil {
+				dens = make([][]float64, h)
+				for y := range dens {
+					dens[y] = make([]float64, w)
+				}
+			}
+			dens[gy][gx] += frac
+		}
+	}
+	return dens
+}
+
+// smokeCell maps an accumulated density to one gray smoke cell: a heavier glyph
+// and brighter gray where puffs compound. Glyphs are gated on emoji like the
+// sparks (shade blocks with UTF-8, an ascii ramp otherwise, so no mojibake), and
+// the gray hex degrades to nothing under NO_COLOR / the Ascii profile -- the
+// glyph alone still reads.
+func smokeCell(d float64, emoji bool) styledCell {
+	glyphs := []rune{'.', ':', '#'}
+	if emoji {
+		glyphs = []rune{'░', '▒', '▓'}
+	}
+	i := 0
+	switch {
+	case d >= 1.8:
+		i = 2
+	case d >= 0.8:
+		i = 1
+	}
+	// Density -> gray brightness: dim for a lone speck, brighter where puffs pile
+	// up, clamped so a heavy overlap stays a soft gray (not a glaring white).
+	lvl := 0.32 + 0.42*d
+	if lvl > 0.74 {
+		lvl = 0.74
+	}
+	g := int(lvl * 255)
+	return styledCell{s: string(glyphs[i]), color: lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", g, g, g))}
+}
+
 // eggView renders the full-screen Easter egg for the current frame. It composes
 // a width x height grid of styledCells -- the centred egg block laid at its
 // computed offset, then any fireworks (5x1e) drawn on top -- and styles each
@@ -2867,7 +3003,20 @@ func (m model) eggView() string {
 		}
 	}
 
-	// Fireworks last -> ON TOP of the egg/fanfare/credits.
+	// Muzzle smoke UNDER the sparks: accumulate every live shell's smoke into a
+	// density buffer (overlapping puffs compound), then paint each non-empty cell
+	// as a gray plume. Bounds-clipped in smokeDensity, so the grid stays w x h.
+	if dens := smokeDensity(m.fireworks, w, h); dens != nil {
+		for y := range dens {
+			for x, d := range dens[y] {
+				if d > 0 {
+					grid[y][x] = smokeCell(d, m.emoji)
+				}
+			}
+		}
+	}
+
+	// Fireworks last -> ON TOP of the egg/fanfare/credits/smoke.
 	for i := range m.fireworks {
 		m.fireworks[i].draw(grid, w, h)
 	}
