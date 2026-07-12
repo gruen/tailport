@@ -701,9 +701,24 @@ type model struct {
 	// XDG_CONFIG_HOME rather than guessing (gahj, y4gt). Empty if
 	// config.Path() errored, in which case helpView describes the rule instead.
 	configPath string
-	// emoji selects the egg-lifecycle exposure markers over the ASCII fallback,
-	// resolved once at New() from cfg.Markers + the terminal's capabilities.
+	// emoji selects the Easter-egg overlay's UNICODE glyph set (egg art, the
+	// fireworks' ·░▒▓█ shading ramp, muzzle smoke) over its ASCII fallback.
+	// It is resolved once at New() from ONLY the terminal's capabilities
+	// (emojiCapable()) -- deliberately independent of cfg.Markers/--markers
+	// (qwcw): the egg is a hidden, undocumented feature, so its glyph style
+	// always auto-detects and is never governed by the exposure-marker flag.
+	// See markerEmoji for the exposure markers' own (now decoupled) glyph
+	// choice.
 	emoji bool
+	// markerEmoji selects the port-state EXPOSURE markers' moon-phase glyph
+	// ramp (🌕🌔🌓🌒🌑🌫️✕) over the mono ASCII/Unicode-symbol fallback
+	// (○◔◑◉●▲✕), resolved once at New() from resolveMarkerEmoji(markersMode)
+	// -- i.e. cfg.Markers, overridden by --markers for this run only (zn2x).
+	// Unlike emoji above, an unset/unrecognized mode resolves to MONO (qwcw):
+	// the exposure markers default to ascii/mono, only opting into
+	// emoji/detection via an explicit "emoji"/"auto" mode. Copied onto each
+	// portItem in rebuildItems so markerGlyph()/Title() pick the same set.
+	markerEmoji bool
 }
 
 // filterNoHighlight ranks items with the list's default fuzzy filter but clears
@@ -718,17 +733,25 @@ func filterNoHighlight(term string, targets []string) []list.Rank {
 	return ranks
 }
 
-// resolveEmoji picks the marker set from the configured mode: "emoji"/"ascii"
-// force it; anything else ("auto" or empty) defers to the terminal's apparent
-// UTF-8 capability.
-func resolveEmoji(mode string) bool {
+// resolveMarkerEmoji picks the EXPOSURE-marker glyph set (the port-state moon
+// ramp 🌕🌔🌓🌒🌑🌫️✕ vs its mono fallback ○◔◑◉●▲✕) from the configured
+// --markers/cfg.Markers mode (qwcw, splitting this from the egg/fireworks'
+// own always-auto-detecting resolution -- see the model.emoji field doc):
+// "emoji"/"ascii" force it; "auto" is an explicit opt-in to the terminal's
+// apparent UTF-8 capability; anything else -- crucially including "" (unset)
+// -- is the NEW default and resolves to MONO. This deliberately splits ""
+// from "auto" (identical before qwcw): unset now means mono, "auto" means
+// detect.
+func resolveMarkerEmoji(mode string) bool {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "emoji":
 		return true
 	case "ascii":
 		return false
+	case "auto":
+		return emojiCapable() // explicit opt-in to detection
 	default:
-		return emojiCapable()
+		return false // ""/unset/unknown -> MONO (new default)
 	}
 }
 
@@ -752,12 +775,14 @@ func emojiCapable() bool {
 	return strings.Contains(loc, "utf-8") || strings.Contains(loc, "utf8")
 }
 
-// ResolveEmoji exports resolveEmoji's marker-glyph resolution for callers
-// outside this package. `tailport quickstart` (kata x4cg) uses it so its
-// printed legend picks the same glyph set (see keyLegendDescs) the "?"
-// overlay would for the same markers mode, not just the same key text.
-func ResolveEmoji(mode string) bool {
-	return resolveEmoji(mode)
+// ResolveMarkerEmoji exports resolveMarkerEmoji's exposure-marker glyph
+// resolution for callers outside this package. `tailport quickstart` (kata
+// x4cg, updated by qwcw) uses it so its printed legend picks the same glyph
+// set (see keyLegendDescs) the "?" overlay would for the same markers mode,
+// not just the same key text. The egg/fireworks glyph choice has no exported
+// resolver -- it's always emojiCapable(), independent of markers mode.
+func ResolveMarkerEmoji(mode string) bool {
+	return resolveMarkerEmoji(mode)
 }
 
 // resolveTheme applies the "theme" manual override (kata n7gc) to lipgloss's
@@ -765,9 +790,9 @@ func ResolveEmoji(mode string) bool {
 // terminal background for the rest of the process, so every package-level
 // AdaptiveColor style in this file -- and the bubbles list/help widgets'
 // own AdaptiveColor values -- render through that same forced choice.
-// Anything else ("auto", "", or an unrecognized value -- mirrors
-// resolveEmoji's handling of an unrecognized markers mode) leaves lipgloss's
-// own auto-detection alone.
+// Anything else ("auto", "", or an unrecognized value) leaves lipgloss's own
+// auto-detection alone -- unlike resolveMarkerEmoji (qwcw), theme mode does
+// NOT split "" from "auto"; both still mean "detect" here.
 //
 // No extra fallback code is needed here for "undetectable -> treat as dark"
 // (the no-regression requirement for existing dark-terminal users):
@@ -805,13 +830,17 @@ func ApplyTheme(mode string) {
 // New builds the initial model from a loaded Config. markersOverride is an
 // optional, run-only "--markers" value (zn2x): the caller (main.go, after
 // its own validation) passes at most one string. When it's non-empty it
-// wins for THIS session's glyph choice (m.emoji, resolved once below), but
-// it deliberately never touches cfg.Markers itself -- cfg is stored as-is
-// into m.cfg, which is what any later Save() (triggered by an unrelated
-// mutation: favorite/label/lock/etc.) writes back to disk. Mutating
-// cfg.Markers here would leak the run-only override into the persisted
-// config on the next unrelated save, which is exactly what "applies to the
-// current run only; never rewrites config" rules out.
+// wins for THIS session's EXPOSURE-marker glyph choice (m.markerEmoji,
+// resolved once below via resolveMarkerEmoji), but it deliberately never
+// touches cfg.Markers itself -- cfg is stored as-is into m.cfg, which is
+// what any later Save() (triggered by an unrelated mutation:
+// favorite/label/lock/etc.) writes back to disk. Mutating cfg.Markers here
+// would leak the run-only override into the persisted config on the next
+// unrelated save, which is exactly what "applies to the current run only;
+// never rewrites config" rules out.
+//
+// markersOverride never affects m.emoji (qwcw): the egg/fireworks glyph
+// choice is always emojiCapable(), decoupled from --markers/cfg.Markers.
 //
 // It's variadic rather than a plain second parameter so every existing
 // New(cfg) call site (there are dozens across ui_test.go) keeps compiling
@@ -885,15 +914,26 @@ func New(cfg config.Config, markersOverride ...string) model {
 	// helpView falls back to describing the rule.
 	configPath, _ := config.Path(cfg.ResolvedPath())
 
-	// Run-only markers override (zn2x): flag > cfg.Markers > terminal
-	// auto-detect. Only the resolved emoji bool below is affected; cfg
-	// itself (and thus what a later Save() persists) is untouched.
+	// Run-only markers override (zn2x): flag > cfg.Markers > mono default
+	// (qwcw -- "auto" is required to opt into terminal detection; unset no
+	// longer implies it). Only the resolved markerEmoji bool below is
+	// affected; cfg itself (and thus what a later Save() persists) is
+	// untouched.
 	markersMode := cfg.Markers
 	if len(markersOverride) > 0 && markersOverride[0] != "" {
 		markersMode = markersOverride[0]
 	}
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(markersMode), operatorUser: tsserve.CurrentUsername()}
+	return model{
+		list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
+		portInput: ti, labelInput: li, sshInput: si, configPath: configPath,
+		// emoji (egg/fireworks) always auto-detects, independent of markersMode.
+		emoji: emojiCapable(),
+		// markerEmoji (exposure markers) obeys --markers/cfg.Markers, defaulting
+		// to mono when unset (qwcw).
+		markerEmoji:  resolveMarkerEmoji(markersMode),
+		operatorUser: tsserve.CurrentUsername(),
+	}
 }
 
 // Run launches the interactive TUI. markersOverride is an optional, run-only
@@ -2057,7 +2097,7 @@ func (m *model) rebuildItems() tea.Cmd {
 				p = portscan.Port{Number: n}
 			}
 			meta := m.cfg.Ports[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.emoji, justCopied: m.copiedPort == n})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -2080,7 +2120,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		}
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.emoji, justCopied: m.copiedPort == n})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
@@ -3646,7 +3686,9 @@ type KeyLegendGroup struct {
 // keyLegendDescs maps a binding's display key to its rich "?"/quickstart prose
 // (deliberately fuller than the terse bottom-bar labels). emoji picks which
 // exposure glyph (🌒/🌑/🌫️ vs ◉/●/▲) is quoted inline in the space/p/C rows,
-// matching whichever marker set the caller is using (see resolveEmoji).
+// matching whichever marker set the caller is using (see resolveMarkerEmoji;
+// callers pass m.markerEmoji, not m.emoji -- this is exposure-marker prose,
+// not egg/fireworks).
 func keyLegendDescs(emoji bool) map[string]string {
 	served, funneled, dangling := "◉", "●", "▲"
 	if emoji {
@@ -3764,7 +3806,7 @@ func configSaveLines(path string) []string {
 // lines -- the ramp states, the two off-ramp broken states, then the
 // decorations -- so it stays readable rather than one very long line.
 func (m model) markerLegend() string {
-	if m.emoji {
+	if m.markerEmoji {
 		return "🌕 localhost   🌔 local network   🌓 on tailnet   🌒 served\n" +
 			"🌑 internet (funnel)   🌫️ stale   ✕ offline\n" +
 			"🔒 locked   ★ favorite"
@@ -3848,7 +3890,7 @@ func (m model) helpContent() string {
 	// Dangling-forward glyph, same resolution as keyLegendDescs' inline "C" row
 	// glyph, quoted again here since this paragraph sits outside that legend.
 	dangling := "▲"
-	if m.emoji {
+	if m.markerEmoji {
 		dangling = "🌫️"
 	}
 	b.WriteString(helpTextStyle.Render(
@@ -3875,7 +3917,7 @@ func (m model) helpContent() string {
 // unchanged either way -- same groups, same rich per-key prose -- so the
 // shared-with-quickstart legend text never diverges; only the layout differs.
 func (m model) renderKeyLegendColumns() string {
-	groups := KeyLegendGroups(m.emoji)
+	groups := KeyLegendGroups(m.markerEmoji)
 	single := RenderKeyLegendGroups(groups)
 	if m.width <= 0 || len(groups) < 2 {
 		return single

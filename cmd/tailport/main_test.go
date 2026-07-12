@@ -230,9 +230,9 @@ func TestRunQuickstartPrerequisitesMatchesOverlay(t *testing.T) {
 // accepted; anything else is a clean error, never a panic.
 func TestValidateMarkers(t *testing.T) {
 	// "  " (whitespace-only) is deliberately in the accepted group: it trims
-	// to "", and both validateMarkers and internal/ui.resolveEmoji treat ""
-	// the same way ("not meaningfully set" -> auto-detect), so the two stay
-	// consistent about what counts as "auto".
+	// to "", and both validateMarkers and internal/ui.resolveMarkerEmoji treat
+	// "" the same way ("not meaningfully set" -> mono default, qwcw), so the
+	// two stay consistent about what counts as unset.
 	for _, v := range []string{"", "  ", "auto", "AUTO", " ascii ", "ASCII", "emoji", "Emoji"} {
 		if err := validateMarkers(v); err != nil {
 			t.Errorf("validateMarkers(%q) = %v, want nil", v, err)

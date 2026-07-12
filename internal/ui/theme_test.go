@@ -423,7 +423,8 @@ func TestBottomBarHintStylesContrast(t *testing.T) {
 
 // TestResolveThemeForcesBackground covers n7gc's "light"/"dark" half of
 // resolveTheme: each forces lipgloss's background notion outright,
-// case-insensitively and trimmed (mirrors resolveEmoji's own handling).
+// case-insensitively and trimmed (mirrors resolveMarkerEmoji's own handling
+// of "emoji"/"ascii").
 func TestResolveThemeForcesBackground(t *testing.T) {
 	origDark := lipgloss.HasDarkBackground()
 	t.Cleanup(func() { lipgloss.SetHasDarkBackground(origDark) })

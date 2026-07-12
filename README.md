@@ -210,18 +210,28 @@ per port automatically (the name it last saw listening, used for the
 
 ### Status markers
 
-A top-level `markers` key selects how a port's exposure state is drawn:
+A top-level `markers` key (or the equivalent `--markers` flag, which wins
+over the config value for that run only) selects how a port's exposure-state
+marker is drawn:
 
 ```yaml
-markers: auto # auto (default) | emoji | ascii
+markers: "" # "" / mono (default) | auto | emoji | ascii
 ```
 
-- `auto` — egg-lifecycle emoji on a UTF-8-capable terminal (locale is
-  UTF-8 and `TERM` isn't the bare Linux console or `dumb`), otherwise ASCII.
-- `emoji` — always 🥚 listening · 🐣 served on tailnet · 🐦 public (funnel) ·
-  🪹 served but nothing listening.
-- `ascii` — always ○ listening · ◉ served on tailnet · ● public (funnel) ·
-  ▲ served but nothing listening.
+- unset (`""`, the default) — mono: ○ localhost · ◔ local network ·
+  ◑ on tailnet · ◉ served · ● public (funnel) · ▲ stale (dangling forward) ·
+  ✕ offline.
+- `auto` — opts into detecting a UTF-8-capable terminal (locale is UTF-8 and
+  `TERM` isn't the bare Linux console or `dumb`) and switches to the
+  moon-phase emoji ramp there, otherwise falls back to mono: 🌕 localhost ·
+  🌔 local network · 🌓 on tailnet · 🌒 served · 🌑 public (funnel) ·
+  🌫️ stale · ✕ offline.
+- `emoji` — always the moon-phase ramp above, regardless of terminal.
+- `ascii` — always mono, regardless of terminal (same glyphs as unset).
+
+This setting governs the exposure markers only. Any other emoji/animation
+tailport might render (e.g. from its hidden Easter-egg overlay) always
+auto-detects terminal capability on its own, independent of `markers`.
 
 ### Theme (light/dark terminals)
 

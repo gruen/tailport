@@ -104,7 +104,7 @@ func printUsage(w io.Writer, configOverride string) {
 	fmt.Fprintln(w, "  -v, --version         print version and exit")
 	fmt.Fprintln(w, "  -c, --config <path>   config file path (default: $XDG_CONFIG_HOME/tailport/config.yaml, else ~/.config/tailport/config.yaml)")
 	fmt.Fprintln(w, "      --no-color        disable ANSI color output (also honors NO_COLOR)")
-	fmt.Fprintln(w, "      --markers <mode>  exposure-glyph style: auto, emoji, or ascii (default: auto)")
+	fmt.Fprintln(w, "      --markers <mode>  exposure-marker glyph style: auto, emoji, or ascii (default: ascii)")
 	fmt.Fprintln(w, "      --theme <mode>    color scheme: auto, light, or dark (default: auto)")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
@@ -121,8 +121,9 @@ func printUsage(w io.Writer, configOverride string) {
 }
 
 // validMarkersModes are the only values --markers (zn2x) accepts, matching
-// what internal/ui.resolveEmoji understands for cfg.Markers: "auto" (or
-// empty) defers to terminal auto-detection, "emoji"/"ascii" force a set.
+// what internal/ui.resolveMarkerEmoji understands for cfg.Markers: "auto"
+// explicitly opts into terminal auto-detection, empty ("" -- not passed)
+// defaults to mono (qwcw), and "emoji"/"ascii" force a set either way.
 var validMarkersModes = map[string]bool{"": true, "auto": true, "emoji": true, "ascii": true}
 
 // validateMarkers rejects any --markers value other than "" (not passed),
@@ -243,8 +244,11 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Marker-glyph precedence mirrors ui.New: this run's --markers flag wins,
-	// else the persisted cfg.Markers, else auto-detect (ui.ResolveEmoji).
+	// Exposure-marker glyph precedence mirrors ui.New: this run's --markers
+	// flag wins, else the persisted cfg.Markers, else mono by default (qwcw --
+	// ui.ResolveMarkerEmoji only detects/emojifies on an explicit "auto" or
+	// "emoji"). This governs the legend's exposure glyphs only; the egg/
+	// fireworks (not shown by quickstart) always auto-detect independently.
 	markersMode := cf.markers
 	if markersMode == "" {
 		markersMode = cfg.Markers
@@ -258,7 +262,7 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 	// should see the same legible colors --theme light gives the TUI.
 	ui.ApplyTheme(resolveThemeMode(cf.theme, cfg.Theme))
 
-	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveEmoji(markersMode), tsserve.CurrentUsername()))
+	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveMarkerEmoji(markersMode), tsserve.CurrentUsername()))
 	return 0
 }
 

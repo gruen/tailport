@@ -459,24 +459,26 @@ func TestFilterDiscoverable(t *testing.T) {
 
 // TestHelpViewUsesSharedKeyLegend covers the single-source-of-truth invariant
 // (kata x4cg, evolved by p39s): the in-TUI "?" overlay's key sections are
-// exactly RenderKeyLegendGroups(KeyLegendGroups(m.emoji)) -- not a hand-copied
-// duplicate -- so it and `tailport quickstart` (cmd/tailport, which calls the
-// same two functions) can never drift apart. Checked in both marker modes,
-// since the space/p/C rows quote the mode-specific exposure glyph. Asserted on
-// helpContent (the full overlay text) with width unset, where the legend is a
-// single vertical column so the shared block appears verbatim; helpView windows
-// that content to the terminal height (v10j) and the wide-terminal layout re-
-// flows the same shared rows into side-by-side columns.
+// exactly RenderKeyLegendGroups(KeyLegendGroups(m.markerEmoji)) -- not a
+// hand-copied duplicate -- so it and `tailport quickstart` (cmd/tailport,
+// which calls the same two functions) can never drift apart. Checked in both
+// EXPOSURE-marker modes (m.markerEmoji, not the egg's m.emoji -- qwcw split
+// the two), since the space/p/C rows quote the mode-specific exposure glyph.
+// Asserted on helpContent (the full overlay text) with width unset, where the
+// legend is a single vertical column so the shared block appears verbatim;
+// helpView windows that content to the terminal height (v10j) and the
+// wide-terminal layout re-flows the same shared rows into side-by-side
+// columns.
 func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	for _, emoji := range []bool{false, true} {
 		m := New(config.Config{})
-		m.emoji = emoji
+		m.markerEmoji = emoji
 
 		want := RenderKeyLegendGroups(KeyLegendGroups(emoji))
 		if got := m.helpContent(); !strings.Contains(got, want) {
-			t.Errorf("helpContent() (emoji=%v) does not contain RenderKeyLegendGroups(KeyLegendGroups(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
+			t.Errorf("helpContent() (markerEmoji=%v) does not contain RenderKeyLegendGroups(KeyLegendGroups(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
 		}
 	}
 }
@@ -2011,13 +2013,16 @@ func TestRememberProcesses(t *testing.T) {
 	}
 }
 
-// TestResolveEmoji covers the markers-mode resolution: emoji/ascii force it,
-// auto (or empty) defers to the terminal heuristic (UTF-8 locale + sane TERM).
-func TestResolveEmoji(t *testing.T) {
-	if !resolveEmoji("emoji") {
+// TestResolveMarkerEmoji covers the EXPOSURE-marker mode resolution (qwcw):
+// emoji/ascii force it, "auto" is an explicit opt-in to the terminal
+// heuristic (UTF-8 locale + sane TERM), and -- the new behavior split off
+// from the old resolveEmoji -- an empty/unset mode is MONO regardless of
+// terminal capability, no longer identical to "auto".
+func TestResolveMarkerEmoji(t *testing.T) {
+	if !resolveMarkerEmoji("emoji") {
 		t.Error("markers=emoji should force emoji")
 	}
-	if resolveEmoji("ascii") {
+	if resolveMarkerEmoji("ascii") {
 		t.Error("markers=ascii should force ascii")
 	}
 
@@ -2026,36 +2031,46 @@ func TestResolveEmoji(t *testing.T) {
 	t.Setenv("LC_ALL", "")
 	t.Setenv("LC_CTYPE", "")
 	t.Setenv("LANG", "en_US.UTF-8")
-	if !resolveEmoji("auto") {
+	if !resolveMarkerEmoji("auto") {
 		t.Error("auto with UTF-8 LANG on xterm should resolve emoji")
 	}
-	if !resolveEmoji("") {
-		t.Error("empty (=auto) with UTF-8 should resolve emoji")
+	// Empty (unset) is the new mono default -- deliberately NOT the same as
+	// "auto" anymore, even though this terminal is UTF-8-capable.
+	if resolveMarkerEmoji("") {
+		t.Error("empty (unset) should resolve mono regardless of terminal capability")
+	}
+	// Case-insensitive/trimmed, same as the other modes.
+	if resolveMarkerEmoji("  ") {
+		t.Error("whitespace-only should resolve mono, same as empty")
+	}
+	if resolveMarkerEmoji("bogus") {
+		t.Error("an unrecognized mode should resolve mono, same as empty")
 	}
 
 	// The bare Linux console can't render emoji, even with a UTF-8 locale.
 	t.Setenv("TERM", "linux")
-	if resolveEmoji("auto") {
+	if resolveMarkerEmoji("auto") {
 		t.Error("auto on the linux console should resolve ascii")
 	}
 
 	// A non-UTF-8 locale -> ascii.
 	t.Setenv("TERM", "xterm-256color")
 	t.Setenv("LANG", "C")
-	if resolveEmoji("auto") {
+	if resolveMarkerEmoji("auto") {
 		t.Error("auto with a non-UTF-8 locale should resolve ascii")
 	}
 }
 
 // TestNewMarkersOverride covers zn2x's precedence and persistence contract
 // at the New()/model level (the CLI-flag validation itself is covered in
-// cmd/tailport): the override passed to New wins for rendering (m.emoji),
-// but must never leak into cfg.Markers -- and therefore never into what a
-// later, unrelated Save() (e.g. from favoriting a port) writes to disk.
+// cmd/tailport): the override passed to New wins for EXPOSURE-marker
+// rendering (m.markerEmoji, split from the egg's m.emoji by qwcw), but must
+// never leak into cfg.Markers -- and therefore never into what a later,
+// unrelated Save() (e.g. from favoriting a port) writes to disk.
 func TestNewMarkersOverride(t *testing.T) {
 	// Override wins over the persisted config value.
 	m := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"}, "ascii")
-	if m.emoji {
+	if m.markerEmoji {
 		t.Error("New(cfg{Markers:emoji}, \"ascii\") should resolve ascii (flag beats config)")
 	}
 	if m.cfg.Markers != "emoji" {
@@ -2065,15 +2080,41 @@ func TestNewMarkersOverride(t *testing.T) {
 	// No override (variadic omitted) falls back to cfg.Markers, exactly as
 	// before zn2x -- the common existing-call-site case stays unaffected.
 	m2 := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"})
-	if !m2.emoji {
+	if !m2.markerEmoji {
 		t.Error("New(cfg{Markers:emoji}) with no override should still resolve emoji")
 	}
 
 	// An empty override (as when --markers wasn't passed at all) must not
 	// clobber a real config value either.
 	m3 := New(config.Config{Ports: map[int]config.PortMeta{}, Markers: "emoji"}, "")
-	if !m3.emoji {
+	if !m3.markerEmoji {
 		t.Error("New(cfg{Markers:emoji}, \"\") should still resolve emoji (empty override = no override)")
+	}
+}
+
+// TestNewEggEmojiDecoupledFromMarkers covers qwcw's central split: the egg/
+// fireworks glyph choice (m.emoji) always tracks emojiCapable() alone, no
+// matter what --markers/cfg.Markers says, while the exposure markers
+// (m.markerEmoji) obey markersMode and default to mono when it's unset.
+func TestNewEggEmojiDecoupledFromMarkers(t *testing.T) {
+	want := emojiCapable() // whatever this test process's env resolves to
+
+	for _, tc := range []struct {
+		markersMode     string
+		wantMarkerEmoji bool
+	}{
+		{"", false},      // unset -> mono (new default)
+		{"ascii", false}, // forced mono
+		{"emoji", true},  // forced emoji
+		{"auto", emojiCapable()},
+	} {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}}, tc.markersMode)
+		if m.emoji != want {
+			t.Errorf("New(cfg, %q).emoji = %v, want emojiCapable() = %v -- egg/fireworks must stay decoupled from --markers", tc.markersMode, m.emoji, want)
+		}
+		if m.markerEmoji != tc.wantMarkerEmoji {
+			t.Errorf("New(cfg, %q).markerEmoji = %v, want %v", tc.markersMode, m.markerEmoji, tc.wantMarkerEmoji)
+		}
 	}
 }
 
@@ -2098,7 +2139,7 @@ func TestMarkersOverrideNeverPersisted(t *testing.T) {
 	}
 
 	m := New(cfg, "ascii")
-	if m.emoji {
+	if m.markerEmoji {
 		t.Fatal("--markers ascii override should resolve ascii for this session")
 	}
 
