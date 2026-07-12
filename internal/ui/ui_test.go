@@ -383,12 +383,12 @@ func TestFilterDiscoverable(t *testing.T) {
 	}
 }
 
-// TestHelpViewUsesSharedKeyLegend covers kata x4cg's single-source-of-truth
-// requirement: the in-TUI "?" overlay's Keys section is exactly
-// RenderKeyLegend(KeyLegendRows(m.emoji)) -- not a hand-copied duplicate --
-// so it and `tailport quickstart` (cmd/tailport, which calls the same two
-// functions) can never drift apart. Checked in both marker modes, since the
-// legend's space/p/C rows quote the mode-specific exposure glyph.
+// TestHelpViewUsesSharedKeyLegend covers the single-source-of-truth invariant
+// (kata x4cg, evolved by p39s): the in-TUI "?" overlay's key sections are
+// exactly RenderKeyLegendGroups(KeyLegendGroups(m.emoji)) -- not a hand-copied
+// duplicate -- so it and `tailport quickstart` (cmd/tailport, which calls the
+// same two functions) can never drift apart. Checked in both marker modes,
+// since the space/p/C rows quote the mode-specific exposure glyph.
 func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -396,9 +396,9 @@ func TestHelpViewUsesSharedKeyLegend(t *testing.T) {
 		m := New(config.Config{})
 		m.emoji = emoji
 
-		want := RenderKeyLegend(KeyLegendRows(emoji))
+		want := RenderKeyLegendGroups(KeyLegendGroups(emoji))
 		if got := m.helpView(); !strings.Contains(got, want) {
-			t.Errorf("helpView() (emoji=%v) does not contain RenderKeyLegend(KeyLegendRows(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
+			t.Errorf("helpView() (emoji=%v) does not contain RenderKeyLegendGroups(KeyLegendGroups(%v)) verbatim.\nwant substring:\n%s\ngot:\n%s", emoji, emoji, want, got)
 		}
 	}
 }
@@ -1397,7 +1397,10 @@ func TestHeader(t *testing.T) {
 	}
 
 	// The toggle moved to the header, so the bottom bar must not duplicate it.
-	if bottom := m.renderBottom(); strings.Contains(bottom, "Favorites") || strings.Contains(bottom, "All ports") {
+	// (p39s: "Favorites" now legitimately appears as a key-group column header,
+	// so match on "All ports" -- the toggle's distinguishing segment, which the
+	// grouped legend never contains.)
+	if bottom := m.renderBottom(); strings.Contains(bottom, "All ports") {
 		t.Errorf("bottom bar should not contain the view toggle; got %q", bottom)
 	}
 }
@@ -2188,5 +2191,278 @@ func TestEggViewTinyNoPanic(t *testing.T) {
 			m.fireworks = stepFireworks(m.fireworks)
 		}
 		_ = m.eggView() // must not panic
+	}
+}
+
+// --- p39s: grouped key hints (bottom-bar grid + unified overlay) ---
+
+// TestKeyGroupsAndFullHelp covers the single grouping source: keyMap.groups()
+// yields the five approved columns in order, and FullHelp() mirrors them one
+// inner slice per column.
+func TestKeyGroupsAndFullHelp(t *testing.T) {
+	k := newKeyMap()
+	groups := k.groups()
+
+	wantNames := []string{"Expose", "Favorites", "Protect", "View", "App"}
+	if len(groups) != len(wantNames) {
+		t.Fatalf("groups() = %d columns, want %d", len(groups), len(wantNames))
+	}
+	wantKeys := [][]string{
+		{"space", "p", "c"},
+		{"f", "u", "n", "l"},
+		{"x", "C"},
+		{"/", "a", "r"},
+		{"?", "q"},
+	}
+	full := k.FullHelp()
+	if len(full) != len(groups) {
+		t.Fatalf("FullHelp() = %d columns, want %d (one per group)", len(full), len(groups))
+	}
+	for i, g := range groups {
+		if g.name != wantNames[i] {
+			t.Errorf("group %d name = %q, want %q", i, g.name, wantNames[i])
+		}
+		if len(g.bindings) != len(wantKeys[i]) {
+			t.Fatalf("group %q has %d bindings, want %d", g.name, len(g.bindings), len(wantKeys[i]))
+		}
+		for j, b := range g.bindings {
+			if got := b.Help().Key; got != wantKeys[i][j] {
+				t.Errorf("group %q binding %d key = %q, want %q", g.name, j, got, wantKeys[i][j])
+			}
+		}
+		// FullHelp column must be the same bindings as the group.
+		if len(full[i]) != len(g.bindings) {
+			t.Fatalf("FullHelp col %d len = %d, want %d", i, len(full[i]), len(g.bindings))
+		}
+		for j, b := range full[i] {
+			if got := b.Help().Key; got != wantKeys[i][j] {
+				t.Errorf("FullHelp col %d binding %d key = %q, want %q", i, j, got, wantKeys[i][j])
+			}
+		}
+	}
+}
+
+// TestBottomBarGridAligned drives the real model at a wide width and asserts
+// the bar renders the five grouped columns with a header row and aligned
+// gutters: descriptions line up within a column and columns line up across
+// rows.
+func TestBottomBarGridAligned(t *testing.T) {
+	m := New(config.Config{})
+	m.help.Width = 100
+	m.width = 100
+
+	grid := stripANSI(m.renderLegend())
+	lines := strings.Split(grid, "\n")
+	if len(lines) < 5 {
+		t.Fatalf("grid should be a header + up to 4 rows (>=5 lines); got %d:\n%s", len(lines), grid)
+	}
+	hdr, r1, r2 := lines[0], lines[1], lines[2]
+
+	// Header row carries all five section names, in order, on one line.
+	prev := -1
+	for _, name := range []string{"Expose", "Favorites", "Protect", "View", "App"} {
+		at := strings.Index(hdr, name)
+		if at < 0 {
+			t.Fatalf("header row missing %q; got %q", name, hdr)
+		}
+		if at <= prev {
+			t.Errorf("header %q out of order (at %d, prev %d): %q", name, at, prev, hdr)
+		}
+		prev = at
+	}
+
+	// Columns line up across rows: each header's start == its cells' start.
+	eq := func(label string, a, b int) {
+		if a != b {
+			t.Errorf("%s misaligned: %d vs %d\nhdr: %q\nr1:  %q\nr2:  %q", label, a, b, hdr, r1, r2)
+		}
+	}
+	eq("Favorites/r1", strings.Index(hdr, "Favorites"), strings.Index(r1, "f favorite"))
+	eq("Favorites/r2", strings.Index(hdr, "Favorites"), strings.Index(r2, "u unfavorite"))
+	eq("Protect/r1", strings.Index(hdr, "Protect"), strings.Index(r1, "x lock/unlock"))
+	eq("View/r1", strings.Index(hdr, "View"), strings.Index(r1, "/ filter"))
+	eq("App/r1", strings.Index(hdr, "App"), strings.Index(r1, "? help"))
+	eq("App/r2", strings.Index(hdr, "App"), strings.Index(r2, "q quit"))
+
+	// Within the Expose column the key gutter aligns the descriptions: "serve"
+	// (after "space ") and "funnel" (after "p     ") start at the same offset.
+	eq("Expose gutter", strings.Index(r1, "serve"), strings.Index(r2, "funnel"))
+}
+
+// TestBottomBarNarrowFallback covers the responsive fallback: below the
+// content-derived threshold the bar becomes a wrapped grouped bar that never
+// truncates (every key+desc still present) and never overflows the width.
+func TestBottomBarNarrowFallback(t *testing.T) {
+	const width = 60
+	m := New(config.Config{})
+	m.help.Width = width
+	m.width = width
+
+	bar := stripANSI(m.renderLegend())
+	lines := strings.Split(bar, "\n")
+
+	// Not the grid: the five headers are no longer all on the first line.
+	if all := strings.Contains(lines[0], "Expose") && strings.Contains(lines[0], "App"); all {
+		t.Errorf("narrow width should fall back, not render the single-row grid header; got %q", lines[0])
+	}
+
+	// No line overflows the width (no soft-wrap that would break the sizing math).
+	for i, ln := range lines {
+		if w := lipgloss.Width(ln); w > width {
+			t.Errorf("fallback line %d width %d > %d (truncation/overflow): %q", i, w, width, ln)
+		}
+	}
+
+	// Every hint is still present -- no truncation, no elision. (C is contextual
+	// and absent with no dangling.)
+	for _, want := range []string{
+		"Expose", "Favorites", "Protect", "View", "App",
+		"space serve", "p funnel public", "c copy URL",
+		"f favorite", "u unfavorite", "n add favorite", "l label",
+		"x lock/unlock", "/ filter", "a switch view", "r refresh",
+		"? help", "q quit",
+	} {
+		if !strings.Contains(bar, want) {
+			t.Errorf("narrow fallback dropped %q; got:\n%s", want, bar)
+		}
+	}
+	if strings.Contains(bar, "clean") {
+		t.Errorf("C clean should be absent with no dangling; got:\n%s", bar)
+	}
+}
+
+// TestProtectColumnContextualClean covers the contextual "C clean stale": the
+// Protect column collapses to just "x lock/unlock" (no reserved blank slot)
+// when nothing is dangling, and expands to add "C clean stale" when a dangling
+// forward exists.
+func TestProtectColumnContextualClean(t *testing.T) {
+	m := New(config.Config{})
+	m.help.Width = 100
+	m.width = 100
+
+	protect := func(groups []keyGroup) keyGroup {
+		for _, g := range groups {
+			if g.name == "Protect" {
+				return g
+			}
+		}
+		t.Fatal("no Protect group")
+		return keyGroup{}
+	}
+
+	// No dangling -> Protect has exactly the lock binding, and the rendered bar
+	// omits "clean".
+	if got := len(protect(m.barGroups(false)).bindings); got != 1 {
+		t.Errorf("Protect should collapse to 1 binding (x) with no dangling; got %d", got)
+	}
+	if noDangle := stripANSI(m.renderLegend()); strings.Contains(noDangle, "clean") {
+		t.Errorf("bar should not show 'clean' with no dangling:\n%s", noDangle)
+	}
+
+	// A served-but-not-listening port is dangling -> Protect gains "C clean".
+	m.active = map[int]bool{9999: true}
+	if !m.hasDangling() {
+		t.Fatal("setup: expected a dangling forward")
+	}
+	if got := len(protect(m.barGroups(true)).bindings); got != 2 {
+		t.Errorf("Protect should expand to 2 bindings (x, C) with a dangling; got %d", got)
+	}
+	if dangle := stripANSI(m.renderLegend()); !strings.Contains(dangle, "C clean stale") {
+		t.Errorf("bar should show 'C clean stale' with a dangling:\n%s", dangle)
+	}
+}
+
+// TestLegendSizingNoClip asserts the list-height/bottom-height bookkeeping stays
+// consistent: after a WindowSizeMsg the whole View fits within the terminal
+// height (nothing clips or overlaps) at wide and narrow widths, with and without
+// a dangling forward -- including when a dangling appears AFTER the resize, which
+// the worst-case reservation must already cover.
+func TestLegendSizingNoClip(t *testing.T) {
+	build := func(w, h int, sizeDangling, renderDangling bool) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.allPorts = []portscan.Port{
+			{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"},
+			{Number: 9000, Process: "api"}, {Number: 5173, Process: "vite"},
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		if sizeDangling {
+			m.active = map[int]bool{9999: true}
+		}
+		r, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		m = r.(model)
+		// Optionally flip the dangling state after sizing (no new resize): the
+		// reservation reserved the worst case, so this must still not clip.
+		if renderDangling {
+			m.active = map[int]bool{9999: true}
+		} else if !sizeDangling {
+			m.active = map[int]bool{}
+		}
+		return m
+	}
+
+	for _, tc := range []struct {
+		name                         string
+		w, h                         int
+		sizeDangling, renderDangling bool
+	}{
+		{"wide/no-dangling", 100, 24, false, false},
+		{"wide/dangling", 100, 24, true, true},
+		{"wide/dangling-appears-after-resize", 100, 24, false, true},
+		{"narrow/no-dangling", 58, 24, false, false},
+		{"narrow/dangling", 58, 24, true, true},
+		{"narrow/dangling-appears-after-resize", 58, 24, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := build(tc.w, tc.h, tc.sizeDangling, tc.renderDangling)
+			view := m.View()
+			if got := lipgloss.Height(view); got > m.height {
+				t.Errorf("View height %d > terminal height %d (clip/overlap):\n%s", got, m.height, stripANSI(view))
+			}
+			// The bar's last line must be present (not pushed off the bottom).
+			plain := stripANSI(view)
+			if !strings.Contains(plain, "q quit") {
+				t.Errorf("bottom bar clipped: %q not found in View:\n%s", "q quit", plain)
+			}
+		})
+	}
+}
+
+// TestHelpOverlayGroupedSections covers the "?" overlay reorg: the same five
+// sections in the same order as the bar, each with an aligned key gutter, but
+// keeping the RICH per-key prose and the surrounding Markers/warnings/config
+// prose.
+func TestHelpOverlayGroupedSections(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+
+	help := stripANSI(m.helpView())
+
+	// Sections appear in the approved order.
+	prev := -1
+	for _, name := range []string{"Expose", "Favorites", "Protect", "View", "App"} {
+		at := strings.Index(help, name)
+		if at < 0 {
+			t.Fatalf("overlay missing section %q", name)
+		}
+		if at <= prev {
+			t.Errorf("overlay section %q out of order (at %d, prev %d)", name, at, prev)
+		}
+		prev = at
+	}
+
+	// Rich prose is preserved, not reduced to the terse bar labels.
+	for _, want := range []string{
+		"Filter by port number",      // '/' rich prose
+		"PUBLIC INTERNET",            // 'p' rich prose
+		"durable",                    // 'f' rich prose
+		"Tear down stale forwards",   // 'C' rich prose
+		"Markers",                    // markers section kept
+		"drop your live SSH session", // :22 warning kept
+		"Settings (favorites, labels, locks) are saved to:", // config-path prose kept
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("overlay dropped prose %q", want)
+		}
 	}
 }

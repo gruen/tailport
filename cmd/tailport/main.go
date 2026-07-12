@@ -219,12 +219,12 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 // AGENTS.md's "Design constraints" section, which this wording tracks
 // closely), the resolved config path, and the full keybinding legend.
 //
-// SINGLE SOURCE OF TRUTH: the legend rows come from ui.KeyLegendRows,
-// rendered by ui.RenderKeyLegend -- the exact same function calls
-// internal/ui.helpView uses for the in-TUI "?" overlay. Nothing here
-// hand-copies a key or a description, so quickstart's legend cannot drift
-// from what "?" shows; a future edit to a binding's help text only has one
-// place to change.
+// SINGLE SOURCE OF TRUTH: the grouped legend comes from ui.KeyLegendGroups,
+// rendered by ui.RenderKeyLegendGroups -- the exact same function calls
+// internal/ui.helpView uses for the in-TUI "?" overlay, and the same
+// keyMap.groups() grouping the bottom-bar grid uses. Nothing here hand-copies a
+// key, a section, or a description, so quickstart's legend cannot drift from
+// what "?" shows; a future edit has only one place to change.
 //
 // Kept as a pure string builder (like versionLine) rather than writing
 // straight to an io.Writer, so it's testable without stdout/exit-code
@@ -251,7 +251,7 @@ func quickstartText(configPath string, emoji bool) string {
 	fmt.Fprintln(&b, "Config path:", configPath)
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Keybinding legend (interactive TUI; run `tailport` with no arguments):")
-	b.WriteString(ui.RenderKeyLegend(ui.KeyLegendRows(emoji)))
+	b.WriteString(ui.RenderKeyLegendGroups(ui.KeyLegendGroups(emoji)))
 
 	return b.String()
 }

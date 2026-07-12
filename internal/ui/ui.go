@@ -76,23 +76,57 @@ type keyMap struct {
 	Quit       key.Binding
 }
 
-// ShortHelp and FullHelp return the same flat list: the legend doesn't
-// distinguish a "short" vs "full" mode, it always shows every binding and
-// relies on width-based wrapping (see wrapBindings) instead of truncation.
-func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{
-		k.Toggle, k.Funnel, k.Filter, k.Copy, k.NewPort, k.Label, k.Favorite,
-		k.Unfavorite, k.Lock, k.ShowAll, k.Clean, k.Refresh, k.Help, k.Quit,
+// keyGroup is one like-for-like column of the keybinding legend (kata p39s): a
+// display name and the bindings under it, in order. keyMap.groups() is the
+// SINGLE grouping source -- the bottom-bar grid (renderLegend), the "?" overlay
+// and `tailport quickstart` (both via KeyLegendGroups), and FullHelp() all
+// derive from it, so the five columns can never drift apart.
+type keyGroup struct {
+	name     string
+	bindings []key.Binding
+}
+
+// groups returns the approved like-for-like grouping (kata p39s): Expose,
+// Favorites, Protect, View, App -- in display order, one group per bottom-bar
+// column and one "?"-overlay section.
+func (k keyMap) groups() []keyGroup {
+	return []keyGroup{
+		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Copy}},
+		{"Favorites", []key.Binding{k.Favorite, k.Unfavorite, k.NewPort, k.Label}},
+		{"Protect", []key.Binding{k.Lock, k.Clean}},
+		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
+		{"App", []key.Binding{k.Help, k.Quit}},
 	}
 }
 
+// ShortHelp flattens groups() in grouped order; FullHelp returns one inner
+// slice per column (per group) -- the columnar vehicle bubbles/help expects and
+// the shape the bottom-bar grid mirrors. Neither distinguishes a "short" vs
+// "full" mode or truncates: the legend relies on width-based layout (see
+// renderLegend) instead of an ellipsis.
+func (k keyMap) ShortHelp() []key.Binding {
+	var out []key.Binding
+	for _, g := range k.groups() {
+		out = append(out, g.bindings...)
+	}
+	return out
+}
+
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{k.ShortHelp()}
+	groups := k.groups()
+	cols := make([][]key.Binding, len(groups))
+	for i, g := range groups {
+		cols[i] = g.bindings
+	}
+	return cols
 }
 
 func newKeyMap() keyMap {
 	return keyMap{
-		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
+		// "serve" (not "toggle") in the bar's Expose column: it names the action
+		// space performs, matching the approved p39s grouping table. The "?"
+		// overlay keeps the fuller "toggle serve on/off" prose (keyLegendDescs).
+		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "serve")),
 		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
@@ -469,7 +503,7 @@ func emojiCapable() bool {
 
 // ResolveEmoji exports resolveEmoji's marker-glyph resolution for callers
 // outside this package. `tailport quickstart` (kata x4cg) uses it so its
-// printed legend picks the same glyph set (see KeyLegendRows) the "?"
+// printed legend picks the same glyph set (see keyLegendDescs) the "?"
 // overlay would for the same markers mode, not just the same key text.
 func ResolveEmoji(mode string) bool {
 	return resolveEmoji(mode)
@@ -959,12 +993,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.Width = msg.Width
 		m.width = msg.Width
 		m.height = msg.Height
+		// Reserve the WORST-CASE legend height -- render it as if a dangling
+		// forward were present (cleanEnabled=true) so the grouped grid/bar always
+		// fits. That way the list never overlaps the bar when a dangling appears
+		// (or vanishes) between resizes: the grid is a constant 5 rows regardless,
+		// and the wrapped fallback is measured with the extra "C" hint included.
 		legendLines := 1
-		if legend := m.renderLegend(); legend != "" {
+		if legend := m.renderLegendWith(true); legend != "" {
 			legendLines = strings.Count(legend, "\n") + 1
 		}
 		// Reserve the persistent top header (one row) plus the bottom bar: one
-		// blank separator, the status line, and the wrapped shortcuts legend.
+		// blank separator, the status line, and the grouped shortcuts legend.
 		// View then pads the gap so the bar lands on the last rows (see
 		// renderHeader / renderBottom).
 		headerLines := lipgloss.Height(m.renderHeader())
@@ -1559,59 +1598,186 @@ func selectIndexForPort(numbers []int, target int) int {
 	return 0
 }
 
-// renderLegend renders the keybinding legend, wrapping onto additional
-// lines as needed to fit m.help.Width rather than truncating with an
-// ellipsis (bubbles/help's own ShortHelpView/FullHelpView only truncate,
-// they don't wrap, so the packing is done by hand in wrapBindings).
+// legendColGap is the blank gutter between adjacent columns in the bottom-bar
+// grid, and between groups in the wrapped fallback.
+const legendColGap = 2
+
+// renderLegend renders the bottom-bar keybinding legend for the current width
+// and dangling state. See renderLegendWith.
 func (m model) renderLegend() string {
-	keys := m.keys
-	// The active view is shown by the segmented indicator (renderViewIndicator),
-	// so "a" is just labeled with its action.
-	keys.ShowAll.SetHelp("a", "switch view")
-	// "clean stale" only makes sense when there's something stale to clean;
-	// wrapBindings skips disabled bindings, so it drops out otherwise.
-	keys.Clean.SetEnabled(m.hasDangling())
-	return wrapBindings(m.help.Styles, keys.ShortHelp(), m.help.Width, m.help.ShortSeparator)
+	return m.renderLegendWith(m.hasDangling())
 }
 
-// wrapBindings greedily packs "key desc" items onto lines, starting a new
-// line whenever the next item would overflow width (a width <= 0 means
-// unbounded, matching bubbles/help's own convention). This is what gives
-// the legend a stacked, multi-line layout in narrow terminals instead of
-// bubbles/help's default single-line-plus-ellipsis truncation.
-func wrapBindings(styles help.Styles, bindings []key.Binding, width int, sep string) string {
-	if len(bindings) == 0 {
-		return ""
+// renderLegendWith renders the grouped keybinding legend (kata p39s). When the
+// aligned column grid fits the width it renders that; otherwise it falls back to
+// a wrapped grouped bar. Neither ever truncates or ellipsizes a hint -- narrow
+// terminals wrap, they never clip. The width source is m.help.Width (set from
+// each WindowSizeMsg); width <= 0 means unbounded, so the full grid renders.
+//
+// cleanEnabled controls the contextual "C clean stale" hint (shown only when
+// dangling forwards exist). WindowSizeMsg passes true to reserve the worst-case
+// height; the live render passes m.hasDangling().
+func (m model) renderLegendWith(cleanEnabled bool) string {
+	groups := m.barGroups(cleanEnabled)
+	grid, gridWidth := renderLegendGrid(m.help.Styles, groups)
+	if m.help.Width > 0 && m.help.Width < gridWidth {
+		return renderGroupedBar(m.help.Styles, groups, m.help.Width)
 	}
-	renderedSep := styles.ShortSeparator.Inline(true).Render(sep)
-	sepWidth := lipgloss.Width(renderedSep)
+	return grid
+}
+
+// barGroups adapts keyMap.groups() for the bottom bar: it relabels "a" to
+// "switch view" (its keymap help is "filtered"; the active view is shown by the
+// header indicator, renderViewIndicator) and drops the contextual "C clean
+// stale" unless cleanEnabled. The Protect column therefore collapses to just
+// "x lock/unlock" when nothing is dangling, with no reserved blank slot.
+func (m model) barGroups(cleanEnabled bool) []keyGroup {
+	keys := m.keys
+	keys.ShowAll.SetHelp("a", "switch view")
+	keys.Clean.SetEnabled(cleanEnabled)
+	src := keys.groups()
+	out := make([]keyGroup, 0, len(src))
+	for _, g := range src {
+		bindings := make([]key.Binding, 0, len(g.bindings))
+		for _, b := range g.bindings {
+			if b.Enabled() {
+				bindings = append(bindings, b)
+			}
+		}
+		if len(bindings) > 0 {
+			out = append(out, keyGroup{g.name, bindings})
+		}
+	}
+	return out
+}
+
+// renderLegendGrid lays the groups out as an aligned column grid: a styled
+// header row over, per group, a left-aligned key gutter + description. Column
+// widths are computed from content (header vs the widest "key desc"), and every
+// cell is padded so the columns line up. It returns the rendered grid and its
+// total display width, which renderLegendWith uses as the responsive threshold.
+func renderLegendGrid(styles help.Styles, groups []keyGroup) (string, int) {
+	n := len(groups)
+	if n == 0 {
+		return "", 0
+	}
+	type cell struct{ key, desc string }
+	cols := make([][]cell, n)
+	keyGutter := make([]int, n)
+	colWidth := make([]int, n)
+	maxRows := 0
+	for c, g := range groups {
+		for _, b := range g.bindings {
+			h := b.Help()
+			cols[c] = append(cols[c], cell{h.Key, h.Desc})
+			if w := lipgloss.Width(h.Key); w > keyGutter[c] {
+				keyGutter[c] = w
+			}
+		}
+		if len(cols[c]) > maxRows {
+			maxRows = len(cols[c])
+		}
+		colWidth[c] = lipgloss.Width(g.name)
+		for _, cl := range cols[c] {
+			if w := keyGutter[c] + 1 + lipgloss.Width(cl.desc); w > colWidth[c] {
+				colWidth[c] = w
+			}
+		}
+	}
+
+	total := 0
+	for c, w := range colWidth {
+		total += w
+		if c < n-1 {
+			total += legendColGap
+		}
+	}
+
+	gap := strings.Repeat(" ", legendColGap)
+	var lines []string
+
+	// Header row: the group names, each padded to its column width.
+	var hb strings.Builder
+	for c, g := range groups {
+		hb.WriteString(helpTitleStyle.Render(g.name))
+		hb.WriteString(strings.Repeat(" ", colWidth[c]-lipgloss.Width(g.name)))
+		if c < n-1 {
+			hb.WriteString(gap)
+		}
+	}
+	lines = append(lines, strings.TrimRight(hb.String(), " "))
+
+	// Data rows: key gutter + description, padded to align.
+	for r := 0; r < maxRows; r++ {
+		var rb strings.Builder
+		for c := range groups {
+			plainW := 0
+			if r < len(cols[c]) {
+				cl := cols[c][r]
+				rb.WriteString(styles.ShortKey.Inline(true).Render(cl.key))
+				rb.WriteString(strings.Repeat(" ", keyGutter[c]-lipgloss.Width(cl.key)))
+				rb.WriteString(" ")
+				rb.WriteString(styles.ShortDesc.Inline(true).Render(cl.desc))
+				plainW = keyGutter[c] + 1 + lipgloss.Width(cl.desc)
+			}
+			rb.WriteString(strings.Repeat(" ", colWidth[c]-plainW))
+			if c < n-1 {
+				rb.WriteString(gap)
+			}
+		}
+		lines = append(lines, strings.TrimRight(rb.String(), " "))
+	}
+	return strings.Join(lines, "\n"), total
+}
+
+// renderGroupedBar is the narrow-terminal fallback: it flows every group's
+// "key desc" hints inline, prefixed by the styled group name, and greedily wraps
+// onto new lines so nothing overflows the width -- and nothing is ever
+// truncated or elided (every key and description is still present, matching the
+// old wrapBindings guarantee, just grouped). width <= 0 means unbounded.
+func renderGroupedBar(styles help.Styles, groups []keyGroup, width int) string {
+	type piece struct {
+		text   string
+		w      int
+		header bool
+	}
+	var pieces []piece
+	for _, g := range groups {
+		pieces = append(pieces, piece{helpTitleStyle.Render(g.name), lipgloss.Width(g.name), true})
+		for _, b := range g.bindings {
+			h := b.Help()
+			txt := styles.ShortKey.Inline(true).Render(h.Key) + " " + styles.ShortDesc.Inline(true).Render(h.Desc)
+			pieces = append(pieces, piece{txt, lipgloss.Width(h.Key) + 1 + lipgloss.Width(h.Desc), false})
+		}
+	}
 
 	var lines []string
 	var cur strings.Builder
-	curWidth := 0
-	for _, kb := range bindings {
-		if !kb.Enabled() {
-			continue
+	curW := 0
+	prevHeader := false
+	for _, p := range pieces {
+		sep, sepW := "", 0
+		if curW > 0 {
+			switch {
+			case p.header:
+				sep, sepW = "   ", 3 // wider break before a new group
+			case prevHeader:
+				sep, sepW = " ", 1 // header to its first hint
+			default:
+				sep, sepW = " · ", 3 // between hints in a group
+			}
 		}
-		item := styles.ShortKey.Inline(true).Render(kb.Help().Key) + " " + styles.ShortDesc.Inline(true).Render(kb.Help().Desc)
-		itemWidth := lipgloss.Width(item)
-
-		addWidth := itemWidth
-		if curWidth > 0 {
-			addWidth += sepWidth
-		}
-		if width > 0 && curWidth > 0 && curWidth+addWidth > width {
+		if width > 0 && curW > 0 && curW+sepW+p.w > width {
 			lines = append(lines, cur.String())
 			cur.Reset()
-			curWidth = 0
+			curW = 0
+			sep, sepW = "", 0
 		}
-
-		if curWidth > 0 {
-			cur.WriteString(renderedSep)
-			curWidth += sepWidth
-		}
-		cur.WriteString(item)
-		curWidth += itemWidth
+		cur.WriteString(sep)
+		curW += sepW
+		cur.WriteString(p.text)
+		curW += p.w
+		prevHeader = p.header
 	}
 	if cur.Len() > 0 {
 		lines = append(lines, cur.String())
@@ -2560,43 +2726,80 @@ type KeyLegendRow struct {
 	Desc string
 }
 
-// KeyLegendRows returns tailport's full keybinding legend -- one row per
-// binding, with the same wording the in-TUI "?" overlay (helpView) shows.
-// It is the SINGLE SOURCE OF TRUTH for that legend: helpView and `tailport
-// quickstart` (kata x4cg) both render off this one definition, so they can
-// never drift apart. emoji picks which exposure glyph (🐣/🐦/🪹 vs ◉/●/▲) is
-// quoted inline in the space/p/C rows, matching whichever marker set the
-// caller is using (see resolveEmoji).
-func KeyLegendRows(emoji bool) []KeyLegendRow {
+// KeyLegendGroup is one like-for-like section of the full keybinding legend
+// (kata p39s): a section name and its rows, in display order. It is the grouped
+// SINGLE SOURCE OF TRUTH for the "?" overlay (helpView) and `tailport
+// quickstart` (kata x4cg), which both render off KeyLegendGroups so they can
+// never drift -- and its section names/order/membership come from the very same
+// keyMap.groups() the bottom-bar grid uses, so the overlay and the bar can't
+// drift either.
+type KeyLegendGroup struct {
+	Name string
+	Rows []KeyLegendRow
+}
+
+// keyLegendDescs maps a binding's display key to its rich "?"/quickstart prose
+// (deliberately fuller than the terse bottom-bar labels). emoji picks which
+// exposure glyph (🐣/🐦/🪹 vs ◉/●/▲) is quoted inline in the space/p/C rows,
+// matching whichever marker set the caller is using (see resolveEmoji).
+func keyLegendDescs(emoji bool) map[string]string {
 	served, funneled, dangling := "◉", "●", "▲"
 	if emoji {
 		served, funneled, dangling = "🐣", "🐦", "🪹"
 	}
-
-	return []KeyLegendRow{
-		{"space", "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it."},
-		{"p", "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served."},
-		{"a", "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down)."},
-		{"f", "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running."},
-		{"u", "Unfavorite (clears ★); the port drops out of the Favorites view."},
-		{"x", "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access)."},
-		{"n", "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up."},
-		{"l", "Set a text label for the selected port."},
-		{"r", "Refresh the port list and serve status."},
-		{"/", "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter."},
-		{"c", "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so."},
-		{"C", "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist."},
-		{"?", "Toggle this help. esc or q also close it."},
-		{"q", "Quit."},
+	return map[string]string{
+		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it.",
+		"p":     "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
+		"c":     "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so.",
+		"f":     "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
+		"u":     "Unfavorite (clears ★); the port drops out of the Favorites view.",
+		"n":     "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
+		"l":     "Set a text label for the selected port.",
+		"x":     "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
+		"C":     "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
+		"/":     "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
+		"a":     "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
+		"r":     "Refresh the port list and serve status.",
+		"?":     "Toggle this help. esc or q also close it.",
+		"q":     "Quit.",
 	}
 }
 
-// RenderKeyLegend formats rows (from KeyLegendRows) as tailport's standard
-// legend block: a bold, left-padded key column followed by its description,
-// with any continuation lines indented to align beneath the description
-// column. Shared verbatim by helpView (the in-TUI "?" overlay) and
-// `tailport quickstart` (kata x4cg) so the two can never render different
-// text for the same rows.
+// KeyLegendGroups returns the full keybinding legend grouped into the same five
+// sections, in the same order, as the bottom-bar grid -- Expose, Favorites,
+// Protect, View, App -- each row carrying the RICH prose (keyLegendDescs), not
+// the terse bar label. The sections and their membership are taken from
+// keyMap.groups(), the one grouping source, so the "?" overlay and the bar
+// cannot diverge.
+func KeyLegendGroups(emoji bool) []KeyLegendGroup {
+	descs := keyLegendDescs(emoji)
+	src := newKeyMap().groups()
+	out := make([]KeyLegendGroup, 0, len(src))
+	for _, g := range src {
+		rows := make([]KeyLegendRow, 0, len(g.bindings))
+		for _, b := range g.bindings {
+			k := b.Help().Key
+			rows = append(rows, KeyLegendRow{Key: k, Desc: descs[k]})
+		}
+		out = append(out, KeyLegendGroup{Name: g.name, Rows: rows})
+	}
+	return out
+}
+
+// KeyLegendRows returns the full legend as a flat row list (grouped order,
+// sections dropped), derived from KeyLegendGroups. Kept for callers that want
+// the flat form; the "?" overlay and quickstart use the grouped renderer.
+func KeyLegendRows(emoji bool) []KeyLegendRow {
+	var out []KeyLegendRow
+	for _, g := range KeyLegendGroups(emoji) {
+		out = append(out, g.Rows...)
+	}
+	return out
+}
+
+// RenderKeyLegend formats rows as tailport's standard legend block: a bold,
+// left-padded key column followed by its description, with any continuation
+// lines indented to align beneath the description column.
 func RenderKeyLegend(rows []KeyLegendRow) string {
 	var b strings.Builder
 	for _, r := range rows {
@@ -2605,6 +2808,22 @@ func RenderKeyLegend(rows []KeyLegendRow) string {
 		for _, extra := range lines[1:] {
 			b.WriteString("          " + helpTextStyle.Render(extra) + "\n")
 		}
+	}
+	return b.String()
+}
+
+// RenderKeyLegendGroups renders the grouped legend for the "?" overlay and
+// `tailport quickstart`: each section led by its styled name (helpTitleStyle),
+// then its rows via RenderKeyLegend, with a blank line between sections. Shared
+// verbatim by both so they can never render different text.
+func RenderKeyLegendGroups(groups []KeyLegendGroup) string {
+	var b strings.Builder
+	for i, g := range groups {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(helpTitleStyle.Render(g.Name) + "\n")
+		b.WriteString(RenderKeyLegend(g.Rows))
 	}
 	return b.String()
 }
@@ -2662,16 +2881,17 @@ func (m model) helpView() string {
 	b.WriteString("\n")
 	b.WriteString(helpTextStyle.Render(m.markerLegend()))
 	b.WriteString("\n\n")
-	b.WriteString(helpTitleStyle.Render("Keys"))
-	b.WriteString("\n")
-	b.WriteString(RenderKeyLegend(KeyLegendRows(m.emoji)))
+	// Keys, grouped into the same five sections/order as the bottom-bar grid
+	// (Expose, Favorites, Protect, View, App) -- each section's own header stands
+	// in for the old flat "Keys" title -- but keeping the rich per-key prose.
+	b.WriteString(RenderKeyLegendGroups(KeyLegendGroups(m.emoji)))
 
 	b.WriteString("\n")
 	b.WriteString(warnStyle.Render(
 		"Toggling port :22 (SSH) asks for a y/n confirmation first, in both\n" +
 			"directions — turning serve off for :22 can drop your live SSH session."))
 	b.WriteString("\n\n")
-	// Dangling-forward glyph, same resolution as KeyLegendRows' inline "C" row
+	// Dangling-forward glyph, same resolution as keyLegendDescs' inline "C" row
 	// glyph, quoted again here since this paragraph sits outside that legend.
 	dangling := "▲"
 	if m.emoji {

@@ -165,11 +165,12 @@ func TestRunQuickstart(t *testing.T) {
 }
 
 // TestRunQuickstartLegendMatchesOverlay proves the SINGLE SOURCE OF TRUTH
-// requirement for kata x4cg directly: `tailport quickstart`'s printed
-// keybinding legend is byte-identical to ui.RenderKeyLegend(ui.KeyLegendRows(...)),
-// the exact same call the in-TUI "?" overlay (internal/ui.helpView) makes.
-// Run with both --markers ascii and --markers emoji so the glyph-dependent
-// rows (space/p/C) are checked in both marker modes, not just the default.
+// requirement (kata x4cg, evolved by p39s) directly: `tailport quickstart`'s
+// printed keybinding legend is byte-identical to
+// ui.RenderKeyLegendGroups(ui.KeyLegendGroups(...)), the exact same grouped call
+// the in-TUI "?" overlay (internal/ui.helpView) makes. Run with both --markers
+// ascii and --markers emoji so the glyph-dependent rows (space/p/C) are checked
+// in both marker modes, not just the default.
 func TestRunQuickstartLegendMatchesOverlay(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -186,9 +187,9 @@ func TestRunQuickstartLegendMatchesOverlay(t *testing.T) {
 			t.Fatalf("run([quickstart --markers %s]) code = %d, want 0; stderr:\n%s", tc.markers, code, errOut.String())
 		}
 
-		want := ui.RenderKeyLegend(ui.KeyLegendRows(tc.emoji))
+		want := ui.RenderKeyLegendGroups(ui.KeyLegendGroups(tc.emoji))
 		if !strings.Contains(out.String(), want) {
-			t.Errorf("run([quickstart --markers %s]) stdout does not contain the shared legend verbatim.\nwant substring:\n%s\ngot:\n%s", tc.markers, want, out.String())
+			t.Errorf("run([quickstart --markers %s]) stdout does not contain the shared grouped legend verbatim.\nwant substring:\n%s\ngot:\n%s", tc.markers, want, out.String())
 		}
 	}
 }
