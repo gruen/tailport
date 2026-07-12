@@ -5,6 +5,7 @@ package portscan
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -14,7 +15,16 @@ import (
 func List() ([]Port, error) {
 	out, err := exec.Command("lsof", "-iTCP", "-sTCP:LISTEN", "-n", "-P").Output()
 	if err != nil {
-		return nil, err
+		// `lsof` exits non-zero in two benign cases: when nothing matches the
+		// filter (no listening sockets) and when it prints usable output to
+		// stdout while also warning on stderr (e.g. it can't stat a mount).
+		// Neither is a real failure -- on an *exec.ExitError we parse whatever
+		// stdout we captured, which may be empty (an empty port list). Only a
+		// genuine failure (lsof missing, killed, any non-ExitError) propagates.
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return nil, err
+		}
 	}
 	return parseLsof(out)
 }
