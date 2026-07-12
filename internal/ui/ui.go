@@ -238,7 +238,7 @@ type portItem struct {
 	dimmed bool
 	meta   config.PortMeta
 	// emoji selects the moon-phase reach-ramp marker set
-	// (🌑/🌒/🌓/🌔/🌕/🌫️/✕) over the ASCII fallback (○/◔/◑/◉/●/▲/✕). Resolved
+	// (🌕/🌔/🌓/🌒/🌑/🌫️/✕) over the ASCII fallback (○/◔/◑/◉/●/▲/✕). Resolved
 	// once for the model and copied onto each item.
 	emoji bool
 }
@@ -269,16 +269,18 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 }
 
 // markerGlyph is the port's reachability marker: a moon-phase "fill ramp"
-// (1exs) tracking i.reach()'s 7-state classification (79xb) from least
-// exposed to most -- 🌑/○ localhost only, 🌒/◔ local network only, 🌓/◑ on
-// tailnet, 🌔/◉ served (a notch more established than merely reachable),
-// 🌕/● funnelled to the public internet. The two BROKEN states sit OFF the
-// ramp as plain glyphs, not moons: 🌫️/▲ a stale dangling forward, ✕/✕ a
-// favorite whose process is down. It switches on the SAME i.reach() resolver
-// Description() uses, so the glyph and the row's text can never disagree
-// about a port's state. Emoji markers are padded to a stable 2-cell width so
-// the :port column stays aligned even if a terminal renders a given emoji
-// (or the naturally 1-cell ✕) narrow.
+// (1exs, direction fixed by e1wv) tracking i.reach()'s 7-state classification
+// (79xb) from least exposed to most -- both channels go open/light at
+// localhost and filled/dark at the public internet, so the emoji ramp reads
+// consistently with the mono ramp: 🌕/○ localhost only, 🌔/◔ local network
+// only, 🌓/◑ on tailnet, 🌒/◉ served (a notch more established than merely
+// reachable), 🌑/● funnelled to the public internet. The two BROKEN states
+// sit OFF the ramp as plain glyphs, not moons: 🌫️/▲ a stale dangling
+// forward, ✕/✕ a favorite whose process is down. It switches on the SAME
+// i.reach() resolver Description() uses, so the glyph and the row's text can
+// never disagree about a port's state. Emoji markers are padded to a stable
+// 2-cell width so the :port column stays aligned even if a terminal renders
+// a given emoji (or the naturally 1-cell ✕) narrow.
 func (i portItem) markerGlyph() string {
 	var m string
 	switch i.reach() {
@@ -286,13 +288,13 @@ func (i portItem) markerGlyph() string {
 		// Reachable from the open internet -- outranks every other state.
 		// Public is safety-critical (AGENTS.md): keep the hot-magenta ●.
 		if i.emoji {
-			m = "🌕"
+			m = "🌑"
 		} else {
 			m = publicStyle.Render("●")
 		}
 	case reachServed:
 		if i.emoji {
-			m = "🌔"
+			m = "🌒"
 		} else {
 			m = activeStyle.Render("◉")
 		}
@@ -316,7 +318,7 @@ func (i portItem) markerGlyph() string {
 		}
 	case reachLAN:
 		if i.emoji {
-			m = "🌒"
+			m = "🌔"
 		} else {
 			m = "◔"
 		}
@@ -333,7 +335,7 @@ func (i portItem) markerGlyph() string {
 		}
 	default: // reachLocalhost
 		if i.emoji {
-			m = "🌑"
+			m = "🌕"
 		} else {
 			m = "○"
 		}
@@ -3528,12 +3530,12 @@ type KeyLegendGroup struct {
 
 // keyLegendDescs maps a binding's display key to its rich "?"/quickstart prose
 // (deliberately fuller than the terse bottom-bar labels). emoji picks which
-// exposure glyph (🌔/🌕/🌫️ vs ◉/●/▲) is quoted inline in the space/p/C rows,
+// exposure glyph (🌒/🌑/🌫️ vs ◉/●/▲) is quoted inline in the space/p/C rows,
 // matching whichever marker set the caller is using (see resolveEmoji).
 func keyLegendDescs(emoji bool) map[string]string {
 	served, funneled, dangling := "◉", "●", "▲"
 	if emoji {
-		served, funneled, dangling = "🌔", "🌕", "🌫️"
+		served, funneled, dangling = "🌒", "🌑", "🌫️"
 	}
 	return map[string]string{
 		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
@@ -3648,8 +3650,8 @@ func configSaveLines(path string) []string {
 // decorations -- so it stays readable rather than one very long line.
 func (m model) markerLegend() string {
 	if m.emoji {
-		return "🌑 localhost   🌒 local network   🌓 on tailnet   🌔 served\n" +
-			"🌕 internet (funnel)   🌫️ stale   ✕ offline\n" +
+		return "🌕 localhost   🌔 local network   🌓 on tailnet   🌒 served\n" +
+			"🌑 internet (funnel)   🌫️ stale   ✕ offline\n" +
 			"🔒 locked   ★ favorite"
 	}
 	return "○ localhost   ◔ local network   ◑ on tailnet   ◉ served\n" +

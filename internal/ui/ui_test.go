@@ -1603,13 +1603,13 @@ func TestMarkerGlyph(t *testing.T) {
 			name:      "A reachLocalhost",
 			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLoopback}, listening: true},
 			wantState: reachLocalhost,
-			wantEmoji: "🌑", wantASCII: "○",
+			wantEmoji: "🌕", wantASCII: "○",
 		},
 		{
 			name:      "B' reachLAN",
 			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN}, listening: true},
 			wantState: reachLAN,
-			wantEmoji: "🌒", wantASCII: "◔",
+			wantEmoji: "🌔", wantASCII: "◔",
 		},
 		{
 			name:      "B reachTailnet",
@@ -1621,19 +1621,19 @@ func TestMarkerGlyph(t *testing.T) {
 			name:      "C reachServed",
 			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true},
 			wantState: reachServed,
-			wantEmoji: "🌔", wantASCII: "◉",
+			wantEmoji: "🌒", wantASCII: "◉",
 		},
 		{
 			name:      "D reachFunnel",
 			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, funnelPublic: 443},
 			wantState: reachFunnel,
-			wantEmoji: "🌕", wantASCII: "●",
+			wantEmoji: "🌑", wantASCII: "●",
 		},
 		{
 			name:      "D reachFunnel outranks a dangling forward",
 			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: false, funnelPublic: 443},
 			wantState: reachFunnel,
-			wantEmoji: "🌕", wantASCII: "●",
+			wantEmoji: "🌑", wantASCII: "●",
 		},
 		{
 			name:      "E reachStale",
