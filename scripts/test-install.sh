@@ -8,6 +8,11 @@
 #   sh scripts/test-install.sh                 # from the repo root
 #   INSTALL_SH_PATH=/abs/install.sh sh scripts/test-install.sh
 #   KEEP_TMP=1 sh scripts/test-install.sh      # leave the workdir for inspection
+#
+# SC2030/SC2031: env vars (HOME, TAILPORT_*) are deliberately scoped to each
+# case's ( ... ) subshell so cases don't leak state into one another -- the
+# "modification is local to the subshell" is the intent, not a bug.
+# shellcheck disable=SC2030,SC2031
 set -eu
 
 INSTALL_SH="${INSTALL_SH_PATH:-$(pwd)/install.sh}"
@@ -26,6 +31,7 @@ fail() {
 }
 
 WORKDIR="$(mktemp -d)"
+# shellcheck disable=SC2317  # invoked indirectly via the EXIT/INT/TERM trap below
 cleanup() {
 	if [ "$KEEP_TMP" = "1" ]; then
 		echo "KEEP_TMP=1: leaving $WORKDIR in place" >&2
