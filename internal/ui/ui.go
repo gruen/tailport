@@ -1188,10 +1188,27 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 	}
 
 	var flash tea.Cmd
-	if sel.active {
-		flash = m.setFlash("copied ✓  "+url, flashInfo)
-	} else {
-		flash = m.setFlash(fmt.Sprintf("copied — :%d is localhost only; press space to serve it", sel.port.Number), flashWarn)
+	switch sel.reach() {
+	case reachTailnet:
+		// Wildcard/tailnet-IP bind: the copied http://<host>:<port> ALREADY
+		// resolves across the tailnet (the app is bound 0.0.0.0:PORT), so this
+		// is honest -- NOT "localhost only", and NOT "press space" (serving is
+		// a no-op here, matching the space guard's "already on tailnet").
+		flash = m.setFlash(fmt.Sprintf("copied — :%d is reachable on your tailnet at this URL", sel.port.Number), flashInfo)
+	case reachLAN:
+		// Bound to a specific LAN IP, not the tailnet: mirrors the space guard's
+		// reachLAN message (ui.go ~2019) so c and space agree.
+		flash = m.setFlash(fmt.Sprintf("copied — :%d is bound to your LAN only; serve can't reach this bind", sel.port.Number), flashWarn)
+	default:
+		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
+		// favorite) -- "press space to serve it" is TRUE here. reachServed
+		// (the inline path didn't fit) / reachFunnel / reachStale are all
+		// `active`, so keep the plain "copied ✓ url" confirmation.
+		if sel.active {
+			flash = m.setFlash("copied ✓  "+url, flashInfo)
+		} else {
+			flash = m.setFlash(fmt.Sprintf("copied — :%d is localhost only; press space to serve it", sel.port.Number), flashWarn)
+		}
 	}
 	return tea.Batch(copyCmd(url), flash)
 }
