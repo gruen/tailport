@@ -429,36 +429,35 @@ func (i portItem) reach() reachState {
 	}
 }
 
-func (i portItem) Description() string {
+// inlineCopyState reports whether a `c` copy on this row confirms INLINE
+// (append a transient "✓ copied" to the row's description) rather than via the
+// bottom-bar toast (vqa3). True for the four healthy copyable states whose row
+// text already states what was copied; false for funnel (shown public URL ≠
+// copied tailnet URL), stale (dangling — the copied URL resolves to nothing),
+// and offline (nothing live to copy), which keep the one disambiguating toast.
+func (i portItem) inlineCopyState() bool {
+	switch i.reach() {
+	case reachLocalhost, reachLAN, reachTailnet, reachServed:
+		return true
+	default: // reachFunnel, reachStale, reachOffline
+		return false
+	}
+}
+
+// plainDescription is the UNSTYLED row text for the current reach state -- what
+// inlineCopyFits measures before choosing inline-✓ vs toast, and the base that
+// styledDescription() and the inline "✓ copied" suffix build on (vqa3). Kept in
+// lockstep with the states in reach().
+func (i portItem) plainDescription() string {
 	switch i.reach() {
 	case reachFunnel:
-		// Public URL, not the tailnet one: this is what "anyone on the
-		// internet" reaches. Degrades to a hostless URL if the FQDN is unknown.
-		return publicStyle.Render("on the internet · " + tsserve.PublicURL(i.fqdn, i.funnelPublic))
+		return "on the internet · " + tsserve.PublicURL(i.fqdn, i.funnelPublic)
 	case reachStale:
-		// Dangling forward: served, but no local process holds it. Lead with
-		// the plain state and WHY it looks exposed-yet-empty -- tailscale is
-		// still holding the port -- since that's the confusing part. The fix
-		// (bind the app to loopback, not 0.0.0.0; or un-expose) is spelled out
-		// in ? help and the README, where there's room to explain it.
-		return warnStyle.Render("bound to tailnet, but stale — space to unbind")
+		return "bound to tailnet, but stale — space to unbind"
 	case reachServed:
-		desc := i.servedDescPlain()
-		if i.justCopied {
-			// Pre-styled bold-green suffix (py5b): the delegate's rune
-			// highlighter is ANSI-unaware, but filterNoHighlight (see New)
-			// already strips the per-char match highlight from every row,
-			// so embedding raw ANSI here is safe -- confirmed by the tmux
-			// capture in the close message.
-			desc += activeStyle.Render(copiedSuffix)
-		}
-		return desc
+		return i.servedDescPlain()
 	case reachTailnet:
 		if i.port.Number == 22 {
-			// sshd on a wildcard bind is the canonical case: already
-			// reachable, and the very SSH session the operator may be
-			// reading this over -- call it out so it's obviously not
-			// something to serve.
 			return "on tailnet · reachable via SSH"
 		}
 		return "on tailnet"
@@ -469,6 +468,34 @@ func (i portItem) Description() string {
 	default: // reachLocalhost
 		return "localhost only"
 	}
+}
+
+// styledDescription wraps plainDescription with the per-state emphasis the row
+// carries today: publicStyle for a funnelled (public) row, warnStyle for a
+// stale dangling forward. The healthy states stay unstyled.
+func (i portItem) styledDescription() string {
+	switch i.reach() {
+	case reachFunnel:
+		return publicStyle.Render(i.plainDescription())
+	case reachStale:
+		return warnStyle.Render(i.plainDescription())
+	default:
+		return i.plainDescription()
+	}
+}
+
+func (i portItem) Description() string {
+	desc := i.styledDescription()
+	if i.justCopied {
+		// Pre-styled bold-green suffix (py5b), now on EVERY inline-copy state
+		// (vqa3), not just served. justCopied is set by copyURL ONLY for
+		// inlineCopyState() rows, so funnel/stale/offline never reach here with
+		// it set. The delegate's rune highlighter is ANSI-unaware, but
+		// filterNoHighlight (see New) strips the per-char match highlight from
+		// every row, so embedding raw ANSI here is safe.
+		desc += activeStyle.Render(copiedSuffix)
+	}
+	return desc
 }
 
 // servedDescPlain returns the UNSTYLED state-C description text ("on
@@ -1193,20 +1220,20 @@ func (m *model) copyTargetURL(sel portItem) string {
 // http://localhost:<port> for a localhost-only port or an offline favorite --
 // never a dead tailnet URL for a port that can't actually be reached that way.
 // A funnelled port still copies the tailnet form on purpose (the toast names
-// the public-vs-tailnet mismatch). State C (reachServed: served, listening,
-// not funnelled) is the one case where the row's description IS that exact
-// URL, so -- provided the annotation fits the terminal width (inlineCopyFits)
-// -- the confirmation goes inline as a transient "✓ copied" on the row
-// instead of the bottom-bar toast (py5b). Every other case keeps the toast,
-// unchanged: it's the only place that can name a MISMATCH between the shown
-// URL and the copied one (funnelled), flag a dangling forward (no URL shown
-// at all), or carry "serve it first" guidance (localhost/LAN-only or
-// offline) -- and it's also the fallback when a state-C copy wouldn't fit
-// inline.
+// the public-vs-tailnet mismatch). The inline "✓ copied" confirmation is now
+// UNIVERSAL (vqa3) across every inlineCopyState() row -- reachLocalhost,
+// reachLAN, reachTailnet, reachServed -- because each row's description
+// already states exactly what got copied, so -- provided the annotation fits
+// the terminal width (inlineCopyFits) -- the confirmation goes inline as a
+// transient "✓ copied" on the row instead of the bottom-bar toast (py5b).
+// The three principled exceptions keep the toast: funnel (row shows the
+// PUBLIC url but c copies the TAILNET url -- shown≠copied), stale (dangling
+// -- the copied URL resolves to nothing), and offline (nothing live to
+// copy). A too-narrow row for an inline state also falls back to the toast.
 func (m *model) copyURL(sel portItem) tea.Cmd {
 	url := m.copyTargetURL(sel)
 
-	if sel.reach() == reachServed && inlineCopyFits(lipgloss.Width(sel.servedDescPlain()), m.availableDescriptionWidth()) {
+	if sel.inlineCopyState() && inlineCopyFits(lipgloss.Width(sel.plainDescription()), m.availableDescriptionWidth()) {
 		m.copiedID++
 		id := m.copiedID
 		m.copiedPort = sel.port.Number
@@ -1237,6 +1264,12 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		// reachLAN message (ui.go ~2019) so c and space agree. Name the copied
 		// URL so it's clear it's the real LAN address, not a dead tailnet one.
 		flash = m.setFlash(fmt.Sprintf("copied %s — LAN only; serve can't reach this bind", url), flashWarn)
+	case reachFunnel:
+		// The row shows the PUBLIC funnel URL but c copies the TAILNET URL by
+		// design; a bare inline ✓ would imply the public URL was copied. Funnel
+		// is the one principled exception to universal inline (vqa3): a toast
+		// that names what was actually copied.
+		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public funnel url)", url), flashInfo)
 	default:
 		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
 		// favorite) -- "press space to serve it" is TRUE here. reachServed

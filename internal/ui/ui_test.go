@@ -1172,11 +1172,13 @@ func TestCopyKeymap(t *testing.T) {
 	}
 }
 
-// TestCopyURL covers vnq7's copy action, updated for py5b: state C (served +
-// listening, not funnelled) now goes INLINE -- the row's own "✓ copied"
-// annotation, no toast -- since the row already shows the copied URL.
-// Every other case (here: not served) keeps the toast, with an amber caveat
-// when the port isn't served yet.
+// TestCopyURL covers vnq7's copy action, updated for py5b and vqa3: state C
+// (served + listening, not funnelled) goes INLINE -- the row's own
+// "✓ copied" annotation, no toast -- since the row already shows the copied
+// URL. Since vqa3, the "not served" case below is ALSO inline: with no
+// explicit bind scope the port resolves to reachLocalhost, one of the four
+// healthy states whose row text ("localhost only") already states what was
+// copied.
 func TestCopyURL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	newModel := func(active bool) model {
@@ -1221,16 +1223,17 @@ func TestCopyURL(t *testing.T) {
 		t.Errorf("copiedPort should survive an unrelated keypress; got %d", got.copiedPort)
 	}
 
-	// Not served: still copies, but the toast warns it won't resolve yet
-	// (no inline annotation -- copiedPort stays 0).
+	// Not served (reachLocalhost: listening, unclassified/loopback bind,
+	// nothing active): since vqa3 this is ALSO inline -- the row's own
+	// "localhost only" text already says what got copied, so no toast.
 	m = newModel(false)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only") {
-		t.Errorf("not-served copy flash = %q (level=%v), want a warn localhost-only caveat", m.flash, m.flashLevel)
+	if m.flash != "" {
+		t.Errorf("not-served (reachLocalhost) copy should not toast; flash = %q", m.flash)
 	}
-	if m.copiedPort != 0 {
-		t.Errorf("not-served copy should not set copiedPort; got %d", m.copiedPort)
+	if m.copiedPort != 8080 {
+		t.Errorf("not-served (reachLocalhost) copy should set copiedPort; got %d", m.copiedPort)
 	}
 }
 
@@ -1333,20 +1336,21 @@ func TestCopyURLInlineVsToast(t *testing.T) {
 	}
 }
 
-// TestCopyURLReachAware covers 83wv: copyURL's toast must be reach()-aware
-// (parallel to Description()/markerGlyph()), not the pre-79xb binary
-// sel.active, so it can never contradict the space guard
-// (TestSpaceGuardForReachablePorts) for the same state. B (wildcard,
-// reachTailnet) and B' (LAN, reachLAN) are the states that were mislabeled
-// "localhost only"; C/D/E (reachServed-too-narrow/reachFunnel/reachStale)
-// must keep the plain "copied ✓" confirmation unchanged.
+// TestCopyURLReachAware covers 83wv/vqa3: copyURL's confirmation must be
+// reach()-aware (parallel to Description()/markerGlyph()), not the pre-79xb
+// binary sel.active, so it can never contradict the space guard
+// (TestSpaceGuardForReachablePorts) for the same state. Since vqa3, the four
+// healthy states -- A (reachLocalhost), B (reachTailnet), B' (reachLAN), and
+// C (reachServed) -- all go inline (copiedPort set, no toast) at a wide
+// width; the three principled exceptions -- D (reachFunnel), E (reachStale),
+// F (reachOffline) -- keep the toast, unchanged.
 func TestCopyURLReachAware(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	newModel := func(port int, scope portscan.BindScope, active, listening bool, bindHost string) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
 		m.host = "host"
-		m.width = 80 // wide enough that a state-C copy would go inline
+		m.width = 80 // wide enough that every inline state actually goes inline
 		if listening {
 			m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope, BindHost: bindHost}}
 		}
@@ -1366,69 +1370,211 @@ func TestCopyURLReachAware(t *testing.T) {
 	}
 
 	// B: reachTailnet (wildcard bind, listening, unserved). The copied URL
-	// already resolves across the tailnet, so this must NOT say "localhost
-	// only" and must NOT say "press space" -- pressing space on this exact
-	// state is the "already on tailnet — nothing to serve" no-op asserted by
-	// TestSpaceGuardForReachablePorts, so the two toasts must now agree.
+	// already resolves across the tailnet, so the row's own "on tailnet"
+	// description is enough -- no toast needed, and (crucially) nothing here
+	// can say "localhost only" or "press space", which would contradict the
+	// "already on tailnet — nothing to serve" no-op asserted by
+	// TestSpaceGuardForReachablePorts.
 	m := press(newModel(8080, portscan.ScopeWildcard, false, true, ""))
-	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "reachable on your tailnet") {
-		t.Errorf("reachTailnet copy flash = %q (level=%v), want an info 'reachable on your tailnet' toast", m.flash, m.flashLevel)
-	}
-	if strings.Contains(m.flash, "localhost only") || strings.Contains(m.flash, "press space") {
-		t.Errorf("reachTailnet copy flash = %q must not contradict the space guard", m.flash)
+	if m.copiedPort != 8080 || m.flash != "" {
+		t.Errorf("reachTailnet copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
 	}
 
-	// B': reachLAN (specific LAN IP, listening, unserved). Mirrors the space
-	// guard's own reachLAN wording (ui.go ~2036) so c and space agree, and
-	// names the real LAN URL that was actually copied.
+	// B': reachLAN (specific LAN IP, listening, unserved). The row already
+	// says "local network only", so the inline ✓ is sufficient.
 	m = press(newModel(3000, portscan.ScopeLAN, false, true, "192.168.1.50"))
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "serve can't reach this bind") || !strings.Contains(m.flash, "http://192.168.1.50:3000") {
-		t.Errorf("reachLAN copy flash = %q (level=%v), want a warn toast naming http://192.168.1.50:3000 and 'serve can't reach this bind'", m.flash, m.flashLevel)
-	}
-	if strings.Contains(m.flash, "localhost") {
-		t.Errorf("reachLAN copy flash = %q must not say localhost", m.flash)
+	if m.copiedPort != 3000 || m.flash != "" {
+		t.Errorf("reachLAN copy: copiedPort=%d flash=%q, want inline (copiedPort 3000, no toast)", m.copiedPort, m.flash)
 	}
 
-	// A: reachLocalhost (loopback bind, listening, unserved). Unchanged --
-	// "press space to serve it" is genuinely true here.
+	// A: reachLocalhost (loopback bind, listening, unserved). The row already
+	// says "localhost only", so the inline ✓ is sufficient -- no separate
+	// "press space" toast is needed to convey that.
 	m = press(newModel(9000, portscan.ScopeLoopback, false, true, ""))
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") || !strings.Contains(m.flash, "http://localhost:9000") {
-		t.Errorf("reachLocalhost copy flash = %q (level=%v), want the localhost-only press-space toast naming http://localhost:9000", m.flash, m.flashLevel)
+	if m.copiedPort != 9000 || m.flash != "" {
+		t.Errorf("reachLocalhost copy: copiedPort=%d flash=%q, want inline (copiedPort 9000, no toast)", m.copiedPort, m.flash)
 	}
 
-	// F: reachOffline (down favorite, unserved). Falls through the same
-	// default !active arm as reachLocalhost.
+	// C: reachServed (served AND listening). Unchanged behavior from py5b --
+	// still goes inline.
+	m = press(newModel(8080, portscan.ScopeLoopback, true, true, ""))
+	if m.copiedPort != 8080 || m.flash != "" {
+		t.Errorf("reachServed copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
+	}
+
+	// F: reachOffline (down favorite, unserved). STILL a toast: nothing live
+	// to copy, so "press space to serve it" is the actionable guidance.
 	m = press(newModel(8025, portscan.ScopeLoopback, false, false, ""))
+	if m.copiedPort != 0 {
+		t.Errorf("reachOffline copy should not go inline; copiedPort = %d", m.copiedPort)
+	}
 	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") || !strings.Contains(m.flash, "http://localhost:8025") {
 		t.Errorf("reachOffline copy flash = %q (level=%v), want the localhost-only press-space toast naming http://localhost:8025", m.flash, m.flashLevel)
 	}
 
-	// E: reachStale (served, but nothing listening). Unchanged plain
-	// "copied ✓ url" confirmation -- the default branch's active arm.
+	// E: reachStale (served, but nothing listening). STILL a toast: the
+	// copied URL is dangling and resolves to nothing.
 	m = press(newModel(8025, portscan.ScopeLoopback, true, false, ""))
+	if m.copiedPort != 0 {
+		t.Errorf("reachStale copy should not go inline; copiedPort = %d", m.copiedPort)
+	}
 	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
 		t.Errorf("reachStale copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
 	}
 
-	// D: reachFunnel. Still active, so it takes the same default active arm
-	// -- unchanged plain "copied ✓ url" toast (the funnel/tailnet URL
-	// mismatch is why it can't go inline, per TestCopyURLInlineVsToast).
+	// D: reachFunnel. STILL a toast: the row shows the PUBLIC url but c
+	// copies the TAILNET url, so a bare inline ✓ would misstate what got
+	// copied -- the toast names it explicitly.
 	fm := newModel(8080, portscan.ScopeWildcard, true, true, "")
 	fm.funnel = map[int]int{8080: 443}
 	fm.rebuildItems()
 	m = press(fm)
-	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
-		t.Errorf("reachFunnel copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
+	if m.copiedPort != 0 {
+		t.Errorf("reachFunnel copy should not go inline; copiedPort = %d", m.copiedPort)
+	}
+	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "the tailnet url") {
+		t.Errorf("reachFunnel copy flash = %q (level=%v), want a toast naming 'the tailnet url'", m.flash, m.flashLevel)
 	}
 
-	// C: reachServed, but too narrow to inline. Unchanged plain
-	// "copied ✓ url" toast fallback.
+	// C, but too narrow to inline: falls back to the toast rather than
+	// silently truncating the confirmation off the row.
 	nm := newModel(8080, portscan.ScopeWildcard, true, true, "")
 	nm.width = 5
 	nm.rebuildItems()
 	m = press(nm)
+	if m.copiedPort != 0 {
+		t.Errorf("narrow reachServed copy should not go inline; copiedPort = %d", m.copiedPort)
+	}
 	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
 		t.Errorf("narrow reachServed copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
+	}
+}
+
+// TestInlineCopyUniversal covers vqa3's core change: the inline "✓ copied"
+// confirmation is no longer state-C-only. It fires for every healthy
+// copyable state (localhost/LAN/tailnet/served) when the annotation fits,
+// gracefully falls back to the toast when the row is too narrow, and the
+// annotation correctly migrates when the selection moves between two
+// eligible rows.
+func TestInlineCopyUniversal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	newModel := func(port int, scope portscan.BindScope, active, listening bool, bindHost string) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
+		m.host = "host"
+		m.width = 80
+		if listening {
+			m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope, BindHost: bindHost}}
+		}
+		if active {
+			m.active = map[int]bool{port: true}
+		} else {
+			m.active = map[int]bool{}
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+
+	press := func(m model) model {
+		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+		return res.(model)
+	}
+
+	// The four inline-eligible states, at a wide width: c goes inline (no
+	// toast), and the annotated row's Description carries the suffix.
+	inlineCases := []struct {
+		name      string
+		port      int
+		scope     portscan.BindScope
+		active    bool
+		listening bool
+		bindHost  string
+	}{
+		{"localhost", 9000, portscan.ScopeLoopback, false, true, ""},
+		{"LAN", 3000, portscan.ScopeLAN, false, true, "10.0.0.9"},
+		{"tailnet", 8080, portscan.ScopeWildcard, false, true, ""},
+		{"served", 8080, portscan.ScopeLoopback, true, true, ""},
+	}
+	for _, tc := range inlineCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := press(newModel(tc.port, tc.scope, tc.active, tc.listening, tc.bindHost))
+			if m.copiedPort != tc.port || m.flash != "" {
+				t.Fatalf("%s copy: copiedPort=%d flash=%q, want inline (copiedPort %d, no toast)", tc.name, m.copiedPort, m.flash, tc.port)
+			}
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok || !sel.justCopied {
+				t.Fatalf("%s: selected item justCopied = %v, want true", tc.name, ok && sel.justCopied)
+			}
+			if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") {
+				t.Errorf("%s Description() = %q, want it to carry the ✓ copied suffix", tc.name, got)
+			}
+		})
+	}
+
+	// inlineCopyState() itself: true for the four healthy states, false for
+	// the three toast exceptions (funnel/stale/offline).
+	elig := []struct {
+		name string
+		item portItem
+		want bool
+	}{
+		{"reachLocalhost", portItem{port: portscan.Port{Number: 9000, BindScope: portscan.ScopeLoopback}, listening: true}, true},
+		{"reachLAN", portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "10.0.0.9"}, listening: true}, true},
+		{"reachTailnet", portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true}, true},
+		{"reachServed", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true}, true},
+		{"reachFunnel", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true, funnelPublic: 443}, false},
+		{"reachStale", portItem{port: portscan.Port{Number: 8025}, active: true}, false},
+		{"reachOffline", portItem{port: portscan.Port{Number: 8025}}, false},
+	}
+	for _, tc := range elig {
+		if got := tc.item.inlineCopyState(); got != tc.want {
+			t.Errorf("%s.inlineCopyState() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// NARROW fallback: an inline-eligible state whose annotation wouldn't
+	// fit the row falls back to the toast, exactly like state C always has.
+	nm := newModel(9000, portscan.ScopeLoopback, false, true, "")
+	nm.width = 5
+	nm.rebuildItems()
+	m := press(nm)
+	if m.copiedPort != 0 || m.flash == "" {
+		t.Errorf("narrow localhost copy: copiedPort=%d flash=%q, want a toast fallback (copiedPort 0, non-empty flash)", m.copiedPort, m.flash)
+	}
+
+	// Rapid A -> B: copying port A (inline), then moving the selection to a
+	// second eligible port B and copying again, must move the annotation --
+	// not leave A's copiedPort stuck.
+	m2 := New(config.Config{Ports: map[int]config.PortMeta{
+		8080: {Favorite: true},
+		9000: {Favorite: true},
+	}})
+	m2.host = "host"
+	m2.width = 80
+	m2.allPorts = []portscan.Port{
+		{Number: 8080, Process: "a", BindScope: portscan.ScopeWildcard},
+		{Number: 9000, Process: "b", BindScope: portscan.ScopeLoopback},
+	}
+	m2.active = map[int]bool{}
+	m2.showAllPorts = true
+	m2.rebuildItems()
+	m2.selectPort(8080)
+	res, _ := m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m2 = res.(model)
+	if m2.copiedPort != 8080 {
+		t.Fatalf("copy A: copiedPort = %d, want 8080", m2.copiedPort)
+	}
+	firstID := m2.copiedID
+
+	m2.selectPort(9000)
+	res, _ = m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m2 = res.(model)
+	if m2.copiedPort != 9000 {
+		t.Errorf("copy B: copiedPort = %d, want 9000 (annotation should move)", m2.copiedPort)
+	}
+	if m2.copiedID <= firstID {
+		t.Errorf("copiedID should increment on the second copy; first=%d second=%d", firstID, m2.copiedID)
 	}
 }
 
