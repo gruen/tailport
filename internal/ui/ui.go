@@ -3125,12 +3125,21 @@ func (f *firework) draw(grid [][]styledCell, w, h int) {
 		launch := math.Max(0, 1-frac/0.15) // 1 at ignition, ->0 by ~15% up
 		const ember = 0.25                 // faint coast brightness
 		headBr := ember + launch*(0.45-ember)
-		// (w9sh) Pin the ascent glyph to the block (last in the active set)
-		// regardless of brightness. a2vq muted headBr down to ~0.25-0.45, and
-		// since the glyph used to track brightness too, the rising shell was
-		// rendering as a faint dot/`░` instead of a shell. Color still fades
-		// with br below, so it reads as a dim/gold-tinted BLOCK streak, not a
-		// dot ramping through the whole glyph set.
+		// (w9sh) Pin the HEAD glyph to the block (last in the active set)
+		// regardless of brightness, so the comet has a coherent solid head
+		// instead of a single faint dot.
+		// (zm95) Color: fwScheme.colorAt ignores br entirely for kind-2
+		// (vivid) schemes -- it returns a fixed full-bright ANSI-palette
+		// color -- so f.color(br, 0) rendered vivid-scheme ascents as
+		// full-bright solid streaks once w9sh swapped the dot for a block.
+		// eggRampColor(br) is br-driven for every scheme (dims to bronze
+		// #5c3f04 at low br), so use it here to restore a genuinely dim
+		// ember ascent across ALL schemes; the burst still uses f.color
+		// (the scheme's own bright palette) and is untouched.
+		// Trail glyph: keep the head (k==0) as the solid block (w9sh), but
+		// let trailing samples ramp through f.glyph(br) (█▓▒░) so the comet
+		// visibly fades/recedes behind the head instead of being a uniform
+		// streak of blocks.
 		set := f.glyphSet()
 		block := set[len(set)-1]
 		for k := 0; k < fwTrailLen; k++ {
@@ -3142,18 +3151,22 @@ func (f *firework) draw(grid [][]styledCell, w, h int) {
 			if br < 0 {
 				br = 0
 			}
-			col := f.color(br, 0)
+			col := eggRampColor(br)
 			if launch > 0 {
 				// Some schemes use ANSI-index palettes (e.g. "196",
 				// eggSparkColors) that don't RGB-blend cleanly, so rather
 				// than crossfade numerically we just render the brief
 				// launch window in a fixed soft warm-gold ("gunpowder").
-				// It hands straight to the scheme colour once launch hits
+				// It hands straight to the ember ramp once launch hits
 				// 0, and pairs with the existing gray muzzle-smoke puff
 				// (fwSmoke*) at the launch point.
 				col = lipgloss.Color("#ffb454")
 			}
-			f.plot(grid, w, h, f.posX(tt), f.posY(tt), block, col)
+			glyph := block
+			if k > 0 {
+				glyph = f.glyph(br)
+			}
+			f.plot(grid, w, h, f.posX(tt), f.posY(tt), glyph, col)
 		}
 	case fwBurst:
 		set := f.glyphSet()
