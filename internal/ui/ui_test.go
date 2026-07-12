@@ -1517,7 +1517,10 @@ func TestMarkerGlyph(t *testing.T) {
 func TestDanglingDescription(t *testing.T) {
 	dangling := portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"}
 	got := stripANSI(dangling.Description())
-	for _, want := range []string{"127.0.0.1:8025", "loopback", "space"} {
+	// Leads with the plain state and why it looks exposed-yet-empty (tailscale
+	// still holds the port), plus the un-expose key. The loopback fix lives in
+	// ? help / README, not this one-liner.
+	for _, want := range []string{"exposed, nothing listening", "tailscale", "space"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("dangling description %q should mention %q", got, want)
 		}

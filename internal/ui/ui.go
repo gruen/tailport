@@ -238,14 +238,12 @@ func (i portItem) Description() string {
 	}
 	if i.active {
 		if !i.listening {
-			// Dangling forward: served, but nothing is on the loopback target.
-			// The usual cause is the app binding 0.0.0.0:<port>, which collides
-			// with tailscaled's tailnet-IP serve listener on the same port -- so
-			// point at the fix (bind loopback) and the un-expose key (space acts
-			// on this row; C batch-cleans all stale). Full story in ? help / README.
-			return warnStyle.Render(fmt.Sprintf(
-				"nothing on 127.0.0.1:%d — bind app to loopback, or space to un-expose",
-				i.port.Number))
+			// Dangling forward: served, but no local process holds it. Lead with
+			// the plain state and WHY it looks exposed-yet-empty -- tailscale is
+			// still holding the port -- since that's the confusing part. The fix
+			// (bind the app to loopback, not 0.0.0.0; or un-expose) is spelled out
+			// in ? help and the README, where there's room to explain it.
+			return warnStyle.Render("exposed, nothing listening — still bound to tailscale; space to un-expose")
 		}
 		return fmt.Sprintf("http://%s:%d", i.host, i.port.Number)
 	}
