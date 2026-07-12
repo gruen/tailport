@@ -243,7 +243,7 @@ func (i portItem) Description() string {
 			// still holding the port -- since that's the confusing part. The fix
 			// (bind the app to loopback, not 0.0.0.0; or un-expose) is spelled out
 			// in ? help and the README, where there's room to explain it.
-			return warnStyle.Render("exposed, nothing listening — still bound to tailscale; space to un-expose")
+			return warnStyle.Render("bound to tailscale, press space to release/unbind")
 		}
 		return fmt.Sprintf("http://%s:%d", i.host, i.port.Number)
 	}
