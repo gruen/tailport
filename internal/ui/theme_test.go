@@ -335,7 +335,8 @@ func TestHelpViewAndLegendReflectTheme(t *testing.T) {
 // walking back part of c5n8's "brighter monochrome key hints"). The bar's key
 // AND desc now share barHintColor -- the EXACT muted grey
 // (#A49FA5 light / #777777 dark) bubbles/list's DefaultDelegate already uses
-// for this app's own idle "not exposed" row description -- with the key kept
+// for this app's own plain reachability row description (e.g. "localhost
+// only"/"offline") -- with the key kept
 // BOLD so it still anchors the row without a brighter hue. That grey is
 // deliberately below the app's 4.5:1 must-fix WCAG bar (this is secondary,
 // not must-read, text -- same tier as the list's idle description), so this

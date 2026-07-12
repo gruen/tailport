@@ -117,17 +117,18 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Usage
 
-Run `tailport`. It scans locally listening TCP ports and shows which ones
-are currently exposed on your tailnet.
+Run `tailport`. It scans locally listening TCP ports and shows how each one
+is actually reachable — localhost only, already on your tailnet, or served
+(and to whom).
 
 | Key | Action |
 | --- | --- |
-| `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port |
+| `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port — only offered for a loopback-bound port; an already-reachable (tailnet/LAN) port shows an info toast instead |
 | `p` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
 | `c` | Copy the selected port's tailnet URL to the clipboard (via OSC 52, so it works over SSH) |
 | `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
 | `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
-| `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to expose it once its service is up |
+| `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to serve it once its service is up |
 | `l` | Label the selected port with custom text (prefilled with its current label if set, else the process name) |
 | `f` | Favorite the selected port, pinning it to the default view |
 | `u` | Unfavorite the selected port |
@@ -137,12 +138,15 @@ are currently exposed on your tailnet.
 | `?` | Toggle the full help overlay |
 | `q` / `ctrl+c` | Quit |
 
-Each row's leading marker encodes the port's exposure state — idle,
-tailnet-served, public (funnel), or served-but-nothing-listening; see
-[Status markers](#status-markers) below for the exact glyphs. A
-tailnet-served port shows the `http://<hostname>:<port>` URL it's reachable
-at from other tailnet devices; a funnelled port shows its public HTTPS URL
-instead. A favorited port additionally shows a star (★). The name shown next
+Each row's leading marker encodes the port's state — listening, served on
+tailnet, public (funnel), or served-but-nothing-listening; see
+[Status markers](#status-markers) below for the exact glyphs. The
+description below the port name spells out who can actually reach it:
+`localhost only` (loopback-bound, unserved), `on tailnet` (already
+reachable — e.g. a wildcard-bound `sshd` on `:22` — no serving needed),
+`local network only` (bound to a specific LAN IP, not the tailnet), the
+served `http://<hostname>:<port>` URL, or the funnelled public HTTPS URL. A
+favorited port additionally shows a star (★). The name shown next
 to a port is its custom label if you've set one, otherwise its resolved
 process name (or `was <name>` for a favorite whose process has since exited)
 — or `?` if that can't be determined, which happens when the port belongs to
@@ -155,7 +159,7 @@ tailport doesn't show every listening port by default — that gets noisy
 fast (sshd, mDNS, Docker, browsers holding sockets open, etc.). Instead it
 shows the union of:
 
-- ports currently exposed via `tailscale serve`, and
+- ports currently served via `tailscale serve`, and
 - ports in the **registry**: anything you've ever toggled on, labeled, or
   favorited.
 
@@ -169,7 +173,7 @@ registry and disappears from the default view (unless it's currently active).
 
 Press `a` to bypass the registry entirely and see every port currently
 listening on the machine, whether known to tailport or not — useful for
-finding something new to expose, label, or favorite.
+finding something new to serve, label, or favorite.
 
 ## Configuration
 
@@ -214,9 +218,9 @@ markers: auto # auto (default) | emoji | ascii
 
 - `auto` — egg-lifecycle emoji on a UTF-8-capable terminal (locale is
   UTF-8 and `TERM` isn't the bare Linux console or `dumb`), otherwise ASCII.
-- `emoji` — always 🥚 idle · 🐣 tailnet-served · 🐦 public (funnel) ·
+- `emoji` — always 🥚 listening · 🐣 served on tailnet · 🐦 public (funnel) ·
   🪹 served but nothing listening.
-- `ascii` — always ○ idle · ◉ tailnet-served · ● public (funnel) ·
+- `ascii` — always ○ listening · ◉ served on tailnet · ● public (funnel) ·
   ▲ served but nothing listening.
 
 ### Theme (light/dark terminals)
@@ -254,20 +258,20 @@ yourself.
 
 ## Troubleshooting
 
-### Dangling forward (`▲` / `🪹`, "bound to tailscale")
+### Dangling forward (`▲` / `🪹`, "bound to tailnet, but stale")
 
-A row marked `▲` / `🪹` — whose description reads *"bound to tailscale, press
-space to release/unbind"* — means the `serve` mapping is up but no local
+A row marked `▲` / `🪹` — whose description reads *"bound to tailnet, but
+stale — space to unbind"* — means the `serve` mapping is up but no local
 process holds the port. Two common cases:
 
 - **The app just isn't running** (it died, or hasn't started). Start it, or
-  un-expose the port — `space` on the row, or `C` to clear all stale forwards.
+  unbind the port — `space` on the row, or `C` to clear all stale forwards.
   The mapping deliberately outlives the app so you can restart it freely, so
   tailport won't tear it down for you.
 - **The app can't start with "address already in use."** When you serve
   `:8025`, tailscaled binds your **tailnet IP** on `:8025`. If your app then
   tries to bind `0.0.0.0:8025` (all interfaces), that collides and the app
-  fails to start — so the forward dangles. The mapping meant to expose the app
+  fails to start — so the forward dangles. The mapping meant to serve the app
   is what's blocking it.
 
   The fix is to bind the app to **loopback**, which is what `serve` proxies to
@@ -279,7 +283,9 @@ process holds the port. Two common cases:
 
   This both resolves the collision and keeps the app off your LAN — it's
   reachable only over the tailnet, through `serve`. If you genuinely need the
-  app on `0.0.0.0:<port>`, un-expose the port first (`space`, or `C`).
+  app on `0.0.0.0:<port>`, unbind the port first (`space`, or `C`) — note
+  that once it's bound to `0.0.0.0`, it's already reachable on the tailnet
+  on its own (state `on tailnet`), so there's no longer anything to serve.
 
 ## Development
 

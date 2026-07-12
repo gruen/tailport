@@ -179,7 +179,7 @@ const (
 // correctly-aligned table is simpler than teaching tabwriter about ANSI.
 func WriteTable(w io.Writer, rows []Row) {
 	if len(rows) == 0 {
-		fmt.Fprintln(w, "No ports currently exposed via tailscale serve or funnel.")
+		fmt.Fprintln(w, "No ports are currently served or funnelled.")
 		return
 	}
 

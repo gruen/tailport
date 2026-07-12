@@ -241,6 +241,79 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 }
 
+// TestSpaceGuardForReachablePorts covers 79xb pt3's footgun guard: `tailscale
+// serve` always proxies tailnet -> 127.0.0.1:PORT, so turning it ON only ever
+// makes sense for a loopback-bound port (state A). Selecting an already
+// tailnet-reachable port (B, wildcard/tailnet-IP bind) or a LAN-only port (B',
+// a specific non-tailnet IP) and pressing space must NO-OP with an
+// informational toast rather than begin a serve. A (loopback, serve-ON) and C
+// (served, serve-OFF) must be unaffected.
+func TestSpaceGuardForReachablePorts(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	newModel := func(port int, scope portscan.BindScope, active bool) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
+		m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope}}
+		if active {
+			m.active = map[int]bool{port: true}
+		} else {
+			m.active = map[int]bool{}
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+
+	// B (wildcard bind, unserved): space no-ops with the "nothing to serve"
+	// info toast, no toggle begun.
+	m := newModel(8080, portscan.ScopeWildcard, false)
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got := res.(model)
+	if got.pending != 0 {
+		t.Errorf("space on a B (tailnet) port should not begin a toggle; pending = %d", got.pending)
+	}
+	if got.flashLevel != flashInfo || !strings.Contains(got.flash, "already on tailnet") {
+		t.Errorf("space on a B port flash = %q (level=%v), want an info 'already on tailnet' toast", got.flash, got.flashLevel)
+	}
+	if cmd == nil {
+		t.Error("space on a B port should still return the toast's flash cmd")
+	}
+
+	// B' (specific LAN IP, unserved): space no-ops with the "can't reach this
+	// bind" info toast, no toggle begun.
+	m = newModel(3000, portscan.ScopeLAN, false)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got = res.(model)
+	if got.pending != 0 {
+		t.Errorf("space on a B' (LAN) port should not begin a toggle; pending = %d", got.pending)
+	}
+	if got.flashLevel != flashInfo || !strings.Contains(got.flash, "on your LAN only") {
+		t.Errorf("space on a B' port flash = %q (level=%v), want an info LAN-only toast", got.flash, got.flashLevel)
+	}
+
+	// A (loopback bind, unserved): space still initiates the toggle -- the
+	// only state serve-ON is meaningful for.
+	m = newModel(9000, portscan.ScopeLoopback, false)
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got = res.(model)
+	if cmd == nil {
+		t.Error("space on an A (loopback) port should return a toggle cmd")
+	}
+	if got.pending != 9000 {
+		t.Errorf("space on an A port should begin a toggle; pending = %d, want 9000", got.pending)
+	}
+
+	// C (already served): space still toggles OFF, regardless of bind scope.
+	m = newModel(8080, portscan.ScopeWildcard, true)
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got = res.(model)
+	if cmd == nil {
+		t.Error("space on a served (C) port should return a toggle-off cmd")
+	}
+	if got.pending != 8080 {
+		t.Errorf("space on a served (C) port should begin a toggle; pending = %d, want 8080", got.pending)
+	}
+}
+
 // settle runs a command and feeds the resulting message(s) back into the
 // model, so bubbles/list's ASYNC filtering (a FilterMatchesMsg produced by a
 // tea.Cmd) is actually applied -- without this, VisibleItems never reflects a
@@ -1113,12 +1186,12 @@ func TestCopyURL(t *testing.T) {
 		t.Errorf("toast should clear on the next key; got %q", got.flash)
 	}
 
-	// Not exposed: still copies, but the toast warns it won't resolve yet.
+	// Not served: still copies, but the toast warns it won't resolve yet.
 	m = newModel(false)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "not exposed") {
-		t.Errorf("not-exposed copy flash = %q (level=%v), want a warn NOT-exposed caveat", m.flash, m.flashLevel)
+	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only") {
+		t.Errorf("not-served copy flash = %q (level=%v), want a warn localhost-only caveat", m.flash, m.flashLevel)
 	}
 }
 
@@ -1170,9 +1243,9 @@ func TestCleanMovedToShiftC(t *testing.T) {
 }
 
 // TestStatusText covers k4ph's multi-state breakdown: listening (portscan
-// total), exposed on tailnet (served count), and public (funnel count), with
-// in-flight operation messages taking precedence and narrow terminals
-// degrading gracefully.
+// total), on tailnet (served count -- 79xb dropped the "exposed" qualifier),
+// and public (funnel count), with in-flight operation messages taking
+// precedence and narrow terminals degrading gracefully.
 func TestStatusText(t *testing.T) {
 	base := model{
 		host:     "host",
@@ -1185,7 +1258,7 @@ func TestStatusText(t *testing.T) {
 	got := base.statusText()
 	// Host on the listening segment (20w6), funnel count labelled "public
 	// (funnel)" (67zk), no trailing "— host".
-	for _, want := range []string{"5 listening on host", "2 exposed on tailnet", "1 public (funnel)"} {
+	for _, want := range []string{"5 listening on host", "2 on tailnet", "1 public (funnel)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("statusText = %q, want it to contain %q", got, want)
 		}
@@ -1196,7 +1269,7 @@ func TestStatusText(t *testing.T) {
 
 	// Zero of everything reads cleanly, not "no ports"; no host -> no "on".
 	empty := model{host: "", width: 120}
-	if got := empty.statusText(); got != "0 listening · 0 exposed on tailnet · 0 public (funnel)" {
+	if got := empty.statusText(); got != "0 listening · 0 on tailnet · 0 public (funnel)" {
 		t.Errorf("empty (no host) statusText = %q", got)
 	}
 
@@ -1348,9 +1421,12 @@ func TestFunnelItemRender(t *testing.T) {
 	if strings.Contains(got, "◉") {
 		t.Errorf("funnelled Title should not show the tailnet ◉ marker; got %q", got)
 	}
+	if got := it.reach(); got != reachFunnel {
+		t.Errorf("reach() = %v, want reachFunnel", got)
+	}
 	desc := it.Description()
-	if !strings.Contains(desc, "https://host.example.ts.net:8443") {
-		t.Errorf("funnelled Description should show the public URL; got %q", desc)
+	if !strings.Contains(desc, "on the internet · https://host.example.ts.net:8443") {
+		t.Errorf("funnelled Description should show the honest 'on the internet' prefix and public URL; got %q", desc)
 	}
 	if strings.Contains(desc, "http://host:3000") {
 		t.Errorf("funnelled Description should not show the tailnet URL; got %q", desc)
@@ -1598,15 +1674,16 @@ func TestFilterValue(t *testing.T) {
 	}
 }
 
-// TestDanglingDescription covers km8x: a served-but-not-listening row explains
-// itself -- names the loopback target and the un-expose key -- while healthy and
-// not-exposed rows keep their plain descriptions.
+// TestDanglingDescription covers km8x (as retargeted by 79xb): a
+// served-but-not-listening row explains itself -- names the stale state and
+// the unbind key -- while a healthy served row and an offline row keep their
+// plain descriptions.
 func TestDanglingDescription(t *testing.T) {
 	dangling := portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"}
 	got := stripANSI(dangling.Description())
-	// Names why it looks exposed-yet-empty (tailscale still holds the port) and
-	// the key to release it. The loopback fix lives in ? help / README.
-	for _, want := range []string{"bound to tailscale", "space", "release"} {
+	// Names why it looks served-yet-empty (tailscale still holds the port) and
+	// the key to unbind it. The loopback fix lives in ? help / README.
+	for _, want := range []string{"bound to tailnet", "stale", "space", "unbind"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("dangling description %q should mention %q", got, want)
 		}
@@ -1614,14 +1691,87 @@ func TestDanglingDescription(t *testing.T) {
 
 	// Healthy serve: the tailnet URL, no scary hint.
 	healthy := portItem{port: portscan.Port{Number: 8025}, active: true, listening: true, host: "host"}
-	if got := stripANSI(healthy.Description()); got != "http://host:8025" {
+	if got := stripANSI(healthy.Description()); got != "on tailnet · http://host:8025" {
 		t.Errorf("healthy description = %q, want the tailnet URL", got)
 	}
 
-	// Not exposed: unchanged.
+	// Offline: not served, not listening -- distinct from the reachable states.
 	idle := portItem{port: portscan.Port{Number: 8025}}
-	if got := idle.Description(); got != "not exposed" {
-		t.Errorf("idle description = %q, want %q", got, "not exposed")
+	if got := idle.Description(); got != "offline" {
+		t.Errorf("idle description = %q, want %q", got, "offline")
+	}
+}
+
+// TestReachStateDescriptions covers 79xb pt2's honest 7-state lexicon end to
+// end: reach() resolves the right state from a portItem's fields, and
+// Description() renders the exact row text for each, per the truth table in
+// the issue. D (funnel) is covered separately by TestFunnelItemRender since
+// it needs fqdn/PublicURL wiring.
+func TestReachStateDescriptions(t *testing.T) {
+	cases := []struct {
+		name  string
+		item  portItem
+		state reachState
+		desc  string
+	}{
+		{
+			name:  "A loopback unserved -> localhost only",
+			item:  portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLoopback}, listening: true, host: "host"},
+			state: reachLocalhost,
+			desc:  "localhost only",
+		},
+		{
+			name:  "A unknown bind scope also reads localhost only (conservative default)",
+			item:  portItem{port: portscan.Port{Number: 3000}, listening: true, host: "host"},
+			state: reachLocalhost,
+			desc:  "localhost only",
+		},
+		{
+			name:  "B wildcard unserved -> on tailnet",
+			item:  portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
+			state: reachTailnet,
+			desc:  "on tailnet",
+		},
+		{
+			name:  "B :22 on a wildcard bind -> on tailnet, reachable via SSH",
+			item:  portItem{port: portscan.Port{Number: 22, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
+			state: reachTailnet,
+			desc:  "on tailnet · reachable via SSH",
+		},
+		{
+			name:  "B' LAN-bound unserved -> local network only",
+			item:  portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN}, listening: true, host: "host"},
+			state: reachLAN,
+			desc:  "local network only",
+		},
+		{
+			name:  "C served and listening -> on tailnet URL",
+			item:  portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, host: "host"},
+			state: reachServed,
+			desc:  "on tailnet · http://host:8080",
+		},
+		{
+			name:  "E served but nothing listening -> stale",
+			item:  portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"},
+			state: reachStale,
+			desc:  "bound to tailnet, but stale — space to unbind",
+		},
+		{
+			name:  "F down favorite -> offline",
+			item:  portItem{port: portscan.Port{Number: 8025}, active: false, listening: false, meta: config.PortMeta{Favorite: true, LastProcess: "mailpit"}},
+			state: reachOffline,
+			desc:  "offline",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.item.reach(); got != c.state {
+				t.Errorf("reach() = %v, want %v", got, c.state)
+			}
+			if got := stripANSI(c.item.Description()); got != c.desc {
+				t.Errorf("Description() = %q, want %q", got, c.desc)
+			}
+		})
 	}
 }
 
@@ -2830,7 +2980,10 @@ func TestLegendSizingNoClip(t *testing.T) {
 // could silently break it and reintroduce the exact clipping bug the
 // reservation exists to prevent. Brute-forcing width here (rather than
 // TestLegendSizingNoClip's few sampled widths) is what would actually catch
-// that regression.
+// that regression. (79xb: this brute-force scan is also what caught the
+// second-hint "space serve" contextual polish breaking the reservation at
+// width 54 -- see the TODO(79xb) on renderLegendWith -- so it stays a
+// single-hint scan, matching the shipped single-hint (cleanEnabled) code.)
 func TestLegendReservationDominatesLive(t *testing.T) {
 	m := New(config.Config{})
 	for w := 1; w <= 300; w++ {

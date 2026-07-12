@@ -501,8 +501,8 @@ func TestRunStatusEmptyTable(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run([status]) code = %d, want 0", code)
 	}
-	if !strings.Contains(out.String(), "No ports currently exposed") {
-		t.Errorf("run([status]) stdout = %q, want a no-ports-exposed message", out.String())
+	if !strings.Contains(out.String(), "No ports are currently served or funnelled") {
+		t.Errorf("run([status]) stdout = %q, want a no-ports-served message", out.String())
 	}
 }
 

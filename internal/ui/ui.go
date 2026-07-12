@@ -89,10 +89,11 @@ var (
 	// and description. It is the EXACT same hex pair bubbles/list's
 	// DefaultDelegate uses for its own idle-row description foreground
 	// (list.NewDefaultItemStyles().NormalDesc, charmbracelet/bubbles
-	// list/defaultitem.go) -- the grey behind this app's "not exposed" text
-	// (Description(), see portItem) -- so the bar's hints read at the same
-	// muted level as the rest of the app's secondary text instead of standing
-	// out as a brighter accent. Duplicated here as a literal (rather than
+	// list/defaultitem.go) -- the grey behind this app's plain reachability
+	// text (Description(), see portItem -- e.g. "localhost only"/"offline")
+	// -- so the bar's hints read at the same muted level as the rest of the
+	// app's secondary text instead of standing out as a brighter accent.
+	// Duplicated here as a literal (rather than
 	// derived via a type assertion on bubbles' returned style at init time)
 	// so a future bubbles upgrade can't panic tailport's startup over a
 	// cosmetic color; TestBottomBarHintStylesContrast pins the value.
@@ -338,24 +339,84 @@ func (i portItem) Title() string {
 	return fmt.Sprintf("%s%s :%d  %s%s", marker, lock, i.port.Number, star, name)
 }
 
+// reachState is the honest 7-state reachability lexicon (79xb): who can
+// ACTUALLY reach this port, as distinct from whether tailport has served it.
+// `tailscale serve` is a separate app-layer reverse proxy that only matters
+// for a loopback-bound app -- a wildcard/tailnet-IP bind (e.g. sshd on :22)
+// is already tailnet-reachable at the IP layer with or without serve. This
+// single resolver backs both Description (the row text) and the Part-3
+// serve-guard, so the two can never disagree about a port's state.
+type reachState int
+
+const (
+	reachLocalhost reachState = iota // A: loopback bind, unserved -- this machine only
+	reachTailnet                     // B: wildcard/tailnet-IP bind, unserved -- already on tailnet
+	reachLAN                         // B': specific LAN-IP bind, unserved -- LAN only, NOT tailnet
+	reachServed                      // C: served AND something is listening
+	reachFunnel                      // D: funnelled to the public internet -- outranks everything
+	reachStale                       // E: served but nothing listening -- a dangling forward
+	reachOffline                     // F: not served, not listening (e.g. a down favorite)
+)
+
+// reach resolves a portItem's reachState. Precedence (top to bottom): funnel
+// outranks serve state (a funnelled port is public regardless of its tailnet
+// serve status); a served port is either healthy (C, listening) or a stale
+// dangling forward (E, not listening); an unserved port's reachability comes
+// straight from its widest bind scope (portscan.BindScope); anything neither
+// served nor listening is simply offline.
+func (i portItem) reach() reachState {
+	switch {
+	case i.funnelPublic != 0:
+		return reachFunnel
+	case i.active && !i.listening:
+		return reachStale
+	case i.active && i.listening:
+		return reachServed
+	case i.listening: // !active && listening
+		switch i.port.BindScope {
+		case portscan.ScopeWildcard, portscan.ScopeTailnet:
+			return reachTailnet
+		case portscan.ScopeLAN:
+			return reachLAN
+		default: // ScopeLoopback or ScopeUnknown
+			return reachLocalhost
+		}
+	default: // !active && !listening
+		return reachOffline
+	}
+}
+
 func (i portItem) Description() string {
-	if i.funnelPublic != 0 {
+	switch i.reach() {
+	case reachFunnel:
 		// Public URL, not the tailnet one: this is what "anyone on the
 		// internet" reaches. Degrades to a hostless URL if the FQDN is unknown.
-		return publicStyle.Render("public: " + tsserve.PublicURL(i.fqdn, i.funnelPublic))
-	}
-	if i.active {
-		if !i.listening {
-			// Dangling forward: served, but no local process holds it. Lead with
-			// the plain state and WHY it looks exposed-yet-empty -- tailscale is
-			// still holding the port -- since that's the confusing part. The fix
-			// (bind the app to loopback, not 0.0.0.0; or un-expose) is spelled out
-			// in ? help and the README, where there's room to explain it.
-			return warnStyle.Render("bound to tailscale, press space to release/unbind")
+		return publicStyle.Render("on the internet · " + tsserve.PublicURL(i.fqdn, i.funnelPublic))
+	case reachStale:
+		// Dangling forward: served, but no local process holds it. Lead with
+		// the plain state and WHY it looks exposed-yet-empty -- tailscale is
+		// still holding the port -- since that's the confusing part. The fix
+		// (bind the app to loopback, not 0.0.0.0; or un-expose) is spelled out
+		// in ? help and the README, where there's room to explain it.
+		return warnStyle.Render("bound to tailnet, but stale — space to unbind")
+	case reachServed:
+		return fmt.Sprintf("on tailnet · http://%s:%d", i.host, i.port.Number)
+	case reachTailnet:
+		if i.port.Number == 22 {
+			// sshd on a wildcard bind is the canonical case: already
+			// reachable, and the very SSH session the operator may be
+			// reading this over -- call it out so it's obviously not
+			// something to serve.
+			return "on tailnet · reachable via SSH"
 		}
-		return fmt.Sprintf("http://%s:%d", i.host, i.port.Number)
+		return "on tailnet"
+	case reachLAN:
+		return "local network only"
+	case reachOffline:
+		return "offline"
+	default: // reachLocalhost
+		return "localhost only"
 	}
-	return "not exposed"
 }
 
 func (i portItem) FilterValue() string {
@@ -901,7 +962,7 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 	if sel.active {
 		flash = m.setFlash("copied ✓  "+url, flashInfo)
 	} else {
-		flash = m.setFlash(fmt.Sprintf("copied — :%d not exposed on tailnet (toggle it on first)", sel.port.Number), flashWarn)
+		flash = m.setFlash(fmt.Sprintf("copied — :%d is localhost only; press space to serve it", sel.port.Number), flashWarn)
 	}
 	return tea.Batch(copyCmd(url), flash)
 }
@@ -1678,6 +1739,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
+			// 79xb pt3 footgun guard: `tailscale serve` always proxies
+			// tailnet -> 127.0.0.1:PORT, so turning it ON is only ever
+			// meaningful for a loopback-bound app (state A). A B port
+			// (wildcard/tailnet-IP) is already tailnet-reachable -- serving
+			// it is redundant and can collide with the existing bind. A B'
+			// port (specific LAN IP) isn't on loopback at all -- serving it
+			// would proxy to nothing, a BROKEN dangling forward. Block
+			// serve-ON for both, with an info (not error) toast explaining
+			// why; every other direction (A serve-ON, C serve-OFF, E
+			// unbind) is unchanged.
+			if !sel.active {
+				switch sel.reach() {
+				case reachTailnet:
+					return m, m.setFlash("already on tailnet — nothing to serve", flashInfo)
+				case reachLAN:
+					return m, m.setFlash("on your LAN only; serve can't reach this bind", flashInfo)
+				}
+			}
 			// requestToggle applies the lock guard and, for :22 only, the SSH
 			// y/n confirm before any serve call.
 			return m, m.requestToggle(sel.port.Number, !sel.active)
@@ -1854,6 +1933,23 @@ func (m model) renderLegend() string {
 // cleanEnabled controls the contextual "C clean stale" hint (shown only when
 // dangling forwards exist). WindowSizeMsg passes true to reserve the worst-case
 // height; the live render passes m.hasDangling().
+//
+// TODO(79xb): the issue's secondary polish asks for a SECOND contextual hint
+// here -- grey/hide "space serve" when the selected port is already B/B'
+// tailnet/LAN reachable (space would just no-op it with an info toast; see
+// the pt3 guard in the space key handler). Prototyped as a second
+// spaceEnabled bool threaded through here/barGroups exactly like
+// cleanEnabled, but MEASURED to break TestLegendReservationDominatesLive's
+// brute-force width scan: at width 54, hiding "space" while "clean" stays
+// shown renders the Expose column at 6 lines against a 4-line worst-case
+// reservation (both hints assumed shown) -- i.e. hiding one hint does NOT
+// always make the bar shorter, because it can shift which fold split the
+// shared-width-budget search (renderLegendGrid) picks for other groups too.
+// That's the same "incidental tie, not enforced" fragility the comment below
+// already flags for the existing single-hint case, now demonstrated to break
+// with a second independent hint. Deferred per the issue ("do not block on
+// this"); the handler guard (space key case, ~1673) is the shipped
+// must-have and needs no bar change to be correct.
 func (m model) renderLegendWith(cleanEnabled bool) string {
 	groups := m.barGroups(cleanEnabled)
 	grid, gridWidth := renderLegendGrid(m.help.Styles, groups, m.help.Width)
@@ -3276,9 +3372,9 @@ func keyLegendDescs(emoji bool) map[string]string {
 		served, funneled, dangling = "🐣", "🐦", "🪹"
 	}
 	return map[string]string{
-		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis exposed (" + served + ") its tailnet URL is shown beneath it.",
+		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
 		"p":     "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
-		"c":     "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even when\nthe port isn't exposed yet — the toast says so.",
+		"c":     "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
 		"f":     "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"u":     "Unfavorite (clears ★); the port drops out of the Favorites view.",
 		"n":     "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
@@ -3385,10 +3481,10 @@ func configSaveLines(path string) []string {
 // marker set (emoji or ASCII) is active, plus the always-present lock/favorite.
 func (m model) markerLegend() string {
 	if m.emoji {
-		return "🥚 idle   🐣 tailnet-served   🐦 public (funnel)   🪹 served, nothing listening\n" +
+		return "🥚 listening   🐣 served on tailnet   🐦 public (funnel)   🪹 served, nothing listening\n" +
 			"🔒 locked   ★ favorite"
 	}
-	return "○ idle   ◉ tailnet-served   ● public (funnel)   ▲ served, nothing listening\n" +
+	return "○ listening   ◉ served on tailnet   ● public (funnel)   ▲ served, nothing listening\n" +
 		"🔒 locked   ★ favorite"
 }
 
@@ -3429,11 +3525,14 @@ func (m model) helpContent() string {
 	b.WriteString(helpTitleStyle.Render("tailport — expose local ports across your tailnet"))
 	b.WriteString("\n\n")
 	b.WriteString(helpTextStyle.Render(
-		"tailport lists the TCP ports listening on this machine and toggles\n" +
-			"`tailscale serve` on or off for each one. An exposed port is reachable\n" +
-			"by your other tailnet devices over plain HTTP at http://<host>:<port> —\n" +
-			"tailnet-only and a 1:1 port mapping (same port in and out). A port can\n" +
-			"also be funnelled to the PUBLIC internet with `p` (opt-in, see below)."))
+		"tailport lists the TCP ports listening on this machine. A served port\n" +
+			"is reachable by your other tailnet devices over plain HTTP at\n" +
+			"http://<host>:<port> — tailnet-only, a 1:1 port mapping (same port in\n" +
+			"and out). `tailscale serve` only matters for a LOOPBACK-bound app: a\n" +
+			"wildcard-bound port (0.0.0.0) is already reachable on the tailnet\n" +
+			"without serving — see the marker legend and each row's description.\n" +
+			"A port can also be funnelled to the PUBLIC internet with `p` (opt-in,\n" +
+			"see below)."))
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Markers"))
 	b.WriteString("\n")
@@ -3467,12 +3566,13 @@ func (m model) helpContent() string {
 		dangling = "🪹"
 	}
 	b.WriteString(helpTextStyle.Render(
-		"A port marked " + dangling + " (its row reads \"bound to tailscale …\") is a\n" +
-			"dangling forward: served, but no local process holds it. If your app\n" +
-			"won't start with \"address already in use\", it's binding 0.0.0.0:<port>,\n" +
-			"which collides with tailscale's serve listener on that port — bind it to\n" +
-			"127.0.0.1:<port> instead (what serve proxies to, and off your LAN). Or\n" +
-			"release it: space on the row, or C to clear all stale forwards."))
+		"A port marked " + dangling + " (its row reads \"bound to tailnet, but stale …\")\n" +
+			"is a dangling forward: served, but no local process holds it. If your\n" +
+			"app won't start with \"address already in use\", it's binding\n" +
+			"0.0.0.0:<port>, which collides with tailscale's serve listener on that\n" +
+			"port — bind it to 127.0.0.1:<port> instead (what serve proxies to, and\n" +
+			"off your LAN). Or unbind it: space on the row, or C to clear all stale\n" +
+			"forwards."))
 	b.WriteString("\n\n")
 	for _, line := range configSaveLines(m.configPath) {
 		b.WriteString(helpTextStyle.Render(line) + "\n")
@@ -3673,10 +3773,11 @@ func (m model) renderViewIndicator() string {
 // operation while one is in flight, otherwise a multi-state breakdown of what
 // this machine is doing -- how many ports are listening locally, how many
 // tailport serves on the tailnet, and how many are funnelled to the public
-// internet. The single word "exposed" (which conflated serve forwards with
-// tailnet reachability) is qualified to "exposed on tailnet"; "public" is the
-// funnel count, real since yt69. It abbreviates on narrow terminals rather
-// than overflowing the line.
+// internet. The served count reads plainly as "N on tailnet" (79xb: "exposed"
+// conflated serve forwards with tailnet reachability -- a wildcard-bound port
+// is on the tailnet with or without being served, so the retired word is
+// gone, not just qualified); "public" is the funnel count, real since yt69.
+// It abbreviates on narrow terminals rather than overflowing the line.
 func (m model) statusText() string {
 	switch {
 	case m.pending != 0:
@@ -3694,16 +3795,15 @@ func (m model) statusText() string {
 	}
 	public := len(m.funnel)
 
-	// The public count is m.funnel -- ports exposed publicly via `tailscale
+	// The public count is m.funnel -- ports made public via `tailscale
 	// funnel`, not an independent public bind -- so it's labelled "public
-	// (funnel)" to name the mechanism (67zk) and pair with "exposed on
-	// tailnet".
-	full := fmt.Sprintf("%d listening · %d exposed on tailnet · %d public (funnel)", listening, tailnet, public)
+	// (funnel)" to name the mechanism (67zk) and pair with "on tailnet".
+	full := fmt.Sprintf("%d listening · %d on tailnet · %d public (funnel)", listening, tailnet, public)
 	// The host rides the "listening" segment ("N listening on <host>") rather
 	// than a trailing "— <host>" (20w6); the other segments are unchanged.
 	withHost := full
 	if m.host != "" {
-		withHost = fmt.Sprintf("%d listening on %s · %d exposed on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
+		withHost = fmt.Sprintf("%d listening on %s · %d on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
 	}
 	// Widest form that fits, degrading host -> shorter labels -> initials.
 	switch {

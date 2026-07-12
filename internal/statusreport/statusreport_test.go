@@ -228,8 +228,8 @@ func TestWriteTableEmpty(t *testing.T) {
 	var buf bytes.Buffer
 	WriteTable(&buf, nil)
 	got := buf.String()
-	if !strings.Contains(got, "No ports currently exposed") {
-		t.Errorf("WriteTable(nil) = %q, want a no-ports-exposed message", got)
+	if !strings.Contains(got, "No ports are currently served or funnelled") {
+		t.Errorf("WriteTable(nil) = %q, want a no-ports-served message", got)
 	}
 	if strings.Contains(got, "MODE") {
 		t.Errorf("WriteTable(nil) = %q, want no table header when there's nothing to show", got)
