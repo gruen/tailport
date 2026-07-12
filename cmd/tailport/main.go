@@ -145,12 +145,9 @@ func applyNoColor(flagSet bool) {
 }
 
 // runSubcommand handles a recognized os.Args[1] that doesn't look like a
-// flag (see run). quickstart (kata x4cg) and status (kata m7jc) are
-// implemented -- see runQuickstart/runStatus. update (kata prh1) is still
-// reserved and just says so plainly instead of silently falling through to
-// the TUI or pretending to work. It should replace its case with a real
-// handler the same way -- see the dispatch scaffold note in run() for how
-// little that diff should need to touch here.
+// flag (see run). quickstart (kata x4cg), status (kata m7jc), and update
+// (kata prh1) all have real handlers -- see runQuickstart/runStatus/runUpdate.
+// Anything else is an unknown subcommand: a clear error plus usage, exit 2.
 func runSubcommand(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "quickstart":
@@ -158,9 +155,10 @@ func runSubcommand(args []string, stdout, stderr io.Writer) int {
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
 	case "update":
-		// case "update": … implemented under kata prh1 (built-in self-updater).
-		fmt.Fprintln(stderr, "tailport: update is not implemented yet (kata prh1)")
-		return 1
+		// Built-in self-updater (kata prh1). runUpdate lives in update.go and
+		// parses its own flags (--check/-y/--yes/-f/--force); args[1:] is
+		// everything after the subcommand name.
+		return runUpdate(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "tailport: unknown subcommand %q\n", args[0])
 		printUsage(stderr, "")

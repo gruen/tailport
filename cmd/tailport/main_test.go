@@ -124,33 +124,6 @@ func TestRunUnknownSubcommand(t *testing.T) {
 	}
 }
 
-// TestRunReservedSubcommands covers the still-reserved-but-not-yet-
-// implemented subcommand name(s) from the dispatch scaffold. quickstart
-// (kata x4cg) and status (kata m7jc) now have real handlers -- see
-// TestRunQuickstart / TestRunStatus* below -- so only update (kata prh1)
-// remains: it's recognized (distinct from an unknown subcommand -- no
-// "unknown subcommand" message, no usage dump) but reports plainly that it
-// isn't implemented yet, on stderr, with a non-zero exit.
-func TestRunReservedSubcommands(t *testing.T) {
-	for _, name := range []string{"update"} {
-		var out, errOut bytes.Buffer
-		code := run([]string{name}, &out, &errOut)
-		if code == 0 {
-			t.Errorf("run([%s]) code = 0, want non-zero (not implemented)", name)
-		}
-		if out.Len() != 0 {
-			t.Errorf("run([%s]) stdout = %q, want empty", name, out.String())
-		}
-		got := errOut.String()
-		if !strings.Contains(got, name) || !strings.Contains(got, "not implemented") {
-			t.Errorf("run([%s]) stderr = %q, want it to name %q and say not implemented", name, got, name)
-		}
-		if strings.Contains(got, "unknown subcommand") {
-			t.Errorf("run([%s]) should be a recognized (reserved) name, not an unknown subcommand; got:\n%s", name, got)
-		}
-	}
-}
-
 // TestRunQuickstart covers kata x4cg's acceptance bar: `tailport quickstart`
 // prints its onboarding text (what tailport does, its safety model, the
 // resolved config path, the full keybinding legend) to stdout, touches
