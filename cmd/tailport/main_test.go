@@ -71,7 +71,7 @@ func TestRunHelpFlag(t *testing.T) {
 			t.Errorf("run(%v) stderr = %q, want empty", args, errOut.String())
 		}
 		got := out.String()
-		for _, want := range []string{"tailport --", "Usage:", "--config", "--no-color", "--markers", "quickstart", "status", "update", "Config path:"} {
+		for _, want := range []string{"tailport --", "Usage:", "--config", "--no-color", "--markers", "--theme", "quickstart", "status", "update", "Config path:"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("run(%v) stdout missing %q; got:\n%s", args, want, got)
 			}
@@ -234,6 +234,110 @@ func TestRunBadMarkersFlag(t *testing.T) {
 	}
 	if strings.Count(got, "\n") > 1 {
 		t.Errorf("run([--markers bogus]) stderr should be a single line, got %d lines:\n%s", strings.Count(got, "\n"), got)
+	}
+}
+
+// TestValidateTheme covers n7gc's validation directly: only "" (not
+// passed), auto, light, and dark (case-insensitively, trimmed) are
+// accepted; anything else is a clean error, never a panic. Mirrors
+// TestValidateMarkers exactly.
+func TestValidateTheme(t *testing.T) {
+	for _, v := range []string{"", "  ", "auto", "AUTO", " light ", "LIGHT", "dark", "Dark"} {
+		if err := validateTheme(v); err != nil {
+			t.Errorf("validateTheme(%q) = %v, want nil", v, err)
+		}
+	}
+	for _, v := range []string{"bogus", "lightish", "DARK!"} {
+		if err := validateTheme(v); err == nil {
+			t.Errorf("validateTheme(%q) = nil, want an error", v)
+		}
+	}
+}
+
+// TestRunBadThemeFlag covers n7gc's CLI-level acceptance bar: an invalid
+// --theme value fails cleanly through run() -- a one-line stderr message,
+// non-zero exit, and (implicitly, since this test would panic-fail
+// otherwise) no stack trace -- and importantly returns before ever touching
+// config, lipgloss's background override, or the TUI. Mirrors
+// TestRunBadMarkersFlag exactly.
+func TestRunBadThemeFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"--theme", "bogus"}, &out, &errOut)
+	if code == 0 {
+		t.Errorf("run([--theme bogus]) code = 0, want non-zero")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run([--theme bogus]) stdout = %q, want empty", out.String())
+	}
+	got := errOut.String()
+	if !strings.Contains(got, "invalid --theme") || !strings.Contains(got, "bogus") {
+		t.Errorf("run([--theme bogus]) stderr = %q, want a clean invalid-theme message", got)
+	}
+	if strings.Count(got, "\n") > 1 {
+		t.Errorf("run([--theme bogus]) stderr should be a single line, got %d lines:\n%s", strings.Count(got, "\n"), got)
+	}
+}
+
+// TestRunBadThemeFlagQuickstart covers the same bar for `tailport
+// quickstart --theme bogus`, since runQuickstart validates --theme
+// independently of run() (quickstart never reaches the default TUI path).
+func TestRunBadThemeFlagQuickstart(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"quickstart", "--theme", "bogus"}, &out, &errOut)
+	if code == 0 {
+		t.Errorf("run([quickstart --theme bogus]) code = 0, want non-zero")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run([quickstart --theme bogus]) stdout = %q, want empty", out.String())
+	}
+	if !strings.Contains(errOut.String(), "invalid --theme") {
+		t.Errorf("run([quickstart --theme bogus]) stderr = %q, want a clean invalid-theme message", errOut.String())
+	}
+}
+
+// TestResolveThemeMode covers n7gc's precedence contract directly: an
+// explicit --theme flag value always wins; otherwise the persisted
+// cfg.Theme; otherwise "" (auto). This is the exact function run() and
+// runQuickstart() both call before ui.ApplyTheme, so exercising it here
+// verifies real precedence, not a reimplementation of it.
+func TestResolveThemeMode(t *testing.T) {
+	cases := []struct {
+		name            string
+		flagVal, cfgVal string
+		want            string
+	}{
+		{"flag wins over config", "light", "dark", "light"},
+		{"flag wins with no config", "dark", "", "dark"},
+		{"falls back to config when flag unset", "", "light", "light"},
+		{"both unset -> auto (empty)", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveThemeMode(tc.flagVal, tc.cfgVal); got != tc.want {
+				t.Errorf("resolveThemeMode(%q, %q) = %q, want %q", tc.flagVal, tc.cfgVal, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunGoodThemeFlagAcceptedByParsing confirms --theme light/dark/auto
+// parse cleanly into cf.theme (the flag itself is accepted, distinct from
+// validateTheme's acceptance of the same strings tested above) without
+// going through run()'s full default path, which would launch the
+// interactive TUI (tea.NewProgram(...).Run()) and hang under `go test`.
+func TestRunGoodThemeFlagAcceptedByParsing(t *testing.T) {
+	for _, v := range []string{"auto", "light", "dark", ""} {
+		var out, errOut bytes.Buffer
+		cf, code, handled := parseFlags([]string{"--theme", v}, &out, &errOut)
+		if handled {
+			t.Fatalf("parseFlags([--theme %q]) unexpectedly handled (code=%d, stderr=%q)", v, code, errOut.String())
+		}
+		if cf.theme != v {
+			t.Errorf("parseFlags([--theme %q]).theme = %q, want %q", v, cf.theme, v)
+		}
+		if err := validateTheme(cf.theme); err != nil {
+			t.Errorf("validateTheme(%q) (from --theme) = %v, want nil", v, err)
+		}
 	}
 }
 
