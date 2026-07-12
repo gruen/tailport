@@ -219,6 +219,21 @@ markers: auto # auto (default) | emoji | ascii
 - `ascii` — always ○ idle · ◉ tailnet-served · ● public (funnel) ·
   ▲ served but nothing listening.
 
+### Theme (light/dark terminals)
+
+tailport auto-detects your terminal's background and picks legible colors
+either way. If detection guesses wrong (common over SSH/tmux/some
+multiplexers), override it with a top-level `theme` key:
+
+```yaml
+theme: auto # auto (default) | light | dark
+```
+
+or the equivalent `--theme` flag (`--theme light`, `--theme dark`,
+`--theme auto`), which wins over the config value. `auto` detects the
+background itself; when it can't tell at all, it falls back to `dark` --
+existing dark-terminal setups see no change either way.
+
 ## How it works
 
 - Port discovery: `ss -H -t -l -n -p` on Linux, `lsof -iTCP -sTCP:LISTEN -n
