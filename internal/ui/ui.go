@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"os"
 	"sort"
 	"strconv"
@@ -277,6 +278,11 @@ type refreshTickMsg struct{}
 // eggTickMsg advances the hidden Easter-egg animation (28mv).
 type eggTickMsg struct{}
 
+// fwTickMsg advances the hidden fireworks animation (5x1e). It runs on its OWN
+// faster cadence (fwInterval) so smooth arcs don't force the slower egg spin
+// (eggInterval) to speed up too -- the two tickers are deliberately decoupled.
+type fwTickMsg struct{}
+
 type toggleDoneMsg struct {
 	port int
 	err  error
@@ -354,6 +360,14 @@ type model struct {
 	// fully modal and always exitable via esc/q/E.
 	showEgg  bool
 	eggFrame int
+	// fireworks holds the in-flight ASCII fireworks launched by the hidden 'f'
+	// key WITHIN the egg overlay (5x1e -- a secret-within-the-secret, never in
+	// the legend/help). Each 'f' press launches one instantly; the slice is
+	// capped at fwCap. fwTicking guards the decoupled fireworks ticker so it's
+	// scheduled at most once (never stacked) and stops when no fireworks remain
+	// or the overlay closes. Kept adjacent to showEgg/eggFrame on purpose.
+	fireworks []firework
+	fwTicking bool
 	// width and height are the terminal dimensions from the last
 	// WindowSizeMsg. height pins the bottom bar (status, shortcuts) to the
 	// last rows of the viewport regardless of how short the body is; width
@@ -580,6 +594,12 @@ const (
 	// Both links are hardcoded (from the origin remote) -- the app never shells
 	// out to git; it only shells to tailscale/ss/lsof (zero extra deps).
 	eggInterval = 100 * time.Millisecond // ~10fps: responsive over SSH, no flood
+	// fwInterval is the fireworks cadence, DECOUPLED from eggInterval so arcs
+	// animate smoothly (~20fps) without also speeding the egg's shimmer/spin.
+	fwInterval = 50 * time.Millisecond
+	// fwCap bounds simultaneous in-flight fireworks; 'f' presses beyond it are
+	// ignored (perf-safe under mashing).
+	fwCap = 25
 )
 
 // eggTick schedules the next Easter-egg animation frame. It is only ever
@@ -587,6 +607,13 @@ const (
 // the overlay stops the ticker -- no leaked goroutine, no busy loop.
 func eggTick() tea.Cmd {
 	return tea.Tick(eggInterval, func(time.Time) tea.Msg { return eggTickMsg{} })
+}
+
+// fwTick schedules the next fireworks frame. Like eggTick it is only rescheduled
+// while there is work to do (showEgg AND at least one live firework -- see the
+// fwTickMsg handler), so an idle overlay and a closed overlay both stop it.
+func fwTick() tea.Cmd {
+	return tea.Tick(fwInterval, func(time.Time) tea.Msg { return fwTickMsg{} })
 }
 
 func refresh() tea.Msg {
@@ -988,6 +1015,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.eggFrame++
 		return m, eggTick()
 
+	case fwTickMsg:
+		// Step the fireworks on their own cadence. Stop (drop the ticker) when
+		// the overlay closed or no fireworks remain, mirroring eggTick's
+		// no-leak discipline. Exactly one fwTicker is ever live (see the 'f'
+		// handler's fwTicking guard), so this never busy-loops or stacks.
+		if !m.showEgg {
+			m.fwTicking = false
+			m.fireworks = nil
+			return m, nil
+		}
+		m.fireworks = stepFireworks(m.fireworks)
+		if len(m.fireworks) == 0 {
+			m.fwTicking = false
+			return m, nil
+		}
+		return m, fwTick()
+
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
@@ -1025,6 +1069,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc", "q", "E":
 				m.showEgg = false // the eggTickMsg handler then stops the ticker
+				m.fireworks = nil // stop drawing at once; fwTick self-stops next
 				return m, nil
 			case "ctrl+c":
 				return m, tea.Quit
@@ -1032,6 +1077,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.eggCopy(eggURL, eggDomain)
 			case "g":
 				return m, m.eggCopy(eggRepoURL, eggRepoDomain)
+			case "f":
+				// Secret-within-the-secret (5x1e): launch ONE firework
+				// instantly. Beyond the cap, ignore the press. Start the
+				// decoupled fireworks ticker only if it isn't already running
+				// (fwTicking) so ticks never stack under mashing.
+				if len(m.fireworks) < fwCap {
+					m.fireworks = append(m.fireworks, newFirework(m.width, m.height, m.emoji))
+				}
+				if !m.fwTicking && len(m.fireworks) > 0 {
+					m.fwTicking = true
+					return m, fwTick()
+				}
+				return m, nil
 			}
 			return m, nil
 		}
@@ -1577,6 +1635,108 @@ var (
 	eggZalgoMarks   = []rune{'́', '҉', '̴', '͓', 'ͯ'}
 )
 
+// styledCell is one column of the egg-overlay compositing grid: a single
+// display-width string (a rune, optionally trailed by zero-width combining
+// marks) plus its colour. Composing RUNES first and styling ONLY on join is
+// the crux of the fireworks feature (5x1e): you cannot index a firework glyph
+// into an already-ANSI-styled string, so the whole overlay -- egg body,
+// floating fanfare, credits, and the fireworks on top -- is laid into a
+// width x height grid of these and rendered in one pass (same technique as the
+// old eggSpin). An empty color means "write s bare" (no SGR), which is also how
+// NO_COLOR / the Ascii profile degrades: the profile drops the escapes.
+type styledCell struct {
+	s     string
+	color lipgloss.Color
+	bold  bool
+}
+
+// blankCell is a bare space -- the grid's default fill.
+func blankCell() styledCell { return styledCell{s: " "} }
+
+// render turns one cell into terminal output: styled when it carries a colour,
+// bare otherwise. Under the Ascii colour profile (NO_COLOR / --no-color) the
+// style renders without escapes, so bursts degrade to monochrome for free.
+func (c styledCell) render() string {
+	if c.color == "" {
+		return c.s
+	}
+	st := lipgloss.NewStyle().Foreground(c.color)
+	if c.bold {
+		st = st.Bold(true)
+	}
+	return st.Render(c.s)
+}
+
+// newCellGrid allocates a rows x cols grid pre-filled with blank cells.
+func newCellGrid(cols, rows int) [][]styledCell {
+	g := make([][]styledCell, rows)
+	for y := range g {
+		row := make([]styledCell, cols)
+		for x := range row {
+			row[x] = blankCell()
+		}
+		g[y] = row
+	}
+	return g
+}
+
+// cellsToStrings joins each grid row into a styled string (bare cells stay
+// bare so the result is byte-identical to composing inline).
+func cellsToStrings(grid [][]styledCell) []string {
+	out := make([]string, len(grid))
+	for y, row := range grid {
+		var b strings.Builder
+		for _, c := range row {
+			b.WriteString(c.render())
+		}
+		out[y] = b.String()
+	}
+	return out
+}
+
+// centerCells pads a cell row to exactly width, centred (extra column to the
+// right, matching lipgloss's Center). A row already at/over width is returned
+// truncated to width so it can never overflow the viewport.
+func centerCells(cells []styledCell, width int) []styledCell {
+	if len(cells) >= width {
+		return cells[:width]
+	}
+	pad := width - len(cells)
+	left := pad / 2
+	out := make([]styledCell, width)
+	for x := range out {
+		out[x] = blankCell()
+	}
+	copy(out[left:], cells)
+	return out
+}
+
+// plainCells turns a plain string into cells of one colour, folding each
+// zero-width combining mark onto the preceding cell so widths stay 1:1 (this
+// is what lets the eggZalgo title survive the grid intact).
+func plainCells(s string, color lipgloss.Color, bold bool) []styledCell {
+	var out []styledCell
+	for _, r := range s {
+		if unicodeCombining(r) && len(out) > 0 {
+			out[len(out)-1].s += string(r)
+			continue
+		}
+		out = append(out, styledCell{s: string(r), color: color, bold: bold})
+	}
+	return out
+}
+
+// unicodeCombining reports whether r is a zero-width combining mark used by
+// eggZalgo (a tiny, closed set -- no need to pull in unicode tables).
+func unicodeCombining(r rune) bool {
+	for _, m := range eggZalgoMarks {
+		if r == m {
+			return true
+		}
+	}
+	return r >= 0x0300 && r <= 0x036F // combining diacritical marks block
+}
+
 // eggHalves computes the per-row half-width of the egg silhouette for a
 // nominal height h and half-width a. The profile is a CAPPED SUPERELLIPSE
 // skewed so the widest point sits below centre (frag): a superellipse (n>2)
@@ -1630,6 +1790,13 @@ func eggHalves(h int, a float64) []int {
 // mass still spins/breathes. Deterministic per (frame, maxCols, maxRows);
 // dimensions clamp DOWN to the budget.
 func eggSpin(frame, maxCols, maxRows int) []string {
+	return cellsToStrings(eggSpinCells(frame, maxCols, maxRows))
+}
+
+// eggSpinCells is eggSpin's compositing core: it returns the shimmer as a grid
+// of styledCells (rune + gold colour) instead of pre-styled strings, so the
+// egg body can be laid into the fireworks grid and re-styled on join.
+func eggSpinCells(frame, maxCols, maxRows int) [][]styledCell {
 	h := 15 // nominal height
 	if h > maxRows {
 		h = maxRows
@@ -1667,16 +1834,16 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 	w := 2*maxHalf + 1
 	cx := maxHalf
 
-	out := make([]string, h)
+	out := make([][]styledCell, h)
 	for y := 0; y < h; y++ {
 		half := halves[y]
 		if half > maxHalf {
 			half = maxHalf
 		}
-		var b strings.Builder
+		row := make([]styledCell, w)
 		for x := 0; x < w; x++ {
 			if x < cx-half || x > cx+half {
-				b.WriteByte(' ')
+				row[x] = blankCell()
 				continue
 			}
 			// Normalise the cell's horizontal position to THIS row's width so
@@ -1687,10 +1854,9 @@ func eggSpin(frame, maxCols, maxRows int) []string {
 				rel = float64(x-cx) / float64(half)
 			}
 			ch, col := eggCell(x, y, h, rel, float64(frame))
-			st := lipgloss.NewStyle().Foreground(col).Bold(true)
-			b.WriteString(st.Render(string(ch)))
+			row[x] = styledCell{s: string(ch), color: col, bold: true}
 		}
-		out[y] = b.String()
+		out[y] = row
 	}
 	return out
 }
@@ -1837,20 +2003,31 @@ func maxInts(v []int) int {
 // deterministically-placed coloured sparkles (varying per frame). Width is
 // clamped so it never overflows the screen.
 func eggSparkleLine(w, frame, salt int) string {
+	var b strings.Builder
+	for _, c := range eggSparkleCells(w, frame, salt) {
+		b.WriteString(c.render())
+	}
+	return b.String()
+}
+
+// eggSparkleCells is eggSparkleLine's compositing core: the same deterministic
+// sparkle pattern as styledCells, so the FLOATING rainbow fanfare can be laid
+// into the fireworks grid (and its absolute row recorded for the burst band).
+func eggSparkleCells(w, frame, salt int) []styledCell {
 	if w > 56 {
 		w = 56
 	}
-	var b strings.Builder
+	out := make([]styledCell, w)
 	for x := 0; x < w; x++ {
 		if (x*29+frame*13+salt*7)%9 == 0 {
 			c := eggSparkColors[(x+frame+salt)%len(eggSparkColors)]
 			s := eggSparks[(x*3+frame)%len(eggSparks)]
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(string(s)))
+			out[x] = styledCell{s: string(s), color: lipgloss.Color(c)}
 		} else {
-			b.WriteRune(' ')
+			out[x] = blankCell()
 		}
 	}
-	return b.String()
+	return out
 }
 
 // eggZalgo sprinkles zero-width combining marks over s for a light glitch
@@ -1866,8 +2043,429 @@ func eggZalgo(s string, frame int) string {
 	return b.String()
 }
 
-// eggView renders the full-screen Easter egg for the current frame, centred
-// and padded to exactly m.width x m.height. Tiny terminals get a bounded
+// --- Hidden fireworks (5x1e) --------------------------------------------------
+//
+// A secret WITHIN the secret: inside the 'E' egg overlay, each 'f' press
+// launches one ASCII firework INSTANTLY (no fuse -- firing time is just when you
+// press). All the randomness lives in each firework's characteristics, sampled
+// on a BELL curve (central bias) via bellRange. Fireworks live in absolute
+// viewport coordinates but explode relative to the FLOATING rainbow fanfare
+// rows (the block is vertically centred), so newFirework and eggView both derive
+// geometry from eggLayout, the single source of truth.
+
+// eggLayoutT is the egg overlay's computed geometry for a viewport: the centred
+// block's placement plus the ABSOLUTE rows of the top/bottom fanfare (which
+// float as the block is vertically centred). ok=false is the tiny-terminal
+// fallback gate (matches eggView).
+type eggLayoutT struct {
+	ok            bool
+	sw            int // inner content width (viewport - 4)
+	eggCols       int // egg body width budget
+	eggRows       int // egg body height == number of body rows
+	blockH        int // total block height: fanfare+egg+fanfare+title+6 credits
+	topPad        int // rows above the block from vertical centring
+	topFanfareRow int // absolute row of the top rainbow fanfare
+	botFanfareRow int // absolute row of the bottom rainbow fanfare
+}
+
+func eggLayout(w, h int) eggLayoutT {
+	var l eggLayoutT
+	if w < 52 || h < 17 { // must match eggView's fallback gate
+		return l
+	}
+	l.ok = true
+	l.sw = w - 4
+	l.eggRows = h - 10
+	if l.eggRows > 15 {
+		l.eggRows = 15
+	}
+	l.eggCols = l.sw
+	if l.eggCols > 21 {
+		l.eggCols = 21
+	}
+	// 1 top fanfare + eggRows egg body + 1 bottom fanfare + 1 title + 6 credits.
+	l.blockH = l.eggRows + 9
+	l.topPad = (h - l.blockH) / 2
+	if l.topPad < 0 {
+		l.topPad = 0
+	}
+	l.topFanfareRow = l.topPad
+	l.botFanfareRow = l.topPad + l.eggRows + 1
+	return l
+}
+
+// Firework tuning. Units are grid cells per fireworks frame (fwInterval).
+const (
+	fwAspect          = 1.9   // stretch X: cells are ~2:1, so round bursts need wider X spread
+	fwGravity         = 0.06  // launch gravity (rows/frame^2): gentle rise to apex
+	fwEmberGravity    = 0.035 // downward pull on burst embers -> they arch and fall
+	fwTrailLen        = 4     // rising-trail samples (bright head + fading tail)
+	fwCountMin        = 10.0  // burst particle count (bell)
+	fwCountMax        = 34.0
+	fwRadiusMin       = 0.45 // burst expansion speed (bell) -> radius
+	fwRadiusMax       = 1.25
+	fwBurstLifeMin    = 8.0 // per-particle life in frames (bell)
+	fwBurstLifeMax    = 18.0
+	fwFlourishChance  = 0.4  // fraction of fireworks that get a secondary crackle
+	fwLaunchSpreadPct = 0.15 // horizontal launch offset: +/-15% of viewport width
+)
+
+type fwStage int
+
+const (
+	fwRising fwStage = iota // climbing the arch, drawing a trail
+	fwBurst                 // exploded: expanding, then falling/fading embers
+)
+
+// fwParticle is one burst spark in absolute grid coords (+vy is downward).
+type fwParticle struct {
+	x, y    float64
+	vx, vy  float64
+	age     int
+	ttl     int
+	crackle bool // secondary-flourish spark: renders near-white regardless of scheme
+}
+
+// firework is one in-flight shell: a rising arch that bursts into particles.
+type firework struct {
+	// Launch + trajectory (absolute viewport coords; +y downward).
+	x0, y0 float64
+	v0     float64 // upward launch speed
+	g      float64 // launch gravity
+	vx     float64 // horizontal drift -> the arch lean
+	tExp   float64 // frames from launch to explosion
+	t      float64 // elapsed frames
+
+	// Explosion.
+	yExp, xExp float64 // burst centre (yExp is the chosen band row)
+	stage      fwStage
+	burstAge   int
+	count      int
+	radius     float64
+	scheme     int
+	particles  []fwParticle
+
+	// Optional secondary crackle.
+	flourish   bool
+	flourishAt int
+	flourished bool
+
+	emoji bool // glyph set captured at spawn (ascii-safe)
+}
+
+// bellUnit returns a value in [-1,1] with a central bias -- the mean of three
+// uniforms (a bell/triangular shape). Bounded by construction, so unlike a
+// clamped NormFloat64 there is no tail to trim: "most values cluster central".
+func bellUnit() float64 {
+	return (rand.Float64()+rand.Float64()+rand.Float64())/3*2 - 1
+}
+
+// bellRange maps bellUnit onto [lo,hi], central-biased toward the midpoint.
+func bellRange(lo, hi float64) float64 {
+	return lo + (bellUnit()+1)/2*(hi-lo)
+}
+
+// newFirework spawns one firework for the current viewport, INSTANTLY (fired at
+// t=0 from centre-bottom). Every characteristic is bell-sampled within bounds.
+func newFirework(w, h int, emoji bool) firework {
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	lay := eggLayout(w, h)
+
+	// Launch: centre-bottom, horizontal offset bell within +/-15% of width.
+	x0 := float64(w)/2 + bellRange(-fwLaunchSpreadPct*float64(w), fwLaunchSpreadPct*float64(w))
+	y0 := float64(h - 1)
+
+	// Explosion band: a few rows above the top fanfare to a few below the
+	// bottom fanfare -- against the FLOATING rows, not fixed lines. Degenerate
+	// (tiny) layouts fall back to the mid-viewport so nothing panics.
+	bandTop := float64(lay.topFanfareRow - 3)
+	bandBot := float64(lay.botFanfareRow + 3)
+	if !lay.ok {
+		bandTop = float64(h) * 0.25
+		bandBot = float64(h) * 0.6
+	}
+	if bandTop < 1 {
+		bandTop = 1
+	}
+	if bandBot > float64(h-2) {
+		bandBot = float64(h - 2)
+	}
+	if bandBot < bandTop {
+		bandBot = bandTop
+	}
+	// Central bias -> most bursts land near the egg's middle.
+	yExp := bellRange(bandTop, bandBot)
+
+	// Explosion phase relative to apex (bell): <1 before apex, ~1 at apex,
+	// >1 slightly past it (on the way down).
+	alpha := bellRange(0.68, 1.18)
+	denom := alpha - 0.5*alpha*alpha
+	if denom < 0.15 {
+		denom = 0.15
+	}
+	rise := y0 - yExp
+	if rise < 1 {
+		rise = 1
+	}
+	// Solve launch speed so the arch reaches yExp exactly at t=tExp with the
+	// requested apex phase: y(t) = y0 - v0*t + g*t^2/2, apex at t=v0/g.
+	reach := rise / denom // = v0^2 / g
+	v0 := math.Sqrt(fwGravity * reach)
+	tExp := alpha * (v0 / fwGravity)
+
+	return firework{
+		x0:         x0,
+		y0:         y0,
+		v0:         v0,
+		g:          fwGravity,
+		vx:         bellRange(-0.3, 0.3),
+		tExp:       tExp,
+		yExp:       yExp,
+		stage:      fwRising,
+		count:      int(bellRange(fwCountMin, fwCountMax)),
+		radius:     bellRange(fwRadiusMin, fwRadiusMax),
+		scheme:     rand.Intn(len(fwSchemes)),
+		flourish:   rand.Float64() < fwFlourishChance,
+		flourishAt: 3 + rand.Intn(4),
+		emoji:      emoji,
+	}
+}
+
+func (f *firework) posY(t float64) float64 { return f.y0 - f.v0*t + 0.5*f.g*t*t }
+func (f *firework) posX(t float64) float64 { return f.x0 + f.vx*t }
+
+// step advances one firework by one frame: climb then explode, then age the
+// embers (with gravity) and, once, add a flourish crackle.
+func (f *firework) step() {
+	f.t++
+	switch f.stage {
+	case fwRising:
+		if f.t >= f.tExp {
+			f.explode()
+		}
+	case fwBurst:
+		f.burstAge++
+		alive := f.particles[:0]
+		for _, p := range f.particles {
+			p.vy += fwEmberGravity
+			p.x += p.vx
+			p.y += p.vy
+			p.age++
+			if p.age < p.ttl {
+				alive = append(alive, p)
+			}
+		}
+		f.particles = alive
+		if f.flourish && !f.flourished && f.burstAge >= f.flourishAt {
+			f.addFlourish()
+			f.flourished = true
+		}
+	}
+}
+
+// done reports a spent firework: burst, all embers expired, and any flourish
+// already emitted (so we don't reap it before the secondary crackle fires).
+func (f *firework) done() bool {
+	return f.stage == fwBurst && len(f.particles) == 0 && (!f.flourish || f.flourished)
+}
+
+// explode converts the rising shell into a radial burst at the arch's current
+// point (== yExp by construction).
+func (f *firework) explode() {
+	f.stage = fwBurst
+	f.burstAge = 0
+	f.xExp = f.posX(f.tExp)
+	f.yExp = f.posY(f.tExp)
+	n := f.count
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		ang := 2*math.Pi*float64(i)/float64(n) + (rand.Float64()-0.5)*0.6
+		speed := f.radius * (0.45 + 0.55*rand.Float64())
+		f.particles = append(f.particles, fwParticle{
+			x:   f.xExp,
+			y:   f.yExp,
+			vx:  math.Cos(ang) * speed * fwAspect,
+			vy:  math.Sin(ang) * speed,
+			ttl: int(bellRange(fwBurstLifeMin, fwBurstLifeMax)),
+		})
+	}
+}
+
+// addFlourish emits a brief bright secondary crackle from the burst centre.
+func (f *firework) addFlourish() {
+	n := 6 + rand.Intn(6)
+	for i := 0; i < n; i++ {
+		ang := 2*math.Pi*float64(i)/float64(n) + rand.Float64()
+		speed := f.radius * 1.4 * (0.5 + 0.6*rand.Float64())
+		f.particles = append(f.particles, fwParticle{
+			x:       f.xExp,
+			y:       f.yExp,
+			vx:      math.Cos(ang) * speed * fwAspect,
+			vy:      math.Sin(ang) * speed,
+			ttl:     4 + rand.Intn(4),
+			crackle: true,
+		})
+	}
+}
+
+// stepFireworks advances every firework and reaps the spent ones (filter in
+// place, no per-frame allocation).
+func stepFireworks(fws []firework) []firework {
+	kept := fws[:0]
+	for i := range fws {
+		fw := fws[i]
+		fw.step()
+		if !fw.done() {
+			kept = append(kept, fw)
+		}
+	}
+	return kept
+}
+
+var (
+	fwGlyphsUnicode = []rune{'·', '∗', '✦', '❋', '✺'} // dim -> bright
+	fwGlyphsASCII   = []rune{'.', ':', '+', '*', '@'} // ascii fallback (no mojibake)
+)
+
+// glyphSet gates the glyph vocabulary on emoji capability (5x1e is stricter than
+// the egg's sparkles, which assumed UTF-8): ascii terminals get pure-ASCII sparks.
+func (f *firework) glyphSet() []rune {
+	if f.emoji {
+		return fwGlyphsUnicode
+	}
+	return fwGlyphsASCII
+}
+
+// glyph picks a spark by brightness (dim -> bright) from the active set.
+func (f *firework) glyph(br float64) rune {
+	set := f.glyphSet()
+	i := int(br * float64(len(set)))
+	if i < 0 {
+		i = 0
+	} else if i > len(set)-1 {
+		i = len(set) - 1
+	}
+	return set[i]
+}
+
+// draw renders a firework into the grid at its current frame. Fireworks are
+// drawn last (in eggView), so they sit ON TOP of the egg/fanfare/credits.
+func (f *firework) draw(grid [][]styledCell, w, h int) {
+	switch f.stage {
+	case fwRising:
+		// A comet: bright head plus a few analytic samples behind it, fading.
+		for k := 0; k < fwTrailLen; k++ {
+			tt := f.t - float64(k)
+			if tt < 0 {
+				break
+			}
+			br := 1 - 0.24*float64(k)
+			f.plot(grid, w, h, f.posX(tt), f.posY(tt), f.glyph(br), f.color(br, 0))
+		}
+	case fwBurst:
+		set := f.glyphSet()
+		for i, p := range f.particles {
+			br := 1 - float64(p.age)/float64(p.ttl)
+			if br < 0 {
+				br = 0
+			}
+			if p.crackle { // bright near-white regardless of scheme
+				g := set[len(set)-1]
+				if br < 0.5 {
+					g = set[len(set)-2]
+				}
+				f.plot(grid, w, h, p.x, p.y, g, lipgloss.Color("#fffbec"))
+				continue
+			}
+			f.plot(grid, w, h, p.x, p.y, f.glyph(br), f.color(br, i))
+		}
+	}
+}
+
+// plot writes one styled spark into the grid, rounding to the nearest cell and
+// clipping to the viewport (so bursts near the edges never panic or overflow).
+func (f *firework) plot(grid [][]styledCell, w, h int, x, y float64, glyph rune, color lipgloss.Color) {
+	gx := int(math.Round(x))
+	gy := int(math.Round(y))
+	if gx < 0 || gx >= w || gy < 0 || gy >= h {
+		return
+	}
+	grid[gy][gx] = styledCell{s: string(glyph), color: color, bold: true}
+}
+
+// color resolves a spark's colour from this firework's scheme.
+func (f *firework) color(br float64, idx int) lipgloss.Color {
+	return fwSchemes[f.scheme].colorAt(br, idx)
+}
+
+// fwScheme is one of ~8 firework colour "types", from single-hue monochrome to
+// multi-hue vivid. kind 0 reuses the egg's gold ramp; 1 is a monochrome
+// brightness ramp; 2 is a vivid ANSI palette sampled per particle.
+type fwScheme struct {
+	kind    int
+	base    [3]float64
+	palette []string
+}
+
+var fwSchemes = []fwScheme{
+	{kind: 0},                                                    // gold (ties to the egg; eggRampColor)
+	{kind: 1, base: [3]float64{235, 45, 45}},                     // red monochrome
+	{kind: 1, base: [3]float64{50, 210, 70}},                     // green monochrome
+	{kind: 1, base: [3]float64{70, 130, 245}},                    // blue monochrome
+	{kind: 1, base: [3]float64{205, 70, 215}},                    // magenta monochrome
+	{kind: 2, palette: []string{"196", "202", "214", "226"}},     // warm vivid (red -> gold)
+	{kind: 2, palette: []string{"51", "45", "39", "201", "129"}}, // cool vivid (cyan -> violet)
+	{kind: 2, palette: eggSparkColors},                           // full rainbow (reuse egg palette)
+}
+
+func (s fwScheme) colorAt(br float64, idx int) lipgloss.Color {
+	switch s.kind {
+	case 0:
+		return eggRampColor(br) // reuse the egg's gold gradient
+	case 2:
+		if len(s.palette) == 0 {
+			return eggRampColor(br)
+		}
+		return lipgloss.Color(s.palette[((idx%len(s.palette))+len(s.palette))%len(s.palette)])
+	default:
+		return fwMonoColor(s.base, br)
+	}
+}
+
+// fwMonoColor is a single-hue brightness ramp (dark -> base -> white), the
+// monochrome end of the scheme range. Truecolor hex; lipgloss degrades it to
+// 256/ANSI, and to nothing under NO_COLOR / --no-color (the Ascii profile).
+func fwMonoColor(base [3]float64, br float64) lipgloss.Color {
+	br = eggClamp01(br)
+	dark := [3]float64{base[0] * 0.28, base[1] * 0.28, base[2] * 0.28}
+	white := [3]float64{255, 255, 255}
+	var c [3]float64
+	if br < 0.6 {
+		t := br / 0.6
+		for i := 0; i < 3; i++ {
+			c[i] = dark[i] + (base[i]-dark[i])*t
+		}
+	} else {
+		t := (br - 0.6) / 0.4
+		for i := 0; i < 3; i++ {
+			c[i] = base[i] + (white[i]-base[i])*t
+		}
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", int(c[0]+0.5), int(c[1]+0.5), int(c[2]+0.5)))
+}
+
+// eggView renders the full-screen Easter egg for the current frame. It composes
+// a width x height grid of styledCells -- the centred egg block laid at its
+// computed offset, then any fireworks (5x1e) drawn on top -- and styles each
+// cell only on join. Composing RUNES first is what lets fireworks overlay the
+// egg without indexing into ANSI-styled strings. Tiny terminals get a bounded
 // fallback rather than any risk of overflow.
 func (m model) eggView() string {
 	w, h := m.width, m.height
@@ -1880,58 +2478,79 @@ func (m model) eggView() string {
 	f := m.eggFrame
 
 	// The full art needs room for a ~7+ row egg plus ~9 rows of sparkles/
-	// credits/hint. The widest credit line is 48 cols, so require sw >= 48
-	// (w >= 52) to keep everything untruncated; below that (or too short), a
-	// bounded fallback rather than any overflow.
-	if w < 52 || h < 17 {
+	// credits/hint (eggLayout's gate: w >= 52, h >= 17). Below it, a bounded
+	// fallback and no fireworks (nowhere safe to place them).
+	lay := eggLayout(w, h)
+	if !lay.ok {
 		msg := lipgloss.NewStyle().Foreground(lipgloss.Color(eggGold[f%len(eggGold)])).Bold(true).
 			Render("🥚 enlarge the terminal — esc: back")
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, msg)
 	}
 
-	sw := w - 4
-	cred := func(i int, s string) string {
-		c := eggCreditColors[(f/2+i)%len(eggCreditColors)]
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(s)
-	}
-	title := lipgloss.NewStyle().Foreground(lipgloss.Color(eggSparkColors[f%len(eggSparkColors)])).Bold(true).
-		Render("✦ " + eggZalgo("tailport", f) + " ✦")
+	sw := lay.sw
 
-	// Size the egg to the remaining vertical budget (9 non-egg rows) and a
-	// pleasing width, clamped so it never overflows.
-	eggRows := h - 10
-	if eggRows > 15 {
-		eggRows = 15
+	// Compose the egg block as ROWS OF CELLS (never pre-styled strings) so the
+	// fireworks share the grid. Row order fixes the fanfare rows the burst band
+	// keys off (top fanfare, eggRows body, bottom fanfare, title, 6 credits).
+	var block [][]styledCell
+	block = append(block, centerCells(eggSparkleCells(sw, f, 1), sw)) // top fanfare
+	for _, row := range eggSpinCells(f, lay.eggCols, lay.eggRows) {
+		block = append(block, centerCells(row, sw)) // egg body
 	}
-	eggCols := sw
-	if eggCols > 21 {
-		eggCols = 21
+	block = append(block, centerCells(eggSparkleCells(sw, f, 2), sw)) // bottom fanfare
+
+	titleColor := lipgloss.Color(eggSparkColors[f%len(eggSparkColors)])
+	block = append(block, centerCells(plainCells("✦ "+eggZalgo("tailport", f)+" ✦", titleColor, true), sw))
+
+	credits := []string{
+		"Michael E. Gruen",
+		"· The LLM Agent Fleet ·",
+		"Claude Opus 4.8 · Sonnet 5 · Haiku 4.5 · Fable 5",
+		eggURL,
+		eggRepoURL,
+		"c: copy site · g: copy repo · esc / q: back",
+	}
+	for i, s := range credits {
+		color := lipgloss.Color(eggCreditColors[(f/2+i)%len(eggCreditColors)])
+		if i == len(credits)-1 {
+			color = lipgloss.Color("241") // the muted hint line
+		}
+		block = append(block, centerCells(plainCells(s, color, false), sw))
 	}
 
-	var lines []string
-	lines = append(lines, eggSparkleLine(sw, f, 1))
-	lines = append(lines, eggSpin(f, eggCols, eggRows)...)
-	lines = append(lines, eggSparkleLine(sw, f, 2))
-	lines = append(lines, title)
-	lines = append(lines,
-		cred(0, "Michael E. Gruen"),
-		cred(1, "· The LLM Agent Fleet ·"),
-		cred(2, "Claude Opus 4.8 · Sonnet 5 · Haiku 4.5 · Fable 5"),
-		cred(3, eggURL),
-		cred(4, eggRepoURL),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("c: copy site · g: copy repo · esc / q: back"),
-	)
+	// Lay the centred block into a full-screen grid at its computed offset.
+	grid := newCellGrid(w, h)
+	const leftPad = 2 // (w - sw) / 2 with sw = w - 4
+	for i, row := range block {
+		gy := lay.topPad + i
+		if gy < 0 || gy >= h {
+			continue
+		}
+		for j, c := range row {
+			if gx := leftPad + j; gx >= 0 && gx < w {
+				grid[gy][gx] = c
+			}
+		}
+	}
+
+	// The transient copy toast sits just below the block (never over the
+	// fanfare rows the fireworks band was computed against).
 	if m.flash != "" {
-		lines = append(lines, activeStyle.Render(m.flash))
+		if fy := lay.topPad + lay.blockH; fy >= 0 && fy < h {
+			for j, c := range centerCells(plainCells(m.flash, lipgloss.Color("42"), true), sw) {
+				if gx := leftPad + j; gx >= 0 && gx < w {
+					grid[fy][gx] = c
+				}
+			}
+		}
 	}
-	// Safety net: never exceed the viewport height.
-	if len(lines) > h {
-		lines = lines[:h]
+
+	// Fireworks last -> ON TOP of the egg/fanfare/credits.
+	for i := range m.fireworks {
+		m.fireworks[i].draw(grid, w, h)
 	}
-	for i, ln := range lines {
-		lines[i] = lipgloss.PlaceHorizontal(sw, lipgloss.Center, ln)
-	}
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
+
+	return strings.Join(cellsToStrings(grid), "\n")
 }
 
 // KeyLegendRow is one row of tailport's full keybinding legend: a key label

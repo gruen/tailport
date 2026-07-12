@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
@@ -1787,5 +1789,404 @@ func TestMarkersOverrideNeverPersisted(t *testing.T) {
 	}
 	if !reloaded.Ports[4242].Favorite {
 		t.Fatal("sanity check: the favorite mutation itself should have persisted")
+	}
+}
+
+// --- Fireworks (5x1e) --------------------------------------------------------
+
+// TestBellRange covers the bell-curve sampler that every firework characteristic
+// draws from: values stay strictly within bounds (no NormFloat64 tail to clamp)
+// and cluster toward the midpoint ("most values central").
+func TestBellRange(t *testing.T) {
+	for i := 0; i < 200000; i++ {
+		if u := bellUnit(); u < -1 || u > 1 {
+			t.Fatalf("bellUnit %v escaped [-1,1]", u)
+		}
+		if v := bellRange(-3, 7); v < -3 || v > 7 {
+			t.Fatalf("bellRange %v escaped [-3,7]", v)
+		}
+	}
+	// Central bias: the mean sits near the midpoint of the range.
+	const n = 300000
+	var sum float64
+	for i := 0; i < n; i++ {
+		sum += bellRange(-3, 7)
+	}
+	if mean := sum / n; math.Abs(mean-2) > 0.1 {
+		t.Errorf("bellRange mean %.3f should cluster near the midpoint 2", mean)
+	}
+}
+
+// TestEggLayout covers the shared geometry source of truth: the tiny-terminal
+// gate, the clamps, and that the FLOATING fanfare rows are recorded correctly
+// against the vertically-centred block.
+func TestEggLayout(t *testing.T) {
+	if eggLayout(40, 40).ok {
+		t.Error("w<52 must be the not-ok fallback")
+	}
+	if eggLayout(80, 16).ok {
+		t.Error("h<17 must be the not-ok fallback")
+	}
+	l := eggLayout(100, 40)
+	if !l.ok {
+		t.Fatal("100x40 should be ok")
+	}
+	if l.sw != 96 {
+		t.Errorf("sw=%d want 96 (w-4)", l.sw)
+	}
+	if l.eggRows != 15 {
+		t.Errorf("eggRows=%d want 15 (clamped)", l.eggRows)
+	}
+	// The block is vertically centred: the top fanfare sits exactly at topPad.
+	if l.topFanfareRow != l.topPad {
+		t.Errorf("top fanfare row %d should equal topPad %d", l.topFanfareRow, l.topPad)
+	}
+	// Bottom fanfare frames the egg: it's eggRows+1 rows below the top one.
+	if gap := l.botFanfareRow - l.topFanfareRow; gap != l.eggRows+1 {
+		t.Errorf("fanfare gap %d want eggRows+1=%d", gap, l.eggRows+1)
+	}
+	// The whole block fits inside the viewport.
+	if l.topPad+l.blockH > 40 {
+		t.Errorf("block bottom %d exceeds height 40", l.topPad+l.blockH)
+	}
+	// A taller terminal floats the fanfare further down (rows are NOT fixed).
+	if tall := eggLayout(100, 60); tall.topFanfareRow <= l.topFanfareRow {
+		t.Errorf("taller viewport should float the fanfare lower: 60->%d vs 40->%d",
+			tall.topFanfareRow, l.topFanfareRow)
+	}
+}
+
+// TestNewFireworkGeometry covers the launch/burst sampling: launch is
+// centre-bottom within +/-15% of width, and every explosion lands inside the
+// band (a few rows around the floating fanfare).
+func TestNewFireworkGeometry(t *testing.T) {
+	const w, h = 100, 40
+	lay := eggLayout(w, h)
+	bandTop := float64(lay.topFanfareRow - 3)
+	bandBot := float64(lay.botFanfareRow + 3)
+	maxOff := fwLaunchSpreadPct * float64(w)
+	const eps = 1e-6
+	for i := 0; i < 20000; i++ {
+		fw := newFirework(w, h, i%2 == 0)
+		if fw.y0 != float64(h-1) {
+			t.Fatalf("launch row %.1f want center-bottom %d", fw.y0, h-1)
+		}
+		if fw.x0 < float64(w)/2-maxOff-eps || fw.x0 > float64(w)/2+maxOff+eps {
+			t.Fatalf("launch col %.3f outside +/-15%% of centre", fw.x0)
+		}
+		if fw.yExp < bandTop-eps || fw.yExp > bandBot+eps {
+			t.Fatalf("explosion row %.3f outside band [%.0f,%.0f]", fw.yExp, bandTop, bandBot)
+		}
+		if fw.count < 1 || fw.v0 <= 0 || fw.tExp <= 0 {
+			t.Fatalf("degenerate firework: count=%d v0=%.3f tExp=%.3f", fw.count, fw.v0, fw.tExp)
+		}
+	}
+}
+
+// TestFireworkLifecycle covers stepping/expiry: a firework rises, bursts into
+// particles, then all embers (and any flourish) expire and it reports done.
+func TestFireworkLifecycle(t *testing.T) {
+	fw := newFirework(100, 40, false)
+
+	// The arch reaches its chosen band row exactly at the explosion frame.
+	wantY := fw.yExp
+	guard := 0
+	for fw.stage == fwRising {
+		fw.step()
+		if guard++; guard > 5000 {
+			t.Fatal("firework never exploded")
+		}
+	}
+	if len(fw.particles) == 0 {
+		t.Fatal("explosion should create particles")
+	}
+	if math.Abs(fw.yExp-wantY) > 1.0 {
+		t.Errorf("burst row %.2f should match the chosen band row %.2f", fw.yExp, wantY)
+	}
+	if fw.done() {
+		t.Fatal("a just-exploded firework is not done")
+	}
+
+	guard = 0
+	for !fw.done() {
+		fw.step()
+		if guard++; guard > 5000 {
+			t.Fatal("firework never finished")
+		}
+	}
+	if len(fw.particles) != 0 {
+		t.Errorf("a done firework should have no live particles, got %d", len(fw.particles))
+	}
+}
+
+// TestStepFireworksReaps covers the pruning: spent fireworks are dropped,
+// live ones survive.
+func TestStepFireworksReaps(t *testing.T) {
+	// Burst with no particles and no pending flourish -> reaped in one step.
+	if out := stepFireworks([]firework{{stage: fwBurst}}); len(out) != 0 {
+		t.Errorf("spent firework should be reaped, got %d", len(out))
+	}
+	// A fresh rising firework survives a step.
+	if out := stepFireworks([]firework{newFirework(100, 40, true)}); len(out) != 1 {
+		t.Errorf("rising firework should survive a step, got %d", len(out))
+	}
+	// A mixed batch drains to empty without panicking.
+	batch := make([]firework, 0, 30)
+	for i := 0; i < 30; i++ {
+		batch = append(batch, newFirework(120, 45, i%2 == 0))
+	}
+	guard := 0
+	for len(batch) > 0 {
+		batch = stepFireworks(batch)
+		if guard++; guard > 5000 {
+			t.Fatal("batch never drained")
+		}
+	}
+}
+
+// TestFireworkGlyphs covers the ascii-vs-unicode glyph gating: ascii terminals
+// get pure-ASCII sparks (no mojibake), emoji terminals get the Unicode set.
+func TestFireworkGlyphs(t *testing.T) {
+	ascii := firework{emoji: false}
+	for _, r := range ascii.glyphSet() {
+		if r > 127 {
+			t.Errorf("ascii glyph set contains non-ASCII rune %q", r)
+		}
+	}
+	for _, br := range []float64{-0.5, 0, 0.3, 0.6, 1, 1.5} {
+		if g := ascii.glyph(br); g > 127 {
+			t.Errorf("ascii glyph(%.2f)=%q is non-ASCII", br, g)
+		}
+	}
+	uni := firework{emoji: true}
+	nonASCII := false
+	for _, r := range uni.glyphSet() {
+		if r > 127 {
+			nonASCII = true
+		}
+	}
+	if !nonASCII {
+		t.Error("unicode glyph set should contain non-ASCII sparks")
+	}
+}
+
+// TestFireworkDraw covers compositing sparks into the grid, with edge clipping
+// (no panic, no overflow) for out-of-bounds particles.
+func TestFireworkDraw(t *testing.T) {
+	grid := newCellGrid(40, 20)
+	rising := firework{stage: fwRising, x0: 20, y0: 19, v0: 2, g: fwGravity, emoji: false}
+	rising.draw(grid, 40, 20)
+	if grid[19][20].s == " " || grid[19][20].s == "" {
+		t.Errorf("a rising firework should plot a head at its launch cell, got %q", grid[19][20].s)
+	}
+
+	burst := firework{stage: fwBurst, emoji: true, scheme: 0, particles: []fwParticle{
+		{x: 10, y: 10, ttl: 10},
+		{x: -5, y: -5, ttl: 10},   // off top-left: must clip
+		{x: 500, y: 500, ttl: 10}, // off bottom-right: must clip
+	}}
+	burst.draw(grid, 40, 20)
+	if grid[10][10].s == " " {
+		t.Error("a burst particle should plot into the grid")
+	}
+}
+
+// TestFireworkCap covers the ~25 concurrency cap: 'f' presses beyond the cap
+// (while 25 are live) are ignored, and no ticker is stacked.
+func TestFireworkCap(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.width, m.height = 120, 45
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+
+	firstCmd := true
+	for i := 0; i < 60; i++ {
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+		m = res.(model)
+		if !m.showEgg {
+			t.Fatal("'f' must never close the egg (modality)")
+		}
+		if firstCmd {
+			if cmd == nil {
+				t.Error("the first 'f' should start the decoupled fireworks ticker")
+			}
+			firstCmd = false
+		} else if cmd != nil {
+			t.Error("later 'f' presses must not stack a second fireworks ticker")
+		}
+	}
+	if len(m.fireworks) != fwCap {
+		t.Errorf("cap: %d live fireworks, want %d (extra presses ignored)", len(m.fireworks), fwCap)
+	}
+
+	// Drain via the fireworks tick; it must stop cleanly (no reschedule, no leak).
+	guard := 0
+	for len(m.fireworks) > 0 {
+		res, _ := m.Update(fwTickMsg{})
+		m = res.(model)
+		if guard++; guard > 5000 {
+			t.Fatal("fireworks never drained under the tick")
+		}
+	}
+	res, cmd := m.Update(fwTickMsg{})
+	m = res.(model)
+	if cmd != nil {
+		t.Error("an idle fireworks tick must not reschedule (no busy loop)")
+	}
+	if m.fwTicking {
+		t.Error("fwTicking should be false once no fireworks remain")
+	}
+}
+
+// TestFireworkKeyLifecycle covers the 'f' handler and ticker discipline: launch,
+// no double-ticker, and esc clearing the fireworks + stopping the tick.
+func TestFireworkKeyLifecycle(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.width, m.height = 100, 40
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = res.(model)
+	if len(m.fireworks) != 1 || !m.fwTicking || cmd == nil {
+		t.Fatalf("first 'f': fireworks=%d fwTicking=%v cmd=%v", len(m.fireworks), m.fwTicking, cmd != nil)
+	}
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = res.(model)
+	if len(m.fireworks) != 2 || cmd != nil {
+		t.Fatalf("second 'f': fireworks=%d cmd=%v (want 2 and no new ticker)", len(m.fireworks), cmd != nil)
+	}
+
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showEgg {
+		t.Error("esc should close the egg")
+	}
+	if len(m.fireworks) != 0 {
+		t.Error("esc should clear in-flight fireworks immediately")
+	}
+	res, cmd = m.Update(fwTickMsg{})
+	m = res.(model)
+	if cmd != nil || m.fwTicking {
+		t.Error("a fireworks tick after close must stop (no reschedule, fwTicking false)")
+	}
+}
+
+// TestEggViewGrid covers full-screen grid composition: exact dimensions, the
+// egg block placed at its offset with the fanfare on its recorded rows, credits
+// present, and fireworks overlaid without overflow.
+func TestEggViewGrid(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Markers: "emoji"})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.showEgg = true
+	m.width, m.height = 100, 40
+
+	// Composition with no fireworks: the block is placed at its offset with the
+	// fanfare on its recorded rows, credits intact, exact viewport dimensions.
+	view := m.eggView()
+	lines := strings.Split(view, "\n")
+	if len(lines) != 40 {
+		t.Fatalf("eggView should render exactly 40 rows, got %d", len(lines))
+	}
+	for i, ln := range lines {
+		if w := lipgloss.Width(ln); w != 100 {
+			t.Fatalf("row %d display width %d != viewport 100 (overflow)", i, w)
+		}
+	}
+	lay := eggLayout(100, 40)
+	if strings.TrimSpace(stripANSI(lines[lay.topFanfareRow])) == "" {
+		t.Error("the top fanfare row should carry sparkles")
+	}
+	if strings.TrimSpace(stripANSI(lines[lay.botFanfareRow])) == "" {
+		t.Error("the bottom fanfare row should carry sparkles")
+	}
+	if strings.TrimSpace(stripANSI(lines[lay.topFanfareRow+lay.eggRows/2])) == "" {
+		t.Error("an egg body row should be non-empty")
+	}
+	plain := stripANSI(view)
+	if !strings.Contains(plain, "Michael E. Gruen") || !strings.Contains(plain, "LLM Agent Fleet") {
+		t.Error("egg credits should render inside the grid")
+	}
+
+	// With fireworks overlaid, the grid must still be exactly 40x100 (the
+	// sparks clip to the viewport; they may draw over text but never overflow).
+	for i := 0; i < 20; i++ {
+		m.fireworks = append(m.fireworks, newFirework(100, 40, true))
+	}
+	for i := 0; i < 12; i++ { // let some rise and some burst
+		m.fireworks = stepFireworks(m.fireworks)
+	}
+	fwLines := strings.Split(m.eggView(), "\n")
+	if len(fwLines) != 40 {
+		t.Fatalf("with fireworks, eggView should still be 40 rows, got %d", len(fwLines))
+	}
+	for i, ln := range fwLines {
+		if w := lipgloss.Width(ln); w != 100 {
+			t.Fatalf("with fireworks, row %d width %d != 100 (overflow)", i, w)
+		}
+	}
+}
+
+// TestEggViewNoColor covers NO_COLOR / --no-color degradation: under the Ascii
+// color profile the overlay (egg + bursts) emits no ANSI escapes at all.
+func TestEggViewNoColor(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	prev := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(prev)
+	lipgloss.SetColorProfile(termenv.Ascii)
+
+	m := New(config.Config{Markers: "ascii"})
+	m.active = map[int]bool{}
+	m.rebuildItems()
+	m.showEgg = true
+	m.width, m.height = 100, 40
+	for i := 0; i < 24; i++ {
+		m.fireworks = append(m.fireworks, newFirework(100, 40, false))
+	}
+	for i := 0; i < 15; i++ {
+		m.fireworks = stepFireworks(m.fireworks)
+	}
+	if view := m.eggView(); strings.ContainsRune(view, '\x1b') {
+		t.Error("under the Ascii profile the egg overlay must contain no ANSI escape sequences")
+	}
+}
+
+// TestFireworkSchemes covers the ~8 distinct colour schemes (monochrome ..
+// vivid), so a firework picks a real variety.
+func TestFireworkSchemes(t *testing.T) {
+	if len(fwSchemes) < 8 {
+		t.Errorf("want ~8 firework colour schemes, got %d", len(fwSchemes))
+	}
+	seen := map[string]bool{}
+	for i := range fwSchemes {
+		seen[string(fwSchemes[i].colorAt(0.85, 0))] = true
+	}
+	if len(seen) < 6 {
+		t.Errorf("schemes should span varied colours; got %d distinct", len(seen))
+	}
+}
+
+// TestEggViewTinyNoPanic covers the small/zero-size fallback paths with
+// fireworks present: they must never panic or overflow.
+func TestEggViewTinyNoPanic(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for _, d := range [][2]int{{0, 0}, {1, 1}, {10, 5}, {52, 17}, {200, 60}} {
+		m := New(config.Config{})
+		m.active = map[int]bool{}
+		m.rebuildItems()
+		m.showEgg = true
+		m.width, m.height = d[0], d[1]
+		for i := 0; i < 30; i++ {
+			m.fireworks = append(m.fireworks, newFirework(d[0], d[1], i%2 == 0))
+		}
+		for i := 0; i < 40; i++ {
+			m.fireworks = stepFireworks(m.fireworks)
+		}
+		_ = m.eggView() // must not panic
 	}
 }
