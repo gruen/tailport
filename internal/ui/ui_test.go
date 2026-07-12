@@ -16,6 +16,7 @@ import (
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/tsserve"
 )
 
 // portNumbers returns the port number of every item currently in the list,
@@ -2464,5 +2465,161 @@ func TestHelpOverlayGroupedSections(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Errorf("overlay dropped prose %q", want)
 		}
+	}
+}
+
+// TestHelpOverlaySetupPrerequisites covers kata tapv's help-overlay note: a
+// localized "Setup / prerequisites" section explaining tailscale's operator
+// requirement, added near Markers -- INTO the same grouped structure
+// (p39s) but not folded into KeyLegendGroups (that source is shared
+// verbatim with the bottom-bar grid and quickstart's legend, and this isn't
+// a keybinding). The fix command is $USER expanded.
+func TestHelpOverlaySetupPrerequisites(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.operatorUser = "alice"
+
+	help := stripANSI(m.helpView())
+	if !strings.Contains(help, "Setup / prerequisites") {
+		t.Fatalf("helpView missing 'Setup / prerequisites' section:\n%s", help)
+	}
+	if !strings.Contains(help, "sudo tailscale set --operator=alice") {
+		t.Errorf("helpView's prerequisites section should show the $USER-expanded fix command; got:\n%s", help)
+	}
+	// It lands ahead of the keybinding groups, near Markers -- not appended
+	// after everything else, and not inside the grouped keybinding legend.
+	if at, expose := strings.Index(help, "Setup / prerequisites"), strings.Index(help, "Expose"); at < 0 || expose < 0 || at > expose {
+		t.Errorf("'Setup / prerequisites' (at %d) should appear before the 'Expose' keybinding group (at %d)", at, expose)
+	}
+}
+
+// TestOperatorHintBanner covers kata tapv's persistent, actionable hint. A
+// serve/funnel failure classified as tsserve.ErrOperatorNotSet raises the
+// STICKY banner -- a deliberate exception to the auto-dismissing toast (see
+// TestErrorToasts case 6 for the ordinary-error contrast) -- carrying the
+// $USER-expanded fix command, and it survives a keypress and a flash-expiry
+// tick that would clear an ordinary toast. It clears only on genuine
+// resolution: a subsequent successful toggle, or a re-check
+// (detectOperatorMsg, as triggered by "r") confirming the operator is now
+// set; an INCONCLUSIVE re-check must leave it standing.
+func TestOperatorHintBanner(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := New(config.Config{})
+	base.operatorUser = "alice"
+	base.width, base.height = 100, 24
+
+	// (1) A serve failure classified as ErrOperatorNotSet raises the sticky
+	// banner, not the auto-dismissing toast.
+	m := mustUpdate(t, base, toggleDoneMsg{port: 8080, err: tsserve.ErrOperatorNotSet})
+	if !m.operatorNotSet {
+		t.Fatal("toggleDoneMsg{err: ErrOperatorNotSet} should set m.operatorNotSet")
+	}
+	if m.flash != "" {
+		t.Errorf("ErrOperatorNotSet should NOT raise the transient toast; flash = %q", m.flash)
+	}
+	const wantCmd = "sudo tailscale set --operator=alice"
+	view := stripANSI(m.View())
+	if !strings.Contains(view, wantCmd) {
+		t.Errorf("View() missing the $USER-expanded fix command %q; got:\n%s", wantCmd, view)
+	}
+	if !strings.Contains(view, "press r") {
+		t.Errorf("View() should mention pressing r to re-check; got:\n%s", view)
+	}
+
+	// (2) It does NOT auto-dismiss: an ordinary keypress -- which clears a
+	// transient toast via the tea.KeyMsg case's unconditional m.flash reset
+	// -- must leave the sticky banner standing, and so must a flash-expiry
+	// tick.
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if !m.operatorNotSet {
+		t.Error("a keypress must not dismiss the sticky operator banner")
+	}
+	if !strings.Contains(stripANSI(m.View()), wantCmd) {
+		t.Error("the sticky operator banner should still render after a keypress")
+	}
+	m = mustUpdate(t, m, flashExpireMsg{id: m.flashID})
+	if !m.operatorNotSet {
+		t.Error("a flashExpireMsg tick must not dismiss the sticky operator banner")
+	}
+
+	// (3) Resolution path A: the next successful toggle clears it immediately.
+	resolved := mustUpdate(t, m, toggleDoneMsg{port: 8080, err: nil})
+	if resolved.operatorNotSet {
+		t.Error("a successful toggle should clear the sticky operator banner")
+	}
+	if strings.Contains(stripANSI(resolved.View()), wantCmd) {
+		t.Error("View() should no longer show the operator banner after a successful toggle")
+	}
+
+	// (4) Resolution path B: a re-check (as triggered by "r") that
+	// CONFIRMS the operator is now set also clears it.
+	rechecked := mustUpdate(t, m, detectOperatorMsg{notSet: false, ok: true})
+	if rechecked.operatorNotSet {
+		t.Error("a confirmed-fine re-check (detectOperatorMsg ok=true, notSet=false) should clear the banner")
+	}
+
+	// (5) An INCONCLUSIVE re-check (older tailscale, no `debug prefs`, etc.)
+	// must leave the banner exactly as it was -- not guess "fine".
+	inconclusive := mustUpdate(t, m, detectOperatorMsg{notSet: false, ok: false})
+	if !inconclusive.operatorNotSet {
+		t.Error("an inconclusive re-check (ok=false) must not clear the sticky operator banner")
+	}
+
+	// (6) "r" itself batches both refresh and detectOperator, so fixing the
+	// operator then pressing r re-checks without needing another failed
+	// serve attempt first.
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatal("'r' should return a non-nil batched command")
+	}
+}
+
+// TestOperatorHintSizingNoClip mirrors TestLegendSizingNoClip for the sticky
+// operator banner (kata tapv): WindowSizeMsg must reserve the banner's
+// worst-case height UNCONDITIONALLY, exactly like legendLines'
+// cleanEnabled=true reservation, because the banner can appear
+// asynchronously (a failed toggle's toggleDoneMsg, or the startup
+// detectOperatorMsg) with no fresh resize in between -- including when it
+// turns on AFTER the last resize, which the worst-case reservation must
+// already cover.
+func TestOperatorHintSizingNoClip(t *testing.T) {
+	build := func(w, h int, bannerAtSize, bannerAtRender bool) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.allPorts = []portscan.Port{
+			{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"},
+			{Number: 9000, Process: "api"}, {Number: 5173, Process: "vite"},
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		m.operatorNotSet = bannerAtSize
+		r, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		m = r.(model)
+		m.operatorNotSet = bannerAtRender
+		return m
+	}
+
+	for _, tc := range []struct {
+		name                         string
+		w, h                         int
+		bannerAtSize, bannerAtRender bool
+	}{
+		{"wide/no-banner", 100, 24, false, false},
+		{"wide/banner", 100, 24, true, true},
+		{"wide/banner-appears-after-resize", 100, 24, false, true},
+		{"narrow/no-banner", 58, 24, false, false},
+		{"narrow/banner", 58, 24, true, true},
+		{"narrow/banner-appears-after-resize", 58, 24, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := build(tc.w, tc.h, tc.bannerAtSize, tc.bannerAtRender)
+			view := m.View()
+			if got := lipgloss.Height(view); got > m.height {
+				t.Errorf("View height %d > terminal height %d (clip/overlap):\n%s", got, m.height, stripANSI(view))
+			}
+			plain := stripANSI(view)
+			if !strings.Contains(plain, "q quit") {
+				t.Errorf("bottom bar clipped: %q not found in View:\n%s", "q quit", plain)
+			}
+		})
 	}
 }

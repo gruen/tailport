@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -347,6 +348,16 @@ type refreshMsg struct {
 // (it's static for the session), keeping the heaviest call out of the poll.
 type fqdnMsg struct{ fqdn string }
 
+// detectOperatorMsg carries the result of tsserve.DetectOperatorNotSet's
+// best-effort, read-only proactive check (kata tapv). ok is false when the
+// check was inconclusive (e.g. an older tailscale without `debug prefs`) --
+// the Update handler then leaves m.operatorNotSet exactly as it was, rather
+// than treating "couldn't tell" as "it's fine".
+type detectOperatorMsg struct {
+	notSet bool
+	ok     bool
+}
+
 // refreshTickMsg fires on the periodic auto-refresh timer (e40f).
 type refreshTickMsg struct{}
 
@@ -484,6 +495,20 @@ type model struct {
 	flash      string
 	flashLevel flashLevel
 	flashID    int
+	// operatorNotSet is the STICKY counterpart to flash (kata tapv): a
+	// deliberate exception to the auto-dismiss toast, because tailscale's
+	// operator requirement is required-setup guidance, not a fleeting
+	// error. Unlike flash it survives keypresses and does NOT time out; it
+	// clears only when the underlying issue is actually resolved -- a
+	// successful serve/funnel toggle, or a re-check (proactively at
+	// startup, or on "r") confirming the operator is now set. See
+	// operatorHintText, and the detectOperatorMsg/toggleDoneMsg handlers.
+	operatorNotSet bool
+	// operatorUser is the OS username used to build the sticky hint's exact,
+	// copy-pasteable fix command ($USER EXPANDED, via tsserve.CurrentUsername
+	// resolved once in New) -- falls back to a "<you>" placeholder at render
+	// time if it couldn't be determined.
+	operatorUser string
 	// configPath is the resolved absolute path where preferences (the port
 	// registry: favorites, labels, locks) are persisted, captured once at
 	// New() from config.Path(cfg.ResolvedPath()) so the help overlay can
@@ -675,7 +700,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 		markersMode = markersOverride[0]
 	}
 
-	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(markersMode)}
+	return model{list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{}, portInput: ti, labelInput: li, sshInput: si, configPath: configPath, emoji: resolveEmoji(markersMode), operatorUser: tsserve.CurrentUsername()}
 }
 
 // Run launches the interactive TUI. markersOverride is an optional, run-only
@@ -695,7 +720,10 @@ const refreshInterval = 3 * time.Second
 func (m model) Init() tea.Cmd {
 	// FQDN is fetched once (it's static for the session; see fetchFQDN); the
 	// periodic tick then only re-reads the cheap serve/funnel state.
-	return tea.Batch(refresh, fetchFQDN, refreshTick())
+	// detectOperator is the best-effort proactive check (kata tapv): it runs
+	// once here so the sticky hint can appear before the user's first
+	// space-press, without waiting on a failed toggle.
+	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick())
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -765,6 +793,16 @@ func autoRefresh() tea.Msg {
 func fetchFQDN() tea.Msg {
 	fqdn, _ := tsserve.FQDN()
 	return fqdnMsg{fqdn: fqdn}
+}
+
+// detectOperator runs the proactive, read-only operator check (kata tapv):
+// batched into Init so the sticky hint can appear before the user's first
+// space-press, and re-run on a manual "r" refresh so fixing the operator
+// (then pressing r) clears the banner without needing another failed
+// attempt first.
+func detectOperator() tea.Msg {
+	notSet, ok := tsserve.DetectOperatorNotSet()
+	return detectOperatorMsg{notSet: notSet, ok: ok}
 }
 
 func toggle(port int, turnOn bool) tea.Cmd {
@@ -1085,12 +1123,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if legend := m.renderLegendWith(true); legend != "" {
 			legendLines = strings.Count(legend, "\n") + 1
 		}
+		// Reserve the WORST-CASE operator-hint banner height too (kata tapv),
+		// unconditionally -- like cleanEnabled=true above, NOT gated on the
+		// CURRENT m.operatorNotSet. The banner can appear asynchronously (a
+		// failed toggle's toggleDoneMsg, or the startup detectOperatorMsg)
+		// with no fresh WindowSizeMsg in between, so sizing done here has to
+		// already assume the worst case or a later appearance would clip the
+		// list by one row. operatorHintText() is always exactly one line (no
+		// embedded newlines), so the reservation is a constant 1.
+		const bannerLines = 1
 		// Reserve the persistent top header (one row) plus the bottom bar: one
 		// blank separator, the status line, and the grouped shortcuts legend.
 		// View then pads the gap so the bar lands on the last rows (see
 		// renderHeader / renderBottom).
 		headerLines := lipgloss.Height(m.renderHeader())
-		m.list.SetSize(msg.Width, msg.Height-headerLines-legendLines-2)
+		m.list.SetSize(msg.Width, msg.Height-headerLines-legendLines-bannerLines-2)
 		return m, nil
 
 	case refreshMsg:
@@ -1116,6 +1163,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case fqdnMsg:
 		if msg.fqdn != "" {
 			m.fqdn = msg.fqdn
+		}
+		return m, nil
+
+	case detectOperatorMsg:
+		// Only a CONCLUSIVE read (ok) ever changes the sticky hint: it can set
+		// it (proactive detection at startup) or clear it (a re-check on "r"
+		// confirming the user's `sudo tailscale set --operator=...` worked).
+		// An inconclusive read leaves whatever catch-on-first-failure already
+		// established alone.
+		if msg.ok {
+			m.operatorNotSet = msg.notSet
 		}
 		return m, nil
 
@@ -1157,11 +1215,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
+			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
+				// Deliberate exception to the auto-dismiss toast (q89g): this is
+				// required-setup guidance, not a fleeting error, so it gets the
+				// STICKY banner (operatorHintText) instead of a transient toast
+				// that would just flash the same information and vanish.
+				m.operatorNotSet = true
+				return m, refresh
+			}
 			// The error toast auto-dismisses (q89g); still refresh to reconcile
 			// state -- the toast survives a refresh now that notifications no
 			// longer live in a field the refresh clears.
 			return m, tea.Batch(m.setErr(msg.err.Error()), refresh)
 		}
+		// A successful serve/funnel toggle proves the operator issue, if any,
+		// is resolved -- clear the sticky banner without waiting for a "r"
+		// re-check.
+		m.operatorNotSet = false
 		return m, refresh
 
 	case cleanupDoneMsg:
@@ -1417,7 +1487,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, cmd
 		case "r":
-			return m, refresh
+			// Also re-run the proactive operator check (kata tapv): pressing r
+			// after fixing it (`sudo tailscale set --operator=...`) clears the
+			// sticky banner even without another serve attempt.
+			return m, tea.Batch(refresh, detectOperator)
 		case "c":
 			// Copy the selected port's TAILNET URL (http://<host>:<port>) to the
 			// clipboard, even when it isn't currently exposed -- the toast then
@@ -2948,6 +3021,33 @@ func (m model) markerLegend() string {
 		"🔒 locked   ★ favorite"
 }
 
+// OperatorSetupText is the prerequisites prose shared by the "?" overlay's
+// "Setup / prerequisites" section (see helpView) and `tailport quickstart`
+// (kata tapv), so the two can't drift apart -- mirroring how
+// KeyLegendGroups/RenderKeyLegendGroups already share the keybinding legend
+// between them. operatorUser is expected $USER EXPANDED (see
+// tsserve.CurrentUsername) so the fix command is directly copy-pasteable; a
+// "<you>" placeholder is substituted if it's empty (couldn't be determined).
+func OperatorSetupText(operatorUser string) string {
+	you := operatorUser
+	if you == "" {
+		you = "<you>"
+	}
+	return "tailscale itself requires an operator to be set before a non-root\n" +
+		"user can run `tailscale serve`/`funnel` -- without it you'll see\n" +
+		"\"Access denied\" the first time you press space. Run this once:\n" +
+		"  sudo tailscale set --operator=" + you + "\n" +
+		"(or run tailport itself with sudo). If it's not set yet, pressing\n" +
+		"space shows a persistent on-screen reminder with this exact command;\n" +
+		"press r afterward to re-check and clear it."
+}
+
+// operatorSetupText binds OperatorSetupText to this model's resolved
+// operator username, for helpView.
+func (m model) operatorSetupText() string {
+	return OperatorSetupText(m.operatorUser)
+}
+
 func (m model) helpView() string {
 	var b strings.Builder
 
@@ -2963,6 +3063,15 @@ func (m model) helpView() string {
 	b.WriteString(helpTitleStyle.Render("Markers"))
 	b.WriteString("\n")
 	b.WriteString(helpTextStyle.Render(m.markerLegend()))
+	b.WriteString("\n\n")
+	// "Setup / prerequisites" (kata tapv): a localized new section, styled the
+	// same way as Markers just above, deliberately kept OUT of
+	// RenderKeyLegendGroups/KeyLegendGroups -- that structure is sourced from
+	// keyMap.groups() and shared verbatim with the bottom-bar grid and
+	// `tailport quickstart`'s legend, and this isn't a keybinding.
+	b.WriteString(helpTitleStyle.Render("Setup / prerequisites"))
+	b.WriteString("\n")
+	b.WriteString(helpTextStyle.Render(m.operatorSetupText()))
 	b.WriteString("\n\n")
 	// Keys, grouped into the same five sections/order as the bottom-bar grid
 	// (Expose, Favorites, Protect, View, App) -- each section's own header stands
@@ -3125,6 +3234,24 @@ func (m model) statusText() string {
 	}
 }
 
+// operatorHintText returns the STICKY banner guiding the user through
+// tailscale's operator requirement (kata tapv), or "" when the hint isn't
+// active (see m.operatorNotSet). The fix command has $USER EXPANDED --
+// m.operatorUser, resolved once at New() via tsserve.CurrentUsername -- so
+// it's directly copy-pasteable, no manual substitution needed. Falls back
+// to a "<you>" placeholder in the unlikely case the OS username couldn't be
+// determined at all, so the line still reads sensibly.
+func (m model) operatorHintText() string {
+	if !m.operatorNotSet {
+		return ""
+	}
+	you := m.operatorUser
+	if you == "" {
+		you = "<you>"
+	}
+	return fmt.Sprintf("⚠ tailscale operator not set — run once: sudo tailscale set --operator=%s  (then press r)  — or run tailport with sudo", you)
+}
+
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
 // for that flow; otherwise it's the status line, with the shortcuts legend on
 // the last row(s). The Favorites|All-ports toggle lives in the top header
@@ -3180,6 +3307,15 @@ func (m model) renderBottom() string {
 		statusLine = toast.Render(m.flash)
 	}
 	bar := statusLine
+	// The sticky operator hint (kata tapv), when active, sits ABOVE the
+	// status line -- unlike the transient toast it never auto-dismisses, so
+	// it stays put through refreshes and keypresses that would otherwise
+	// clear m.flash. Styled via warnStyle (a NAMED style, not a hardcoded
+	// color) so it stays legible under any future light/dark AdaptiveColor
+	// conversion of that style.
+	if hint := m.operatorHintText(); hint != "" {
+		bar = warnStyle.Render(hint) + "\n" + bar
+	}
 	if legend := m.renderLegend(); legend != "" {
 		bar += "\n" + legend
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/gruen/tailport/internal/statusreport"
+	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -124,11 +125,13 @@ func TestRunUnknownSubcommand(t *testing.T) {
 	}
 }
 
-// TestRunQuickstart covers kata x4cg's acceptance bar: `tailport quickstart`
-// prints its onboarding text (what tailport does, its safety model, the
-// resolved config path, the full keybinding legend) to stdout, touches
-// stderr not at all, and exits 0 -- no TUI, no side effects (it must not
-// create a config file that didn't already exist: quickstart only reads).
+// TestRunQuickstart covers kata x4cg's acceptance bar (evolved by tapv):
+// `tailport quickstart` prints its onboarding text (what tailport does, a
+// prerequisites note on tailscale's operator requirement, its safety
+// model, the resolved config path, the full keybinding legend) to stdout,
+// touches stderr not at all, and exits 0 -- no TUI, no side effects (it
+// must not create a config file that didn't already exist: quickstart only
+// reads).
 func TestRunQuickstart(t *testing.T) {
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
@@ -146,6 +149,8 @@ func TestRunQuickstart(t *testing.T) {
 	for _, want := range []string{
 		// What tailport does.
 		"tailport exposes", "tailscale serve",
+		// Prerequisites: tailscale's own operator requirement (kata tapv).
+		"Prerequisites:", "operator", "sudo tailscale set --operator=",
 		// Safety model wording (AGENTS.md's design constraints).
 		"tailnet-only", "tailscale funnel", "public", "deliberate",
 		"p` key", "y/n confirm", ":22", "hard-blocked",
@@ -190,6 +195,32 @@ func TestRunQuickstartLegendMatchesOverlay(t *testing.T) {
 		want := ui.RenderKeyLegendGroups(ui.KeyLegendGroups(tc.emoji))
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("run([quickstart --markers %s]) stdout does not contain the shared grouped legend verbatim.\nwant substring:\n%s\ngot:\n%s", tc.markers, want, out.String())
+		}
+	}
+}
+
+// TestRunQuickstartPrerequisitesMatchesOverlay is the prerequisites-note
+// counterpart to TestRunQuickstartLegendMatchesOverlay (kata tapv):
+// `tailport quickstart`'s printed prerequisites section is (line-for-line,
+// modulo quickstart's two-space indent) the exact same
+// ui.OperatorSetupText the in-TUI "?" overlay's "Setup / prerequisites"
+// section renders, so the two can never drift apart. tsserve.CurrentUsername
+// is called from the test itself (not hardcoded) since both quickstart and
+// the test resolve it the same way on whatever machine runs this.
+func TestRunQuickstartPrerequisitesMatchesOverlay(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"quickstart"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("run([quickstart]) code = %d, want 0; stderr:\n%s", code, errOut.String())
+	}
+
+	want := ui.OperatorSetupText(tsserve.CurrentUsername())
+	got := out.String()
+	for _, line := range strings.Split(want, "\n") {
+		if !strings.Contains(got, "  "+line) {
+			t.Errorf("run([quickstart]) stdout missing prerequisites line %q (from the shared ui.OperatorSetupText); got:\n%s", line, got)
 		}
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/statusreport"
+	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -257,34 +258,45 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 	// should see the same legible colors --theme light gives the TUI.
 	ui.ApplyTheme(resolveThemeMode(cf.theme, cfg.Theme))
 
-	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveEmoji(markersMode)))
+	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveEmoji(markersMode), tsserve.CurrentUsername()))
 	return 0
 }
 
 // quickstartText builds `tailport quickstart`'s entire stdout output: a short
-// paragraph on what tailport does, its safety model (serve is tailnet-only
-// and the only automatic path; funnel is public and opt-in ONLY via the `p`
-// key behind a strong confirm; :22 is hard-blocked from funnel -- see
-// AGENTS.md's "Design constraints" section, which this wording tracks
-// closely), the resolved config path, and the full keybinding legend.
+// paragraph on what tailport does, a prerequisites note (tailscale's own
+// operator requirement -- kata tapv), its safety model (serve is
+// tailnet-only and the only automatic path; funnel is public and opt-in
+// ONLY via the `p` key behind a strong confirm; :22 is hard-blocked from
+// funnel -- see AGENTS.md's "Design constraints" section, which this
+// wording tracks closely), the resolved config path, and the full
+// keybinding legend.
 //
 // SINGLE SOURCE OF TRUTH: the grouped legend comes from ui.KeyLegendGroups,
 // rendered by ui.RenderKeyLegendGroups -- the exact same function calls
 // internal/ui.helpView uses for the in-TUI "?" overlay, and the same
 // keyMap.groups() grouping the bottom-bar grid uses. Nothing here hand-copies a
 // key, a section, or a description, so quickstart's legend cannot drift from
-// what "?" shows; a future edit has only one place to change.
+// what "?" shows; a future edit has only one place to change. The
+// prerequisites note is likewise shared verbatim with the "?" overlay via
+// ui.OperatorSetupText, so the two can't drift either.
 //
 // Kept as a pure string builder (like versionLine) rather than writing
 // straight to an io.Writer, so it's testable without stdout/exit-code
-// plumbing.
-func quickstartText(configPath string, emoji bool) string {
+// plumbing. operatorUser is passed in (rather than resolved here via
+// tsserve.CurrentUsername) so a test can pin it to a fixed value instead of
+// depending on whichever OS user happens to run the test.
+func quickstartText(configPath string, emoji bool, operatorUser string) string {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, "tailport exposes your machine's locally listening TCP ports across your")
 	fmt.Fprintln(&b, "tailnet. It discovers what's listening with `ss` (Linux) / `lsof` (macOS)")
 	fmt.Fprintln(&b, "and toggles `tailscale serve` on and off per port -- from an interactive")
 	fmt.Fprintln(&b, "list (run `tailport` with no arguments) or headlessly via its subcommands.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Prerequisites:")
+	for _, line := range strings.Split(ui.OperatorSetupText(operatorUser), "\n") {
+		fmt.Fprintln(&b, "  "+line)
+	}
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Safety model:")
 	fmt.Fprintln(&b, "  Tailnet-first. `tailscale serve` (tailnet-only exposure) is the default")
