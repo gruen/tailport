@@ -3110,14 +3110,42 @@ func (f *firework) glyph(br float64) rune {
 func (f *firework) draw(grid [][]styledCell, w, h int) {
 	switch f.stage {
 	case fwRising:
-		// A comet: bright head plus a few analytic samples behind it, fading.
+		// A comet: muted head plus a few analytic samples behind it, fading.
+		// (a2vq) Real fireworks ascend mostly dark -- the bright moment is the
+		// burst -- so the head is no longer pinned to br=1.0. Instead it's a
+		// faint ember (br~0.25) for most of the climb, with a brief soft
+		// warm-gold "gunpowder" glow (br~0.45) over the bottom ~15% of the
+		// flight that decays into the ember as the shell rises. The trail
+		// keeps its old relative comet fade (0.24/step), just measured off
+		// the muted head instead of a full-bright one.
+		frac := 1.0 // guard f.tExp<=0: treat as "past ignition" -> launch=0
+		if f.tExp > 0 {
+			frac = f.t / f.tExp
+		}
+		launch := math.Max(0, 1-frac/0.15) // 1 at ignition, ->0 by ~15% up
+		const ember = 0.25                 // faint coast brightness
+		headBr := ember + launch*(0.45-ember)
 		for k := 0; k < fwTrailLen; k++ {
 			tt := f.t - float64(k)
 			if tt < 0 {
 				break
 			}
-			br := 1 - 0.24*float64(k)
-			f.plot(grid, w, h, f.posX(tt), f.posY(tt), f.glyph(br), f.color(br, 0))
+			br := headBr - 0.24*float64(k)
+			if br < 0 {
+				br = 0
+			}
+			col := f.color(br, 0)
+			if launch > 0 {
+				// Some schemes use ANSI-index palettes (e.g. "196",
+				// eggSparkColors) that don't RGB-blend cleanly, so rather
+				// than crossfade numerically we just render the brief
+				// launch window in a fixed soft warm-gold ("gunpowder").
+				// It hands straight to the scheme colour once launch hits
+				// 0, and pairs with the existing gray muzzle-smoke puff
+				// (fwSmoke*) at the launch point.
+				col = lipgloss.Color("#ffb454")
+			}
+			f.plot(grid, w, h, f.posX(tt), f.posY(tt), f.glyph(br), col)
 		}
 	case fwBurst:
 		set := f.glyphSet()
