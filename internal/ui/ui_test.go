@@ -263,31 +263,53 @@ func TestSpaceGuardForReachablePorts(t *testing.T) {
 		return m
 	}
 
-	// B (wildcard bind, unserved): space no-ops with the "nothing to serve"
-	// info toast, no toggle begun.
+	// B (wildcard bind, unserved, non-:22): space no-ops with the general
+	// "app bound wide (0.0.0.0)" info toast (83wv pt2 -- reworded from the
+	// old "nothing to serve" line to be honest about WHY and actionable
+	// about how to make it toggleable), no toggle begun.
+	const wantGeneralWildcard = "already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable"
 	m := newModel(8080, portscan.ScopeWildcard, false)
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	got := res.(model)
 	if got.pending != 0 {
 		t.Errorf("space on a B (tailnet) port should not begin a toggle; pending = %d", got.pending)
 	}
-	if got.flashLevel != flashInfo || !strings.Contains(got.flash, "already on tailnet") {
-		t.Errorf("space on a B port flash = %q (level=%v), want an info 'already on tailnet' toast", got.flash, got.flashLevel)
+	if got.flashLevel != flashInfo || got.flash != wantGeneralWildcard {
+		t.Errorf("space on a B port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantGeneralWildcard)
 	}
 	if cmd == nil {
 		t.Error("space on a B port should still return the toast's flash cmd")
 	}
 
+	// B (wildcard bind, unserved, :22 -- the operator's own live SSH port):
+	// space no-ops with the DEDICATED SSH variant, not the general
+	// "rebind to localhost" line, which would be nonsensical (and
+	// self-locking) advice for sshd (83wv pt2).
+	const wantSSHVariant = "already on tailnet as SSH — this is how you're connected; nothing for tailport to serve"
+	m = newModel(22, portscan.ScopeWildcard, false)
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	got = res.(model)
+	if got.pending != 0 {
+		t.Errorf("space on a wildcard-bound :22 port should not begin a toggle; pending = %d", got.pending)
+	}
+	if got.flashLevel != flashInfo || got.flash != wantSSHVariant {
+		t.Errorf("space on a wildcard-bound :22 port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantSSHVariant)
+	}
+	if cmd == nil {
+		t.Error("space on a wildcard-bound :22 port should still return the toast's flash cmd")
+	}
+
 	// B' (specific LAN IP, unserved): space no-ops with the "can't reach this
-	// bind" info toast, no toggle begun.
+	// bind" info toast, no toggle begun -- unchanged by 83wv pt2.
+	const wantLAN = "on your LAN only; serve can't reach this bind"
 	m = newModel(3000, portscan.ScopeLAN, false)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	got = res.(model)
 	if got.pending != 0 {
 		t.Errorf("space on a B' (LAN) port should not begin a toggle; pending = %d", got.pending)
 	}
-	if got.flashLevel != flashInfo || !strings.Contains(got.flash, "on your LAN only") {
-		t.Errorf("space on a B' port flash = %q (level=%v), want an info LAN-only toast", got.flash, got.flashLevel)
+	if got.flashLevel != flashInfo || got.flash != wantLAN {
+		t.Errorf("space on a B' port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantLAN)
 	}
 
 	// A (loopback bind, unserved): space still initiates the toggle -- the

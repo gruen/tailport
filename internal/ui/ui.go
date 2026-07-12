@@ -2031,7 +2031,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !sel.active {
 				switch sel.reach() {
 				case reachTailnet:
-					return m, m.setFlash("already on tailnet — nothing to serve", flashInfo)
+					if sel.port.Number == 22 {
+						// :22 is the operator's own live SSH port (they may be
+						// connected over it right now). "rebind to localhost" is
+						// nonsense for sshd (you don't HTTP-serve SSH) and would
+						// lock them out -- so a dedicated, non-actionable line.
+						return m, m.setFlash("already on tailnet as SSH — this is how you're connected; nothing for tailport to serve", flashInfo)
+					}
+					// Wildcard bind owned by the APP (0.0.0.0), not a tailport
+					// serve, so there's no mapping to toggle. Honest about WHY,
+					// and actionable: rebinding to loopback -> reach()==reachLocalhost,
+					// which the guard does NOT block -> space then serves it.
+					return m, m.setFlash("already on tailnet — app bound wide (0.0.0.0), not tailport; rebind it to localhost (or 127.0.0.1) to make serve toggleable", flashInfo)
 				case reachLAN:
 					return m, m.setFlash("on your LAN only; serve can't reach this bind", flashInfo)
 				}
