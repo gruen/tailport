@@ -4282,3 +4282,225 @@ func TestOperatorHintSizingNoClip(t *testing.T) {
 		})
 	}
 }
+
+// --- 9gys: multi-column grid layout ---------------------------------------
+
+// TestGridCols pins gridCols' width->column-count table: roughly one column
+// per minColWidth cells, clamped to maxCols, never less than 1. See gridCols'
+// own doc comment for the boundary caveat TestGridColWidth below covers.
+func TestGridCols(t *testing.T) {
+	cases := []struct{ width, want int }{
+		{60, 1}, {99, 1}, {100, 2}, {149, 2}, {150, 3}, {300, 3}, {10, 1},
+	}
+	for _, tc := range cases {
+		if got := gridCols(tc.width); got != tc.want {
+			t.Errorf("gridCols(%d) = %d, want %d", tc.width, got, tc.want)
+		}
+	}
+}
+
+// TestGridColWidth pins the exact per-column-width formula, and separately
+// checks the minColWidth floor holds once a width is comfortably inside a
+// column tier (not immediately at the tier's own transition point -- see
+// gridCols' doc comment: gridCols(100)==2 and gridCols(150)==3 are pinned
+// exact test values that put the resulting cell 1-2 cells UNDER minColWidth
+// right at those two boundaries, which a stricter gridCols could avoid only
+// by changing those two pinned outputs).
+func TestGridColWidth(t *testing.T) {
+	if got := gridColWidth(150, 3); got != 48 {
+		t.Errorf("gridColWidth(150, 3) = %d, want 48 ((150-2*2)/3)", got)
+	}
+	if got := gridColWidth(80, 1); got != 80 {
+		t.Errorf("gridColWidth(80, 1) = %d, want 80 (single column, no gutter)", got)
+	}
+	// Right at the tier boundary, the naive split can undershoot -- accepted,
+	// see gridCols' doc comment.
+	if got := gridColWidth(100, gridCols(100)); got != 49 {
+		t.Errorf("gridColWidth(100, %d) = %d, want 49 (documented under minColWidth at this exact boundary)", gridCols(100), got)
+	}
+	// A few columns past the boundary, the floor holds again.
+	for _, w := range []int{102, 154, 200, 300} {
+		cols := gridCols(w)
+		if cw := gridColWidth(w, cols); cols >= 2 && cw < minColWidth {
+			t.Errorf("gridColWidth(%d, %d) = %d, want >= minColWidth (%d)", w, cols, cw, minColWidth)
+		}
+	}
+}
+
+// TestGridRows pins gridRows' body-height -> row-count formula: r rows of
+// itemHeight with (r-1) spacing gaps fit in h.
+func TestGridRows(t *testing.T) {
+	cases := []struct{ h, itemHeight, spacing, want int }{
+		{30, 2, 1, 10},
+		{2, 2, 1, 1},
+		{5, 2, 1, 2},
+	}
+	for _, tc := range cases {
+		if got := gridRows(tc.h, tc.itemHeight, tc.spacing); got != tc.want {
+			t.Errorf("gridRows(%d, %d, %d) = %d, want %d", tc.h, tc.itemHeight, tc.spacing, got, tc.want)
+		}
+	}
+}
+
+// TestGridColumnMajorPlacement covers gridPlacement, the pure helper
+// renderGrid uses to fan a page's items out column-major: a column fills
+// top-to-bottom before the next one starts.
+func TestGridColumnMajorPlacement(t *testing.T) {
+	const rows = 4
+	cases := []struct{ k, wantCol, wantRow int }{
+		{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3},
+		{4, 1, 0}, {7, 1, 3},
+		{8, 2, 0}, {11, 2, 3},
+	}
+	for _, tc := range cases {
+		col, row := gridPlacement(tc.k, rows)
+		if col != tc.wantCol || row != tc.wantRow {
+			t.Errorf("gridPlacement(%d, %d) = (%d, %d), want (%d, %d)", tc.k, rows, col, row, tc.wantCol, tc.wantRow)
+		}
+	}
+}
+
+// TestAvailableDescriptionWidthPerColumn covers the fix availableDescriptionWidth
+// needed for 9gys: the inline "✓ copied" fit check must budget against the
+// per-column width in a multi-column layout, not the full terminal width, or
+// copyURL would think a suffix fits when the column it actually renders into
+// is much narrower. At a width that stays single-column it's unchanged from
+// before 9gys (colWidth == width).
+func TestAvailableDescriptionWidthPerColumn(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	pad := descTruncateStyle.GetPaddingLeft() + descTruncateStyle.GetPaddingRight()
+
+	narrow := New(config.Config{})
+	narrow.width = 80
+	if cols, _, _ := narrow.gridDims(); cols != 1 {
+		t.Fatalf("width 80 should stay single-column, got %d cols", cols)
+	}
+	if got, want := narrow.availableDescriptionWidth(), 80-pad; got != want {
+		t.Errorf("width 80 (1 col) availableDescriptionWidth = %d, want %d (== width-pad)", got, want)
+	}
+
+	wide := New(config.Config{})
+	wide.width = 150
+	cols, _, colWidth := wide.gridDims()
+	if cols != 3 {
+		t.Fatalf("width 150 should choose 3 columns, got %d", cols)
+	}
+	if got, want := wide.availableDescriptionWidth(), colWidth-pad; got != want {
+		t.Errorf("width 150 (3 cols) availableDescriptionWidth = %d, want %d (== colWidth-pad)", got, want)
+	}
+	if got, narrowGot := wide.availableDescriptionWidth(), narrow.availableDescriptionWidth(); got >= narrowGot {
+		t.Errorf("3-column availableDescriptionWidth (%d) should be MUCH less than 1-column (%d)", got, narrowGot)
+	}
+}
+
+// TestGridNavLeftRight covers the ONE genuinely new nav move the grid needs:
+// Left/Right jump exactly one column over (±rows), same row -- intercepted
+// before m.list.Update so bubbles/list's own left/right-bound
+// PrevPage/NextPage default keys don't also fire. Down still flows through
+// to m.list.Update unmodified and must still advance Index() by exactly 1
+// (column-major fill means a linear +1 already walks down a column and
+// wraps to the next column's top, so Down needs no special-casing -- see
+// gridDims' doc comment on why Index()/Select() stay accurate regardless of
+// the list's own internal PerPage).
+func TestGridNavLeftRight(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	var ports []portscan.Port
+	for i := 0; i < 12; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("p%d", i)})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = res.(model)
+
+	cols, rows, _ := m.gridDims()
+	if cols != 2 {
+		t.Fatalf("width 120 should choose 2 columns, got %d", cols)
+	}
+	if rows < 2 {
+		t.Fatalf("need at least 2 rows per column for this test to be meaningful, got %d rows", rows)
+	}
+
+	m.list.Select(0)
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = res.(model)
+	if got := m.list.Index(); got != rows {
+		t.Errorf("after Right from index 0, Index() = %d, want %d (rows)", got, rows)
+	}
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = res.(model)
+	if got := m.list.Index(); got != 0 {
+		t.Errorf("after Left back, Index() = %d, want 0", got)
+	}
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = res.(model)
+	if got := m.list.Index(); got != 1 {
+		t.Errorf("after Down from index 0, Index() = %d, want 1 (native list handling, untouched by 9gys)", got)
+	}
+}
+
+// TestRenderGridNoOverflow covers the width-containment requirement: no
+// rendered grid line ever exceeds the terminal width, at a width wide enough
+// to pick the max column count.
+func TestRenderGridNoOverflow(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	var ports []portscan.Port
+	for i := 0; i < 20; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i)})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m = res.(model)
+
+	for _, ln := range strings.Split(m.renderGrid(), "\n") {
+		if w := lipgloss.Width(ln); w > m.width {
+			t.Errorf("renderGrid line exceeds terminal width %d (got %d): %q", m.width, w, stripANSI(ln))
+		}
+	}
+}
+
+// TestRenderGridPageIndicator covers the "more below/next page" affordance
+// renderGrid restores now that it no longer uses bubbles/list's own
+// paginator: a compact "page N/M" line appears exactly when there's more
+// than one page, and moving selection to a later page changes it.
+func TestRenderGridPageIndicator(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i)})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m = res.(model)
+
+	cols, rows, _ := m.gridDims()
+	perPage := cols * rows
+	if perPage >= 40 {
+		t.Skip("terminal fits all 40 ports on one page; nothing to page through here")
+	}
+
+	grid := stripANSI(m.renderGrid())
+	if !strings.Contains(grid, "page 1/") {
+		t.Errorf("expected a page indicator on a multi-page grid, got:\n%s", grid)
+	}
+
+	m.list.Select(len(m.list.VisibleItems()) - 1)
+	grid = stripANSI(m.renderGrid())
+	if strings.Contains(grid, "page 1/") {
+		t.Errorf("selecting the last item should move off page 1, got:\n%s", grid)
+	}
+}

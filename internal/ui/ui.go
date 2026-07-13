@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -630,10 +631,16 @@ const (
 
 type model struct {
 	list list.Model
-	help help.Model
-	keys keyMap
-	cfg  config.Config
-	host string
+	// delegate is the SAME portDelegate instance handed to list.New (list.Model
+	// exposes no public delegate getter) -- kept here too so renderGrid can
+	// reuse it directly to render each grid cell (identical
+	// selection/dimmed/ANSI styling to the old single-column list.View()
+	// path) and so gridDims can read its Height()/Spacing() for row math.
+	delegate portDelegate
+	help     help.Model
+	keys     keyMap
+	cfg      config.Config
+	host     string
 	// fqdn is this node's MagicDNS name (host.tailnet.ts.net), refreshed
 	// alongside serve/funnel status and used to build public funnel URLs.
 	fqdn string
@@ -898,7 +905,8 @@ func ApplyTheme(mode string) {
 func New(cfg config.Config, markersOverride ...string) model {
 	host, _ := os.Hostname()
 
-	l := list.New(nil, newPortDelegate(), 0, 0)
+	del := newPortDelegate()
+	l := list.New(nil, del, 0, 0)
 	// The "tailport" wordmark now lives in View()'s persistent header
 	// (renderHeader), drawn above both the list and the empty state, so the
 	// list's own built-in title is turned off to avoid rendering it twice.
@@ -975,7 +983,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 	}
 
 	return model{
-		list: l, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
+		list: l, delegate: del, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
 		portInput: ti, labelInput: li, sshInput: si, configPath: configPath,
 		// emoji (egg/fireworks) always auto-detects, independent of markersMode.
 		emoji: emojiCapable(),
@@ -1184,13 +1192,106 @@ const copiedSuffix = "  ✓ copied"
 // on every call.
 var descTruncateStyle = list.NewDefaultDelegate().Styles.NormalTitle
 
+// Grid layout constants (9gys): minColWidth is the narrowest a single
+// column's cell is ever allowed to be, maxCols caps how many side-by-side
+// columns a very wide terminal ever grows to, and colGutter is the blank gap
+// between adjacent columns. See gridCols/gridColWidth/gridRows.
+const (
+	minColWidth = 50
+	maxCols     = 3
+	colGutter   = 2
+)
+
+// gridCols returns how many side-by-side columns fit a terminal of the given
+// width: roughly one per minColWidth cells, clamped to maxCols and never
+// less than 1 (so a very narrow terminal still gets a single, ordinary
+// column). Below minColWidth it's always 1.
+//
+// NOTE (boundary caveat): this is the naive width/minColWidth floor-division
+// split the kata spec pins exact test values against (gridCols(100)==2,
+// gridCols(150)==3, ...). Right AT those transition widths the resulting
+// gridColWidth dips a couple of cells below minColWidth (e.g.
+// gridColWidth(100, 2) == 49, gridColWidth(150, 3) == 48) before recovering
+// a few columns later (>=102 and >=154 respectively) -- see
+// TestGridColWidth. A stricter gridCols that floors on colWidth>=minColWidth
+// at every width would change gridCols(100) to 1 and gridCols(150) to 2,
+// contradicting the pinned test table, so this deliberately keeps the exact
+// formula given rather than "fixing" it unilaterally; the undershoot is at
+// most 2 cells and self-heals a few columns later.
+func gridCols(width int) int {
+	if width < minColWidth {
+		return 1
+	}
+	c := width / minColWidth
+	if c > maxCols {
+		c = maxCols
+	}
+	if c < 1 {
+		c = 1
+	}
+	return c
+}
+
+// gridColWidth is the per-column cell width given the terminal width and
+// column count (colGutter-wide gutters between columns, none at the outer
+// edges).
+func gridColWidth(width, cols int) int {
+	if cols < 1 {
+		cols = 1
+	}
+	return (width - colGutter*(cols-1)) / cols
+}
+
+// gridRows is how many item rows fit a body of height h, given the
+// delegate's per-item height and the spacing between items: r rows of
+// itemHeight with (r-1) spacing gaps between them fit in h.
+func gridRows(h, itemHeight, spacing int) int {
+	unit := itemHeight + spacing
+	if unit < 1 {
+		unit = 1
+	}
+	r := (h + spacing) / unit
+	if r < 1 {
+		r = 1
+	}
+	return r
+}
+
+// gridPlacement maps a window-relative item index k (0-based) to its
+// column-major (col, row) position in a grid with the given row count: a
+// column fills top-to-bottom before the next column starts (like a
+// newspaper), so the k-th item lands at column k/rows, row k%rows.
+func gridPlacement(k, rows int) (col, row int) {
+	if rows < 1 {
+		rows = 1
+	}
+	return k / rows, k % rows
+}
+
+// gridDims computes the current grid layout from the model's terminal width
+// and available body height: cols (gridCols), rows (gridRows, from the same
+// body height resizeList gives m.list -- see listBodyHeight), and colWidth
+// (gridColWidth). renderGrid, availableDescriptionWidth, and the Left/Right
+// grid-nav keys all derive from this single computation so they can never
+// disagree about the current layout.
+func (m model) gridDims() (cols, rows, colWidth int) {
+	cols = gridCols(m.width)
+	colWidth = gridColWidth(m.width, cols)
+	rows = gridRows(m.listBodyHeight(), m.delegate.Height(), m.delegate.Spacing())
+	return cols, rows, colWidth
+}
+
 // availableDescriptionWidth returns the width (in cells) the list delegate
-// truncates a row's title/description to, given the model's current
-// terminal width -- the same budget bubbles/list enforces at render time, so
-// inlineCopyFits can decide whether the "✓ copied" suffix will actually be
-// visible before copyURL appends it.
+// truncates a row's title/description to, given the model's current PER-
+// COLUMN width (9gys: multi-column layouts render each cell at colWidth, not
+// the full terminal width) -- the same budget bubbles/list enforces at
+// render time, so inlineCopyFits can decide whether the "✓ copied" suffix
+// will actually be visible before copyURL appends it. At a single-column
+// width this is identical to the pre-9gys width-based budget, since
+// gridColWidth(width, 1) == width.
 func (m *model) availableDescriptionWidth() int {
-	return m.width - descTruncateStyle.GetPaddingLeft() - descTruncateStyle.GetPaddingRight()
+	_, _, colWidth := m.gridDims()
+	return colWidth - descTruncateStyle.GetPaddingLeft() - descTruncateStyle.GetPaddingRight()
 }
 
 // inlineCopyFits reports whether appending copiedSuffix to a description of
@@ -1945,6 +2046,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "left", "right":
+			// Grid column jump (9gys): the one genuinely NEW nav move the
+			// column-major grid needs -- move one column over, same row --
+			// intercepted here, BEFORE the fallthrough to m.list.Update,
+			// so bubbles/list's own left/right-bound PrevPage/NextPage
+			// default keys never also fire and double-move the selection.
+			// Deliberately ARROW KEYS ONLY: "h"/"l" are left bound to the
+			// list's native PrevPage/NextPage (h) and this app's own "l"
+			// label shortcut (l, handled below) respectively, so hijacking
+			// either would either collide with "l" or need a second
+			// carve-out -- not worth it for a key with an arrow equivalent.
+			// Up/Down/PgUp/PgDn/Home/End/j/k deliberately are NOT
+			// intercepted: they already fall through to m.list.Update below
+			// and land on the right Index() there -- CursorUp/CursorDown
+			// move it by exactly ±1 and GoToStart/GoToEnd snap to 0/len-1
+			// regardless of the list's own internal PerPage, because
+			// Index()/Select() are self-consistent by construction
+			// (Page*PerPage+cursor round-trips any index); see gridDims'
+			// doc comment. PgUp/PgDn still jump by the list's own
+			// single-column PerPage rather than the grid's cols*rows page
+			// size -- a known, accepted imprecision (not a correctness bug:
+			// it's still a monotonic, in-bounds jump) rather than fight
+			// bubbles/list's paginator to make it exact.
+			items := m.list.VisibleItems()
+			if len(items) == 0 {
+				return m, nil
+			}
+			_, rows, _ := m.gridDims()
+			if rows < 1 {
+				rows = 1
+			}
+			sel := m.list.Index()
+			target := sel - rows
+			if msg.String() == "right" {
+				target = sel + rows
+			}
+			if target < 0 {
+				target = 0
+			}
+			if last := len(items) - 1; target > last {
+				target = last
+			}
+			m.list.Select(target)
+			return m, nil
 		case "/":
 			// Widen scope to ALL listening ports BEFORE handing "/" to the list
 			// (4ye6): the list snapshots its current items when filtering
@@ -4282,19 +4427,17 @@ func (m model) operatorHintText() string {
 	return fmt.Sprintf("⚠ tailscale operator not set — run once: sudo tailscale set --operator=%s  (then press r)  — or run tailport with sudo", you)
 }
 
-// resizeList recomputes the bubbles/list viewport height from the current
-// terminal size and every reservation the bottom bar makes below it, then
-// applies it via list.SetSize. It's called from the WindowSizeMsg handler
-// (m.width/m.height just changed) and again from every site that mutates
-// m.flash (set or clear), because a wrapped multi-line toast changes
-// renderStatusLine's height without any resize -- so the list's reserved
-// height has to track it live, shrinking while a wrapped toast shows and
-// growing back the moment it clears, or the two would either overlap or
-// leave a stale gap. A no-op before the first WindowSizeMsg (m.width/height
-// still zero).
-func (m *model) resizeList() {
+// listBodyHeight computes the vertical space available for the port grid/
+// list body: the current terminal height minus every reservation the bottom
+// bar (and now the grid's own page indicator) makes below it. Factored out
+// of resizeList (9gys) so gridDims -- and thus renderGrid's row count and
+// the Left/Right grid-nav jump distance -- shares the EXACT same height
+// accounting resizeList feeds to m.list.SetSize; the two must never drift
+// apart or the grid would compute a different row count than the space
+// list.Model itself was actually given.
+func (m model) listBodyHeight() int {
 	if m.width <= 0 || m.height <= 0 {
-		return
+		return 1
 	}
 	// Reserve the WORST-CASE legend height -- render it as if a dangling
 	// forward were present (cleanEnabled=true) so the grouped grid/bar always
@@ -4327,11 +4470,40 @@ func (m *model) resizeList() {
 	// mutation site calls resizeList so the reservation is always current by
 	// the next render.
 	statusLines := lipgloss.Height(m.renderStatusLine())
-	h := m.height - headerLines - legendLines - bannerLines - 1 - statusLines
+	// pageIndicatorLines reserves a constant 1 line for renderGrid's compact
+	// "page N/M" line (blank when the grid is single-page), so the body
+	// height -- and thus gridDims' row count -- never shifts as pagination
+	// appears or disappears between resizes (9gys; mirrors the bannerLines
+	// worst-casing above).
+	const pageIndicatorLines = 1
+	h := m.height - headerLines - legendLines - bannerLines - 1 - statusLines - pageIndicatorLines
 	if h < 1 {
 		h = 1
 	}
-	m.list.SetSize(m.width, h)
+	return h
+}
+
+// resizeList recomputes the bubbles/list viewport height (listBodyHeight)
+// and applies it via list.SetSize -- still needed even though the grid body
+// is now rendered by renderGrid rather than list.View(), because list.Model
+// uses m.width/m.height to size its own internal state: FilterInput.Width
+// (renderFilterRow renders it directly) and the keybinding/pagination
+// enablement m.list.Update relies on for Up/Down/PgUp/PgDn/Home/End (9gys;
+// see gridDims' doc comment -- those keys stay correct under the grid
+// because Index()/Select() are self-consistent regardless of the list's own
+// internal PerPage, not because this height happens to equal the grid's
+// page size). It's called from the WindowSizeMsg handler (m.width/m.height
+// just changed) and again from every site that mutates m.flash (set or
+// clear), because a wrapped multi-line toast changes renderStatusLine's
+// height without any resize -- so the list's reserved height has to track it
+// live, shrinking while a wrapped toast shows and growing back the moment it
+// clears, or the two would either overlap or leave a stale gap. A no-op
+// before the first WindowSizeMsg (m.width/height still zero).
+func (m *model) resizeList() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	m.list.SetSize(m.width, m.listBodyHeight())
 }
 
 // renderStatusLine renders the bottom bar's status portion: a transient toast
@@ -4427,6 +4599,95 @@ func (m model) renderBottom() string {
 	return bar
 }
 
+// renderGrid lays out the current page of the port list in gridDims' cols
+// side-by-side columns (1 on an ordinary terminal, up to maxCols on a wide
+// one), taking over LAYOUT and paging from bubbles/list while list.Model
+// stays the single source of truth for STATE -- Items/VisibleItems, Index,
+// Select, FilterState (9gys). It pages off m.list.Index() directly rather
+// than the list's own internal paginator (which bubbles/list sizes for a
+// single column and which this code never touches): perPage = cols*rows,
+// and the window is VisibleItems()[page*perPage : ...].
+//
+// Each cell in the window is rendered by REUSING m.delegate -- the exact
+// same delegate list.New(nil, del, ...) was built with -- on a scratch copy
+// of m.list (sl) whose width is narrowed to the column width. m is already a
+// value copy (View/renderGrid have value receivers), so mutating sl is safe
+// and never leaks back to the real m.list. Because sl.Index() == m.list.Index()
+// == sel unchanged, the delegate still selects/highlights the right cell,
+// and dimmed/ANSI styling is byte-identical to the old single-column
+// list.View() path -- only the surrounding layout differs.
+//
+// Items fill COLUMN-MAJOR (gridPlacement): the k-th window item lands at
+// column k/rows, row k%rows, so a column reads top-to-bottom before
+// wrapping to the next, like a newspaper.
+func (m model) renderGrid() string {
+	cols, rows, colWidth := m.gridDims()
+	items := m.list.VisibleItems()
+	perPage := cols * rows
+	if perPage < 1 {
+		perPage = 1
+	}
+	sel := m.list.Index()
+	page := sel / perPage
+	start := page * perPage
+	end := start + perPage
+	if end > len(items) {
+		end = len(items)
+	}
+	window := items[start:end]
+
+	sl := m.list
+	sl.SetWidth(colWidth)
+	spacing := m.delegate.Spacing()
+
+	columns := make([][]string, cols)
+	for k, it := range window {
+		var buf bytes.Buffer
+		m.delegate.Render(&buf, sl, start+k, it)
+		c, _ := gridPlacement(k, rows)
+		columns[c] = append(columns[c], buf.String())
+	}
+
+	// Join each column's cells vertically with `spacing` blank line(s)
+	// between them (matching the delegate's own inter-item gap), then pad
+	// every column to the tallest one's line count so JoinHorizontal aligns
+	// them on a common baseline, with a colGutter-wide blank gutter between
+	// columns.
+	colStrs := make([]string, cols)
+	tallest := 0
+	for c := 0; c < cols; c++ {
+		colStrs[c] = strings.Join(columns[c], strings.Repeat("\n", spacing+1))
+		if hgt := lipgloss.Height(colStrs[c]); hgt > tallest {
+			tallest = hgt
+		}
+	}
+	gutter := lipgloss.NewStyle().Width(colGutter).Height(tallest).Render("")
+	parts := make([]string, 0, cols*2-1)
+	for c := 0; c < cols; c++ {
+		block := colStrs[c]
+		if pad := tallest - lipgloss.Height(block); pad > 0 {
+			block += strings.Repeat("\n", pad)
+		}
+		parts = append(parts, lipgloss.NewStyle().Width(colWidth).Render(block))
+		if c < cols-1 {
+			parts = append(parts, gutter)
+		}
+	}
+	grid := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+
+	// A compact "page N/M" indicator when there's more than one page, so the
+	// more-below/next-page affordance bubbles/list's own paginator used to
+	// give isn't lost. Always emitted as exactly one line -- blank when
+	// there's only one page -- so listBodyHeight's pageIndicatorLines
+	// reservation never has to change between single- and multi-page states.
+	indicator := ""
+	if len(items) > perPage {
+		totalPages := (len(items) + perPage - 1) / perPage
+		indicator = helpStyle.Render(fmt.Sprintf("page %d/%d", page+1, totalPages))
+	}
+	return grid + "\n" + indicator
+}
+
 func (m model) View() string {
 	if m.showEgg {
 		return m.eggView()
@@ -4458,7 +4719,7 @@ func (m model) View() string {
 	case len(m.list.Items()) == 0 && !filtering:
 		body += m.renderEmptyState()
 	default:
-		body += m.list.View()
+		body += m.renderGrid()
 	}
 
 	// Pin the bottom bar (shortcuts, status -- or a modal prompt) to the last
