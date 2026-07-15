@@ -66,7 +66,11 @@ func runUpdate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	u := selfupdate.NewUpdater(version)
+	// buildVersion(), not the raw stamp: a `go install` build knows its real
+	// module version, and without it the updater would treat itself as a dev
+	// build (older than every release) and offer an "upgrade" to what's
+	// already installed.
+	u := selfupdate.NewUpdater(buildVersion())
 	if v := os.Getenv(envUpdateAPIURL); v != "" {
 		u.APIBase = v
 	}

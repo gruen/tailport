@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -36,6 +37,63 @@ func TestVersionLine(t *testing.T) {
 	version = "0.1.1"
 	if got := versionLine(); got != "tailport 0.1.1" {
 		t.Errorf("with injected version, versionLine() = %q, want %q", got, "tailport 0.1.1")
+	}
+}
+
+// TestResolveVersion covers the `go install` version fix. `go install` applies
+// no -ldflags, so main.version stays "dev" -- but Go embeds the module version
+// in the binary, and that's the real answer. The risk being tested is the other
+// direction: Go synthesizes Main.Version for builds with NO tag behind them
+// too, and reporting one of those as a release would make a random working tree
+// look like the shipped artifact.
+func TestResolveVersion(t *testing.T) {
+	bi := func(v string) *debug.BuildInfo {
+		return &debug.BuildInfo{Main: debug.Module{Version: v}}
+	}
+	for _, tc := range []struct {
+		name    string
+		stamped string
+		bi      *debug.BuildInfo
+		ok      bool
+		want    string
+	}{
+		// The stamp is authoritative wherever it exists: releases, AUR, brew.
+		{"ldflags stamp wins", "0.1.4", bi("v0.1.3"), true, "0.1.4"},
+		{"stamp wins even over no build info", "0.1.4", nil, false, "0.1.4"},
+
+		// The fix: `go install ...@latest` of a real tag.
+		{"go install of a tag", devVersion, bi("v0.1.4"), true, "0.1.4"},
+		{"go install of a prerelease tag", devVersion, bi("v0.2.0-rc1"), true, "0.2.0-rc1"},
+
+		// Everything with no tag behind it must stay "dev".
+		{"local go build (pseudo-version + dirty)", devVersion, bi("v0.1.4-0.20260713001843-f1c0508a5634+dirty"), true, devVersion},
+		{"go install of a bare commit (pseudo-version)", devVersion, bi("v0.1.4-0.20260713001843-f1c0508a5634"), true, devVersion},
+		{"devel placeholder", devVersion, bi("(devel)"), true, devVersion},
+		{"empty module version", devVersion, bi(""), true, devVersion},
+		{"build metadata", devVersion, bi("v0.1.4+incompatible"), true, devVersion},
+		{"no build info at all", devVersion, nil, false, devVersion},
+		{"not a semver", devVersion, bi("banana"), true, devVersion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveVersion(tc.stamped, tc.bi, tc.ok); got != tc.want {
+				t.Errorf("resolveVersion(%q, %+v, %v) = %q, want %q", tc.stamped, tc.bi, tc.ok, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveVersionReturnsBareSemver pins the convention both version paths
+// must share: -ldflags stamps a BARE semver (build.yml passes
+// ${GITHUB_REF_NAME#v}), so the module-info fallback has to strip the "v" too.
+// If it didn't, `go install` builds would print "tailport v0.1.4" while release
+// builds print "tailport 0.1.4", and the TUI header would read "vv0.1.4".
+func TestResolveVersionReturnsBareSemver(t *testing.T) {
+	got := resolveVersion(devVersion, &debug.BuildInfo{Main: debug.Module{Version: "v0.1.4"}}, true)
+	if strings.HasPrefix(got, "v") {
+		t.Errorf("resolveVersion returned %q, want a bare semver with no leading 'v'", got)
+	}
+	if got != "0.1.4" {
+		t.Errorf("resolveVersion = %q, want %q", got, "0.1.4")
 	}
 }
 

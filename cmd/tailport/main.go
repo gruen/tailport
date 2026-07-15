@@ -8,27 +8,96 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
 	"github.com/gruen/tailport/internal/config"
+	"github.com/gruen/tailport/internal/selfupdate"
 	"github.com/gruen/tailport/internal/statusreport"
 	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
 )
 
+// devVersion is the version string of a build with no identifiable release
+// version: an honest "I don't know", not a value anything should parse.
+const devVersion = "dev"
+
 // version is the build version, injected at release time via the linker:
 // -ldflags "-X main.version=<pkgver>" (see .github/workflows/build.yml and the
-// AUR PKGBUILDs). It stays "dev" for plain `go build`/`go run` so an
-// unversioned local build is self-evident.
-var version = "dev"
+// AUR PKGBUILDs). It stays "dev" for plain `go build`/`go run`. Read it via
+// buildVersion(), not directly -- an unstamped `go install` can still recover
+// the real version from the module info Go embeds.
+var version = devVersion
+
+// pseudoVersionRe matches the timestamp-and-commit tail Go synthesizes for a
+// module version with no release tag behind it -- the "20260713001843-f1c0508a5634"
+// in v0.1.4-0.20260713001843-f1c0508a5634. It's the marker that distinguishes a
+// PSEUDO-version (an untagged commit, or a build from a working tree) from a
+// real published tag, and it's why buildVersion can't just trust Main.Version.
+var pseudoVersionRe = regexp.MustCompile(`\d{14}-[0-9a-f]{12}`)
+
+// buildVersion reports the version this binary should claim to be.
+func buildVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	return resolveVersion(version, bi, ok)
+}
+
+// resolveVersion picks the version from the linker stamp, falling back to the
+// module version Go embeds in every binary. The fallback is what makes
+// `go install github.com/gruen/tailport/cmd/tailport@latest` -- a documented
+// install path (README) -- report a real version: `go install` applies no
+// -ldflags, so main.version stays "dev" even though the binary demonstrably
+// knows it was built from module v0.1.4.
+//
+// Main.Version is NOT trusted blindly, because Go also synthesizes it for
+// builds with no tag behind them, and those must stay "dev":
+//   - "(devel)"/"" -- older toolchains, and `go test`.
+//   - a pseudo-version (v0.1.4-0.20260713001843-f1c0508a5634) -- `go install`
+//     of a bare commit, or a `go build` in a clone: the tag is the NEAREST one,
+//     not the built code, so reporting it would be a lie.
+//   - "+dirty"/"+incompatible" build metadata -- a modified working tree.
+//
+// Claiming a release version for any of those would be worse than "dev": it
+// would make an arbitrary working tree indistinguishable from the shipped
+// artifact, and selfupdate (which treats an unparseable version as "older than
+// every release", see Check.CurrentIsDev) would silently stop offering the
+// upgrade that repairs it.
+//
+// Returns a BARE semver ("0.1.4") to match what -ldflags stamps, so both paths
+// feed versionLine and the TUI header identically. Pure (build info is passed
+// in, not read) so every branch is table-testable.
+func resolveVersion(stamped string, bi *debug.BuildInfo, ok bool) string {
+	if stamped != devVersion {
+		return stamped // an explicit stamp is authoritative; never second-guess it
+	}
+	if !ok || bi == nil {
+		return devVersion
+	}
+	v := strings.TrimPrefix(bi.Main.Version, "v")
+	switch {
+	case v == "" || v == "(devel)":
+		return devVersion
+	case strings.Contains(v, "+"): // +dirty, +incompatible
+		return devVersion
+	case pseudoVersionRe.MatchString(v):
+		return devVersion
+	}
+	// Reuse the project's one semver parser rather than a second opinion on
+	// what a version is: if selfupdate can't compare it, don't report it.
+	if _, err := selfupdate.ParseVersion(v); err != nil {
+		return devVersion
+	}
+	return v
+}
 
 // versionLine is the string printed by --version. Kept tiny and pure so it can
 // be asserted in a test without standing up the whole TUI.
 func versionLine() string {
-	return "tailport " + version
+	return "tailport " + buildVersion()
 }
 
 // cliFlags holds tailport's global flags: the set shared by the default
@@ -463,7 +532,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// config on the next unrelated save. ui.Run/ui.New apply the override to
 	// rendering only. See internal/ui/ui.go's New doc comment for the full
 	// reasoning.
-	if err := ui.Run(cfg, cf.markers, version); err != nil {
+	if err := ui.Run(cfg, cf.markers, buildVersion()); err != nil {
 		fmt.Fprintln(stderr, "tailport:", err)
 		return 1
 	}
