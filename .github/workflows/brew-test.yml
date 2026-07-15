@@ -31,6 +31,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: brew update
+        # Not boilerplate -- without this the job tests an environment no user
+        # has, and fails (kata 8jdh, first non-skipped run 29440235804).
+        #
+        # GitHub's macOS images set HOMEBREW_NO_AUTO_UPDATE=1 and ship a
+        # homebrew-core snapshot that can be weeks stale. `depends_on "go"`
+        # then pours whatever go that snapshot pins -- 1.26.4 on the run above,
+        # a week after core had moved to 1.26.5 -- while brew builds with
+        # GOTOOLCHAIN=local, so go cannot fetch the newer toolchain it needs
+        # and the build dies on `go.mod requires go >= 1.26.5`.
+        #
+        # A real user's `brew install` auto-updates first and gets current go,
+        # so updating here is what makes this job test the actual user path
+        # rather than a stale-snapshot artifact.
+        run: brew update
+
       - name: stage the formula in a local tap
         run: |
           set -eux
