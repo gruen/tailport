@@ -131,7 +131,9 @@ is actually reachable — localhost only, already on your tailnet, or served
 | `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to serve it once its service is up |
 | `l` | Label the selected port with custom text (prefilled with its current label if set, else the process name) |
 | `f` | Favorite the selected port, pinning it to the default view |
-| `u` | Unfavorite the selected port |
+| `F` | Forget the selected port: clears its ★ and drops it from the default view |
+| `u` | Undo the last registry edit (favorite, forget, label, lock, add) — session-only, and never touches what's exposed |
+| `ctrl+r` | Redo the last undone registry edit |
 | `a` | Toggle between the default view and showing every listening port |
 | `/` | Filter by port number, process, or label (fuzzy) |
 | `r` | Refresh the port list and serve status |
@@ -167,9 +169,17 @@ A port earns a place in the registry the moment you interact with it —
 serving it (`space`), adding it by number (`n`), labeling it (`l`),
 favoriting it (`f`), or locking it (`x`) all add it. Once a port is in the
 registry it keeps showing up, marked inactive, even after you toggle it off —
-and that persists across restarts, not just for the current session. `u` on a
-port that has no label and isn't locked reverses this: it's dropped from the
-registry and disappears from the default view (unless it's currently active).
+and that persists across restarts, not just for the current session. `F`
+(forget) on a port that has no label and isn't locked reverses this: it's
+dropped from the registry and disappears from the default view (unless it's
+currently active).
+
+Registry edits are undoable within a session: `u` steps back through them one
+at a time and `ctrl+r` steps forward. Undo covers only the registry —
+favorites, labels, locks, adds. It never changes what's actually exposed:
+serve and funnel have their own keys and confirms, and undo won't flip them
+behind your back. For the same reason it won't unlock `:22`, since that needs
+a deliberate typed confirm.
 
 Press `a` to bypass the registry entirely and see every port currently
 listening on the machine, whether known to tailport or not — useful for

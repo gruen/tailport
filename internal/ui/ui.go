@@ -139,20 +139,25 @@ var (
 // ShowAll's Desc is refreshed on each render to reflect the current view
 // (favorites vs all ports; see model.renderLegend).
 type keyMap struct {
-	Toggle     key.Binding
-	Funnel     key.Binding
-	Filter     key.Binding
-	NewPort    key.Binding
-	Label      key.Binding
-	Favorite   key.Binding
-	Unfavorite key.Binding
-	Lock       key.Binding
-	ShowAll    key.Binding
-	Copy       key.Binding
-	Clean      key.Binding
-	Refresh    key.Binding
-	Help       key.Binding
-	Quit       key.Binding
+	Toggle   key.Binding
+	Funnel   key.Binding
+	Filter   key.Binding
+	NewPort  key.Binding
+	Label    key.Binding
+	Favorite key.Binding
+	// Forget clears ★ -- what "u" did before 3cwx moved that key to Undo.
+	Forget key.Binding
+	Lock   key.Binding
+	// Undo/Redo step through registry edits (favorite/forget/label/lock/add).
+	// Redo is deliberately absent from the bottom bar -- see barGroups.
+	Undo    key.Binding
+	Redo    key.Binding
+	ShowAll key.Binding
+	Copy    key.Binding
+	Clean   key.Binding
+	Refresh key.Binding
+	Help    key.Binding
+	Quit    key.Binding
 }
 
 // keyGroup is one like-for-like column of the keybinding legend (kata p39s): a
@@ -176,9 +181,12 @@ type keyGroup struct {
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
 		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Clean, k.Lock}},
-		{"Favorites", []key.Binding{k.Favorite, k.Unfavorite, k.NewPort, k.Copy, k.Label}},
+		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
-		{"App", []key.Binding{k.Help, k.Quit}},
+		// Undo/Redo sit in App, not Favorites: they step through every registry
+		// edit, including the lock changes that live in the Expose column, so
+		// filing them under Favorites would understate their reach.
+		{"App", []key.Binding{k.Undo, k.Redo, k.Help, k.Quit}},
 	}
 }
 
@@ -213,14 +221,19 @@ func newKeyMap() keyMap {
 		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
-		Filter:     key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
-		NewPort:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "add favorite")),
-		Label:      key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
-		Favorite:   key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
-		Unfavorite: key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "unfavorite")),
-		Lock:       key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "lock/unlock")),
-		ShowAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
-		Copy:       key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
+		Filter:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
+		NewPort:  key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "add favorite")),
+		Label:    key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
+		Favorite: key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
+		// 3cwx: "u" used to unfavorite; it's Undo now, and the unfavorite
+		// action moved to shift-F under the clearer name "forget". The pair
+		// is deliberately f/F -- same letter, shifted, opposite effect.
+		Forget:  key.NewBinding(key.WithKeys("F"), key.WithHelp("F", "forget")),
+		Lock:    key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "lock/unlock")),
+		Undo:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "undo")),
+		Redo:    key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "redo")),
+		ShowAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
+		Copy:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
 		// Clean moved to shift-C when "c" was reassigned to copy (vnq7); it's
 		// contextual (only enabled when dangling forwards exist), so demoting
 		// it to a shifted key is fine.
@@ -649,6 +662,18 @@ type model struct {
 	keys     keyMap
 	cfg      config.Config
 	host     string
+	// undoStack/redoStack step through registry edits (3cwx). Session-only:
+	// deliberately NOT persisted, so undo can never reach back past a restart
+	// into edits the user has long since forgotten making.
+	//
+	// They hold per-PORT deltas rather than whole-config snapshots, which is
+	// load-bearing: the registry is also written by bookkeeping the user never
+	// asked for (remember() on serve, rememberProcesses() on every background
+	// refresh). Restoring a whole-config snapshot would silently revert those
+	// too, so an undo of "favorite :8080" could erase an unrelated port's
+	// remembered process name. A delta touches only its own port.
+	undoStack []registryEdit
+	redoStack []registryEdit
 	// version is the build version to show beside the wordmark (0qy8),
 	// threaded in from main's -ldflags-injected `version` via Run -- the ui
 	// package has no build stamp of its own. Empty means "unknown": New's
@@ -1544,6 +1569,134 @@ func (m model) hasDangling() bool {
 	return len(m.danglingPorts()) > 0
 }
 
+// undoStackLimit caps how many registry edits are held. Deep enough that a
+// real editing session never hits it, bounded so a long-lived session can't
+// grow the stacks without limit.
+const undoStackLimit = 50
+
+// portState is one port's registry entry, plus whether it existed at all --
+// "no entry" and "an entry with every field zero" are different states
+// (rebuildItems and the Favorites view both distinguish a known port from an
+// unknown one), so a bare PortMeta can't represent the difference.
+type portState struct {
+	meta    config.PortMeta
+	present bool
+}
+
+// registryEdit is one undoable change to one port's registry entry: what it
+// was, what it became, and a human phrase for the toast ("favorite :8080").
+type registryEdit struct {
+	port   int
+	before portState
+	after  portState
+	desc   string
+}
+
+// portState reads the current registry state of port.
+func (m model) portState(port int) portState {
+	meta, ok := m.cfg.Ports[port]
+	return portState{meta: meta, present: ok}
+}
+
+// applyPortState writes s back over port's registry entry, deleting the entry
+// when s recorded "no entry at all".
+func (m *model) applyPortState(port int, s portState) {
+	if !s.present {
+		delete(m.cfg.Ports, port)
+		return
+	}
+	if m.cfg.Ports == nil {
+		m.cfg.Ports = map[int]config.PortMeta{}
+	}
+	m.cfg.Ports[port] = s.meta
+}
+
+// pushUndo records a deliberate registry edit, to be called with the port's
+// BEFORE state captured and the edit already applied. New edits clear the redo
+// stack -- the standard rule, and the honest one: once the registry has moved
+// on, the redo entries describe a history that no longer happened.
+//
+// Only user-initiated edits go through here. remember()/rememberProcesses()
+// deliberately do NOT: they're bookkeeping the user never asked for, and
+// letting a background refresh push undo entries would make "u" step through
+// changes nobody made.
+func (m *model) pushUndo(port int, before portState, desc string) {
+	m.undoStack = append(m.undoStack, registryEdit{
+		port:   port,
+		before: before,
+		after:  m.portState(port),
+		desc:   desc,
+	})
+	if len(m.undoStack) > undoStackLimit {
+		m.undoStack = m.undoStack[len(m.undoStack)-undoStackLimit:]
+	}
+	m.redoStack = nil
+}
+
+// wouldUnlockSSH reports whether moving port to s would strip the lock from
+// :22 -- the one registry change that is gated behind a typed confirm (ah23,
+// the entryConfirmUnlockSSH flow), because :22's lock guards SSH access.
+//
+// undo/redo must not become a back door around that gate: a user who locked
+// :22 this session could otherwise unlock it with a single unprompted "u".
+// The invariant is that undo/redo may never land the registry in a state the
+// user couldn't have reached by pressing keys directly without a confirm.
+func (m model) wouldUnlockSSH(port int, s portState) bool {
+	if port != 22 {
+		return false
+	}
+	return m.portState(port).meta.Locked && !(s.present && s.meta.Locked)
+}
+
+// historyDirection selects which way stepHistory walks.
+type historyDirection int
+
+const (
+	undoDirection historyDirection = iota
+	redoDirection
+)
+
+// stepHistory pops one registry edit off the undo (or redo) stack, applies the
+// state for that direction, and pushes the edit onto the opposite stack. Both
+// directions are the same move -- restore one port to a recorded state -- so
+// they share an implementation rather than drifting apart.
+func (m model) stepHistory(dir historyDirection) (tea.Model, tea.Cmd) {
+	from, to := &m.undoStack, &m.redoStack
+	verb, none := "undo", "nothing to undo"
+	if dir == redoDirection {
+		from, to = &m.redoStack, &m.undoStack
+		verb, none = "redo", "nothing to redo"
+	}
+	if len(*from) == 0 {
+		return m, m.setFlash(none, flashInfo)
+	}
+
+	edit := (*from)[len(*from)-1]
+	target := edit.before
+	if dir == redoDirection {
+		target = edit.after
+	}
+
+	// The one state undo/redo may not reach on its own (see wouldUnlockSSH):
+	// refuse and leave both stacks untouched, so the edit stays available once
+	// the user unlocks :22 deliberately. Refusing rather than re-prompting
+	// keeps the confirm flow in one place -- x -- instead of growing a second
+	// entry point through the history stack.
+	if m.wouldUnlockSSH(edit.port, target) {
+		return m, m.setFlash(fmt.Sprintf("%s would unlock :22 — use x to unlock SSH deliberately", verb), flashWarn)
+	}
+
+	*from = (*from)[:len(*from)-1]
+	m.applyPortState(edit.port, target)
+	*to = append(*to, edit)
+
+	return m, tea.Batch(
+		m.saveConfig(),
+		m.rebuildItems(),
+		m.setFlash(fmt.Sprintf("%s: %s", verb, edit.desc), flashInfo),
+	)
+}
+
 // remember ensures port has a registry entry (creating a bare one if
 // needed) and persists it. Called whenever a port is toggled on, so it
 // stays visible in the default view even after being toggled back off.
@@ -2001,7 +2154,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// added port sticks instead of vanishing. No lock/:22 guard
 					// is needed here since nothing is exposed. New adds are
 					// silent (dup-only feedback).
-					return m, tea.Batch(m.favorite(port), m.rebuildItems())
+					before := m.portState(port)
+					cmd := m.favorite(port)
+					m.pushUndo(port, before, fmt.Sprintf("add :%d", port))
+					return m, tea.Batch(cmd, m.rebuildItems())
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
 					port := m.labelPort
@@ -2013,9 +2169,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.cfg.Ports == nil {
 							m.cfg.Ports = map[int]config.PortMeta{}
 						}
+						before := m.portState(port)
 						meta := m.cfg.Ports[port]
+						// Committing the same label is a no-op; recording it
+						// would put a "u" on the stack that visibly does
+						// nothing (vgn5 prefills the input, so enter-with-no-
+						// edits is the common path, not a rare one).
+						if meta.Label == label {
+							return m, m.rebuildItems()
+						}
 						meta.Label = label
 						m.cfg.Ports[port] = meta
+						m.pushUndo(port, before, fmt.Sprintf("label :%d", port))
 						return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 					}
 					return m, m.rebuildItems()
@@ -2031,9 +2196,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if typed != "ssh" {
 						return m, nil // cancelled: :22 stays locked
 					}
+					before := m.portState(port)
 					meta := m.cfg.Ports[port]
 					meta.Locked = false
 					m.cfg.Ports[port] = meta
+					// Undoable like any other lock edit: undo RE-locks :22,
+					// which is the safe direction and needs no confirm. It's
+					// the reverse (an undo that unlocks) that wouldUnlockSSH
+					// refuses.
+					m.pushUndo(port, before, fmt.Sprintf("unlock :%d", port))
 					return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 				}
 			}
@@ -2207,25 +2378,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cfg.Ports == nil {
 				m.cfg.Ports = map[int]config.PortMeta{}
 			}
+			before := m.portState(sel.port.Number)
 			meta := m.cfg.Ports[sel.port.Number]
 			meta.Favorite = true
 			m.cfg.Ports[sel.port.Number] = meta
+			m.pushUndo(sel.port.Number, before, fmt.Sprintf("favorite :%d", sel.port.Number))
 			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
-		case "u":
+		case "F":
+			// 3cwx: this is the old "u" behavior, verbatim -- clear ★, and drop
+			// the registry entry entirely if nothing else was worth keeping.
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
 				return m, nil
 			}
 			if meta, ok := m.cfg.Ports[sel.port.Number]; ok {
+				before := m.portState(sel.port.Number)
 				meta.Favorite = false
 				if meta.Label == "" && !meta.Locked {
 					delete(m.cfg.Ports, sel.port.Number)
 				} else {
 					m.cfg.Ports[sel.port.Number] = meta
 				}
+				m.pushUndo(sel.port.Number, before, fmt.Sprintf("forget :%d", sel.port.Number))
 				return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 			}
 			return m, nil
+		case "u":
+			return m.stepHistory(undoDirection)
+		case "ctrl+r":
+			return m.stepHistory(redoDirection)
 		case "x":
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
@@ -2234,10 +2415,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cfg.Ports == nil {
 				m.cfg.Ports = map[int]config.PortMeta{}
 			}
-			// Unlike "u", unlocking never deletes the registry entry: once
+			// Unlike "F", unlocking never deletes the registry entry: once
 			// a port has been locked (or explicitly unlocked), it stays
 			// "known" and visible in the default view, same as a port
 			// that's been toggled on at least once (see remember).
+			before := m.portState(sel.port.Number)
 			meta := m.cfg.Ports[sel.port.Number]
 			// Unlocking :22 removes the guard on SSH access, so it's gated
 			// behind a type-"ssh" confirm (ah23) rather than flipped here.
@@ -2251,6 +2433,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			meta.Locked = !meta.Locked
 			m.cfg.Ports[sel.port.Number] = meta
+			verb := "unlock"
+			if meta.Locked {
+				verb = "lock"
+			}
+			m.pushUndo(sel.port.Number, before, fmt.Sprintf("%s :%d", verb, sel.port.Number))
 			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 		case " ":
 			if m.pending != 0 {
@@ -2501,6 +2688,11 @@ func (m model) barGroups(cleanEnabled bool) []keyGroup {
 	keys := m.keys
 	keys.ShowAll.SetHelp("a", "switch view")
 	keys.Clean.SetEnabled(cleanEnabled)
+	// Redo is supported but stays OFF the bottom bar (3cwx, owner's call): it's
+	// the rarer half of the pair and the bar is already dense. It remains in
+	// groups(), so the "?" overlay and `tailport quickstart` still document it
+	// -- hidden from the bar is not the same as undiscoverable.
+	keys.Redo.SetEnabled(false)
 	src := keys.groups()
 	out := make([]keyGroup, 0, len(src))
 	for _, g := range src {
@@ -3973,20 +4165,22 @@ func keyLegendDescs(emoji bool) map[string]string {
 		served, funneled, dangling = "🌒", "🌑", "🌫️"
 	}
 	return map[string]string{
-		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
-		"p":     "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
-		"c":     "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
-		"f":     "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
-		"u":     "Unfavorite (clears ★); the port drops out of the Favorites view.",
-		"n":     "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
-		"l":     "Set a text label for the selected port.",
-		"x":     "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
-		"C":     "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
-		"/":     "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
-		"a":     "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
-		"r":     "Refresh the port list and serve status.",
-		"?":     "Toggle this help. esc or q also close it.",
-		"q":     "Quit.",
+		"space":  "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
+		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
+		"c":      "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
+		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
+		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
+		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them.",
+		"ctrl+r": "Redo the last undone registry edit. Any new edit clears the redo\nstack, so you can't redo onto a changed registry.",
+		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
+		"l":      "Set a text label for the selected port.",
+		"x":      "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
+		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
+		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
+		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
+		"r":      "Refresh the port list and serve status.",
+		"?":      "Toggle this help. esc or q also close it.",
+		"q":      "Quit.",
 	}
 }
 

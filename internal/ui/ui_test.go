@@ -1930,6 +1930,225 @@ func TestHeader(t *testing.T) {
 	}
 }
 
+// buildHistoryModel is a model with one selected listening port, ready to
+// drive registry edits through Update.
+func buildHistoryModel(t *testing.T, cfg config.Config, ports []portscan.Port) model {
+	t.Helper()
+	m := New(cfg)
+	m.allPorts = ports
+	m.active = map[int]bool{}
+	m.showAllPorts = true
+	m.rebuildItems()
+	return m
+}
+
+func pressRune(t *testing.T, m model, r rune) model {
+	t.Helper()
+	return mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+}
+
+// TestForgetKey covers 3cwx's rename half: shift-F now does what "u" used to
+// (clear ★, dropping the entry when nothing else is worth keeping), and "u"
+// no longer unfavorites anything.
+func TestForgetKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ports := []portscan.Port{{Number: 8080, Process: "srv"}}
+
+	m := buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}, ports)
+	m = pressRune(t, m, 'F')
+	if _, ok := m.cfg.Ports[8080]; ok {
+		t.Errorf("F should forget :8080 and drop its bare entry; registry still has %+v", m.cfg.Ports[8080])
+	}
+
+	// A labelled/locked port keeps its entry, same as the old "u" did.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true, Label: "web"}}}, ports)
+	m = pressRune(t, m, 'F')
+	if got := m.cfg.Ports[8080]; got.Favorite || got.Label != "web" {
+		t.Errorf("F on a labelled port should clear ★ but keep the entry+label; got %+v", got)
+	}
+
+	// "u" is undo now -- with an empty history it must not touch the registry.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}, ports)
+	m = pressRune(t, m, 'u')
+	if !m.cfg.Ports[8080].Favorite {
+		t.Error("u must not unfavorite any more (it's undo); :8080 lost its ★")
+	}
+}
+
+// TestUndoRedo covers the core of 3cwx: u steps registry edits back, ctrl+r
+// steps them forward, and a new edit clears the redo stack.
+func TestUndoRedo(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ports := []portscan.Port{{Number: 8080, Process: "srv"}}
+	ctrlR := tea.KeyMsg{Type: tea.KeyCtrlR}
+
+	// favorite -> undo restores "no entry at all" (not a zeroed entry: the two
+	// are different states to the Favorites view).
+	m := buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}}, ports)
+	m = pressRune(t, m, 'f')
+	if !m.cfg.Ports[8080].Favorite {
+		t.Fatalf("f should favorite :8080; got %+v", m.cfg.Ports[8080])
+	}
+	m = pressRune(t, m, 'u')
+	if _, ok := m.cfg.Ports[8080]; ok {
+		t.Errorf("undo of a favorite on a previously-unregistered port should leave NO entry; got %+v", m.cfg.Ports[8080])
+	}
+	// redo puts it back.
+	m = mustUpdate(t, m, ctrlR)
+	if !m.cfg.Ports[8080].Favorite {
+		t.Errorf("redo should re-apply the favorite; got %+v", m.cfg.Ports[8080])
+	}
+
+	// Undo is multi-step and ordered: lock, then label, then undo twice peels
+	// them off newest-first.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}}, ports)
+	m = pressRune(t, m, 'f')
+	m = pressRune(t, m, 'x')
+	if !m.cfg.Ports[8080].Locked {
+		t.Fatalf("x should lock :8080; got %+v", m.cfg.Ports[8080])
+	}
+	m = pressRune(t, m, 'u')
+	if m.cfg.Ports[8080].Locked {
+		t.Errorf("first undo should reverse the lock; got %+v", m.cfg.Ports[8080])
+	}
+	if !m.cfg.Ports[8080].Favorite {
+		t.Errorf("first undo should reverse ONLY the lock, leaving the earlier favorite; got %+v", m.cfg.Ports[8080])
+	}
+	m = pressRune(t, m, 'u')
+	if _, ok := m.cfg.Ports[8080]; ok {
+		t.Errorf("second undo should reverse the favorite too; got %+v", m.cfg.Ports[8080])
+	}
+
+	// A fresh edit clears the redo stack: you can't redo onto a registry that
+	// has moved on.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}}, ports)
+	m = pressRune(t, m, 'f')
+	m = pressRune(t, m, 'u')
+	if len(m.redoStack) != 1 {
+		t.Fatalf("undo should leave one redoable edit; got %d", len(m.redoStack))
+	}
+	m = pressRune(t, m, 'x') // a new edit
+	if len(m.redoStack) != 0 {
+		t.Errorf("a new edit must clear the redo stack; got %d entries", len(m.redoStack))
+	}
+
+	// Empty stacks are a no-op with a toast, not a crash.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}}, ports)
+	m = pressRune(t, m, 'u')
+	if m.flash == "" {
+		t.Error("u with nothing to undo should flash 'nothing to undo'")
+	}
+	m = mustUpdate(t, m, ctrlR)
+	if m.flash == "" {
+		t.Error("ctrl+r with nothing to redo should flash 'nothing to redo'")
+	}
+}
+
+// TestUndoIgnoresBookkeeping is why registryEdit holds per-port deltas rather
+// than whole-config snapshots. The registry is written by things the user never
+// asked for -- remember() when a port is served, rememberProcesses() on every
+// background refresh -- and undo must neither step through those nor clobber
+// them when reversing an unrelated port's edit.
+func TestUndoIgnoresBookkeeping(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}},
+		[]portscan.Port{{Number: 8080, Process: "srv"}})
+
+	m = pressRune(t, m, 'f') // the only deliberate edit
+	m.remember(3000)         // bookkeeping: :3000 was served
+	if _, ok := m.cfg.Ports[3000]; !ok {
+		t.Fatal("remember(3000) should have registered :3000")
+	}
+
+	if len(m.undoStack) != 1 {
+		t.Errorf("only the deliberate edit belongs on the undo stack; got %d entries", len(m.undoStack))
+	}
+	m = pressRune(t, m, 'u')
+	if _, ok := m.cfg.Ports[3000]; !ok {
+		t.Error("undo of :8080's favorite must not erase :3000's remembered entry -- per-port deltas, not config snapshots")
+	}
+	if _, ok := m.cfg.Ports[8080]; ok {
+		t.Error("undo should still have reversed :8080's favorite")
+	}
+}
+
+// TestUndoCannotUnlockSSH is the safety invariant: undo/redo may never land the
+// registry somewhere the user couldn't have reached by pressing keys directly
+// without a confirm. Unlocking :22 is gated behind typing "ssh" (ah23) because
+// it guards SSH access, so an undo that would strip that lock is refused --
+// otherwise "x" then "u" would be an unprompted back door around the gate.
+func TestUndoCannotUnlockSSH(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}},
+		[]portscan.Port{{Number: 22, Process: "sshd"}})
+
+	m = pressRune(t, m, 'x') // lock :22 -- instant, no confirm needed
+	if !m.cfg.Ports[22].Locked {
+		t.Fatalf("x should lock :22; got %+v", m.cfg.Ports[22])
+	}
+
+	m = pressRune(t, m, 'u') // undo would unlock it -> must be refused
+	if !m.cfg.Ports[22].Locked {
+		t.Error("undo must NOT unlock :22 -- that would bypass the typed ssh confirm")
+	}
+	if !strings.Contains(m.flash, ":22") {
+		t.Errorf("the refusal should say why and name :22; flash = %q", m.flash)
+	}
+	// Refused, not consumed: the edit stays available for after a deliberate unlock.
+	if len(m.undoStack) != 1 {
+		t.Errorf("a refused undo must leave the stack untouched; got %d entries", len(m.undoStack))
+	}
+
+	// The safe direction is fine: undo that RE-locks :22 needs no confirm.
+	m = buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}},
+		[]portscan.Port{{Number: 22, Process: "sshd"}})
+	m = pressRune(t, m, 'x') // opens the ssh confirm rather than unlocking
+	if m.mode != entryConfirmUnlockSSH {
+		t.Fatalf("x on a locked :22 should open the ssh confirm; mode = %v", m.mode)
+	}
+	for _, r := range "ssh" {
+		m = pressRune(t, m, r)
+	}
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.cfg.Ports[22].Locked {
+		t.Fatalf("typing ssh should unlock :22; got %+v", m.cfg.Ports[22])
+	}
+	m = pressRune(t, m, 'u')
+	if !m.cfg.Ports[22].Locked {
+		t.Error("undo of an ssh-confirmed unlock should re-lock :22 -- the safe direction needs no confirm")
+	}
+}
+
+// TestUndoStackBounded pins the cap: a long session can't grow the history
+// without bound, and the OLDEST edits are the ones dropped.
+func TestUndoStackBounded(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := buildHistoryModel(t, config.Config{Ports: map[int]config.PortMeta{}},
+		[]portscan.Port{{Number: 8080, Process: "srv"}})
+
+	for i := 0; i < undoStackLimit+10; i++ {
+		m = pressRune(t, m, 'x') // lock/unlock toggles, one edit each
+	}
+	if len(m.undoStack) != undoStackLimit {
+		t.Errorf("undo stack = %d entries, want it capped at %d", len(m.undoStack), undoStackLimit)
+	}
+}
+
+// TestKeyLegendDescsCoverEveryBinding guards the drift KeyLegendGroups can't:
+// it looks descriptions up by key, so a binding with no entry silently renders
+// a blank "?" overlay row rather than failing. 3cwx added three keys at once.
+func TestKeyLegendDescsCoverEveryBinding(t *testing.T) {
+	descs := keyLegendDescs(false)
+	for _, g := range newKeyMap().groups() {
+		for _, b := range g.bindings {
+			k := b.Help().Key
+			if strings.TrimSpace(descs[k]) == "" {
+				t.Errorf("group %q binding %q has no keyLegendDescs entry -- the ? overlay would show a blank row", g.name, k)
+			}
+		}
+	}
+}
+
 // TestDisplayVersion covers 0qy8's version formatting. The header wants the
 // tag-shaped "v0.1.4", but build.yml stamps main.version with the tag MINUS
 // its v, so the prefix has to be added back -- without ever producing "vdev"
@@ -3473,11 +3692,14 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	if len(groups) != len(wantNames) {
 		t.Fatalf("groups() = %d columns, want %d", len(groups), len(wantNames))
 	}
+	// 3cwx: Favorites carries F (forget, the old "u"); u is undo and lives in
+	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
+	// documents it even though barGroups hides it from the bottom bar.
 	wantKeys := [][]string{
 		{"space", "p", "C", "x"},
-		{"f", "u", "n", "c", "l"},
+		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
-		{"?", "q"},
+		{"u", "ctrl+r", "?", "q"},
 	}
 	full := k.FullHelp()
 	if len(full) != len(groups) {
@@ -3656,8 +3878,8 @@ func TestBottomBarGridFolds(t *testing.T) {
 	if r1, r2 := lineOf(wideLines, "f favorite"), lineOf(wideLines, "c copy URL"); r1 < 0 || r1 != r2 {
 		t.Errorf("Favorites should fold f favorite/c copy URL onto the same row; f favorite row %d, c copy URL row %d:\n%s", r1, r2, wide)
 	}
-	if r1, r2 := lineOf(wideLines, "u unfavorite"), lineOf(wideLines, "l label"); r1 < 0 || r1 != r2 {
-		t.Errorf("Favorites should fold u unfavorite/l label onto the same row; u unfavorite row %d, l label row %d:\n%s", r1, r2, wide)
+	if r1, r2 := lineOf(wideLines, "F forget"), lineOf(wideLines, "l label"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold F forget/l label onto the same row; F forget row %d, l label row %d:\n%s", r1, r2, wide)
 	}
 	if r := lineOf(wideLines, "n add favorite"); r < 0 {
 		t.Errorf("n add favorite missing from wide grid:\n%s", wide)
@@ -3671,8 +3893,9 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("Expose should fold space serve/x lock/unlock onto the same row; space serve row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
 
-	// App (only 2 bindings, tried last) doesn't fit the fold at width 100 --
-	// it stays a single unfolded column: help and quit on SEPARATE rows.
+	// App (3 bar bindings since 3cwx -- u undo, ? help, q quit; ctrl+r redo is
+	// hidden from the bar) is tried last and doesn't fit the fold at width 100,
+	// so it stays a single unfolded column: help and quit on SEPARATE rows.
 	if r1, r2 := lineOf(wideLines, "? help"), lineOf(wideLines, "q quit"); r1 < 0 || r2 < 0 || r1 == r2 {
 		t.Errorf("App should NOT fold at width 100 (no surplus left after the other 3 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
 	}
@@ -3688,8 +3911,15 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("grid should stop changing once every group is folded; width=200 and width=400 rendered differently:\n200:\n%s\n400:\n%s", ceiling, pastCeiling)
 	}
 	ceilingLines := strings.Split(ceiling, "\n")
-	if r1, r2 := lineOf(ceilingLines, "? help"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold at the ceiling width (? help | q quit on one row); ? help row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	// App's 3 bar bindings fold top-heavy 2/1: "u undo" and "? help" down the
+	// first sub-column, "q quit" alone in the second -- so the fold shows up as
+	// q quit rising to share u undo's row (before 3cwx, App was 2 bindings and
+	// this read "? help | q quit").
+	if r1, r2 := lineOf(ceilingLines, "u undo"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold at the ceiling width (u undo | q quit on one row); u undo row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	}
+	if r1, r2 := lineOf(ceilingLines, "? help"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 == r2 {
+		t.Errorf("App's folded second sub-col holds only q quit; ? help should be on its own row, not beside q quit; ? help row %d, q quit row %d:\n%s", r1, r2, ceiling)
 	}
 
 	// Still no truncation/ellipsis at the ceiling: every hint present. ("p
@@ -3700,13 +3930,19 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// sidesteps that padding.)
 	for _, want := range []string{
 		"space serve", "funnel public", "x lock/unlock",
-		"f favorite", "u unfavorite", "n add favorite", "c copy URL", "l label",
+		"f favorite", "F forget", "n add favorite", "c copy URL", "l label",
 		"/ filter", "a switch view", "r refresh",
-		"? help", "q quit",
+		"u undo", "? help", "q quit",
 	} {
 		if !strings.Contains(ceiling, want) {
 			t.Errorf("ceiling grid dropped %q; got:\n%s", want, ceiling)
 		}
+	}
+
+	// ...but redo stays OFF the bar at every width, ceiling included: it's in
+	// groups() for the "?" overlay only (3cwx).
+	if strings.Contains(ceiling, "ctrl+r") {
+		t.Errorf("ctrl+r redo must not appear in the bottom bar, even at the ceiling width; got:\n%s", ceiling)
 	}
 }
 
@@ -3788,9 +4024,9 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	for _, want := range []string{
 		"Expose", "Favorites", "View", "App",
 		"space serve", "p funnel public", "c copy URL",
-		"f favorite", "u unfavorite", "n add favorite", "l label",
+		"f favorite", "F forget", "n add favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
-		"? help", "q quit",
+		"u undo", "? help", "q quit",
 	} {
 		if !strings.Contains(bar, want) {
 			t.Errorf("narrow fallback dropped %q; got:\n%s", want, bar)
