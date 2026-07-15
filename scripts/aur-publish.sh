@@ -28,7 +28,11 @@ DIST="${DIST:-dist}"
 AUR_PUSH="${AUR_PUSH:-0}"
 CHECK="${CHECK:-0}"
 AUR_HOST="${AUR_HOST:-ssh://aur@aur.archlinux.org}"
-REPO_URL="https://github.com/gruen/tailport"
+
+# The source tarball URL/digest is shared with the Homebrew publisher -- same
+# tarball, so they must not derive it separately and drift.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/lib/packaging.sh"
 # The PKGBUILD maintainer line, not the committer's default identity: AUR
 # commits are public and there's no reason to publish a second address.
 GIT_NAME="${GIT_NAME:-Michael E. Gruen}"
@@ -52,7 +56,7 @@ command -v makepkg >/dev/null || die "makepkg not found -- this needs an Arch en
 say "collecting digests for $VERSION"
 
 # The one digest with no local source: GitHub generates this tarball on demand.
-src_sha=$(curl -fsSL "$REPO_URL/archive/refs/tags/v$VERSION.tar.gz" | sha256sum | cut -d' ' -f1)
+src_sha=$(source_tarball_sha256 "$VERSION")
 [ -n "$src_sha" ] || die "could not hash the source tarball for v$VERSION"
 
 # Prebuilt binary digests, straight from build.yml's artifacts.

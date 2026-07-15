@@ -93,9 +93,13 @@ contract. The short version:
   per j68f), writes the notes by hand, tags behind one explicit confirm,
   then verifies against the *published* artifact before closing the release
   ticket with that evidence. `RELEASING.md` stays the authoritative runbook
-  for the mechanics. Packaging is not its job: the AUR bump publishes from
-  CI on a tag and bot-commits back to `main` (18cr), so main moves after a
-  release; Homebrew stays a manual tap update (s3wn).
+  for the mechanics. Packaging is not its job: on a tag, CI publishes the AUR
+  packages (18cr) and the Homebrew formula (nqmn) and bot-commits both bumps
+  back to `main`, so **main moves after a release** — expect two extra
+  commits and don't mistake them for drift. Both publishers are scripts
+  (`scripts/aur-publish.sh`, `scripts/brew-publish.sh`) with a `CHECK=1` mode
+  that asserts re-running them for a published version is a no-op; that is how
+  they're tested without cutting a throwaway release.
 - `kata purge` is denied outright in `.claude/settings.json`: it is
   irreversible ("remove an issue + all its rows"), and no agent should
   reach for it autonomously. Purge by hand if you truly mean it.

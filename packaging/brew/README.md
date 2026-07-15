@@ -40,6 +40,27 @@ in `ldflags` matches what `build.yml` does for release binaries.
 
 ## Bumping for a new release
 
+**Normally you don't** — CI does it. `.github/workflows/build.yml`'s `brew` job
+runs after the release publishes and does everything below automatically:
+rewrite `url` + `sha256`, push `Formula/tailport.rb` to the tap, and commit the
+same bump back to `main`. The logic is
+[`scripts/brew-publish.sh`](../../scripts/brew-publish.sh) (kata nqmn), sibling
+to the AUR publisher.
+
+It authenticates with a **deploy key scoped to `gruen/homebrew-tap`**, stored as
+the `HOMEBREW_TAP_DEPLOY_KEY` secret. It cannot use `GITHUB_TOKEN`: that token
+is scoped to the repo whose workflow is running and has no write access to the
+tap. The key is disposable — to rotate, generate a new pair, replace the deploy
+key on the tap, and reset the secret.
+
+The rest of this section is the **fallback**: for when CI is broken, or to check
+its work. To dry-run the script against an already-published version — it must
+reproduce the committed formula exactly:
+
+```sh
+VERSION=0.1.5 CHECK=1 sh scripts/brew-publish.sh
+```
+
 Do this *after* the GitHub release exists (see [RELEASING.md](../../RELEASING.md)) —
 the digest is computed from a published artifact.
 

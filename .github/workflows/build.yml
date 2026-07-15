@@ -152,3 +152,62 @@ jobs:
           git add packaging/aur
           git commit -m "chore(aur): bump PKGBUILDs to $version (18cr)"
           git push origin main
+
+  # Bump the Homebrew formula and publish it to gruen/homebrew-tap (kata nqmn).
+  # Needs `aur` as well as `release` -- NOT because the formula depends on the
+  # AUR work, but because both jobs commit their bump back to main. Run in
+  # parallel they race two pushes at the same branch and one loses on a
+  # non-fast-forward. Serialising is cheaper than teaching both to rebase.
+  brew:
+    needs: [release, aur]
+    # No Arch container and no makepkg here: the formula is a url + sha256
+    # rewrite, and Homebrew infers `version` from the url.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: publish the formula to the tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY secret is not set; cannot publish the formula."
+            exit 1
+          fi
+          # GITHUB_TOKEN is scoped to THIS repo and cannot write to the tap, so
+          # the push uses a deploy key scoped to gruen/homebrew-tap alone --
+          # narrower than a PAT, and revocable on the tap without touching
+          # anything else.
+          install -d -m700 "$HOME/.ssh"
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$HOME/.ssh/tap"
+          chmod 600 "$HOME/.ssh/tap"
+          # GitHub's published ed25519 host key, pinned rather than TOFU-accepted.
+          printf '%s\n' \
+            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+            > "$HOME/.ssh/known_hosts_tap"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tap -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_tap"
+          VERSION="$version" BREW_PUSH=1 sh scripts/brew-publish.sh
+
+      - name: sync the bump onto main
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if git diff --quiet -- packaging/brew; then
+            echo "no formula change to sync"; exit 0
+          fi
+          tmp=$(mktemp -d); cp -r packaging/brew "$tmp/"
+          # Fetch main fresh: the aur job has already landed its own bump here.
+          git fetch --depth=1 origin main
+          git checkout -B main FETCH_HEAD
+          cp -r "$tmp/brew/." packaging/brew/
+          if git diff --quiet -- packaging/brew; then
+            echo "main already carries this bump"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packaging/brew
+          git commit -m "chore(brew): bump formula to $version (nqmn)"
+          git push origin main
