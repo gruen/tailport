@@ -115,19 +115,49 @@ brew audit --strict --online gruen/tap/tailport
 
 ## What is / isn't verifiable in this repo's environment
 
-**Not verified here — none of it.** This is an Arch Linux host with no
-Homebrew and no Linuxbrew prefix (`brew` is not installed), so the formula has
-never been executed: not `brew install --build-from-source`, not `brew test`,
-not `brew audit`. The formula is written against Homebrew's documented API
-(`std_go_args`, `depends_on ... => :build`, `assert_match`) and its build
-recipe matches the `go build` line that `build.yml` and the AUR source PKGBUILD
-both use and that *is* verified — but that is reasoning, not evidence.
+**Nothing here — but that is no longer the end of the story.** This is an Arch
+Linux host with no Homebrew, no Linuxbrew prefix, and no ruby, so the formula
+cannot be so much as syntax-checked locally. It is not verifiable *on this box*
+and never will be.
 
-**What is independently verified:** the `url`/`sha256` pair. The v0.1.5 source
+**It is verified on a macOS runner.**
+[`.github/workflows/brew-test.yml`](../../.github/workflows/brew-test.yml) is
+where this formula gets proven, and it is the only place that can happen. It is
+opt-in — macOS minutes are pricey — so ask for it explicitly:
+
+```sh
+gh workflow run brew-test.yml --ref main    # or put [ci brew] in a commit message
+```
+
+**Verified for 0.1.6** on `macos-14` (Apple Silicon), run
+[29440498745](https://github.com/gruen/tailport/actions/runs/29440498745), kata
+8jdh — the first time the formula had ever executed: it taps and parses,
+`brew install --build-from-source` compiles it, `brew test` passes (so the
+`-X main.version` stamp survived — the binary reports the real version, not
+`dev`), `brew audit --strict` is clean, and the installed
+`/opt/homebrew/bin/tailport` runs from `PATH` reporting `tailport 0.1.6`.
+
+**Read that run's scope precisely.** The job stages *this repo's copy* of the
+formula into a scaffold tap, and the formula pins a release tarball. So it
+proves the formula as committed here, building the published v0.1.6 source. It
+does **not** prove the tap's published copy, and it says nothing about a
+version other than the one `url` currently pins — re-dispatch after a bump.
+
+**The one trap that run exposed, worth knowing before you read a red X.** The
+first attempt ([29440235804](https://github.com/gruen/tailport/actions/runs/29440235804))
+failed in `brew install` with `go.mod requires go >= 1.26.5 (running go 1.26.4;
+GOTOOLCHAIN=local)`. That was the runner, not the formula: GitHub's macOS
+images set `HOMEBREW_NO_AUTO_UPDATE=1` and ship a homebrew-core snapshot weeks
+stale, so `depends_on "go"` poured a go older than `go.mod` demands, and brew
+builds with `GOTOOLCHAIN=local` so go cannot fetch the toolchain itself. Hence
+the `brew update` step. A real user's `brew install` auto-updates and gets
+current go — but note the sharp edge this leaves: **the formula's source build
+requires a Homebrew `go` at least as new as `go.mod`'s pin**, so a user on a
+stale brew still fails. `go.mod` currently pins an exact patch (`go 1.26.5`),
+which is a tighter constraint than anything in the tree needs — tracked
+separately in kata tvyh.
+
+**Also independently verified:** the `url`/`sha256` pair. The v0.1.5 source
 tarball was fetched and hashes to
 `dc366a0c57823e5aac342b6085d6a8d0957e108157067e7677c71235d2c7484b`, matching
 both this formula and the AUR source package.
-
-Run `brew install --build-from-source ./packaging/brew/tailport.rb` plus
-`brew test` and `brew audit --strict --new tailport` on a Mac (or any Linuxbrew
-host) before trusting the formula in the tap.
