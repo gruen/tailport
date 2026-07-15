@@ -87,6 +87,15 @@ contract. The short version:
   It fires on `/ticket <request>` and also on its own when someone
   describes work they want tracked. It deliberately does not close,
   delete, or purge — filing work and finishing it are different jobs.
+- Cut releases through the `/release` skill
+  (`.claude/skills/release/SKILL.md`). It takes everything on main since
+  the last tag, holds the release gate ("bump patch after all < p3 done",
+  per j68f), writes the notes by hand, tags behind one explicit confirm,
+  then verifies against the *published* artifact before closing the release
+  ticket with that evidence. `RELEASING.md` stays the authoritative runbook
+  for the mechanics. Packaging is not its job: the AUR bump publishes from
+  CI on a tag and bot-commits back to `main` (18cr), so main moves after a
+  release; Homebrew stays a manual tap update (s3wn).
 - `kata purge` is denied outright in `.claude/settings.json`: it is
   irreversible ("remove an issue + all its rows"), and no agent should
   reach for it autonomously. Purge by hand if you truly mean it.

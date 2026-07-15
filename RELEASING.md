@@ -57,27 +57,35 @@ latest *published* release, so a draft or pre-release is invisible to it.
 ## 4. Release notes
 
 `generate_release_notes: true` (this repo, see `build.yml`'s `release` job)
-makes GitHub auto-generate the body from commits/PRs since the previous tag.
-Nothing to write by hand — after the release publishes, review the
-generated notes on the GitHub Release page and augment if anything needs
-more context.
+is set, so GitHub auto-generates the body from commits/PRs since the previous
+tag. **Expect that to give you nothing, and write the notes by hand.** It
+summarizes *pull requests*, and work here lands straight on `main` — with no
+PRs to draw on it emits a bare "Full Changelog" link and stops. Every release
+so far has had hand-written notes attached after the fact:
 
-## 5. Packaging (manual, separate from build.yml)
+```sh
+gh release edit vX.Y.Z --notes-file <path> --draft=false --prerelease=false
+```
 
-Not automated — do this after the release is published:
+The v0.1.4 and v0.1.5 release pages are the house style: a one-sentence
+characterization, `## Highlights` with bold lead-ins and bare kata refs in
+parens, then `## Install`. The `/release` skill
+(`.claude/skills/release/SKILL.md`) drives the whole process and carries the
+style guide. Lesson recorded in kata yqb0 and j68f.
 
-- **AUR** (`packaging/aur/tailport` and `packaging/aur/tailport-bin`): bump
-  `pkgver` (and reset `pkgrel=1`) and update `sha256sums` in both
-  `PKGBUILD`s.
-  - `tailport` (source): sha256 of the source tarball
-    (`https://github.com/gruen/tailport/archive/refs/tags/vX.Y.Z.tar.gz`).
-  - `tailport-bin` (prebuilt): sha256 of the LICENSE/README at that tag,
-    plus `sha256sums_x86_64` / `sha256sums_aarch64` — these come straight
-    from the `.sha256` files build.yml published alongside
-    `tailport-linux-amd64` / `tailport-linux-arm64`.
-  - See kata jtpx for the AUR package setup, hpx2 for the umbrella.
-- **Homebrew**: update the tap formula (`gruen/homebrew-tap`) — see kata
-  s3wn.
+## 5. Packaging
+
+- **AUR: automated.** `build.yml`'s `aur` job, gated on `needs: release`,
+  runs `scripts/aur-publish.sh` on a tag — it bumps `pkgver`, recomputes all
+  six digests, regenerates both `.SRCINFO`, pushes both AUR repos, and
+  bot-commits the same bump back to `main`. **So `main` gains a
+  `chore(aur): bump PKGBUILDs …` commit after every release — fetch before
+  you branch off it.** Dry-run it on any Arch box with
+  `VERSION=X.Y.Z CHECK=1 scripts/aur-publish.sh`; the manual recipe in
+  `packaging/aur/README.md` is now the fallback path. Setup and rationale:
+  kata 18cr, jtpx for the package setup, hpx2 for the umbrella.
+- **Homebrew: still manual.** Update the tap formula (`gruen/homebrew-tap`)
+  after the release publishes — see kata s3wn.
 
 ## 6. install.sh
 
