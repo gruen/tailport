@@ -1,0 +1,64 @@
+name: brew-test
+
+# Opt-in macOS job: proves packaging/brew/tailport.rb actually installs, runs,
+# and passes audit (kata s3wn). Same economics and gate style as
+# darwin-tests.yml -- macOS minutes are pricey, so it runs ONLY when asked:
+# a pushed commit whose message contains the literal token `[ci brew]`, or a
+# manual run from the Actions tab (workflow_dispatch).
+#
+# This exists because the formula is otherwise unverifiable: the dev box is
+# Arch, with no Homebrew, no Linuxbrew, and no ruby -- the formula could not
+# even be syntax-checked there. GitHub's macOS runners ship Homebrew, so this
+# is the first place the thing has ever run.
+#
+# It deliberately installs through a REAL TAP rather than `brew install
+# ./path.rb`, because the tap is the path users take (`brew install
+# gruen/tap/tailport`). Installing a local file would test a codepath nobody
+# uses and skip tap resolution entirely.
+#
+# Note: the `[ci brew]` gate reads github.event.head_commit.message, which is
+# populated on PUSH events (not pull_request). Trigger it on a branch push or
+# via manual dispatch.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  brew:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci brew]') }}
+    runs-on: macos-14 # Apple Silicon -- the arch the tap primarily serves
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: stage the formula in a local tap
+        run: |
+          set -eux
+          # --no-git: this tap is scaffolding for the test, not a repo to keep.
+          brew tap-new gruen/tap --no-git
+          cp packaging/brew/tailport.rb "$(brew --repository gruen/tap)/Formula/tailport.rb"
+
+      - name: brew install --build-from-source
+        # The formula is a source build by design (s3wn): build.yml publishes no
+        # darwin/amd64, so a prebuilt formula would strand Intel Macs. Force the
+        # source path explicitly -- there is no bottle, but be unambiguous.
+        run: brew install --build-from-source --verbose gruen/tap/tailport
+
+      - name: brew test
+        # Runs the formula's `test do` block: asserts `tailport --version`
+        # reports the real version, which is what catches a dropped
+        # -X main.version ldflags stamp (a tarball build has no VCS metadata to
+        # fall back on, so it would silently report "dev").
+        run: brew test gruen/tap/tailport
+
+      - name: brew audit
+        run: brew audit --strict gruen/tap/tailport
+
+      - name: prove the installed binary actually runs
+        # Independent of brew's own harness: the point of the package is a
+        # working tailport on PATH, so exercise it directly.
+        run: |
+          set -eux
+          which tailport
+          tailport --version
+          tailport --help >/dev/null
