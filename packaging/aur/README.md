@@ -68,6 +68,14 @@ every digest below is computed from published artifacts.
 curl -sL https://github.com/gruen/tailport/archive/refs/tags/vX.Y.Z.tar.gz | sha256sum
 ```
 
+This tarball is **generated on demand by GitHub, not published by us**, so its
+bytes are not contractually stable — a known, accepted risk with a rehearsed
+reactive fix. Read
+[docs/source-archive-stability.md](../../docs/source-archive-stability.md)
+(kata 3qyp) before concluding that a sudden digest mismatch on an
+already-published version means someone tampered with a release. (`tailport-bin`
+is immune: it pins real, immutable release assets.)
+
 **`tailport-bin/PKGBUILD`** — four digests. The two binary digests are already
 published by `build.yml`; prefer them over recomputing, then cross-check:
 

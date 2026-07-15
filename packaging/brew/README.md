@@ -74,6 +74,13 @@ This is the **same source tarball, and therefore the same digest**, as
 `packaging/aur/tailport/PKGBUILD`'s `sha256sums`. If those two disagree, one of
 them is wrong — that is a useful cross-check, so bump both together.
 
+That tarball is **generated on demand by GitHub, not published by us**, so its
+bytes are not contractually stable — a known, accepted risk with a rehearsed
+reactive fix. Read
+[docs/source-archive-stability.md](../../docs/source-archive-stability.md)
+(kata 3qyp) before concluding that a sudden digest mismatch on an
+already-published version means someone tampered with a release.
+
 ### 2. Copy to the tap and push (see below)
 
 `version` is inferred by Homebrew from the `url`, so nothing else needs editing;
