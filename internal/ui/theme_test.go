@@ -505,3 +505,39 @@ func TestApplyTheme(t *testing.T) {
 		t.Error(`ApplyTheme("dark") should force HasDarkBackground() == true`)
 	}
 }
+
+// TestVersionStyleContrast holds 0qy8's new versionStyle to the same bar as
+// the rest of the app's informational text. The version is secondary, but
+// it's a string users read character-by-character to answer "which build am
+// I on?" -- a misread digit is a wrong answer, so it gets the 4.5:1 "normal
+// text" bar rather than the decorative 3.0:1 one. It reuses the exact
+// Light/Dark pair already accepted for wasStyle/viewInactiveStyle, so this
+// is really a pin against someone later swapping in an unvetted grey.
+func TestVersionStyleContrast(t *testing.T) {
+	const bar = 4.5
+	fg, ok := versionStyle.GetForeground().(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("versionStyle.GetForeground() is a %T, not a lipgloss.AdaptiveColor", versionStyle.GetForeground())
+	}
+
+	lightRatio, err := contrastRatio(fg.Light, "#ffffff")
+	if err != nil {
+		t.Fatalf("computing Light contrast: %v", err)
+	}
+	if lightRatio < bar {
+		t.Errorf("versionStyle Light %s vs white = %.2f:1, want >= %.1f:1", fg.Light, lightRatio, bar)
+	}
+
+	darkHex, ok := ansiHexByIndex[fg.Dark]
+	if !ok {
+		t.Fatalf("no known hex for ANSI-256 index %q -- add it to ansiHexByIndex", fg.Dark)
+	}
+	darkRatio, err := contrastRatio(darkHex, "#000000")
+	if err != nil {
+		t.Fatalf("computing Dark contrast: %v", err)
+	}
+	if darkRatio < bar {
+		t.Errorf("versionStyle Dark %s (ANSI %s) vs black = %.2f:1, want >= %.1f:1", darkHex, fg.Dark, darkRatio, bar)
+	}
+	t.Logf("versionStyle: Light %s vs white = %.2f:1, Dark %s vs black = %.2f:1 (bar %.1f:1)", fg.Light, lightRatio, darkHex, darkRatio, bar)
+}

@@ -463,7 +463,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// config on the next unrelated save. ui.Run/ui.New apply the override to
 	// rendering only. See internal/ui/ui.go's New doc comment for the full
 	// reasoning.
-	if err := ui.Run(cfg, cf.markers); err != nil {
+	if err := ui.Run(cfg, cf.markers, version); err != nil {
 		fmt.Fprintln(stderr, "tailport:", err)
 		return 1
 	}

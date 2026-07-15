@@ -1930,6 +1930,96 @@ func TestHeader(t *testing.T) {
 	}
 }
 
+// TestDisplayVersion covers 0qy8's version formatting. The header wants the
+// tag-shaped "v0.1.4", but build.yml stamps main.version with the tag MINUS
+// its v, so the prefix has to be added back -- without ever producing "vdev"
+// for an unstamped local build, and without doubling an already-present v.
+func TestDisplayVersion(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"0.1.4", "v0.1.4"},  // the release case: build.yml's ${GITHUB_REF_NAME#v}
+		{"dev", "dev"},       // unstamped local build -- never "vdev"
+		{"", ""},             // unknown -> caller draws nothing
+		{"v0.1.4", "v0.1.4"}, // already tag-shaped -> no "vv0.1.4"
+		{"0.2.0-rc1", "v0.2.0-rc1"},
+	} {
+		if got := displayVersion(tc.in); got != tc.want {
+			t.Errorf("displayVersion(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestHeaderVersion covers 0qy8: the build version rides in the top bar just
+// after the wordmark, in a color distinct from it, and an unknown version
+// degrades to the bare wordmark rather than a stray "v" or empty styling.
+func TestHeaderVersion(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.width = 80
+	m.height = 24
+
+	// Unset (every New(cfg) call site): wordmark only, no version artifacts.
+	if got := m.renderHeader(); strings.Contains(got, "v0.") || strings.Contains(got, "dev") {
+		t.Errorf("header with no version should show the bare wordmark; got %q", got)
+	}
+
+	m.version = "0.1.4"
+	header := m.renderHeader()
+	// Order matters: the version sits AFTER the wordmark, not before it.
+	plain := stripANSI(header)
+	if !strings.Contains(plain, "tailport v0.1.4") {
+		t.Errorf("header should read 'tailport v0.1.4'; got %q", plain)
+	}
+	// "use a different color" is the ticket's actual ask, so assert it on the
+	// style definitions rather than on rendered output: under `go test` there's
+	// no TTY, lipgloss degrades to the Ascii profile, and EVERY style renders
+	// as bare text -- a rendered-string comparison would pass no matter what
+	// color versionStyle carried. theme_test.go reads GetForeground() for the
+	// same reason.
+	logoFg, ok := logoStyle.GetForeground().(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("logoStyle foreground is %T, want lipgloss.AdaptiveColor", logoStyle.GetForeground())
+	}
+	verFg, ok := versionStyle.GetForeground().(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("versionStyle foreground is %T, want lipgloss.AdaptiveColor", versionStyle.GetForeground())
+	}
+	if verFg == logoFg {
+		t.Errorf("versionStyle must differ from logoStyle; both are %+v", verFg)
+	}
+
+	// The toggle still right-aligns on the same row, and the version didn't
+	// push the header onto a second line at a normal width.
+	if lipgloss.Height(header) != 1 {
+		t.Errorf("header should stay one row at width 80; got %d rows: %q", lipgloss.Height(header), header)
+	}
+	if !strings.Contains(header, "All ports") {
+		t.Errorf("header should still carry the view toggle; got %q", header)
+	}
+}
+
+// TestHeaderSpacer covers 0qy8's "not crowded" half: View puts a blank row
+// between the header and the body, and listBodyHeight RESERVES that row --
+// if the two ever disagree the grid sizes one row too tall and pushes the
+// bottom bar off the viewport.
+func TestHeaderSpacer(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.width = 80
+	m.height = 24
+
+	lines := strings.Split(m.View(), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("View should render multiple lines; got %q", m.View())
+	}
+	if strings.TrimSpace(stripANSI(lines[1])) != "" {
+		t.Errorf("line 2 of View should be the blank spacer under the header; got %q", stripANSI(lines[1]))
+	}
+
+	// The whole view still fits the viewport -- the spacer is reserved, not
+	// bolted on top of a body already sized to fill the height.
+	if got := lipgloss.Height(m.View()); got > m.height {
+		t.Errorf("View is %d rows, exceeds the %d-row viewport -- spacer not reserved in listBodyHeight", got, m.height)
+	}
+}
+
 // TestEmptyStateMessage covers the contextual empty-view text: both views
 // must lead with what tailport is and the commands that power it (ss/lsof,
 // tailscale serve), then name the current view.

@@ -118,6 +118,14 @@ var (
 	// top-left of every view (list and empty-state alike); see renderHeader.
 	logoStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#005f5f", Dark: "51"}).Bold(true)
 
+	// versionStyle draws the build version next to the wordmark (0qy8). It's
+	// deliberately the app's muted secondary grey rather than another accent:
+	// the version is reference metadata you look up, not something competing
+	// with the cyan wordmark for attention. Same pair as viewInactiveStyle /
+	// wasStyle, so it clears the app-wide 4.5:1 contrast bar on both
+	// backgrounds (see TestVersionStyleContrast).
+	versionStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#6a6a6a", Dark: "245"})
+
 	// The two segments of the Favorites|All-ports view indicator: the active
 	// view is a filled green chip, the inactive one is dim.
 	viewActiveStyle = lipgloss.NewStyle().Background(lipgloss.Color("42")).Foreground(lipgloss.Color("233")).Bold(true)
@@ -641,6 +649,12 @@ type model struct {
 	keys     keyMap
 	cfg      config.Config
 	host     string
+	// version is the build version to show beside the wordmark (0qy8),
+	// threaded in from main's -ldflags-injected `version` via Run -- the ui
+	// package has no build stamp of its own. Empty means "unknown": New's
+	// dozens of test call sites leave it unset and renderHeader then draws
+	// the bare wordmark, so no test has to know a version string.
+	version string
 	// fqdn is this node's MagicDNS name (host.tailnet.ts.net), refreshed
 	// alongside serve/funnel status and used to build public funnel URLs.
 	fqdn string
@@ -996,9 +1010,14 @@ func New(cfg config.Config, markersOverride ...string) model {
 
 // Run launches the interactive TUI. markersOverride is an optional, run-only
 // "--markers" value (zn2x); see New for why it's kept separate from
-// cfg.Markers rather than overwriting it.
-func Run(cfg config.Config, markersOverride string) error {
-	_, err := tea.NewProgram(New(cfg, markersOverride), tea.WithAltScreen()).Run()
+// cfg.Markers rather than overwriting it. version is main's
+// -ldflags-injected build version, rendered beside the wordmark (0qy8) --
+// passed in rather than read from a package global for the same reason
+// selfupdate.NewUpdater takes it: only main owns the build stamp.
+func Run(cfg config.Config, markersOverride, version string) error {
+	m := New(cfg, markersOverride)
+	m.version = version
+	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
 
@@ -4330,13 +4349,17 @@ func (m model) renderEmptyState() string {
 }
 
 // renderHeader draws the persistent top header: the cyan "tailport" wordmark
-// pinned top-left and the Favorites|All-ports toggle right-aligned on the same
-// row, spanning the terminal width. View() draws it above both the list body
-// and the empty state, so the logo never disappears when a view is empty or
-// when switching views. Before the first WindowSizeMsg (width == 0) the two
-// fall back to a single-space separation.
+// pinned top-left, the build version in muted grey just after it (0qy8), and
+// the Favorites|All-ports toggle right-aligned on the same row, spanning the
+// terminal width. View() draws it above both the list body and the empty
+// state, so the logo never disappears when a view is empty or when switching
+// views. Before the first WindowSizeMsg (width == 0) the two fall back to a
+// single-space separation.
 func (m model) renderHeader() string {
 	logo := logoStyle.Render("tailport")
+	if v := displayVersion(m.version); v != "" {
+		logo += " " + versionStyle.Render(v)
+	}
 	toggle := m.renderViewIndicator()
 	gap := m.width - lipgloss.Width(logo) - lipgloss.Width(toggle)
 	if gap < 1 {
@@ -4344,6 +4367,31 @@ func (m model) renderHeader() string {
 	}
 	return logo + strings.Repeat(" ", gap) + toggle
 }
+
+// displayVersion formats a build version for the header. Release builds stamp
+// a bare semver ("0.1.4" -- build.yml passes -X main.version=${GITHUB_REF_NAME#v},
+// which strips the tag's leading v), and the header wants it tag-shaped, so
+// the v goes back on: "v0.1.4". Two values are passed through verbatim
+// instead: "" (unknown -- caller draws no version at all) and the default
+// "dev" of an unstamped local build, which is not a semver and would read as
+// a nonsense "vdev". Pure and total so it can be table-tested without a model.
+func displayVersion(v string) string {
+	switch {
+	case v == "" || v == "dev":
+		return v
+	case strings.HasPrefix(v, "v"):
+		return v // already tag-shaped; don't double the prefix
+	default:
+		return "v" + v
+	}
+}
+
+// headerSpacerLines is the blank row View draws between the header and the
+// body, so the wordmark isn't crowded against the first port row (0qy8). It's
+// a named constant because two places must agree on it: View, which emits it,
+// and listBodyHeight, which reserves it -- if the reservation missed it the
+// grid would size one row too tall and the bottom bar would be pushed off.
+const headerSpacerLines = 1
 
 // renderViewIndicator renders the Favorites | All-ports segmented control,
 // with the active view as a filled chip so it's unmistakable which one "a"
@@ -4462,7 +4510,7 @@ func (m model) listBodyHeight() int {
 	// rather than a flat 1, since a wrapped flash toast can span multiple
 	// rows), and the grouped shortcuts legend. View then pads the gap so the
 	// bar lands on the last rows (see renderHeader / renderBottom).
-	headerLines := lipgloss.Height(m.renderHeader())
+	headerLines := lipgloss.Height(m.renderHeader()) + headerSpacerLines
 	// statusLines is the CURRENT height of renderStatusLine -- >=1, and >1
 	// while a long flash toast is wrapped across lines (83wv pt2). Unlike the
 	// legend/banner reservations above, this one is NOT worst-cased to some
@@ -4726,11 +4774,11 @@ func (m model) View() string {
 	// rows of the viewport by padding the gap. Before the first WindowSizeMsg
 	// (m.height == 0) this falls back to a single blank separator line.
 	bottom := m.renderBottom()
-	gap := m.height - lipgloss.Height(header) - lipgloss.Height(body) - lipgloss.Height(bottom)
+	gap := m.height - lipgloss.Height(header) - headerSpacerLines - lipgloss.Height(body) - lipgloss.Height(bottom)
 	if gap < 1 {
 		gap = 1
 	}
-	return header + "\n" + body + strings.Repeat("\n", gap) + bottom
+	return header + strings.Repeat("\n", 1+headerSpacerLines) + body + strings.Repeat("\n", gap) + bottom
 }
 
 // renderFilterRow renders the on-demand filter input shown beneath the header
