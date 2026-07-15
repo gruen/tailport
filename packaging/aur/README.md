@@ -14,8 +14,8 @@ go ≥ 1.26.5 — make sure Arch's `go` is new enough at package time).
 
 The PKGBUILDs and generated `.SRCINFO` files are kept here under version
 control. The real AUR repos are separate git remotes, one per package;
-publishing is copying `PKGBUILD` + `.SRCINFO` into each and pushing (step 5
-below).
+publishing is copying `PKGBUILD` + `.SRCINFO` into each and pushing (see
+"Publish to the AUR" below).
 
 ## Supporting machinery (already in place)
 
@@ -108,11 +108,11 @@ git push
 
 ## What is / isn't verifiable in this repo's environment
 
-**Verified for 0.1.4 on this x86_64 Arch host:** both packages built with
+**Verified for 0.1.5 on this x86_64 Arch host:** both packages built with
 `makepkg -f` (every source re-downloaded and digest-validated by makepkg
 itself), `go test ./...` green as the source package's `check()` step, both
 built packages extracted and their `usr/bin/tailport --version` printing
-`tailport 0.1.4`, and `makepkg --printsrcinfo` matching each committed
+`tailport 0.1.5`, and `makepkg --printsrcinfo` matching each committed
 `.SRCINFO` byte-for-byte.
 
 **Not verifiable here:** the aarch64 build (x86_64 host — the *digest* is
