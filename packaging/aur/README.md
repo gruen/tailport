@@ -17,86 +17,83 @@ control. The real AUR repos are separate git remotes, one per package;
 publishing is copying `PKGBUILD` + `.SRCINFO` into each and pushing (step 5
 below).
 
-## What's already done (in this repo)
+## Supporting machinery (already in place)
 
-- `tailport --version` (injected at build via `-ldflags "-X main.version=…"`;
-  `dev` for plain `go build`).
+- `tailport --version` — injected at build via `-ldflags "-X main.version=…"`,
+  which is what both PKGBUILDs do. (A plain `go build` reports `dev`; a
+  `go install` recovers the version from the embedded module info. Neither
+  path applies to packaging — the PKGBUILDs always stamp explicitly.)
 - `.github/workflows/build.yml` builds **linux/amd64, linux/arm64, darwin/arm64**
   on a `v*` tag, injects the version, writes a `.sha256` next to each binary,
-  and attaches everything to the GitHub release. (linux/arm64 was added purely
-  to feed `tailport-bin`'s aarch64 — it is a release artifact, not a fleet node.)
-- Both PKGBUILDs + `.SRCINFO` (generated with `makepkg --printsrcinfo`).
+  and attaches everything to the GitHub release. (linux/arm64 exists purely to
+  feed `tailport-bin`'s aarch64 — a release artifact, not a fleet node.)
+- Both PKGBUILDs + `.SRCINFO` (generated with `makepkg --printsrcinfo`), with
+  real digests. **Currently at 0.1.4.**
 
-The four `sha256sums*` entries are placeholders (`REPLACE_WITH_SHA256_…`) —
-they can only be filled once the v0.1.1 tag and its release assets exist
-(steps 2–3).
+## Bumping for a new release
 
-## Steps only you (the maintainer) can do
+Do this *after* the GitHub release exists (see [RELEASING.md](../../RELEASING.md)) —
+every digest below is computed from published artifacts.
 
-### 1. AUR account (one-time)
+### 1. Bump `pkgver` (and reset `pkgrel=1`) in both PKGBUILDs
 
-Create an account at <https://aur.archlinux.org> and add your SSH public key
-under **My Account**. Required to push to `ssh://aur@aur.archlinux.org/<pkg>.git`.
+### 2. Replace every digest — no placeholders
 
-### 2. Cut the v0.1.1 tag + GitHub release
-
-```sh
-git tag -a v0.1.1 -m "tailport 0.1.1"
-git push origin v0.1.1
-```
-
-The tag push triggers `build.yml`, which builds the three targets and creates
-the GitHub release with the binaries and their `.sha256` files attached.
-Confirm the release has:
-`tailport-linux-amd64`, `tailport-linux-arm64`, `tailport-darwin-arm64`
-(+ each `.sha256`).
-
-### 3. Fill in the sha256sums
-
-**Source PKGBUILD** (`tailport/PKGBUILD`) — hash the release source tarball:
+**`tailport/PKGBUILD`** — one digest, the release source tarball:
 
 ```sh
-cd packaging/aur/tailport
-# either:
-makepkg -g >> PKGBUILD        # then delete the old placeholder line
-# or compute directly:
-curl -sL https://github.com/gruen/tailport/archive/refs/tags/v0.1.1.tar.gz | sha256sum
+curl -sL https://github.com/gruen/tailport/archive/refs/tags/vX.Y.Z.tar.gz | sha256sum
 ```
 
-**Binary PKGBUILD** (`tailport-bin/PKGBUILD`) — four hashes:
+**`tailport-bin/PKGBUILD`** — four digests. The two binary digests are already
+published by `build.yml`; prefer them over recomputing, then cross-check:
 
-- `sha256sums` (LICENSE, README): from the raw files at the tag, e.g.
-  `curl -sL https://raw.githubusercontent.com/gruen/tailport/v0.1.1/LICENSE | sha256sum`
-- `sha256sums_x86_64` / `sha256sums_aarch64`: published as
-  `tailport-linux-amd64.sha256` / `tailport-linux-arm64.sha256` on the release
-  (or `makepkg -g` will fetch and hash them).
+```sh
+# authoritative, published next to each asset:
+curl -sL https://github.com/gruen/tailport/releases/download/vX.Y.Z/tailport-linux-amd64.sha256
+curl -sL https://github.com/gruen/tailport/releases/download/vX.Y.Z/tailport-linux-arm64.sha256
+# LICENSE + README, hashed from the raw files at the tag:
+curl -sL https://raw.githubusercontent.com/gruen/tailport/vX.Y.Z/LICENSE   | sha256sum
+curl -sL https://raw.githubusercontent.com/gruen/tailport/vX.Y.Z/README.md | sha256sum
+```
 
-Then regenerate each `.SRCINFO`:
+`sha256sums_x86_64` ← amd64, `sha256sums_aarch64` ← arm64. Note the arch names
+differ between Arch (`x86_64`/`aarch64`) and Go (`amd64`/`arm64`) — the
+`source_*` URLs use the Go names, the `sha256sums_*` arrays use the Arch ones.
+
+### 3. Regenerate both `.SRCINFO` (the AUR requires it to match)
 
 ```sh
 cd packaging/aur/tailport     && makepkg --printsrcinfo > .SRCINFO
 cd packaging/aur/tailport-bin && makepkg --printsrcinfo > .SRCINFO
 ```
 
-Commit the filled hashes + updated `.SRCINFO`.
+### 4. Verify locally (x86_64 Arch)
 
-### 4. Lint & build in a clean chroot (recommended)
-
-Not doable in the dev sandbox here (no `namcap`, no C compiler for the
-source package's `-linkmode=external`, no ARM box). On an Arch machine with
-`devtools` + `namcap`:
+Both packages build here — `makepkg` re-downloads every source and validates
+the digests you just wrote, so a bad hash fails loudly:
 
 ```sh
-cd packaging/aur/tailport
-namcap PKGBUILD
-extra-x86_64-build          # clean-chroot build (base-devel provides gcc → cgo/PIE work)
-namcap tailport-*.pkg.tar.zst
-# aarch64 needs an ARM host or cross toolchain.
+cd packaging/aur/tailport     && makepkg -f    # runs go test ./... as check()
+cd packaging/aur/tailport-bin && makepkg -f
+# then confirm the packaged binary reports the new version:
+tar xf tailport-X.Y.Z-1-x86_64.pkg.tar.zst -O usr/bin/tailport > /tmp/tp && chmod +x /tmp/tp && /tmp/tp --version
 ```
 
-For `tailport-bin`, `makepkg -f` after the real assets exist; `namcap` both.
+`makepkg` refuses to run as root — use a normal user. Clean up `pkg/`, `src/`,
+and `*.pkg.tar.*` afterwards; they're build byproducts, not source.
 
-### 5. Publish to the AUR
+If `namcap` is installed, lint both: `namcap PKGBUILD` and
+`namcap <built-pkg>.tar.zst`.
+
+## Steps only you (the maintainer) can do
+
+### AUR account (one-time)
+
+Create an account at <https://aur.archlinux.org> and add your SSH public key
+under **My Account**. Required to push to `ssh://aur@aur.archlinux.org/<pkg>.git`.
+
+### Publish to the AUR
 
 For each package (`tailport`, then `tailport-bin`):
 
@@ -105,20 +102,20 @@ git clone ssh://aur@aur.archlinux.org/<pkg>.git aur-<pkg>
 cp packaging/aur/<pkg>/PKGBUILD packaging/aur/<pkg>/.SRCINFO aur-<pkg>/
 cd aur-<pkg>
 git add PKGBUILD .SRCINFO
-git commit -m "Initial import: <pkg> 0.1.1"
+git commit -m "<pkg> X.Y.Z"
 git push
 ```
 
-## What was verified in-env vs. left to you
+## What is / isn't verifiable in this repo's environment
 
-Verified here: `--version` (default + injected), `go test ./...` (the `check()`
-step), the `build.yml` recipe for all three targets (linux/arm64 cross-compiles
-to a valid aarch64 ELF; version injection confirmed), both `.SRCINFO` generate
-cleanly, and the source `package()` install lines produce the correct FHS tree
-with a version-reporting binary.
+**Verified for 0.1.4 on this x86_64 Arch host:** both packages built with
+`makepkg -f` (every source re-downloaded and digest-validated by makepkg
+itself), `go test ./...` green as the source package's `check()` step, both
+built packages extracted and their `usr/bin/tailport --version` printing
+`tailport 0.1.4`, and `makepkg --printsrcinfo` matching each committed
+`.SRCINFO` byte-for-byte.
 
-Left to you (can't run in the sandbox): filling real sha256sums (needs the
-tag/release), the source PKGBUILD's `-linkmode=external`/`-buildmode=pie` build
-(needs a C toolchain — present in an Arch clean chroot via base-devel),
-`namcap` lint, the aarch64 build (needs an ARM host), and the AUR account +
-push.
+**Not verifiable here:** the aarch64 build (x86_64 host — the *digest* is
+verified against the published `.sha256`, but the ARM binary is never
+executed), `namcap` lint (not installed), and the AUR push itself (needs your
+account + SSH key).
