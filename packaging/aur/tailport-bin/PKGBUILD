@@ -9,6 +9,10 @@ license=('MIT')
 depends=('tailscale' 'iproute2')
 provides=('tailport')
 conflicts=('tailport')
+# The release binaries are prebuilt and already stripped. Without this, makepkg
+# strips them again -- mutating the exact artifact the sha256sums below attest
+# to -- and emits an empty -debug package built from nonexistent symbols.
+options=('!strip' '!debug')
 
 # Arch-independent sources: LICENSE (required per-package) and README, pulled
 # from the tag so the -bin package can ship them without the source tarball.

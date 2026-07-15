@@ -83,8 +83,35 @@ tar xf tailport-X.Y.Z-1-x86_64.pkg.tar.zst -O usr/bin/tailport > /tmp/tp && chmo
 `makepkg` refuses to run as root — use a normal user. Clean up `pkg/`, `src/`,
 and `*.pkg.tar.*` afterwards; they're build byproducts, not source.
 
-If `namcap` is installed, lint both: `namcap PKGBUILD` and
-`namcap <built-pkg>.tar.zst`.
+Lint both with `namcap PKGBUILD` and `namcap <built-pkg>.tar.zst`
+(`pacman -S namcap`). Two warnings on the built packages are **expected and
+correct** — don't "fix" them:
+
+- `Dependency included, but may not be needed ('tailscale'/'iproute2')` on both
+  packages. False positive: namcap looks for linkage, and both are runtime
+  shell-outs.
+- `lacks PIE` / `lacks FULL RELRO` on `tailport-bin` only. That is upstream's
+  own release binary, which `build.yml` builds `CGO_ENABLED=0` (hence static,
+  hence non-PIE). Shipping it unmodified is the entire point of a `-bin`
+  package; the fix would be a `build.yml` change that invalidates every
+  published digest. The source package *is* PIE, via `-buildmode=pie`.
+
+A clean-chroot build (`extra-x86_64-build`, from `devtools`) is the stronger
+check — it proves `depends`/`makedepends` are complete rather than silently
+satisfied by your host. It needs root, so it can't run unattended.
+
+It ends by printing an error that is **expected — ignore it**:
+
+```
+error: target not found: tailport
+==> WARNING: Skipped checkpkg due to missing repo packages
+```
+
+`checkpkg` diffs a freshly built package against the same package *in the
+official repos* to catch soname breaks. tailport is an AUR package and has
+never been in the official repos, so there is nothing to diff and it skips.
+This says nothing about the build, which has already finished by that point —
+confirm success by the package appearing in the build dir, not by checkpkg.
 
 ## Steps only you (the maintainer) can do
 
@@ -113,9 +140,28 @@ git push
 itself), `go test ./...` green as the source package's `check()` step, both
 built packages extracted and their `usr/bin/tailport --version` printing
 `tailport 0.1.5`, and `makepkg --printsrcinfo` matching each committed
-`.SRCINFO` byte-for-byte.
+`.SRCINFO` byte-for-byte. `namcap` is clean on both PKGBUILDs (no output) and
+reports only the expected warnings above on the built packages. The source
+binary was confirmed `ELF … pie executable, dynamically linked` against
+`libc.so.6` — which is what makes `glibc` a real, direct dependency rather
+than one borrowed from `tailscale`.
 
-**Not verifiable here:** the aarch64 build (x86_64 host — the *digest* is
-verified against the published `.sha256`, but the ARM binary is never
-executed), `namcap` lint (not installed), and the AUR push itself (needs your
-account + SSH key).
+`tailport-bin`'s packaged binary was confirmed **byte-for-byte identical** to
+the published `tailport-linux-amd64` asset (`84565110…`). That identity is
+what `options=('!strip' '!debug')` buys: without it makepkg re-strips the
+prebuilt binary *after* makepkg has validated its digest, so the package ships
+bytes that no published checksum attests to. Re-check this whenever the -bin
+recipe changes — it's the property the whole package exists to provide.
+
+**Also verified for 0.1.5: the source package builds in a clean chroot**
+(`extra-x86_64-build`), which is what proves `depends`/`makedepends` are
+actually complete rather than quietly satisfied by a dev box that already has
+the toolchain. Evidence it was genuinely clean: `.BUILDINFO` records
+`builddir = /build` and a from-scratch 165-package environment. The
+chroot-built binary prints `tailport 0.1.5` and is PIE + dynamically linked,
+and `namcap` on it shows only the two false positives above — no `glibc`
+warning, confirming that dependency is now declared correctly.
+
+**Not verified here:** the aarch64 build (x86_64 host — the *digest* is
+checked against the published `.sha256`, but the ARM binary is never
+executed), and the AUR push itself (needs your account + SSH key).

@@ -6,9 +6,13 @@ pkgdesc="TUI to expose local ports across your tailnet via tailscale serve"
 arch=('x86_64' 'aarch64')
 url='https://github.com/gruen/tailport'
 license=('MIT')
+# glibc: build() links libc dynamically via -linkmode=external, so depend on it
+# directly rather than leaning on tailscale to pull it in.
 # tailscale is shelled out to for serve/funnel; ss (iproute2) discovers
 # listening ports on Linux. lsof is the macOS path only, so not a dep here.
-depends=('tailscale' 'iproute2')
+# namcap flags tailscale/iproute2 as "may not be needed" -- a false positive; it
+# sees no linkage because both are runtime shell-outs, not linked libraries.
+depends=('glibc' 'tailscale' 'iproute2')
 # go.mod requires go >= 1.26.5; ensure Arch's go is new enough at build time.
 makedepends=('go')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/gruen/tailport/archive/refs/tags/v$pkgver.tar.gz")
