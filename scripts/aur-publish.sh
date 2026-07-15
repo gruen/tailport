@@ -81,6 +81,14 @@ bump_common() {
 say "rewriting packaging/aur/tailport/PKGBUILD"
 bump_common packaging/aur/tailport/PKGBUILD
 sed -i "s|^sha256sums=('[0-9a-f]*')|sha256sums=('$src_sha')|" packaging/aur/tailport/PKGBUILD
+# Prove the rewrite landed. A sed whose pattern silently stops matching (a
+# reformat, an uppercase digest, a SKIP) would bump pkgver while leaving the
+# OLD digest in place -- a green run that publishes a package failing checksum
+# for every user. Cheap guard against an expensive, quiet failure.
+grep -q "^sha256sums=('$src_sha')" packaging/aur/tailport/PKGBUILD \
+  || die "tailport/PKGBUILD: source sha256sums rewrite did not take"
+grep -q "^pkgver=$VERSION" packaging/aur/tailport/PKGBUILD \
+  || die "tailport/PKGBUILD: pkgver rewrite did not take"
 
 say "rewriting packaging/aur/tailport-bin/PKGBUILD"
 bump_common packaging/aur/tailport-bin/PKGBUILD
@@ -100,6 +108,26 @@ awk -v lic="$lic_sha" -v rdm="$rdm_sha" -v amd="$amd_sha" -v arm="$arm_sha" '
   { print }
 ' packaging/aur/tailport-bin/PKGBUILD > packaging/aur/tailport-bin/PKGBUILD.new
 mv packaging/aur/tailport-bin/PKGBUILD.new packaging/aur/tailport-bin/PKGBUILD
+
+# Same post-conditions as the source package, plus one specific to the awk: its
+# skip-until-`)` rule assumes the two-line array it re-emits. If the block ever
+# became one line, skip would never clear and awk would silently swallow the
+# rest of the file -- package() included, producing a PKGBUILD that still
+# parses and still generates a valid-looking .SRCINFO while installing nothing.
+grep -q "^pkgver=$VERSION" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: pkgver rewrite did not take"
+grep -q "^sha256sums=('$lic_sha'$" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: LICENSE digest rewrite did not take"
+grep -q "^            '$rdm_sha')$" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: README digest rewrite did not take"
+grep -q "^sha256sums_x86_64=('$amd_sha')$" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: x86_64 digest rewrite did not take"
+grep -q "^sha256sums_aarch64=('$arm_sha')$" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: aarch64 digest rewrite did not take"
+grep -q '^package()' packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: the awk rewrite ate package() -- refusing to publish"
+grep -q "^options=('!strip' '!debug')" packaging/aur/tailport-bin/PKGBUILD \
+  || die "tailport-bin/PKGBUILD: options=('!strip' '!debug') is missing -- without it makepkg re-strips the prebuilt binary after its digest is validated (jtpx)"
 
 for p in tailport tailport-bin; do
   say "regenerating packaging/aur/$p/.SRCINFO"

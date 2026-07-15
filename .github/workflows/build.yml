@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+# Serialise releases. Two tags in flight would race the bot-commits to main and
+# could publish to the AUR out of order, leaving it describing the older one.
+# Never cancel: a half-cancelled run could publish the AUR and not the tap.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -83,7 +90,11 @@ jobs:
     container: archlinux:base-devel
     steps:
       - name: install what base-devel lacks
-        run: pacman -Sy --noconfirm --needed git openssh
+        # -Syu, not -Sy: a partial upgrade is unsupported on Arch. The image is
+        # rebuilt only ~weekly, so `-Sy` against moved repos can pull a git or
+        # openssh linked against a newer glibc than the image carries, or hit
+        # "unknown trust" from a stale archlinux-keyring.
+        run: pacman -Syu --noconfirm --needed git openssh
 
       - uses: actions/checkout@v5
         # Checks out the tag, which is what aur-publish.sh requires: it hashes
@@ -129,6 +140,10 @@ jobs:
           su builder -c "cd '$GITHUB_WORKSPACE' && VERSION='$version' DIST=dist AUR_PUSH=1 sh scripts/aur-publish.sh"
 
       - name: sync the bump onto main
+        # Bookkeeping must never gate publishing. The packages are already on
+        # the AUR by this point; if this step fails, `brew` still has to run, so
+        # do not let a sync problem strand the tap at the old version.
+        continue-on-error: true
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
@@ -142,7 +157,11 @@ jobs:
           # before the release exists.
           tmp=$(mktemp -d); cp -r packaging/aur "$tmp/"
           git fetch --depth=1 origin main
-          git checkout -B main FETCH_HEAD
+          # -f: the bump is already saved in $tmp, so the dirty tree is
+          # expendable. Without it checkout ABORTS whenever packaging/aur
+          # differs between the tag and main -- which is always true on a
+          # re-run, i.e. exactly when you are trying to recover.
+          git checkout -f -B main FETCH_HEAD
           cp -r "$tmp/aur/." packaging/aur/
           if git diff --quiet -- packaging/aur; then
             echo "main already carries this bump"; exit 0
@@ -191,6 +210,9 @@ jobs:
           VERSION="$version" BREW_PUSH=1 sh scripts/brew-publish.sh
 
       - name: sync the bump onto main
+        # Same reasoning as the aur job's sync: the tap is already published by
+        # now, so a bookkeeping failure must not fail the run.
+        continue-on-error: true
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
@@ -201,7 +223,9 @@ jobs:
           tmp=$(mktemp -d); cp -r packaging/brew "$tmp/"
           # Fetch main fresh: the aur job has already landed its own bump here.
           git fetch --depth=1 origin main
-          git checkout -B main FETCH_HEAD
+          # -f for the same reason as the aur job: the bump is saved in $tmp,
+          # and without it a re-run aborts on the locally-modified formula.
+          git checkout -f -B main FETCH_HEAD
           cp -r "$tmp/brew/." packaging/brew/
           if git diff --quiet -- packaging/brew; then
             echo "main already carries this bump"; exit 0
