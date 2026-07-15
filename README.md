@@ -67,6 +67,13 @@ paru -S tailport        # or: yay -S tailport
 paru -S tailport-bin    # prebuilt
 ```
 
+**On macOS or Linux**, from the [Homebrew](https://brew.sh) tap. It builds from
+source, so it works on Apple Silicon and Intel Macs alike, and on Linuxbrew:
+
+```sh
+brew install gruen/tap/tailport
+```
+
 **With Go installed**, for any supported OS/arch:
 
 ```sh

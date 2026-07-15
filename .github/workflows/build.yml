@@ -137,6 +137,15 @@ jobs:
           chmod 600 /home/builder/.ssh/aur /home/builder/.ssh/config
           chmod 644 /home/builder/.ssh/known_hosts
           chown -R builder:builder /home/builder/.ssh
+          # Prove the secret round-tripped to a usable key. Learned on v0.1.6:
+          # a malformed AUR_SSH_KEY surfaces as `Load key: invalid format`
+          # buried under an opaque `git` exit 128, which reads like a repo or
+          # permissions problem and sends you debugging the wrong thing. A
+          # web-UI paste can mangle the newlines, or hold the .pub by mistake.
+          if ! ssh-keygen -y -f /home/builder/.ssh/aur > /dev/null 2>&1; then
+            echo "::error::AUR_SSH_KEY is not a valid OpenSSH private key. Re-set it from the file, which preserves the newlines a paste can eat: gh secret set AUR_SSH_KEY < ~/.ssh/aur"
+            exit 1
+          fi
           su builder -c "cd '$GITHUB_WORKSPACE' && VERSION='$version' DIST=dist AUR_PUSH=1 sh scripts/aur-publish.sh"
 
       - name: sync the bump onto main
@@ -206,6 +215,12 @@ jobs:
           printf '%s\n' \
             'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
             > "$HOME/.ssh/known_hosts_tap"
+          # Same guard as the aur job -- see the note there. A bad key here
+          # would otherwise surface as an opaque git exit 128.
+          if ! ssh-keygen -y -f "$HOME/.ssh/tap" > /dev/null 2>&1; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not a valid OpenSSH private key. Re-set it from a file rather than a paste."
+            exit 1
+          fi
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tap -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_tap"
           VERSION="$version" BREW_PUSH=1 sh scripts/brew-publish.sh
 

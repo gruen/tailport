@@ -260,26 +260,40 @@ kata close <ref> --done --message "<scope + what you actually observed>" --commi
 
 The message carries the evidence. "It built" is not evidence.
 
-**11. Packaging — mostly not yours.** The AUR half publishes itself as of
-`18cr`: `build.yml`'s `aur` job is gated on `needs: release` and runs
-`scripts/aur-publish.sh`, which bumps both PKGBUILDs, recomputes all six
-digests, regenerates both `.SRCINFO`, pushes both AUR repos, and bot-commits
-the same bump back to `main`. Three consequences for you:
+**11. Packaging — not yours.** Both halves publish themselves, gated on
+`needs: release`. The `aur` job (`18cr`) runs `scripts/aur-publish.sh`: bumps
+both PKGBUILDs, recomputes all six digests, regenerates both `.SRCINFO`, pushes
+both AUR repos. The `brew` job (`nqmn`) runs `scripts/brew-publish.sh`:
+rewrites the formula's `url`/`sha256` and pushes it to `gruen/homebrew-tap`
+with a deploy key. Both bot-commit their bump back to `main`. `brew` needs
+`aur` so those two pushes can't race.
 
-- **Watch that job too.** It's the last one in the run, after `release`.
-- **`main` moves under you after a tag.** The job bot-commits
-  `chore(aur): bump PKGBUILDs to X.Y.Z (18cr)`. Fetch before you do anything
-  else with the branch, and don't be startled by a commit you didn't write.
-- **As of 2026-07-15 that job has never run.** `18cr` shipped deliberately
-  unexercised — no container runtime on the dev host — so the first real tag
-  is its test, and it hard-fails if the `AUR_SSH_KEY` secret is unset. If it
-  breaks, that is an AUR problem, not a release problem: the GitHub release
-  has already published and `install.sh` users are already served. Report it
-  against `18cr`. **Do not re-cut the tag** to fix a packaging job.
+Consequences for you:
 
-Homebrew is still manual and still `s3wn`'s — the tap (`gruen/homebrew-tap`)
-is a separate repo, and the opt-in macOS job verifies the formula rather than
-publishing it.
+- **Watch both jobs.** They're the last in the run, after `release`.
+- **`main` moves under you after a tag** — two bot commits,
+  `chore(aur): bump PKGBUILDs to X.Y.Z (18cr)` and
+  `chore(brew): bump formula to X.Y.Z (nqmn)`. Fetch before touching the
+  branch; don't be startled by commits you didn't write.
+- **A packaging failure is not a release failure.** The GitHub release has
+  already published and `install.sh` users are already served. Report it
+  against `18cr`/`nqmn` and fix forward. **Never re-cut the tag** for a
+  packaging job — the jobs are re-runnable (`gh run rerun <id> --failed`) and
+  secrets are read at run time, so a bad secret is fixable without a new tag.
+
+Two things v0.1.6 learned the hard way, both worth knowing before you debug:
+
+- **The AUR's web page lies for a few minutes after a push.** It served
+  `0.1.5-1` while the git repo already held `0.1.6` and the job log said
+  `pushed tailport 0.1.6`. The RPC `info` endpoint caches too — it returned
+  `resultcount:0` for minutes after the initial import. Verify against the
+  **git repo** (`git clone ssh://aur@aur.archlinux.org/<pkg>.git`), never the
+  page. Do not report a publish failure off a stale page.
+- **Verify the digests, not just the exit code.** `makepkg --verifysource` in
+  a clone of each AUR package re-downloads every source and validates what was
+  actually published; the tap's `sha256` should equal the AUR source package's
+  (same tarball). This is the cheap catch for anything that publishes a digest
+  users can't reproduce.
 
 ## When to stop and ask
 
