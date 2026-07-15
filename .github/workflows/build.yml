@@ -32,11 +32,19 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          # Read the exact version from go.mod (currently 1.26.5) rather than a
-          # bare "1.26": setup-go's default check-latest:false would otherwise
-          # reuse the runner's preinstalled lower 1.26.x, which fails go.mod's
-          # `go 1.26.5` requirement and rejects `go build` before it compiles.
+          # go.mod states a MINIMUM (`go 1.26`), not the toolchain to build
+          # with -- it is a floor for packagers, deliberately loose (tvyh).
+          # Release binaries should still be built with the newest patch, so
+          # ask for that explicitly here rather than inferring it from go.mod.
+          #
+          # check-latest is what does that work. Left at its default (false),
+          # setup-go resolves a bare minor by taking the newest match it finds
+          # *in the runner's cache first*, which is whatever preinstalled
+          # 1.26.x that image happens to carry -- silently building releases on
+          # a stale toolchain. true resolves to the latest 1.26.x for real,
+          # downloading when the cache is behind.
           go-version-file: go.mod
+          check-latest: true
 
       - name: build
         env:

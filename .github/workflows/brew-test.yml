@@ -32,19 +32,23 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: brew update
-        # Not boilerplate -- without this the job tests an environment no user
-        # has, and fails (kata 8jdh, first non-skipped run 29440235804).
+        # Not boilerplate. GitHub's macOS images set HOMEBREW_NO_AUTO_UPDATE=1
+        # and ship a homebrew-core snapshot that can be weeks stale, so
+        # `depends_on "go"` pours whatever go that snapshot pins. A real user's
+        # `brew install` auto-updates first and gets current go -- without this
+        # step the job tests an environment nobody actually installs from.
         #
-        # GitHub's macOS images set HOMEBREW_NO_AUTO_UPDATE=1 and ship a
-        # homebrew-core snapshot that can be weeks stale. `depends_on "go"`
-        # then pours whatever go that snapshot pins -- 1.26.4 on the run above,
-        # a week after core had moved to 1.26.5 -- while brew builds with
-        # GOTOOLCHAIN=local, so go cannot fetch the newer toolchain it needs
-        # and the build dies on `go.mod requires go >= 1.26.5`.
+        # History: this was added because the first non-skipped run (kata 8jdh,
+        # 29440235804) died on `go.mod requires go >= 1.26.5 (running go
+        # 1.26.4; GOTOOLCHAIN=local)`. That exact failure is now impossible --
+        # tvyh relaxed go.mod to a `go 1.26` floor, which 1.26.4 satisfies --
+        # so do not expect to reproduce it by deleting this step.
         #
-        # A real user's `brew install` auto-updates first and gets current go,
-        # so updating here is what makes this job test the actual user path
-        # rather than a stale-snapshot artifact.
+        # Keep the step anyway, for the reason above and because the same
+        # failure returns at the next MINOR bump: brew builds with
+        # GOTOOLCHAIN=local, so go cannot fetch a toolchain, and a homebrew-core
+        # still on 1.26.x cannot satisfy a `go 1.27` floor at all. Updating
+        # first is what gives that the best chance of resolving on its own.
         run: brew update
 
       - name: stage the formula in a local tap

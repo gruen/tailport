@@ -23,11 +23,14 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          # Read the exact version from go.mod (currently 1.26.5) rather than a
-          # bare "1.26": setup-go's default check-latest:false would otherwise
-          # reuse the runner's preinstalled lower 1.26.x, which fails go.mod's
-          # `go 1.26.5` requirement and rejects `go build` before it compiles.
+          # go.mod is a floor (`go 1.26`), not the toolchain to test with
+          # (tvyh). Test on the newest patch: check-latest at its default
+          # (false) would resolve the bare minor against the runner's cache
+          # first and quietly pin us to whatever 1.26.x the image ships, so a
+          # toolchain-level regression would not show up here until the image
+          # moved. Matches build.yml.
           go-version-file: go.mod
+          check-latest: true
 
       - name: build
         run: go build ./...

@@ -157,12 +157,22 @@ GOTOOLCHAIN=local)`. That was the runner, not the formula: GitHub's macOS
 images set `HOMEBREW_NO_AUTO_UPDATE=1` and ship a homebrew-core snapshot weeks
 stale, so `depends_on "go"` poured a go older than `go.mod` demands, and brew
 builds with `GOTOOLCHAIN=local` so go cannot fetch the toolchain itself. Hence
-the `brew update` step. A real user's `brew install` auto-updates and gets
-current go — but note the sharp edge this leaves: **the formula's source build
-requires a Homebrew `go` at least as new as `go.mod`'s pin**, so a user on a
-stale brew still fails. `go.mod` currently pins an exact patch (`go 1.26.5`),
-which is a tighter constraint than anything in the tree needs — tracked
-separately in kata tvyh.
+the `brew update` step.
+
+That exact failure can no longer recur: `go.mod` asked for an exact patch
+(`go 1.26.5`) at the time, which nothing in the tree needed, and tvyh relaxed
+it to the `go 1.26` floor — so a merely stale-by-a-patch Homebrew `go` now
+satisfies it fine.
+
+**The class of failure survives, one boundary up.** This is a source build
+under `GOTOOLCHAIN=local`, so go cannot fetch a toolchain to rescue itself:
+**a Homebrew `go` older than `go.mod`'s floor fails, full stop.** A patch of
+slack no longer bites, but a *minor* bump does — raise the floor to `go 1.27`
+while homebrew-core still ships 1.26.x and every `brew install` breaks until
+brew catches up. So when you raise the floor, check what `brew` currently
+ships before assuming it is safe. That is also why the `brew update` step
+stays: it keeps this job on the same footing as a real user's auto-updating
+`brew install`.
 
 **Also independently verified:** the `url`/`sha256` pair. The v0.1.5 source
 tarball was fetched and hashes to

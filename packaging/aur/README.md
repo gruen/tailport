@@ -10,7 +10,8 @@ Two AUR packages ship tailport on Arch:
 Both target `x86_64` and `aarch64`, are MIT-licensed, and depend on
 `tailscale` + `iproute2` (`ss` lives in iproute2; `lsof`/macOS is not an Arch
 dep). The source package additionally `makedepends=('go')` (go.mod needs
-go ≥ 1.26.5 — make sure Arch's `go` is new enough at package time).
+go ≥ 1.26 — a minor floor rather than a patch pin, so any current Arch `go`
+satisfies it; see kata tvyh for why that looseness is deliberate).
 
 The PKGBUILDs and generated `.SRCINFO` files are kept here under version
 control. The real AUR repos are separate git remotes, one per package;
