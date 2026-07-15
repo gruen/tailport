@@ -30,8 +30,9 @@ downloads. That switched `git archive`'s default compressor from an external
 `gzip` to an internal implementation, which changed the compressed bytes — and
 therefore the checksum — of every `/archive/` tarball, **including tags
 published years earlier**. Build systems that pinned digests broke
-simultaneously and en masse; Homebrew, Spack, EasyBuild, CMake-based projects
-and the AUR all felt it at once. GitHub reverted the change.
+simultaneously and en masse — Spack, EasyBuild, and CMake's `ExternalProject`
+downloads were among the visible casualties, one project alone counting 258
+packages and 728 tarballs to re-hash. GitHub reverted the change within days.
 
 On **2023-02-21** GitHub responded with a commitment:
 
