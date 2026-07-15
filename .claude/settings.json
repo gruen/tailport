@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(kata purge *)",
+      "Bash(kata * purge *)"
+    ]
+  }
+}

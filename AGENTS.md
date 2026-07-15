@@ -79,6 +79,20 @@ contract. The short version:
 
 - Use kata for all real feature/bug work in this repo. Search before
   creating, claim before starting, close only with evidence.
+- File new work through the `/ticket` skill
+  (`.claude/skills/ticket/SKILL.md`). It searches the ledger first, folds
+  into an existing issue when one already owns the scope, pushes back when
+  a request is unclear or collides with the design constraints above, and
+  files at priority 2 by default (kata's scale is `0..4`, 0 = highest).
+  It fires on `/ticket <request>` and also on its own when someone
+  describes work they want tracked. It deliberately does not close,
+  delete, or purge — filing work and finishing it are different jobs.
+- `kata purge` is denied outright in `.claude/settings.json`: it is
+  irreversible ("remove an issue + all its rows"), and no agent should
+  reach for it autonomously. Purge by hand if you truly mean it.
+  `kata delete` is left alone deliberately — it is a *soft* delete,
+  reversible via `kata restore`, and already gated behind `--force` plus
+  an exact `--confirm "DELETE <short_id>"` string.
 - Signal that work has started by claiming the issue: `kata claim <ref>`
   (optionally with `--comment "<what I'm starting>"`). Ownership is the
   "actively being worked" signal — kata has no in-progress status, so an
