@@ -177,7 +177,7 @@ type keyGroup struct {
 // exposure guards, so they live at the end of Expose with x lock/unlock always
 // the last item. Clean is contextual: barGroups drops it unless a dangling
 // forward exists, so ordering it before Lock keeps Lock last in every state.
-// Copy moved from Expose to sit under "n add favorite" in Favorites.)
+// Copy moved from Expose to sit under "n new favorite" in Favorites.)
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
 		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Clean, k.Lock}},
@@ -221,8 +221,11 @@ func newKeyMap() keyMap {
 		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
-		Filter:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
-		NewPort:  key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "add favorite")),
+		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
+		// "new favorite", matching the binding's own name (NewPort) and ykgj's
+		// "n (new port)" -- "add" was the drift (2pz4). Deliberately scoped to
+		// the bar hint: the n input prompt and the "?" overlay still say "add".
+		NewPort:  key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new favorite")),
 		Label:    key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "label")),
 		Favorite: key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "favorite")),
 		// 3cwx: "u" used to unfavorite; it's Undo now, and the unfavorite

@@ -3796,11 +3796,11 @@ func TestBottomBarGridAligned(t *testing.T) {
 	col("App/help", "App", "? help")
 	col("App/quit", "App", "q quit")
 
-	// Copy sits directly under "n add favorite": same column, next row down.
-	nRow, nCol := at("n add favorite")
+	// Copy sits directly under "n new favorite": same column, next row down.
+	nRow, nCol := at("n new favorite")
 	cRow, cCol := at("c copy URL")
 	if cCol != nCol || cRow != nRow+1 {
-		t.Errorf("c copy URL should be the row directly under n add favorite; n at (%d,%d), c at (%d,%d)", nRow, nCol, cRow, cCol)
+		t.Errorf("c copy URL should be the row directly under n new favorite; n at (%d,%d), c at (%d,%d)", nRow, nCol, cRow, cCol)
 	}
 
 	// Lock is the LAST Expose row, and its key sits flush at the Expose column
@@ -3881,10 +3881,10 @@ func TestBottomBarGridFolds(t *testing.T) {
 	if r1, r2 := lineOf(wideLines, "F forget"), lineOf(wideLines, "l label"); r1 < 0 || r1 != r2 {
 		t.Errorf("Favorites should fold F forget/l label onto the same row; F forget row %d, l label row %d:\n%s", r1, r2, wide)
 	}
-	if r := lineOf(wideLines, "n add favorite"); r < 0 {
-		t.Errorf("n add favorite missing from wide grid:\n%s", wide)
+	if r := lineOf(wideLines, "n new favorite"); r < 0 {
+		t.Errorf("n new favorite missing from wide grid:\n%s", wide)
 	} else if strings.Contains(wideLines[r], "l label") {
-		t.Errorf("n add favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
 	// Expose folded too (tied at 3 with View, but earlier in group order so
@@ -3930,7 +3930,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// sidesteps that padding.)
 	for _, want := range []string{
 		"space serve", "funnel public", "x lock/unlock",
-		"f favorite", "F forget", "n add favorite", "c copy URL", "l label",
+		"f favorite", "F forget", "n new favorite", "c copy URL", "l label",
 		"/ filter", "a switch view", "r refresh",
 		"u undo", "? help", "q quit",
 	} {
@@ -3984,13 +3984,13 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 		t.Errorf("Favorites sub-col 2 misaligned across rows: 'c copy URL' at %d, 'l label' at %d (should match):\n%s", cCol, lCol, grid)
 	}
 
-	// A short sub-col-1 cell doesn't shift sub-col 2 left: "n add favorite" is
+	// A short sub-col-1 cell doesn't shift sub-col 2 left: "n new favorite" is
 	// sub-col 1's widest row (14 wide, == subWidth[0]), so sub-col 2's fixed
 	// edge must sit exactly one sub-column gap past where that row's content
 	// ends -- not past the shorter "f favorite"/"u unfavorite" rows' content.
-	nEnd := col("n add favorite") + len("n add favorite")
+	nEnd := col("n new favorite") + len("n new favorite")
 	if want := nEnd + legendSubColGap; cCol != want {
-		t.Errorf("Favorites sub-col 2 should start at %d (widest sub-col-1 row %q ends at %d, + %d-wide gap); got %d:\n%s", want, "n add favorite", nEnd, legendSubColGap, cCol, grid)
+		t.Errorf("Favorites sub-col 2 should start at %d (widest sub-col-1 row %q ends at %d, + %d-wide gap); got %d:\n%s", want, "n new favorite", nEnd, legendSubColGap, cCol, grid)
 	}
 }
 
@@ -4024,7 +4024,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	for _, want := range []string{
 		"Expose", "Favorites", "View", "App",
 		"space serve", "p funnel public", "c copy URL",
-		"f favorite", "F forget", "n add favorite", "l label",
+		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
 		"u undo", "? help", "q quit",
 	} {
