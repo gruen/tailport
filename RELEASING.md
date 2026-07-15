@@ -84,8 +84,27 @@ style guide. Lesson recorded in kata yqb0 and j68f.
   `VERSION=X.Y.Z CHECK=1 scripts/aur-publish.sh`; the manual recipe in
   `packaging/aur/README.md` is now the fallback path. Setup and rationale:
   kata 18cr, jtpx for the package setup, hpx2 for the umbrella.
-- **Homebrew: still manual.** Update the tap formula (`gruen/homebrew-tap`)
-  after the release publishes — see kata s3wn.
+- **Homebrew: automated too.** `build.yml`'s `brew` job runs
+  `scripts/brew-publish.sh`, which rewrites the formula's `url`/`sha256` and
+  pushes it to the tap (`gruen/homebrew-tap`) with a deploy key — `GITHUB_TOKEN`
+  is scoped to this repo and can't write there. It also bot-commits back to
+  `main`, so that's a **second** post-release commit,
+  `chore(brew): bump formula …`. Dry-run with
+  `VERSION=X.Y.Z CHECK=1 scripts/brew-publish.sh`; `packaging/brew/README.md`
+  holds the fallback. It `needs: [release, aur]` — not a real dependency, but
+  both jobs push to `main` and in parallel they'd race. Setup: kata nqmn, s3wn.
+
+Two things v0.1.6 (the first automated release) learned:
+
+- **The AUR's web page and RPC both lie for minutes after a push.** The page
+  served `0.1.5-1` while the git repo already held `0.1.6`. Verify with
+  `git clone ssh://aur@aur.archlinux.org/<pkg>.git`, never the page — and
+  don't report a publish failure off a stale one.
+- **A packaging failure is not a release failure, and never needs a new tag.**
+  The release has already published and `install.sh` users are already served.
+  Both jobs are re-runnable (`gh run rerun <id> --failed`) and secrets are read
+  at run time, so even a bad key is fixable in place. Fix forward against
+  18cr/nqmn.
 
 ## 6. install.sh
 
