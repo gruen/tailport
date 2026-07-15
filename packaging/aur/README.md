@@ -32,6 +32,29 @@ publishing is copying `PKGBUILD` + `.SRCINFO` into each and pushing (see
 
 ## Bumping for a new release
 
+**Normally you don't** — CI does it. `.github/workflows/build.yml`'s `aur` job
+runs after the release publishes and does everything in this section
+automatically: bump `pkgver`, recompute all six digests, regenerate both
+`.SRCINFO`, push both AUR repos, and commit the same bump back to `main`. The
+logic is [`scripts/aur-publish.sh`](../../scripts/aur-publish.sh) (kata 18cr).
+It needs the `AUR_SSH_KEY` secret set on the repo.
+
+The rest of this section is the **fallback**: what to do by hand when CI is
+broken, when you're publishing out-of-band, or when you want to check CI's
+work. It's also what the script automates, so it doubles as the spec.
+
+To dry-run the script against an already-published version — it must reproduce
+the committed files exactly, which is the only way to test it without cutting a
+throwaway release:
+
+```sh
+VERSION=0.1.5 DIST=<dir with the release .sha256 files> CHECK=1 sh scripts/aur-publish.sh
+```
+
+Run it from a checkout **at the tag**: it hashes `LICENSE`/`README.md` from the
+working tree to describe what `raw.githubusercontent.com` serves at that tag,
+so a `main` that has moved on since would produce digests no user can reproduce.
+
 Do this *after* the GitHub release exists (see [RELEASING.md](../../RELEASING.md)) —
 every digest below is computed from published artifacts.
 

@@ -69,3 +69,86 @@ jobs:
           # Auto-generate the release body from commits/PRs since the previous tag.
           generate_release_notes: true
           files: dist/*
+
+  # Bump both AUR packages to the released version and publish them (kata 18cr).
+  # Gated on `release` because tailport-bin's digests describe release assets:
+  # they have to exist first. The logic lives in scripts/aur-publish.sh rather
+  # than here so it can be dry-run on any Arch box (CHECK=1) instead of only
+  # being testable by cutting a real tag.
+  aur:
+    needs: release
+    runs-on: ubuntu-latest
+    # makepkg --printsrcinfo needs a real Arch environment; base-devel carries
+    # makepkg but not git/openssh.
+    container: archlinux:base-devel
+    steps:
+      - name: install what base-devel lacks
+        run: pacman -Sy --noconfirm --needed git openssh
+
+      - uses: actions/checkout@v5
+        # Checks out the tag, which is what aur-publish.sh requires: it hashes
+        # LICENSE/README from the working tree to describe what
+        # raw.githubusercontent.com serves AT THE TAG.
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          # Fail loudly rather than letting this surface as a cryptic ssh error
+          # ten lines later -- or, worse, as a silent skip that reads as success.
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "::error::AUR_SSH_KEY secret is not set; cannot publish to the AUR."
+            exit 1
+          fi
+          # makepkg refuses to run as root, and a container job is root.
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          install -d -m700 -o builder -g builder /home/builder/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > /home/builder/.ssh/aur
+          # Pin the AUR's published host key instead of TOFU-accepting whatever
+          # answers on a throwaway container.
+          printf '%s\n' \
+            'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
+            > /home/builder/.ssh/known_hosts
+          printf '%s\n' \
+            'Host aur.archlinux.org' \
+            '  User aur' \
+            '  IdentityFile ~/.ssh/aur' \
+            '  IdentitiesOnly yes' \
+            > /home/builder/.ssh/config
+          chmod 600 /home/builder/.ssh/aur /home/builder/.ssh/config
+          chmod 644 /home/builder/.ssh/known_hosts
+          chown -R builder:builder /home/builder/.ssh
+          su builder -c "cd '$GITHUB_WORKSPACE' && VERSION='$version' DIST=dist AUR_PUSH=1 sh scripts/aur-publish.sh"
+
+      - name: sync the bump onto main
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if git diff --quiet -- packaging/aur; then
+            echo "no packaging change to sync"; exit 0
+          fi
+          # The bump was made on a detached tag checkout; carry it over to main
+          # so the in-repo PKGBUILDs keep matching what is published. This
+          # necessarily lands AFTER the tag -- the digests cannot be known
+          # before the release exists.
+          tmp=$(mktemp -d); cp -r packaging/aur "$tmp/"
+          git fetch --depth=1 origin main
+          git checkout -B main FETCH_HEAD
+          cp -r "$tmp/aur/." packaging/aur/
+          if git diff --quiet -- packaging/aur; then
+            echo "main already carries this bump"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packaging/aur
+          git commit -m "chore(aur): bump PKGBUILDs to $version (18cr)"
+          git push origin main
