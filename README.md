@@ -57,6 +57,16 @@ Two deliberate constraints on the tailnet-`serve` path:
 
 ## Install
 
+**On Arch Linux**, from the AUR. [`tailport`](https://aur.archlinux.org/packages/tailport)
+builds from source; [`tailport-bin`](https://aur.archlinux.org/packages/tailport-bin)
+drops in the prebuilt release binary and needs no Go toolchain. They conflict
+with each other by design — install one:
+
+```sh
+paru -S tailport        # or: yay -S tailport
+paru -S tailport-bin    # prebuilt
+```
+
 **With Go installed**, for any supported OS/arch:
 
 ```sh
