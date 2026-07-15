@@ -28,7 +28,7 @@ below).
   and attaches everything to the GitHub release. (linux/arm64 exists purely to
   feed `tailport-bin`'s aarch64 — a release artifact, not a fleet node.)
 - Both PKGBUILDs + `.SRCINFO` (generated with `makepkg --printsrcinfo`), with
-  real digests. **Currently at 0.1.4.**
+  real digests. **Currently at 0.1.5.**
 
 ## Bumping for a new release
 

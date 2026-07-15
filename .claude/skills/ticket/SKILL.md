@@ -26,11 +26,18 @@ pre-approves the verbs it lists, it does not remove the others. Deliberately
 leaving `close`, `delete`, and `purge` off the list means they still hit a
 permission prompt. Don't reach for them from here.
 
-<!-- Editors: the !`cmd` lines below are preprocessing — they run before the
-     model sees this file, and it is undocumented whether allowed-tools gates
-     them at all. Keep them read-only and boring. Anything with side effects
-     belongs in the Process section as a real tool call, where the permission
-     matcher demonstrably applies. -->
+<!-- Editors, two rules about the shell-injection placeholders below (the
+     bang-backtick form used under "Today" and "Current ledger"):
+
+     1. Never write that syntax in prose anywhere in this file — not in a
+        sentence, not even inside an HTML comment like this one. Substitution
+        runs over the raw file before the model sees it and does not respect
+        comments, so a placeholder written as an example gets EXECUTED. An
+        earlier revision of this very comment broke the skill that way.
+     2. Keep the real ones read-only and boring. They are preprocessing, not
+        tool calls, and it is undocumented whether allowed-tools gates them at
+        all. Anything with side effects belongs in the Process section as a
+        real tool call, where the permission matcher demonstrably applies. -->
 
 ## Today
 
