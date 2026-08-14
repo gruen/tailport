@@ -392,48 +392,62 @@ func quickstartText(configPath string, emoji bool, operatorUser string) string {
 
 // statusGather is the data source runStatus reads from. It's a package-level
 // var -- not a hardcoded statusreport.Gather() call -- purely so tests can
-// substitute a fake without touching live tailscaled/portscan; see
-// main_test.go's TestRunStatus*. Production code never reassigns it.
+// substitute a fake without touching live tailscaled/portscan/a Caddy edge;
+// see main_test.go's TestRunStatus*. Production code never reassigns it. Its
+// type follows statusreport.Gather's signature, which now takes a
+// config.Config (kata v1z5 step 6: status needs cfg.Caddy.* to query
+// published state) -- see runStatus, which loads that config honoring
+// -c/--config.
 var statusGather = statusreport.Gather
 
-// newStatusFlagSet builds the flag.FlagSet for `tailport status`: --json
-// plus --no-color, reusing 5dgj's ContinueOnError/io.Discard-output/silent-
-// Usage pattern (see newFlagSet) so parse errors and -h/--help are handled
-// the same way as the top-level flags. Deliberately narrower than the
-// shared cliFlags set: --version/--config/--markers don't mean anything for
-// a one-shot, config-free status report, so they're left undefined here
+// newStatusFlagSet builds the flag.FlagSet for `tailport status`: --json,
+// --no-color, and -c/--config, reusing 5dgj's ContinueOnError/io.Discard-
+// output/silent-Usage pattern (see newFlagSet) so parse errors and -h/--help
+// are handled the same way as the top-level flags. --config is no longer
+// meaningless here (kata v1z5 step 6): status reads cfg.Caddy.* to query a
+// published route's state, so an explicit -c/--config override behaves
+// identically to every other subcommand. --version/--markers still don't
+// mean anything for a one-shot status report, so they stay undefined here
 // rather than silently accepted and ignored.
-func newStatusFlagSet() (fs *flag.FlagSet, jsonOut, noColor *bool) {
+func newStatusFlagSet() (fs *flag.FlagSet, jsonOut, noColor *bool, configPath *string) {
 	fs = flag.NewFlagSet("tailport status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
 	jsonOut = fs.Bool("json", false, "emit machine-readable JSON (stable schema) instead of a table")
 	noColor = fs.Bool("no-color", false, "disable ANSI color output (also honors NO_COLOR)")
-	return fs, jsonOut, noColor
+	configPath = fs.String("config", "", "config file path (default: $XDG_CONFIG_HOME/tailport/config.yaml, else ~/.config/tailport/config.yaml)")
+	fs.StringVar(configPath, "c", "", "shorthand for --config")
+	return fs, jsonOut, noColor, configPath
 }
 
 // printStatusUsage writes `tailport status`'s help text.
 func printStatusUsage(w io.Writer) {
 	fmt.Fprintln(w, "tailport status -- headless, READ-ONLY report of ports currently exposed")
-	fmt.Fprintln(w, "via tailscale serve (tailnet) or funnel (public internet). Never launches")
-	fmt.Fprintln(w, "the TUI and never mutates serve/funnel state.")
+	fmt.Fprintln(w, "via tailscale serve (tailnet), funnel (public internet), or a Caddy-edge")
+	fmt.Fprintln(w, "publish (public internet at a custom hostname). Never launches the TUI")
+	fmt.Fprintln(w, "and never mutates serve/funnel/publish state.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  tailport status [flags]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "      --json        emit machine-readable JSON (stable schema) instead of a table")
-	fmt.Fprintln(w, "      --no-color    disable ANSI color output (also honors NO_COLOR)")
+	fmt.Fprintln(w, "      --json               emit machine-readable JSON (stable schema) instead of a table")
+	fmt.Fprintln(w, "      --no-color           disable ANSI color output (also honors NO_COLOR)")
+	fmt.Fprintln(w, "  -c, --config <path>      config file path (default: $XDG_CONFIG_HOME/tailport/config.yaml, else ~/.config/tailport/config.yaml)")
 }
 
-// runStatus implements `tailport status [--json]`: kata m7jc, tailport's
-// first non-interactive mode. It is strictly READ-ONLY (it never calls
-// tsserve.On/Off/FunnelOn/FunnelOff) and reuses the exact same status
-// functions the TUI's own refresh reads, via statusGather -- see
-// internal/statusreport's package doc for why that matters (drift
-// prevention between the TUI and this report).
+// runStatus implements `tailport status [--json] [-c/--config <path>]`: kata
+// m7jc, tailport's first non-interactive mode, extended by v1z5 step 6 to
+// also report Caddy-edge publish state. It is strictly READ-ONLY (it never
+// calls tsserve.On/Off/FunnelOn/FunnelOff or caddyedge's
+// Publish/Unpublish) and reuses the exact same status functions the TUI's
+// own refresh reads, via statusGather -- see internal/statusreport's
+// package doc for why that matters (drift prevention between the TUI and
+// this report). Loading config here (honoring -c/--config, same as every
+// other subcommand) is what lets statusGather reach cfg.Caddy.* to query the
+// edge.
 func runStatus(args []string, stdout, stderr io.Writer) int {
-	fs, jsonOut, noColor := newStatusFlagSet()
+	fs, jsonOut, noColor, configPath := newStatusFlagSet()
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			printStatusUsage(stdout)
@@ -445,7 +459,13 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	}
 	applyNoColor(*noColor)
 
-	rows, err := statusGather()
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "tailport status: resolving config:", err)
+		return 1
+	}
+
+	rows, err := statusGather(cfg)
 	if err != nil {
 		fmt.Fprintln(stderr, "tailport status:", err)
 		return 1

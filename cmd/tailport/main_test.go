@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/statusreport"
 	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
@@ -461,14 +462,17 @@ func TestApplyNoColorForcesAsciiProfile(t *testing.T) {
 
 // stubStatusGather swaps statusGather for a fixed fake result and restores
 // the original (statusreport.Gather, which shells to live tailscaled/ss/
-// lsof) via t.Cleanup. This is the seam that lets TestRunStatus* exercise
-// runStatus's flag parsing, JSON/table output, and exit codes without a live
-// tailscaled -- see statusGather's doc comment in main.go.
+// lsof, and now also best-effort queries a Caddy edge) via t.Cleanup. This
+// is the seam that lets TestRunStatus* exercise runStatus's flag parsing,
+// JSON/table output, and exit codes without a live tailscaled or Caddy edge
+// -- see statusGather's doc comment in main.go. The fake ignores the
+// config.Config argument; TestRunStatusConfigOverride below is the
+// dedicated test that inspects what runStatus actually threads through.
 func stubStatusGather(t *testing.T, rows []statusreport.Row, err error) {
 	t.Helper()
 	orig := statusGather
 	t.Cleanup(func() { statusGather = orig })
-	statusGather = func() ([]statusreport.Row, error) { return rows, err }
+	statusGather = func(config.Config) ([]statusreport.Row, error) { return rows, err }
 }
 
 // fakeStatusRows is a fixed two-row fixture shared by the TestRunStatus*
@@ -486,6 +490,7 @@ func fakeStatusRows() []statusreport.Row {
 // "serve" even with color disabled by the test environment), exit is 0, and
 // stderr stays empty.
 func TestRunStatusTable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stubStatusGather(t, fakeStatusRows(), nil)
 
 	var out, errOut bytes.Buffer
@@ -507,6 +512,7 @@ func TestRunStatusTable(t *testing.T) {
 // TestRunStatusJSON covers --json: valid, parseable JSON matching
 // statusreport's stable Document schema, exit 0, empty stderr.
 func TestRunStatusJSON(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stubStatusGather(t, fakeStatusRows(), nil)
 
 	var out, errOut bytes.Buffer
@@ -537,6 +543,7 @@ func TestRunStatusJSON(t *testing.T) {
 // contract at the CLI level: no exposed ports still emits a "ports" array,
 // [], never a JSON null, so a consumer never needs a null check.
 func TestRunStatusEmptyJSONIsEmptyArrayNotNull(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stubStatusGather(t, nil, nil)
 
 	var out, errOut bytes.Buffer
@@ -552,6 +559,7 @@ func TestRunStatusEmptyJSONIsEmptyArrayNotNull(t *testing.T) {
 // TestRunStatusEmptyTable covers the human-readable empty case: a plain
 // sentence, not an empty/blank table.
 func TestRunStatusEmptyTable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stubStatusGather(t, nil, nil)
 
 	var out, errOut bytes.Buffer
@@ -559,7 +567,7 @@ func TestRunStatusEmptyTable(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run([status]) code = %d, want 0", code)
 	}
-	if !strings.Contains(out.String(), "No ports are currently served or funnelled") {
+	if !strings.Contains(out.String(), "No ports are currently served, funnelled, or published") {
 		t.Errorf("run([status]) stdout = %q, want a no-ports-served message", out.String())
 	}
 }
@@ -568,6 +576,7 @@ func TestRunStatusEmptyTable(t *testing.T) {
 // unreachable): a clean one-line-ish stderr message, exit 1, and -- since
 // this is a READ-ONLY report -- nothing on stdout.
 func TestRunStatusGatherError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	stubStatusGather(t, nil, errors.New("reading tailscale serve status: exit status 1"))
 
 	var out, errOut bytes.Buffer
@@ -590,7 +599,7 @@ func TestRunStatusGatherError(t *testing.T) {
 func TestRunStatusHelp(t *testing.T) {
 	orig := statusGather
 	t.Cleanup(func() { statusGather = orig })
-	statusGather = func() ([]statusreport.Row, error) {
+	statusGather = func(config.Config) ([]statusreport.Row, error) {
 		t.Fatal("statusGather should not be called for --help")
 		return nil, nil
 	}
@@ -605,7 +614,7 @@ func TestRunStatusHelp(t *testing.T) {
 			t.Errorf("run(%v) stderr = %q, want empty", args, errOut.String())
 		}
 		got := out.String()
-		for _, want := range []string{"tailport status", "Usage:", "--json", "--no-color", "READ-ONLY"} {
+		for _, want := range []string{"tailport status", "Usage:", "--json", "--no-color", "--config", "READ-ONLY"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("run(%v) stdout missing %q; got:\n%s", args, want, got)
 			}
@@ -628,5 +637,68 @@ func TestRunStatusBadFlag(t *testing.T) {
 	got := errOut.String()
 	if !strings.Contains(got, "bogus") || !strings.Contains(got, "Usage:") {
 		t.Errorf("run([status --bogus]) stderr = %q, want it to mention the bad flag and usage", got)
+	}
+}
+
+// TestRunStatusConfigOverride covers kata v1z5 step 6's ripple: `tailport
+// status` now loads config (so statusGather/Gather can reach cfg.Caddy.* to
+// query a published route's state) and honors an explicit -c/--config
+// override the same way every other subcommand does. This is proven by
+// pointing --config at a config file OUTSIDE the resolved-by-XDG default
+// location and asserting the exact config runStatus loaded from disk is
+// what reaches statusGather -- not just that the command exits 0.
+func TestRunStatusConfigOverride(t *testing.T) {
+	// A config file that would never be found by the default XDG resolution
+	// (this dir isn't XDG_CONFIG_HOME/tailport/config.yaml), so the only way
+	// its content could show up in gotCfg is via the -c/--config flag
+	// actually being threaded through runStatus -> config.Load -> statusGather.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "custom-config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("caddy:\n  domain: example.com\n  hostname: caddy-edge\n"), 0o600); err != nil {
+		t.Fatalf("writing fixture config: %v", err)
+	}
+	// A DIFFERENT config at the default XDG location, so a test failure that
+	// silently fell back to the default path would read visibly wrong data
+	// (a different domain) instead of accidentally matching by coincidence.
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	defaultDir := filepath.Join(xdg, "tailport")
+	if err := os.MkdirAll(defaultDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultDir, "config.yaml"), []byte("caddy:\n  domain: wrong.example.com\n"), 0o600); err != nil {
+		t.Fatalf("writing default-location fixture config: %v", err)
+	}
+
+	var gotCfg config.Config
+	orig := statusGather
+	t.Cleanup(func() { statusGather = orig })
+	statusGather = func(cfg config.Config) ([]statusreport.Row, error) {
+		gotCfg = cfg
+		return nil, nil
+	}
+
+	for _, flagArgs := range [][]string{
+		{"status", "--config", cfgPath},
+		{"status", "-c", cfgPath},
+	} {
+		gotCfg = config.Config{}
+		var out, errOut bytes.Buffer
+		code := run(flagArgs, &out, &errOut)
+		if code != 0 {
+			t.Fatalf("run(%v) code = %d, want 0; stderr:\n%s", flagArgs, code, errOut.String())
+		}
+		if errOut.Len() != 0 {
+			t.Errorf("run(%v) stderr = %q, want empty", flagArgs, errOut.String())
+		}
+		if gotCfg.Caddy.Domain != "example.com" {
+			t.Errorf("run(%v): statusGather received cfg.Caddy.Domain = %q, want %q (the override config's value, proving -c/--config threaded through to Gather)", flagArgs, gotCfg.Caddy.Domain, "example.com")
+		}
+		if gotCfg.Caddy.Hostname != "caddy-edge" {
+			t.Errorf("run(%v): statusGather received cfg.Caddy.Hostname = %q, want %q", flagArgs, gotCfg.Caddy.Hostname, "caddy-edge")
+		}
+		if gotCfg.ResolvedPath() != cfgPath {
+			t.Errorf("run(%v): statusGather received cfg.ResolvedPath() = %q, want %q", flagArgs, gotCfg.ResolvedPath(), cfgPath)
+		}
 	}
 }
