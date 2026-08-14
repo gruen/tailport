@@ -171,10 +171,21 @@ type RouteInfo struct {
 	Owned    bool   // the @id carries the tailport- prefix
 }
 
+// canonHost canonicalizes a public hostname for identity and comparison. DNS
+// hostnames are case-insensitive, so lowercasing (after trimming surrounding
+// whitespace) is the single boundary transform that keeps casing from ever
+// minting a distinct-but-overlapping route or a phantom-distinct @id. Every
+// entry point that identifies or matches on a hostname runs through it.
+func canonHost(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // IDFor returns the deterministic @id tailport uses for a route publishing the
-// given public hostname.
+// given public hostname. The hostname is canonicalized first, so case-variant
+// spellings of one hostname collapse to a single @id (Caddy treats them as one
+// route; distinct @ids would be phantom-distinct).
 func IDFor(hostname string) string {
-	return idPrefix + hostname
+	return idPrefix + canonHost(hostname)
 }
 
 // ValidHostname reports whether s is a syntactically valid DNS hostname usable
@@ -224,6 +235,7 @@ func validLabel(label string) bool {
 // auth must run first). There is intentionally no scheme parameter: the emitted
 // upstream is always plain http.
 func BuildRoute(hostname, label string, port int, auth *BasicAuth) Route {
+	hostname = canonHost(hostname)
 	dial := fmt.Sprintf("%s:%d", label, port)
 
 	var handle []Handler
@@ -310,7 +322,10 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, ifMatc
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return nil, resp.StatusCode, "", fmt.Errorf("reading caddy response: %w", err)
+		// A body read that fails after headers arrive (client timeout, dropped
+		// connection mid-body) is still a transport failure: the edge could not
+		// be read to completion. Honor the sentinel contract and wrap it.
+		return nil, resp.StatusCode, "", fmt.Errorf("%w: reading caddy response: %v", ErrUnreachable, err)
 	}
 	return b, resp.StatusCode, resp.Header.Get("Etag"), nil
 }
@@ -413,6 +428,7 @@ func (c *Client) List(ctx context.Context) ([]RouteInfo, error) {
 // Every mutation carries an If-Match Etag; an HTTP 412 re-reads and re-evaluates
 // (bounded by maxRetries, then ErrConcurrentUpdate).
 func (c *Client) Publish(ctx context.Context, hostname, label string, port int, auth *BasicAuth) error {
+	hostname = canonHost(hostname)
 	id := IDFor(hostname)
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		route, etag, found, err := c.fetchByID(ctx, id)
@@ -420,7 +436,15 @@ func (c *Client) Publish(ctx context.Context, hostname, label string, port int, 
 			return err
 		}
 		if found {
-			// The @id is ours by construction, so this route is tailport-owned.
+			// The @id is ours by construction, but a foreign edit could have
+			// kept the @id while changing or adding host matchers. Trusting the
+			// @id alone would let us overwrite an unrelated public route, so
+			// require the live matcher to still be exactly this one hostname
+			// before mutating; otherwise refuse without touching anything.
+			if !hostMatcherIs(route, hostname) {
+				return fmt.Errorf("%w: route %q no longer matches only %q; refusing to overwrite",
+					ErrHostnameConflict, id, hostname)
+			}
 			curLabel, curPort, ok := backendOf(route)
 			if !ok {
 				return fmt.Errorf("existing route %q has an unparseable backend", id)
@@ -473,6 +497,7 @@ func (c *Client) Publish(ctx context.Context, hostname, label string, port int, 
 // ErrNotFound when absent, ErrHostnameConflict when it now points elsewhere. A
 // 404 during the DELETE itself is success (someone already removed it).
 func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int) error {
+	hostname = canonHost(hostname)
 	id := IDFor(hostname)
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		route, etag, found, err := c.fetchByID(ctx, id)
@@ -481,6 +506,14 @@ func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int
 		}
 		if !found {
 			return ErrNotFound
+		}
+		// A foreign edit could have kept our @id while changing or adding host
+		// matchers. Deleting on @id alone would then remove an unrelated public
+		// route, so require the live matcher to still be exactly this one
+		// hostname before deleting; otherwise refuse.
+		if !hostMatcherIs(route, hostname) {
+			return fmt.Errorf("%w: route %q no longer matches only %q; refusing to delete",
+				ErrHostnameConflict, id, hostname)
 		}
 		curLabel, curPort, ok := backendOf(route)
 		if !ok {
@@ -519,7 +552,7 @@ func parseRoute(r Route) (RouteInfo, bool) {
 		return RouteInfo{}, false
 	}
 	return RouteInfo{
-		Hostname: r.Match[0].Host[0],
+		Hostname: canonHost(r.Match[0].Host[0]),
 		Label:    label,
 		Port:     port,
 		Auth:     hasAuth(r),
@@ -562,14 +595,38 @@ func splitDial(dial string) (label string, port int, ok bool) {
 	return dial[:i], p, true
 }
 
+// hostMatcherIs reports whether route's matcher is exactly the single expected
+// public hostname: one match block, one host entry, equal after
+// canonicalization. A foreign edit that kept our @id but changed or added host
+// matchers fails this check, so Publish/Unpublish can refuse rather than
+// mutate an unrelated route they no longer actually own the shape of.
+func hostMatcherIs(route Route, hostname string) bool {
+	return len(route.Match) == 1 &&
+		len(route.Match[0].Host) == 1 &&
+		canonHost(route.Match[0].Host[0]) == canonHost(hostname)
+}
+
 // findHostConflict returns a human description of the first route whose host
-// matcher includes hostname, or "" if none does. Used only on the absent-@id
+// matcher overlaps hostname, or "" if none does. Used only on the absent-@id
 // path, where any match is by definition foreign or differently-owned.
+//
+// Overlap is judged the way Caddy's host matcher actually matches: hostnames
+// are compared case-insensitively (via canonHost), and the common single-label
+// leading wildcard "*.<suffix>" is honored — an existing "*.example.com"
+// conflicts with a requested "app.example.com", and vice versa. hostname is
+// expected already canonicalized by the caller.
+//
+// Boundary: this deliberately models only exact (case-insensitive) matches and
+// the single-label "*.<suffix>" wildcard, which is the form tailport can emit
+// and the overwhelmingly common foreign form. It does NOT model Caddy's full
+// matcher grammar — a bare "*", multi-label wildcards, or path/expression
+// matchers can still overlap without being reported here; those broader cases
+// are left for Caddy itself to resolve.
 func findHostConflict(routes []Route, hostname string) string {
 	for _, r := range routes {
 		for _, m := range r.Match {
 			for _, h := range m.Host {
-				if h == hostname {
+				if hostsOverlap(canonHost(h), hostname) {
 					if r.ID != "" {
 						return "route " + r.ID
 					}
@@ -579,4 +636,41 @@ func findHostConflict(routes []Route, hostname string) string {
 		}
 	}
 	return ""
+}
+
+// hostsOverlap reports whether two already-canonicalized Caddy host matchers
+// can match the same request, covering case-insensitive exact equality and the
+// single-label leading wildcard "*.<suffix>" in either position. See
+// findHostConflict for the boundary on which matcher forms are modeled.
+func hostsOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if suffix, ok := wildcardSuffix(a); ok && oneLabelUnder(b, suffix) {
+		return true
+	}
+	if suffix, ok := wildcardSuffix(b); ok && oneLabelUnder(a, suffix) {
+		return true
+	}
+	return false
+}
+
+// wildcardSuffix reports whether h is a single-label leading wildcard matcher
+// "*.<suffix>" (with a non-empty suffix) and returns that suffix.
+func wildcardSuffix(h string) (suffix string, ok bool) {
+	if rest, found := strings.CutPrefix(h, "*."); found && rest != "" {
+		return rest, true
+	}
+	return "", false
+}
+
+// oneLabelUnder reports whether host is exactly "<one non-empty label>.suffix",
+// i.e. host is one DNS label deeper than suffix — precisely the set a Caddy
+// "*.suffix" wildcard matches (a single label, not "a.b.suffix").
+func oneLabelUnder(host, suffix string) bool {
+	rest, found := strings.CutSuffix(host, "."+suffix)
+	if !found || rest == "" {
+		return false
+	}
+	return !strings.Contains(rest, ".")
 }

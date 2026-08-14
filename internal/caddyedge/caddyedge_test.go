@@ -508,3 +508,149 @@ func TestUnreachableAdmin(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
 	}
 }
+
+// TestPublishStaleHostMatcherConflictsNoMutation covers finding #1 for Publish:
+// a foreign edit kept our deterministic @id but repointed the host matcher at a
+// different public hostname (same backend, so only the matcher check can fire).
+// Trusting the @id would overwrite an unrelated route; Publish must refuse.
+func TestPublishStaleHostMatcherConflictsNoMutation(t *testing.T) {
+	stale := BuildRoute("myapp.example.com", "dev-box", 3000, nil)
+	stale.Match = []Match{{Host: []string{"evil.example.com"}}} // @id kept, matcher changed
+	c, f := newFake(t, stale)
+
+	err := c.Publish(context.Background(), "myapp.example.com", "dev-box", 3000, nil)
+	if !errors.Is(err, ErrHostnameConflict) {
+		t.Fatalf("err = %v, want ErrHostnameConflict", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("stale host matcher must not mutate, got %d mutations", f.mutations)
+	}
+	if len(f.routes) != 1 || f.routes[0].Match[0].Host[0] != "evil.example.com" {
+		t.Errorf("foreign-edited route must survive untouched, got %+v", f.routes)
+	}
+}
+
+// TestUnpublishStaleHostMatcherRefusesNoDelete covers finding #1 for Unpublish:
+// a foreign edit kept our @id but ADDED a second host matcher (backend still
+// ours). Deleting on @id alone would remove an unrelated public route, so
+// Unpublish must refuse with ErrHostnameConflict and delete nothing.
+func TestUnpublishStaleHostMatcherRefusesNoDelete(t *testing.T) {
+	stale := BuildRoute("myapp.example.com", "dev-box", 3000, nil)
+	stale.Match[0].Host = append(stale.Match[0].Host, "extra.example.com") // @id kept, matcher widened
+	c, f := newFake(t, stale)
+
+	err := c.Unpublish(context.Background(), "myapp.example.com", "dev-box", 3000)
+	if !errors.Is(err, ErrHostnameConflict) {
+		t.Fatalf("err = %v, want ErrHostnameConflict (refuse stale-matcher delete)", err)
+	}
+	if f.del != 0 || f.mutations != 0 {
+		t.Errorf("stale host matcher must NOT delete, got del=%d mutations=%d", f.del, f.mutations)
+	}
+	if len(f.routes) != 1 {
+		t.Errorf("route must survive a refused unpublish, got %d", len(f.routes))
+	}
+}
+
+// TestPublishCaseVariantForeignConflictsNoMutation covers finding #2 (casing):
+// an existing foreign route claims the hostname in a different case. DNS host
+// matching is case-insensitive, so this must be a conflict, not a silent
+// second route that shadows or is shadowed by it.
+func TestPublishCaseVariantForeignConflictsNoMutation(t *testing.T) {
+	foreign := Route{
+		ID:    "someone-elses-route",
+		Match: []Match{{Host: []string{"App.Example.COM"}}},
+		Handle: []Handler{{
+			Handler:   "reverse_proxy",
+			Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}},
+		}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign)
+
+	err := c.Publish(context.Background(), "app.example.com", "dev-box", 3000, nil)
+	if !errors.Is(err, ErrHostnameConflict) {
+		t.Fatalf("err = %v, want ErrHostnameConflict", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("case-variant conflict must not mutate, got %d mutations", f.mutations)
+	}
+}
+
+// TestPublishWildcardForeignConflictsNoMutation covers finding #2 (wildcard):
+// an existing foreign "*.example.com" already covers the requested
+// "app.example.com" under Caddy's single-label wildcard semantics.
+func TestPublishWildcardForeignConflictsNoMutation(t *testing.T) {
+	foreign := Route{
+		ID:    "wildcard-route",
+		Match: []Match{{Host: []string{"*.example.com"}}},
+		Handle: []Handler{{
+			Handler:   "reverse_proxy",
+			Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}},
+		}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign)
+
+	err := c.Publish(context.Background(), "app.example.com", "dev-box", 3000, nil)
+	if !errors.Is(err, ErrHostnameConflict) {
+		t.Fatalf("err = %v, want ErrHostnameConflict", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("wildcard conflict must not mutate, got %d mutations", f.mutations)
+	}
+}
+
+// TestHostsOverlap locks the overlap predicate directly, including the
+// requested-wildcard direction and the single-label boundary (a "*.suffix"
+// wildcard matches exactly one deeper label, not two).
+func TestHostsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"app.example.com", "app.example.com", true},    // exact
+		{"*.example.com", "app.example.com", true},      // existing wildcard covers requested
+		{"app.example.com", "*.example.com", true},      // requested wildcard covers existing
+		{"*.example.com", "a.b.example.com", false},     // single-label wildcard: not two labels deep
+		{"app.example.com", "other.example.com", false}, // sibling labels don't overlap
+		{"*.example.com", "*.other.com", false},         // different wildcard suffixes
+		{"*.example.com", "example.com", false},         // wildcard needs a leading label
+	}
+	for _, tc := range cases {
+		if got := hostsOverlap(tc.a, tc.b); got != tc.want {
+			t.Errorf("hostsOverlap(%q,%q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// TestUnreachableOnMidBodyRead covers finding #3: the server sends headers
+// (Do() returns cleanly) then drops the connection mid-body, so the
+// io.ReadAll of the response fails. That post-header transport failure must
+// still map to ErrUnreachable, honoring the sentinel contract.
+func TestUnreachableOnMidBodyRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("test server ResponseWriter is not a Hijacker")
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// Promise 4096 bytes, deliver a fragment, then close early: the client
+		// reads headers fine but the body read hits an unexpected EOF.
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n")
+		_, _ = buf.WriteString(`[{"partial":`)
+		_ = buf.Flush()
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{HTTPClient: srv.Client(), AdminURL: srv.URL, ServerName: "tailport"}
+	_, err := c.List(context.Background())
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable (body read failed after headers)", err)
+	}
+}
