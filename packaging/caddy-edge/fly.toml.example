@@ -1,0 +1,60 @@
+# fly.toml.example -- template for the tailport Caddy edge (kata v1z5).
+#
+# Copy this to fly.toml (gitignored -- never commit the real one) and fill
+# in the placeholders, or run `fly launch` from this directory and reconcile
+# the generated fly.toml against this file instead. Full runbook:
+# ../../docs/caddy-edge.md. TS_AUTHKEY is NEVER set here -- see the note
+# above [[services]] below.
+
+app = "<your-fly-app-name>"
+primary_region = "<fly-region>"   # e.g. "iad" -- pick one near your DNS's expected users
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Holds tailscaled's node state and Caddy's autosaved live config (routes +
+# ACME account/certs) -- see entrypoint.sh and Dockerfile.
+# Create with: fly volumes create caddy_data --region <fly-region> --size 1
+[[mounts]]
+  source = "caddy_data"
+  destination = "/data"
+
+# Raw TCP passthrough on 80 and 443: Caddy terminates TLS itself, so these
+# services carry NO handlers (no "tls", no "http") -- Fly just forwards the
+# bytes. This requires a DEDICATED IPv4 (`fly ips allocate-v4`, ~$2/mo,
+# waived under Fly's $5/mo free allowance for a small deployment): the free
+# shared IPv4 only supports Fly's own HTTP(S)-terminating proxy on 80/443,
+# which would collide with Caddy trying to terminate the same ports itself.
+# IPv6 is free and dedicated by default: `fly ips allocate-v6`.
+[[services]]
+  internal_port = 80
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+
+[[services]]
+  internal_port = 443
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 443
+
+# Deliberately NO [[services]] block for the admin port (default 2019): the
+# Caddy admin API must stay tailnet-only. It's reached over Tailscale Serve
+# (`tailscale serve --bg --http=<admin_port> <admin_port>`, set up by
+# entrypoint.sh), never through Fly's public proxy. Do not add a service
+# block for it here, even temporarily for debugging.
+
+# TS_AUTHKEY is a secret, not config: never write it here, even commented
+# out. Set it with:
+#   fly secrets set TS_AUTHKEY=tskey-auth-...
+# See docs/caddy-edge.md step 1 for how to mint a tagged, reusable,
+# non-ephemeral key (tagging is what disables its node-key expiry).
+
+# Uncomment and set only if you changed tailport's caddy.hostname or
+# caddy.admin_port away from their defaults (caddy / 2019) -- and update
+# bootstrap-caddy.json's admin.listen/admin.origins to match.
+# [env]
+#   TS_HOSTNAME = "caddy"
+#   CADDY_ADMIN_PORT = "2019"

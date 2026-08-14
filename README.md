@@ -275,6 +275,60 @@ or the equivalent `--theme` flag (`--theme light`, `--theme dark`,
 background itself; when it can't tell at all, it falls back to `dark` --
 existing dark-terminal setups see no change either way.
 
+### Publish (Caddy edge)
+
+A `caddy` block configures the optional publish-to-the-internet path (see
+[Publishing to the public internet](#publishing-to-the-public-internet-caddy-edge)
+below). Unlike the port registry, this block is **always present** in the
+saved config file, seeded with visible defaults and explanatory comments the
+first time tailport writes it, so the available knobs are discoverable
+without reading docs:
+
+```yaml
+caddy:
+    # Tailnet name of the Caddy edge node (short MagicDNS label or FQDN);
+    # tailport reaches its admin API here.
+    hostname: caddy
+
+    # Public base domain used to build publish hostnames. Point its DNS
+    # (typically a wildcard) at the public Caddy edge before publishing.
+    domain: ""
+
+    # Name of the shared Caddy JSON HTTP server under apps.http.servers.
+    # Every tailport computer publishing through this same Caddy edge must
+    # use the same value; this does not identify the source computer.
+    server_name: tailport
+
+    # Port of the Caddy admin API on the edge (reachable tailnet-only).
+    admin_port: 2019
+```
+
+- **`hostname`** (default `caddy`) — the edge's own private tailnet
+  identity, used only so tailport can find its admin API at
+  `http://<hostname>:<admin_port>`. It has nothing to do with any published
+  route's public hostname (e.g. `app.example.com`) — private edge identity
+  and public route identity are deliberately separate.
+- **`domain`** (default `""`, blank) — the public base domain publish
+  hostnames are built from. Blank means publishing is unconfigured: `P`
+  refuses with an error naming this field, and the background
+  published-state poll doesn't run (zero cost until you set it).
+- **`server_name`** (default `tailport`) — the shared Caddy HTTP server
+  tailport manages. Every tailport computer publishing through the same
+  edge must agree on this value; it selects the routes array, it does not
+  identify the source computer.
+- **`admin_port`** (default `2019`) — the Caddy admin API's port on the
+  edge.
+- **`auth_user`** / **`auth_hash`** — unset (no auth) until you opt into
+  basic auth at a publish confirmation. `auth_hash` is always a bcrypt hash
+  of the password you typed then, never the plaintext; every published
+  route that opts into auth shares this one credential — it isn't
+  per-hostname.
+
+None of this configures the edge itself — it only tells tailport where an
+**already-deployed** edge lives. Standing up the edge (Fly.io, Tailscale ACL
+and auth key, DNS) is a separate one-time operator task; see
+[`docs/caddy-edge.md`](docs/caddy-edge.md).
+
 ## How it works
 
 - Port discovery: `ss -H -t -l -n -p` on Linux, `lsof -iTCP -sTCP:LISTEN -n
@@ -292,6 +346,42 @@ tailport has no dependencies beyond the `tailscale` CLI and the OS tools
 above — no daemon, no config beyond the YAML file, and nothing is installed
 or modified system-wide other than the `serve` mappings you toggle
 yourself.
+
+## Publishing to the public internet (Caddy edge)
+
+Tailnet `serve` and Funnel aren't the only way out to the world: tailport can
+also publish a port to a **custom public hostname** —
+`https://app.example.com`, no port in the URL, no `*.ts.net` — through a
+Caddy edge node you run yourself (on Fly.io; see below). This is a third
+exposure level, architecturally independent of both `serve` (tailnet) and
+Funnel: Tailscale's role in this path is private WireGuard transport from
+the edge to your machine only, and nothing more — Caddy owns the entire
+public trust plane (custom-domain DNS, `:443` ingress, TLS termination and
+certificate issuance/renewal, hostname routing). No Funnel slots, Funnel
+commands, or Tailscale-managed public TLS participate in a publish.
+
+Publishing and Funnel are **mutually exclusive per port**: tailport refuses
+to publish a currently-funnelled port (and refuses to funnel a
+currently-published one), naming the conflicting exposure and asking you to
+remove it first. There is no "publish outranks funnel" — normal use never
+needs to rank them, and dual exposure created outside tailport (a foreign
+tool, or a manual edit) is surfaced as an explicit conflict rather than
+silently picked for you.
+
+**Setup is a separate, one-time operator task**, not something tailport
+does for you: a Caddy edge deployed and reachable on your tailnet, a
+domain whose DNS points at it, and a Tailscale auth key for the edge itself.
+See [`docs/caddy-edge.md`](docs/caddy-edge.md) for the full runbook (written
+for a Caddy/Fly first-timer) and the `caddy.*` fields under
+[Configuration](#configuration) above for what tailport needs once that edge
+exists. Until `caddy.domain` is set, publishing is unconfigured and refuses
+with an error naming the field and pointing at that doc.
+
+Once configured, publishing a port works the same shape as Funnel: select a
+port, confirm the public hostname and (optionally) a shared basic-auth
+credential, and confirm again against the exact `https://` URL before
+anything goes live — the same funnel-grade guardrails (`:22` hard-blocked,
+public exposure never automatic) apply here too.
 
 ## Troubleshooting
 

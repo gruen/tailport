@@ -1,0 +1,24 @@
+{
+    "admin": {
+        "listen": "localhost:2019",
+        "origins": [
+            "localhost:2019",
+            "127.0.0.1:2019",
+            "caddy:2019",
+            "caddy.<tailnet>.ts.net:2019"
+        ]
+    },
+    "apps": {
+        "http": {
+            "servers": {
+                "tailport": {
+                    "listen": [
+                        ":443",
+                        ":80"
+                    ],
+                    "routes": []
+                }
+            }
+        }
+    }
+}
