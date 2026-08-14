@@ -42,6 +42,81 @@ when you deploy it.
    Adjust the owner (`autogroup:admin`, a specific user, or a group) to
    whoever should be allowed to issue keys under this tag. Save the policy.
 
+   `tagOwners` alone only decides who can *mint a key* for this tag — it
+   grants the edge no actual network reachability. Two more rules belong in
+   the same policy, in **both directions**, or the edge either can't reach
+   your backends or is more exposed than you think:
+
+   - **The edge needs to reach the backend tailport machine(s) it proxies
+     to.** On a tailnet whose policy already defaults to "everyone reaches
+     everyone" this may already work, but don't assume it — a locked-down
+     tailnet denies by default, and the reverse-proxy hop (`header_up Host
+     {label}:{port}`, dialing the backend's short MagicDNS label) will fail
+     with nothing more specific than a 502 if `tag:tailport-edge` has no
+     path to the backend's ports.
+   - **Only trusted nodes should be able to reach the edge's admin API on
+     `caddy.admin_port` (`:2019` by default).** This is the more important
+     rule of the two. Caddy's admin API has **no authentication of its
+     own** — it's guarded only by (a) whether a caller can reach the port
+     over the tailnet at all, and (b) a `Host`-header allow-list
+     (`bootstrap-caddy.json`'s `admin.origins`, see
+     [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)),
+     which is an anti-DNS-rebinding check, not an identity check — anyone
+     who can reach the port and send a matching `Host` header can add,
+     remove, or rewrite every published route, including turning off
+     basic auth on someone else's route. On a tailnet with an open default
+     policy, that means *any* tailnet member, not just the tailport
+     machines you intend to administer it from.
+
+   Tailscale's policy file is [HuJSON](https://tailscale.com/kb/1018/acls)
+   (JSON plus comments and trailing commas), so both rules can be spelled
+   out inline. The exact grammar has evolved (older `acls` entries vs.
+   newer `grants`) and depends on what's already in your policy file, so
+   treat the following as an example to adapt against
+   [Tailscale's current ACL syntax reference](https://tailscale.com/kb/1337/acl-syntax)
+   rather than something to paste in verbatim:
+
+   ```json
+   {
+     "tagOwners": {
+       "tag:tailport-edge": ["autogroup:admin"],
+     },
+
+     "acls": [
+       // ... whatever rules your tailnet already has ...
+
+       // 1) Let the edge reach the backend tailport machine(s) it proxies
+       //    to, on the ports they actually serve. Replace the dst tag/user
+       //    and port list with your real backend(s) -- this example scopes
+       //    it to a "tailport-backend" tag rather than opening every port.
+       {
+         "action": "accept",
+         "src": ["tag:tailport-edge"],
+         "dst": ["tag:tailport-backend:8080,8443,9000"],
+       },
+
+       // 2) Restrict the admin API (:2019) to only the node(s)/user(s) you
+       //    actually run tailport from. Do NOT use "autogroup:member" or
+       //    "*" as src here -- that's precisely the over-broad grant this
+       //    step exists to avoid. Replace the src with your own
+       //    user/tag.
+       {
+         "action": "accept",
+         "src": ["<your-user-or-tag-that-runs-tailport>"],
+         "dst": ["tag:tailport-edge:2019"],
+       },
+     ],
+   }
+   ```
+
+   If your tailnet's default policy already grants broad `src: ["*"]`
+   reachability to `dst: ["*:*"]`, rule 2 alone does **not** narrow that —
+   Tailscale ACLs are additive (any matching `accept` rule grants access,
+   there is no `deny`). In that case the fix is to narrow the existing
+   broad rule's ports (e.g. exclude `2019`) rather than to rely on adding a
+   second, more specific rule on top of it. Check what your policy already
+   allows before assuming rule 2 is sufficient on its own.
+
 2. Generate an auth key (admin console → **Settings → Keys → Generate auth
    key**) with:
    - **Reusable** — yes (the edge may need to re-authenticate after a
@@ -159,9 +234,27 @@ path end to end, cert included):
 curl -I https://<published-hostname>/
 ```
 
-A `200`/`3xx` with a valid certificate here means DNS, the dedicated IP,
-Caddy's automatic HTTPS, the route, the Host rewrite, and the backend are
-all correctly wired together.
+For a route published **without** basic auth, a `200`/`3xx` with a valid
+certificate here means DNS, the dedicated IP, Caddy's automatic HTTPS, the
+route, the Host rewrite, and the backend are all correctly wired together.
+
+For a route published **with** basic auth (tailport's shared,
+bcrypt-hashed `auth_user`/`auth_hash` credential — see the root
+[README](../README.md#configuration)), **a `401` on this unauthenticated
+request is the expected, correct result, not a failure** — it's proof
+Caddy's `http_basic` handler is active and gating the route before the
+request ever reaches the backend. Confirm the backend is actually
+reachable by retrying with the credential:
+
+```sh
+curl -I -u <auth_user>:<password> https://<published-hostname>/
+```
+
+A `200`/`3xx` on *this* authenticated request is what confirms the full
+chain end to end for a protected route. A `401` on the unauthenticated
+request above is expected on its own and not itself evidence of a
+problem; something other than `401`/`200`/`3xx` on either request (a
+`502`, a TLS error, a hang) means work through Troubleshooting below.
 
 ## 5. Troubleshooting
 
