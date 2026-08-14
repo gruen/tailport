@@ -24,6 +24,27 @@ contract. The short version:
   is hard-blocked from funnel. Never funnel implicitly, in bulk, or without
   that confirm. (Implemented under kata yt69: the `p` key, `entryConfirmFunnel`
   gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`.)
+- Publish-via-edge is a SECOND public path (the `P` key, kata v1z5),
+  **independent of and mutually exclusive with Funnel — not layered or ranked
+  above it**. A local port can carry funnel OR publish, never both: the `P`
+  path refuses a funnelled port and the `p` path refuses a Caddy-published
+  port, each instructing the user to remove the other exposure first. There is
+  no implicit precedence between them — dual exposure created outside tailport
+  (a foreign Funnel or a manual Caddy edit) is surfaced as explicit drift (the
+  warning affordance + a "funnelled AND published" description), never silently
+  collapsed to one marker. It carries the same funnel-grade guardrails:
+  per-service opt-in, a strong y/n confirm naming the exact `https://<hostname>`
+  URL, `:22` hard-blocked, ungated de-escalation (an immediate unpublish, no
+  confirm), and unpublish never touches serve state. In this path **Tailscale
+  supplies private tailnet transport only; Caddy owns the entire public trust
+  plane** (custom-domain DNS, public `:443` ingress, TLS termination and
+  renewal, hostname routing). Basic auth at the edge is a single SHARED
+  credential stored as a bcrypt hash, never plaintext. Published state is read
+  live from the edge's `@id`-tagged routes on a separate poll, never persisted
+  per-port — Caddy is the source of truth, the same philosophy as serve/funnel
+  state being read live. (Implemented under kata v1z5: `internal/caddyedge`,
+  the `caddy:` config block, and the `P` key / `entryConfirmPublish` gate /
+  published-state poll in `internal/ui`.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel
   already encrypts peer-to-peer traffic, so app-layer TLS added no real
@@ -45,10 +66,14 @@ contract. The short version:
   builds `linux/arm64` purely so the AUR `tailport-bin` package can offer
   an `aarch64` binary (jtpx). It is a distribution artifact, not a deployed
   fleet node — don't add it to `install.sh`'s fleet list.
-- Zero non-Go runtime dependencies in the shipped binary. It shells out
+- Zero non-Go RUNTIME dependencies in the shipped binary. It shells out
   to `tailscale`, and to `ss` (Linux) / `lsof` (macOS) for port discovery
   — nothing else *required*. Don't add a dependency on `yq`, `gum`, `fzf`,
   etc.; config parsing uses `gopkg.in/yaml.v3` natively for this reason.
+  This rule is about runtime/PATH binaries, NOT Go module dependencies:
+  pure-Go module deps are fine (e.g. `golang.org/x/crypto/bcrypt`, added
+  under kata v1z5 to hash the shared publish credential) — they compile into
+  the single static binary and add nothing to what must be on the host's PATH.
   Carve-out (vnq7): an OPTIONAL, best-effort clipboard helper
   (`pbcopy` / `wl-copy` / `xclip` / `xsel`) may be shelled out to for the
   `c` copy-URL action, but it is never required to build or run — the

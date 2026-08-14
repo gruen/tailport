@@ -4,6 +4,7 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +22,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gruen/tailport/internal/caddyedge"
 	"github.com/gruen/tailport/internal/clip"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
@@ -139,8 +142,12 @@ var (
 // ShowAll's Desc is refreshed on each render to reflect the current view
 // (favorites vs all ports; see model.renderLegend).
 type keyMap struct {
-	Toggle   key.Binding
-	Funnel   key.Binding
+	Toggle key.Binding
+	Funnel key.Binding
+	// Publish exposes a port to the public internet through a user-controlled
+	// Caddy edge (the `P` key, kata v1z5). It is a SECOND public path, sibling
+	// to Funnel and mutually exclusive with it per port -- never ranked above.
+	Publish  key.Binding
 	Filter   key.Binding
 	NewPort  key.Binding
 	Label    key.Binding
@@ -180,7 +187,7 @@ type keyGroup struct {
 // Copy moved from Expose to sit under "n new favorite" in Favorites.)
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Clean, k.Lock}},
+		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Clean, k.Lock}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
@@ -219,6 +226,9 @@ func newKeyMap() keyMap {
 		// overlay keeps the fuller "toggle serve on/off" prose (keyLegendDescs).
 		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "serve")),
 		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
+		// "publish edge": the second public path (kata v1z5), a Caddy-edge
+		// publish sibling to funnel, listed right after it in the Expose group.
+		Publish: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "publish edge")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -257,6 +267,15 @@ type portItem struct {
 	// funnelled on, or 0 if it isn't funnelled. A funnelled port is exposed to
 	// the public internet, which outranks its tailnet-serve state in the UI.
 	funnelPublic int
+	// publishHostname is the public custom hostname this port is published at
+	// through the Caddy edge (kata v1z5), or "" if it isn't published. Set from
+	// the live edge poll (m.published), never persisted per-port. publishAuth
+	// records whether that route carries basic auth. Publish is a SIBLING of
+	// funnel, not ranked against it: tailport enforces mutual exclusion, so a
+	// tailport-driven port is funnelled XOR published, never both -- the only
+	// way to see both is external mutation, surfaced as explicit drift (reach).
+	publishHostname string
+	publishAuth     bool
 	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
 	// Favorites view by an active "/" filter (4ye6), so real favorites still
 	// stand out among the wider search results. See portDelegate.Render.
@@ -324,6 +343,16 @@ func (i portItem) markerGlyph() string {
 			m = "🌑"
 		} else {
 			m = publicStyle.Render("●")
+		}
+	case reachPublish:
+		// Published to the public internet via the Caddy edge (kata v1z5). A
+		// DISTINCT public marker from funnel's ●/🌑 per the safety-marker
+		// mandate (the two public paths must be tellable apart at a glance),
+		// same publicStyle magenta since both mean "reachable by anyone".
+		if i.emoji {
+			m = "🌐"
+		} else {
+			m = publicStyle.Render("◆")
 		}
 	case reachServed, reachTailnet:
 		// Served AND already-tailnet-reachable-by-IP (wildcard/tailnet bind)
@@ -437,20 +466,36 @@ const (
 	reachLAN                         // B': specific LAN-IP bind, unserved -- LAN only, NOT tailnet
 	reachServed                      // C: served AND something is listening
 	reachFunnel                      // D: funnelled to the public internet -- outranks everything
+	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel, not ranked (mutual exclusion means a tailport port is in exactly one)
 	reachStale                       // E: served but nothing listening -- a dangling forward
 	reachOffline                     // F: not served, not listening (e.g. a down favorite)
 )
 
-// reach resolves a portItem's reachState. Precedence (top to bottom): funnel
-// outranks serve state (a funnelled port is public regardless of its tailnet
-// serve status); a served port is either healthy (C, listening) or a stale
-// dangling forward (E, not listening); an unserved port's reachability comes
-// straight from its widest bind scope (portscan.BindScope); anything neither
-// served nor listening is simply offline.
+// reach resolves a portItem's reachState. Precedence (top to bottom): the two
+// public paths (funnel D and publish D') come first -- either makes the port
+// public regardless of its tailnet serve status. They are SIBLINGS, not a
+// ranked pair (kata v1z5): tailport enforces funnel/publish mutual exclusion,
+// so a tailport-driven port is in exactly one and reach() never has to pick a
+// winner. The one case where BOTH are observed on a port is external mutation
+// (a foreign Funnel or Caddy edit); rather than silently collapse to one
+// marker, reach() surfaces it with the existing warning/stale affordance (▲)
+// and a distinct "funnelled AND published" description (see plainDescription)
+// -- no bespoke drift state, glyph, or field. Below the public tier: a served
+// port is either healthy (C, listening) or a stale dangling forward (E, not
+// listening); an unserved port's reachability comes straight from its widest
+// bind scope (portscan.BindScope); anything neither served nor listening is
+// simply offline.
 func (i portItem) reach() reachState {
+	published := i.publishHostname != ""
 	switch {
+	case i.funnelPublic != 0 && published:
+		// External drift: both public paths on one port. Reuse the warning/stale
+		// affordance rather than picking a winner (plainDescription names it).
+		return reachStale
 	case i.funnelPublic != 0:
 		return reachFunnel
+	case published:
+		return reachPublish
 	case i.active && !i.listening:
 		return reachStale
 	case i.active && i.listening:
@@ -479,7 +524,10 @@ func (i portItem) inlineCopyState() bool {
 	switch i.reach() {
 	case reachLocalhost, reachLAN, reachTailnet, reachServed:
 		return true
-	default: // reachFunnel, reachStale, reachOffline
+	default: // reachFunnel, reachPublish, reachStale, reachOffline
+		// reachPublish joins funnel as a shown≠copied case: the row shows the
+		// PUBLIC https URL but `c` copies the TAILNET url, so it keeps the
+		// disambiguating toast rather than a bare inline ✓.
 		return false
 	}
 }
@@ -492,7 +540,19 @@ func (i portItem) plainDescription() string {
 	switch i.reach() {
 	case reachFunnel:
 		return "on the internet · " + tsserve.PublicURL(i.fqdn, i.funnelPublic)
+	case reachPublish:
+		d := "published to the internet · https://" + i.publishHostname
+		if i.publishAuth {
+			d += " · basic auth"
+		}
+		return d
 	case reachStale:
+		// Drift: a port carrying BOTH public paths (external mutation only) is
+		// routed here to reuse the ▲ warning affordance; name it explicitly
+		// rather than pretending it's an ordinary dangling forward.
+		if i.funnelPublic != 0 && i.publishHostname != "" {
+			return "funnelled AND published — remove one"
+		}
 		return "bound to tailnet, but stale — space to unbind"
 	case reachServed:
 		return i.servedDescPlain()
@@ -523,7 +583,7 @@ func (i portItem) plainDescription() string {
 // stale dangling forward. The healthy states stay unstyled.
 func (i portItem) styledDescription() string {
 	switch i.reach() {
-	case reachFunnel:
+	case reachFunnel, reachPublish:
 		return publicStyle.Render(i.plainDescription())
 	case reachStale:
 		return warnStyle.Render(i.plainDescription())
@@ -602,6 +662,38 @@ type toggleDoneMsg struct {
 	err  error
 }
 
+// publishInfo is the live per-port publish state the edge poll returns: the
+// public hostname a local port is published at, and whether that route carries
+// basic auth. Keyed by local port in m.published. Never persisted -- Caddy is
+// the source of truth (kata v1z5).
+type publishInfo struct {
+	hostname string
+	auth     bool
+}
+
+// publishDoneMsg reports a completed publish/unpublish edge op (kata v1z5). Its
+// handler MIRRORS toggleDoneMsg: it clears m.pending and, rather than hand-set
+// the published map from the op's outcome, always re-fetches (refresh +
+// pollPublishedCmd) so the UI reflects Caddy's actual state, not an optimistic
+// guess.
+type publishDoneMsg struct {
+	port int
+	err  error
+}
+
+// publishPollMsg carries one edge-poll result (kata v1z5 step 5). On err the
+// poll degrades quietly: last-known m.published is kept and publishReachable
+// goes false. On success published replaces m.published wholesale.
+type publishPollMsg struct {
+	published map[int]publishInfo
+	err       error
+}
+
+// publishTickMsg fires the separate 15s published-state poll timer. The ticker
+// never stops (it reschedules unconditionally); the poll it triggers is a nil
+// cmd when publishing is unconfigured, so an unconfigured edge costs nothing.
+type publishTickMsg struct{}
+
 type cleanupDoneMsg struct{ err error }
 
 // flashExpireMsg clears the transient toast if it's still the one that
@@ -651,6 +743,17 @@ const (
 	// stray "x" must not remove it. Only unlocking is gated -- locking :22 and
 	// any non-:22 lock toggle stay a single instant keypress.
 	entryConfirmUnlockSSH
+	// The publish (`P`) flow (kata v1z5) is a small state machine of its own,
+	// all handled in updatePublishEntry. It gathers a public hostname, an
+	// optional shared basic-auth credential (first authed publish only), then a
+	// funnel-grade confirm before touching the Caddy edge:
+	//   entryPublishHost -> entryPublishAuth -> [entryPublishCredUser ->
+	//   entryPublishCredPass ->] entryConfirmPublish
+	entryPublishHost     // text: the public hostname, prefilled <label-or-process>.<domain>
+	entryPublishAuth     // 3-way y/n/esc: require basic auth? ("no auth" != "abort")
+	entryPublishCredUser // text: shared basic-auth username (first authed publish)
+	entryPublishCredPass // text (masked): shared basic-auth password (first authed publish)
+	entryConfirmPublish  // funnel-grade y/n naming the exact https://<hostname>
 )
 
 type model struct {
@@ -741,6 +844,25 @@ type model struct {
 	// funnel maps a local port to the public ingress port it's funnelled on
 	// (443/8443/10000). Reconciled from tsserve.FunnelStatus on refresh.
 	funnel map[int]int
+	// published maps a local port to its live Caddy-edge publish state (kata
+	// v1z5), keyed by RouteInfo.Port and filtered to routes whose backend Label
+	// is THIS machine's short MagicDNS label. Read live from the edge on a
+	// separate 15s poll (pollPublishedCmd) -- never persisted per-port, Caddy is
+	// the source of truth. Nil/empty when publish is unconfigured.
+	published map[int]publishInfo
+	// publishReachable tracks the edge poll's health. It starts optimistically
+	// true (so the status line doesn't cry "edge unreachable" before the first
+	// poll finishes) and flips false on a poll failure; a later successful poll
+	// flips it back. On failure the LAST-KNOWN published map is kept (quiet
+	// degrade) and a small persistent " · edge unreachable" fragment is shown --
+	// never a toast (kata v1z5 step 5).
+	publishReachable bool
+	// caddyClientOverride, when non-nil, replaces the client built from
+	// cfg.Caddy for every edge call. Production leaves it nil (caddyClient builds
+	// AdminURL/ServerName from config); tests inject a client pointed at an
+	// httptest.Server so the whole publish/unpublish/poll flow runs against
+	// in-process fakes, never a real caddy or a bound port.
+	caddyClientOverride *caddyedge.Client
 
 	mode       entryMode
 	portInput  textinput.Model
@@ -762,6 +884,21 @@ type model struct {
 	funnelPort   int
 	funnelPublic int
 	funnelTurnOn bool
+	// Publish (`P`) flow state (kata v1z5), carried across the dialog steps and
+	// cleared by clearPublishFlow on esc/abort/confirm. publishInput is the ONE
+	// shared textinput reused for the host / cred-user / cred-pass steps (its
+	// EchoMode is flipped to EchoPassword only for the password step).
+	// publishCredUser/publishCredPass hold the plaintext credential gathered on
+	// a first authed publish ONLY until confirm-time, where the password is
+	// bcrypt-hashed and the plaintext dropped -- clearPublishFlow zeroes both so
+	// an aborted flow never leaves a plaintext password in memory.
+	publishInput       textinput.Model
+	publishPort        int    // local port being published
+	publishHostname    string // the public hostname entered (held into the confirm)
+	publishWithAuth    bool   // basic auth requested for this publish
+	publishCredUser    string // plaintext username (first authed publish only)
+	publishCredPass    string // plaintext password (first authed publish only; hashed + dropped at confirm)
+	publishEnableServe bool   // this confirm will also turn tailscale serve on
 	// flash is the single transient notification shown in the bottom bar --
 	// copy confirmations, refusals, and errors alike (q89g). flashLevel tints
 	// it (info green / warn amber / error red). It clears on the next keypress
@@ -992,6 +1129,15 @@ func New(cfg config.Config, markersOverride ...string) model {
 	si.CharLimit = 8
 	si.Width = 10
 
+	// One shared textinput for the publish flow's three text steps (host,
+	// cred-user, cred-pass). Wide enough for a nested public hostname; its
+	// EchoMode is flipped to EchoPassword for the masked password step and back
+	// to EchoNormal otherwise (see updatePublishEntry / clearPublishFlow).
+	pi := textinput.New()
+	pi.Placeholder = "host.example.com"
+	pi.CharLimit = 253 // max DNS name length
+	pi.Width = 40
+
 	if cfg.Ports == nil {
 		cfg.Ports = map[int]config.PortMeta{}
 	}
@@ -1026,7 +1172,11 @@ func New(cfg config.Config, markersOverride ...string) model {
 
 	return model{
 		list: l, delegate: del, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
-		portInput: ti, labelInput: li, sshInput: si, configPath: configPath,
+		portInput: ti, labelInput: li, sshInput: si, publishInput: pi, configPath: configPath,
+		// Optimistic until the first edge poll actually fails (see the field
+		// doc), so a configured-but-not-yet-polled edge doesn't flash
+		// "unreachable" on startup.
+		publishReachable: true,
 		// emoji (egg/fireworks) always auto-detects, independent of markersMode.
 		emoji: emojiCapable(),
 		// markerEmoji (exposure markers) obeys --markers/cfg.Markers, defaulting
@@ -1071,7 +1221,12 @@ func (m model) Init() tea.Cmd {
 	if m.host != "" {
 		title = "tailport — " + m.host
 	}
-	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), tea.SetWindowTitle(title))
+	// The published-state poll (kata v1z5 step 5) is a SEPARATE ticker from the
+	// serve/funnel refresh: a remote round-trip to the Caddy edge, so it runs on
+	// its own slower 15s cadence and is a no-op (nil cmd) when unconfigured. The
+	// Init poll races fqdn resolution -- it may not yet know our short label --
+	// so fqdnMsg re-polls once the label is known.
+	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -1218,6 +1373,116 @@ func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
 			err = tsserve.FunnelOff(localPort, publicPort)
 		}
 		return toggleDoneMsg{port: localPort, err: err}
+	}
+}
+
+// publishPollInterval is the published-state poll cadence (kata v1z5 step 5).
+// Deliberately slower than refreshInterval: each poll is a remote round-trip to
+// the Caddy edge over the tailnet, not a cheap local `ss`/serve-status read.
+const publishPollInterval = 15 * time.Second
+
+// publishTick schedules the next published-state poll. Unlike the egg/fireworks
+// tickers it NEVER stops (the handler reschedules unconditionally); when
+// publishing is unconfigured the poll it fires is simply a nil cmd, so the only
+// cost is the timer itself.
+func publishTick() tea.Cmd {
+	return tea.Tick(publishPollInterval, func(time.Time) tea.Msg { return publishTickMsg{} })
+}
+
+// shortLabel derives this machine's short MagicDNS label -- the first
+// `.`-component of its FQDN (from Self.DNSName). This is the backend label the
+// Caddy edge dials (`<label>:<port>`), and the key the poll filters live routes
+// by. Returns "" for an empty fqdn (tailscale down / not yet resolved), which
+// the callers guard against.
+func shortLabel(fqdn string) string {
+	return strings.SplitN(fqdn, ".", 2)[0]
+}
+
+// caddyClient builds the edge client from cfg.Caddy (AdminURL from
+// hostname:admin_port, ServerName from server_name), or returns the test
+// override when one is injected. The nil HTTPClient means caddyedge's own 5s
+// default timeout bounds each call.
+func (m model) caddyClient() *caddyedge.Client {
+	if m.caddyClientOverride != nil {
+		return m.caddyClientOverride
+	}
+	return &caddyedge.Client{
+		AdminURL:   "http://" + m.cfg.Caddy.Hostname + ":" + strconv.Itoa(m.cfg.Caddy.AdminPort),
+		ServerName: m.cfg.Caddy.ServerName,
+	}
+}
+
+// pollPublishedCmd is the published-state poll (kata v1z5 step 5): a remote
+// List() against the Caddy edge, filtered to routes whose backend label is THIS
+// machine's short label and keyed by local port. It returns a nil cmd -- zero
+// cost -- when publishing is unconfigured (blank caddy.domain), matching the
+// config semantics. A failure degrades quietly (publishPollMsg carries the err;
+// the handler keeps last-known state and sets publishReachable=false), never a
+// toast.
+func (m model) pollPublishedCmd() tea.Cmd {
+	if m.cfg.Caddy.Domain == "" {
+		return nil
+	}
+	client := m.caddyClient()
+	label := shortLabel(m.fqdn)
+	return func() tea.Msg {
+		infos, err := client.List(context.Background())
+		if err != nil {
+			return publishPollMsg{err: err}
+		}
+		published := make(map[int]publishInfo, len(infos))
+		for _, r := range infos {
+			// Filter to OUR machine's routes: multiple tailport computers share
+			// one Caddy server, distinguished by backend label + port.
+			if label == "" || r.Label != label {
+				continue
+			}
+			published[r.Port] = publishInfo{hostname: r.Hostname, auth: r.Auth}
+		}
+		return publishPollMsg{published: published}
+	}
+}
+
+// publishCmd auto-enables serve (when needed) and THEN publishes, sequentially,
+// inside ONE tea.Cmd (kata v1z5 step 3). The order is load-bearing: serve must
+// be on before the public route is created, so a serve-enable failure
+// short-circuits and NO public route is ever created for a backend that isn't
+// actually serving. This is deliberately not two concurrently-batched cmds.
+func publishCmd(client *caddyedge.Client, hostname, label string, port int, auth *caddyedge.BasicAuth, enableServe bool) tea.Cmd {
+	return func() tea.Msg {
+		if enableServe {
+			if err := tsserve.On(port); err != nil {
+				return publishDoneMsg{port: port, err: err}
+			}
+		}
+		return publishDoneMsg{port: port, err: client.Publish(context.Background(), hostname, label, port, auth)}
+	}
+}
+
+// unpublishCmd removes a published route. caddyedge.Unpublish re-verifies live
+// ownership (still tailport-owned, still pointing at this label:port) before
+// deleting, and it NEVER touches serve state (kata v1z5): de-escalating the
+// public route leaves the tailnet serve mapping exactly as it was.
+func unpublishCmd(client *caddyedge.Client, hostname, label string, port int) tea.Cmd {
+	return func() tea.Msg {
+		return publishDoneMsg{port: port, err: client.Unpublish(context.Background(), hostname, label, port)}
+	}
+}
+
+// publishErrText maps a caddyedge failure onto a friendly one-line toast,
+// keying off the package's sentinel errors with errors.Is.
+func publishErrText(err error) string {
+	switch {
+	case errors.Is(err, caddyedge.ErrUnreachable):
+		return "caddy edge unreachable — check caddy.hostname and that the edge is up"
+	case errors.Is(err, caddyedge.ErrNotFound):
+		return "route not found on the edge (already removed?)"
+	case errors.Is(err, caddyedge.ErrConcurrentUpdate):
+		return "caddy config changed concurrently — try again"
+	default:
+		// ErrHostnameConflict and any wrapped Caddy body already name the
+		// conflicting backend / carry Caddy's own message.
+		return err.Error()
 	}
 }
 
@@ -1379,7 +1644,7 @@ func (m *model) copyTargetURL(sel portItem) string {
 		return httpURL(sel.port.BindHost, sel.port.Number)
 	case reachLocalhost, reachOffline:
 		return fmt.Sprintf("http://localhost:%d", sel.port.Number)
-	default: // reachTailnet, reachServed, reachFunnel, reachStale
+	default: // reachTailnet, reachServed, reachFunnel, reachPublish, reachStale
 		return tailnetURL
 	}
 }
@@ -1441,6 +1706,10 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		// is the one principled exception to universal inline (vqa3): a toast
 		// that names what was actually copied.
 		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public funnel url)", url), flashInfo)
+	case reachPublish:
+		// Same shown≠copied split as funnel (kata v1z5): the row shows the
+		// public https URL but c copies the tailnet url; the toast says so.
+		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public published url)", url), flashInfo)
 	default:
 		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
 		// favorite) -- "press space to serve it" is TRUE here. reachServed
@@ -1772,6 +2041,14 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 		// reduces exposure.
 		return m.beginFunnel(port, pub, false)
 	}
+	// Mutual-exclusion mirror guard (kata v1z5): funnel refuses a port that is
+	// currently Caddy-published. Funnel and publish are two INDEPENDENT public
+	// paths, never layered or ranked -- so escalating a published port to also
+	// carry a funnel is refused, with the same no-ranking treatment publish
+	// gives a funnelled port. The user removes the other exposure first.
+	if info, ok := m.published[port]; ok {
+		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (P) before funnelling", port, info.hostname))
+	}
 	if port == 22 {
 		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
 	}
@@ -1844,6 +2121,255 @@ func looksHTTP(port int, process string) bool {
 	return false
 }
 
+// requestPublish is the `P` key's up-front gate (kata v1z5 step 3), mirroring
+// requestFunnel. It runs the local guards IN ORDER before opening the publish
+// dialog (or, for de-escalation, before the immediate unpublish). Beyond these
+// local guards, caddyedge.Publish itself enforces route ownership (a hostname
+// owned by a different backend/port, or a foreign route, is a conflict with no
+// mutation) -- that can't be pre-checked here since Caddy alone is the source of
+// truth, so it surfaces later as a publishDoneMsg error. Returns a nil cmd
+// whenever it defers to the dialog.
+func (m *model) requestPublish(port int) tea.Cmd {
+	// 1. busy: a toggle/funnel/publish is already in flight.
+	if m.pending != 0 {
+		return nil
+	}
+	// 2. :22 (SSH) is hard-blocked from the public internet, same as funnel.
+	if port == 22 {
+		return m.setErr("refusing to publish :22 (SSH) to the public internet")
+	}
+	// 3. empty fqdn: we derive the backend dial label from this machine's
+	// MagicDNS name, so without it we can't build a route. Refuse.
+	if m.fqdn == "" {
+		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
+	}
+	// 4. mutual exclusion: a funnelled port must lose the funnel first (no
+	// ranking -- publish does not outrank funnel; they're independent paths).
+	if pub, on := m.funnel[port]; on {
+		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (p) before publishing", port, pub))
+	}
+	// 5. already published by tailport on THIS exact port -> de-escalation:
+	// unpublish immediately, no confirm (reducing exposure is never gated).
+	if info, ok := m.published[port]; ok {
+		m.pending = port
+		return unpublishCmd(m.caddyClient(), info.hostname, shortLabel(m.fqdn), port)
+	}
+	// 6. config: publishing needs a public base domain AND a reachable edge
+	// admin hostname. Name the missing field, its config file, and the docs.
+	if m.cfg.Caddy.Domain == "" || m.cfg.Caddy.Hostname == "" {
+		field := "caddy.domain"
+		if m.cfg.Caddy.Domain != "" {
+			field = "caddy.hostname"
+		}
+		where := m.configPath
+		if where == "" {
+			where = "your tailport config"
+		}
+		return m.setErr(fmt.Sprintf("publish is unconfigured: set %s in %s (see docs/caddy-edge.md)", field, where))
+	}
+	// 7. locked port: publish must not bypass the `x` lock any more than serve
+	// or funnel do.
+	if m.cfg.Ports[port].Locked {
+		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
+	}
+
+	// All guards passed: open the host dialog, prefilled <label-or-process>.<domain>.
+	// Prefill precedence: the port's user label, else its live process name,
+	// else this machine's short label -- then "."+domain. It's editable and
+	// nested subdomains are allowed; ValidHostname checks it on submit.
+	m.publishPort = port
+	prefix := m.cfg.Ports[port].Label
+	if prefix == "" {
+		prefix = m.selectedProcess(port)
+	}
+	if prefix == "" {
+		prefix = shortLabel(m.fqdn)
+	}
+	m.publishInput.EchoMode = textinput.EchoNormal
+	m.publishInput.SetValue(prefix + "." + m.cfg.Caddy.Domain)
+	m.publishInput.CursorEnd()
+	m.publishInput.Focus()
+	m.mode = entryPublishHost
+	return nil
+}
+
+// clearPublishFlow resets every publish-flow field to its zero value and
+// returns the input to entryNone. CRITICAL: it zeroes publishCredUser and
+// publishCredPass, so an aborted (or completed) flow never leaves the plaintext
+// basic-auth password sitting in the model. Called on esc at every step, on the
+// 3-way auth gate's esc, and at confirm-time once the password has been hashed.
+func (m *model) clearPublishFlow() {
+	m.mode = entryNone
+	m.publishInput.Reset()
+	m.publishInput.EchoMode = textinput.EchoNormal
+	m.publishPort = 0
+	m.publishHostname = ""
+	m.publishWithAuth = false
+	m.publishCredUser = ""
+	m.publishCredPass = ""
+	m.publishEnableServe = false
+}
+
+// updatePublishEntry drives the publish dialog's state machine (kata v1z5 step
+// 3). It owns every key for the publish modes -- including feeding the text
+// steps into publishInput -- so keystrokes never leak into labelInput via the
+// shared entry-mode fallthrough. esc aborts (clearing the plaintext credential)
+// at every step.
+func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
+	switch m.mode {
+	case entryPublishHost:
+		switch msg.String() {
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		case "enter":
+			host := strings.TrimSpace(m.publishInput.Value())
+			if !caddyedge.ValidHostname(host) {
+				return m.setErr(fmt.Sprintf("invalid public hostname: %q", host))
+			}
+			m.publishHostname = host
+			m.mode = entryPublishAuth
+			return nil
+		}
+		var cmd tea.Cmd
+		m.publishInput, cmd = m.publishInput.Update(msg)
+		return cmd
+
+	case entryPublishAuth:
+		// 3-way gate (a documented deviation from the 2-way y/n confirms): y
+		// requires auth, n publishes with NO auth, esc aborts -- so "no auth" is
+		// distinct from "cancel". Other keys are ignored (stay on the gate).
+		switch msg.String() {
+		case "y", "Y":
+			m.publishWithAuth = true
+			if m.cfg.Caddy.AuthHash == "" {
+				// First authed publish: gather the single shared credential.
+				m.publishInput.Reset()
+				m.publishInput.EchoMode = textinput.EchoNormal
+				m.publishInput.Placeholder = "username"
+				m.publishInput.Focus()
+				m.mode = entryPublishCredUser
+				return nil
+			}
+			// A shared credential already exists -> reuse it, skip the cred steps.
+			return m.enterConfirmPublish()
+		case "n", "N":
+			m.publishWithAuth = false
+			return m.enterConfirmPublish()
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		default:
+			return nil
+		}
+
+	case entryPublishCredUser:
+		switch msg.String() {
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		case "enter":
+			user := strings.TrimSpace(m.publishInput.Value())
+			if user == "" {
+				return m.setErr("username required (or esc to cancel)")
+			}
+			m.publishCredUser = user
+			m.publishInput.Reset()
+			m.publishInput.EchoMode = textinput.EchoPassword // mask the password
+			m.publishInput.Placeholder = "password"
+			m.publishInput.Focus()
+			m.mode = entryPublishCredPass
+			return nil
+		}
+		var cmd tea.Cmd
+		m.publishInput, cmd = m.publishInput.Update(msg)
+		return cmd
+
+	case entryPublishCredPass:
+		switch msg.String() {
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		case "enter":
+			// Don't TrimSpace a password -- spaces can be significant.
+			pass := m.publishInput.Value()
+			if pass == "" {
+				return m.setErr("password required (or esc to cancel)")
+			}
+			m.publishCredPass = pass
+			m.publishInput.Reset()
+			m.publishInput.EchoMode = textinput.EchoNormal
+			m.publishInput.Placeholder = "host.example.com"
+			return m.enterConfirmPublish()
+		}
+		var cmd tea.Cmd
+		m.publishInput, cmd = m.publishInput.Update(msg)
+		return cmd
+
+	case entryConfirmPublish:
+		// Funnel-grade y/n: y confirms, every other key cancels.
+		switch msg.String() {
+		case "y", "Y":
+			return m.confirmPublish()
+		default:
+			m.clearPublishFlow()
+			return nil
+		}
+	}
+	return nil
+}
+
+// enterConfirmPublish sets up the funnel-grade confirm step, recording whether
+// the confirm will also turn serve on (serve isn't already active for the port)
+// so the confirm can say so.
+func (m *model) enterConfirmPublish() tea.Cmd {
+	m.publishEnableServe = !m.active[m.publishPort]
+	m.mode = entryConfirmPublish
+	return nil
+}
+
+// confirmPublish is the entryConfirmPublish "yes" path. On a first authed
+// publish it bcrypt-hashes the gathered password AT CONFIRM-TIME (sync, one-off)
+// and persists the shared credential via an explicit saveConfig -- remember()
+// is a no-op for an already-known port and would skip writing the hash. It then
+// hands off to a single sequential publish cmd (serve-then-publish). The
+// plaintext password is dropped by clearPublishFlow before the op runs.
+func (m *model) confirmPublish() tea.Cmd {
+	port := m.publishPort
+	hostname := m.publishHostname
+	enableServe := m.publishEnableServe
+
+	var auth *caddyedge.BasicAuth
+	var saveCmd tea.Cmd
+	if m.publishWithAuth {
+		if m.publishCredPass != "" {
+			// First authed publish gathered a new shared credential: hash it now.
+			hash, err := bcrypt.GenerateFromPassword([]byte(m.publishCredPass), bcrypt.DefaultCost)
+			if err != nil {
+				m.clearPublishFlow()
+				return m.setErr("could not hash password: " + err.Error())
+			}
+			m.cfg.Caddy.AuthUser = m.publishCredUser
+			m.cfg.Caddy.AuthHash = string(hash)
+			saveCmd = m.saveConfig() // explicit -- remember() would skip a known port
+		}
+		auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
+	}
+
+	// Guard 3 re-check: never build a route dialling ":port" with no label.
+	if m.fqdn == "" {
+		m.clearPublishFlow()
+		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
+	}
+	label := shortLabel(m.fqdn)
+	client := m.caddyClient()
+
+	// Drop the flow state (esp. the plaintext password) BEFORE the op runs.
+	m.clearPublishFlow()
+	m.pending = port
+	return tea.Batch(saveCmd, publishCmd(client, hostname, label, port, auth, enableServe))
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -1875,7 +2401,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fqdnMsg:
 		if msg.fqdn != "" {
+			hadFQDN := m.fqdn != ""
 			m.fqdn = msg.fqdn
+			// The Init poll fired before fqdn resolved, so it couldn't know our
+			// short label. Now that we do, re-poll once so published markers
+			// appear promptly instead of waiting a full 15s tick.
+			if !hadFQDN {
+				return m, m.pollPublishedCmd()
+			}
 		}
 		return m, nil
 
@@ -1964,6 +2497,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// re-check.
 		m.operatorNotSet = false
 		return m, refresh
+
+	case publishDoneMsg:
+		// Mirrors toggleDoneMsg (kata v1z5): clear pending, and rather than
+		// hand-set the published map from this op's outcome, always re-fetch
+		// (refresh reconciles serve state; pollPublishedCmd re-reads the live
+		// routes) so the UI reflects Caddy's actual state.
+		m.pending = 0
+		if msg.err != nil {
+			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
+				// The auto-enable-serve step hit tailscale's operator gate --
+				// same sticky guidance banner a serve toggle would raise.
+				m.operatorNotSet = true
+				return m, tea.Batch(refresh, m.pollPublishedCmd())
+			}
+			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+		}
+		// A publish that auto-enabled serve proves the operator is set.
+		m.operatorNotSet = false
+		return m, tea.Batch(refresh, m.pollPublishedCmd())
+
+	case publishPollMsg:
+		if msg.err != nil {
+			// Quiet degrade (kata v1z5 step 5): keep the last-known published
+			// map, just mark the edge unreachable. No toast -- a persistent
+			// " · edge unreachable" status-line fragment carries it instead.
+			m.publishReachable = false
+			return m, nil
+		}
+		m.published = msg.published
+		m.publishReachable = true
+		return m, m.rebuildItems()
+
+	case publishTickMsg:
+		// The published-state ticker NEVER stops: reschedule unconditionally.
+		// Poll only when idle (an in-flight op will re-poll on its
+		// publishDoneMsg) and only when configured (pollPublishedCmd is nil for
+		// a blank caddy.domain).
+		if m.pending != 0 || m.cleaning != 0 {
+			return m, publishTick()
+		}
+		return m, tea.Batch(m.pollPublishedCmd(), publishTick())
 
 	case cleanupDoneMsg:
 		m.cleaning = 0
@@ -2125,6 +2699,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.funnelPublic = 0
 					return m, nil
 				}
+			}
+			// The publish (`P`) flow (kata v1z5) is a self-contained state
+			// machine handled here, BEFORE the generic esc/enter switch and the
+			// textinput fallthrough below -- so its keystrokes reach publishInput
+			// and never leak into labelInput.
+			switch m.mode {
+			case entryPublishHost, entryPublishAuth, entryPublishCredUser,
+				entryPublishCredPass, entryConfirmPublish:
+				return m, m.updatePublishEntry(msg)
 			}
 			switch msg.String() {
 			case "esc":
@@ -2493,6 +3076,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestFunnel hard-blocks :22, refuses when all ingress ports are
 			// taken, and defers a turn-on to the strong public-internet confirm.
 			return m, m.requestFunnel(sel.port.Number)
+		case "P":
+			if m.pending != 0 {
+				return m, nil // a toggle/funnel/publish is already in flight
+			}
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			// requestPublish runs the publish guards in order (busy, :22, empty
+			// fqdn, funnel mutual-exclusion, de-escalation, config, lock) and
+			// otherwise opens the publish dialog (kata v1z5).
+			return m, m.requestPublish(sel.port.Number)
 		}
 	}
 
@@ -2557,7 +3152,8 @@ func (m *model) rebuildItems() tea.Cmd {
 				p = portscan.Port{Number: n}
 			}
 			meta := m.cfg.Ports[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+			pub := m.published[n]
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -2580,7 +3176,8 @@ func (m *model) rebuildItems() tea.Cmd {
 		}
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+		pub := m.published[n]
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
@@ -4163,13 +4760,14 @@ type KeyLegendGroup struct {
 // callers pass m.markerEmoji, not m.emoji -- this is exposure-marker prose,
 // not egg/fireworks).
 func keyLegendDescs(emoji bool) map[string]string {
-	served, funneled, dangling := "◉", "●", "▲"
+	served, funneled, published, dangling := "◉", "●", "◆", "▲"
 	if emoji {
-		served, funneled, dangling = "🌒", "🌑", "🌫️"
+		served, funneled, published, dangling = "🌒", "🌑", "🌐", "🌫️"
 	}
 	return map[string]string{
 		"space":  "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
 		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
+		"P":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. Needs caddy.domain/hostname\nconfigured (see docs/caddy-edge.md). Press P again to unpublish.",
 		"c":      "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
@@ -4283,11 +4881,11 @@ func configSaveLines(path string) []string {
 func (m model) markerLegend() string {
 	if m.markerEmoji {
 		return "🌕 localhost   🌔 local network   🌒 on tailnet (served or bound wide)\n" +
-			"🌑 internet (funnel)   🌫️ stale   ✕ offline\n" +
+			"🌑 internet (funnel)   🌐 internet (published)   🌫️ stale   ✕ offline\n" +
 			"🔒 locked   ★ favorite"
 	}
 	return "○ localhost   ◔ local network   ◉ on tailnet (served or bound wide)\n" +
-		"● internet (funnel)   ▲ stale   ✕ offline\n" +
+		"● internet (funnel)   ◆ internet (published)   ▲ stale   ✕ offline\n" +
 		"🔒 locked   ★ favorite"
 }
 
@@ -4334,8 +4932,11 @@ func (m model) helpContent() string {
 			"and out). `tailscale serve` only matters for a LOOPBACK-bound app: a\n" +
 			"wildcard-bound port (0.0.0.0) is already reachable on the tailnet\n" +
 			"without serving — see the marker legend and each row's description.\n" +
-			"A port can also be funnelled to the PUBLIC internet with `p` (opt-in,\n" +
-			"see below)."))
+			"A port can also be exposed to the PUBLIC internet two independent,\n" +
+			"mutually-exclusive ways (opt-in, see below): `p` funnels it via\n" +
+			"tailscale, and `P` publishes it at a custom hostname through your own\n" +
+			"Caddy edge (configure caddy.domain/hostname first — see\n" +
+			"docs/caddy-edge.md)."))
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Markers"))
 	b.WriteString("\n")
@@ -4638,20 +5239,29 @@ func (m model) statusText() string {
 		withHost = fmt.Sprintf("%d listening on %s · %d on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
 	}
 	// Widest form that fits, degrading host -> shorter labels -> initials.
+	var base string
 	switch {
 	case m.width <= 0 || lipgloss.Width(withHost) <= m.width:
-		return withHost
+		base = withHost
 	case lipgloss.Width(full) <= m.width:
-		return full
+		base = full
 	default:
 		// Medium drops the host and shortens labels; "funnel" stands in for
 		// "public (funnel)" for compactness while staying precise.
 		medium := fmt.Sprintf("%d listening · %d tailnet · %d funnel", listening, tailnet, public)
 		if lipgloss.Width(medium) <= m.width {
-			return medium
+			base = medium
+		} else {
+			base = fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 		}
-		return fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 	}
+	// Persistent quiet-degrade fragment (kata v1z5 step 5): only when publishing
+	// is configured (a blank caddy.domain suppresses the poll entirely) and the
+	// last edge poll failed. Never a toast -- a small trailing status fragment.
+	if m.cfg.Caddy.Domain != "" && !m.publishReachable {
+		base += " · edge unreachable"
+	}
+	return base
 }
 
 // operatorHintText returns the STICKY banner guiding the user through
@@ -4680,19 +5290,40 @@ func (m model) operatorHintText() string {
 // accounting resizeList feeds to m.list.SetSize; the two must never drift
 // apart or the grid would compute a different row count than the space
 // list.Model itself was actually given.
+// legendReservationLines is the number of rows the bottom-bar legend can ever
+// occupy at the current width: the MAX of the two cleanEnabled renders (with
+// and without the contextual "C clean stale" hint). listBodyHeight reserves
+// this so a dangling forward appearing or vanishing between resizes can never
+// leave the live legend taller than what was reserved -- the invariant
+// TestLegendReservationDominatesLive pins. Reserving the max (rather than
+// assuming cleanEnabled=true is worst-case) is robust to 04rb's non-monotonic
+// fold, where one more binding can shrink a group.
+func (m model) legendReservationLines() int {
+	lines := 1
+	for _, cleanEnabled := range []bool{true, false} {
+		if legend := m.renderLegendWith(cleanEnabled); legend != "" {
+			if n := strings.Count(legend, "\n") + 1; n > lines {
+				lines = n
+			}
+		}
+	}
+	return lines
+}
+
 func (m model) listBodyHeight() int {
 	if m.width <= 0 || m.height <= 0 {
 		return 1
 	}
-	// Reserve the WORST-CASE legend height -- render it as if a dangling
-	// forward were present (cleanEnabled=true) so the grouped grid/bar always
-	// fits. That way the list never overlaps the bar when a dangling appears
-	// (or vanishes) between resizes: the grid is a constant 5 rows regardless,
-	// and the wrapped fallback is measured with the extra "C" hint included.
-	legendLines := 1
-	if legend := m.renderLegendWith(true); legend != "" {
-		legendLines = strings.Count(legend, "\n") + 1
-	}
+	// Reserve the WORST-CASE legend height so the list never overlaps the bar
+	// when a dangling forward appears (or vanishes) between resizes. Because
+	// 04rb's fold is width-driven and keyed off each group's UNFOLDED binding
+	// count, adding/removing the contextual "C clean stale" hint can make the
+	// bar TALLER *or* shorter at a given width (folding is non-monotonic: an
+	// extra binding can push a group over a fold threshold and shrink it). So we
+	// reserve the max of both cleanEnabled states rather than assuming
+	// cleanEnabled=true dominates -- see legendReservationLines and
+	// TestLegendReservationDominatesLive.
+	legendLines := m.legendReservationLines()
 	// Reserve the WORST-CASE operator-hint banner height too (kata tapv),
 	// unconditionally -- like cleanEnabled=true above, NOT gated on the
 	// CURRENT m.operatorNotSet. The banner can appear asynchronously (a
@@ -4824,6 +5455,34 @@ func (m model) renderBottom() string {
 		// Funnel proxies HTTP(S); warn when the target may not speak it.
 		if proc := m.selectedProcess(m.funnelPort); !looksHTTP(m.funnelPort, proc) {
 			lines = append(lines, warnStyle.Render(fmt.Sprintf("   note: funnel only proxies HTTP; :%d may not speak it", m.funnelPort)))
+		}
+		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
+		return strings.Join(lines, "\n")
+	case entryPublishHost:
+		return helpStyle.Render(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort)) +
+			m.publishInput.View() + helpStyle.Render("  (enter: next, esc: cancel)")
+	case entryPublishAuth:
+		return helpStyle.Render(fmt.Sprintf("protect :%d behind basic auth at the edge? ", m.publishPort)) +
+			helpStyle.Render("(y: yes / n: no auth / esc: cancel)")
+	case entryPublishCredUser:
+		return helpStyle.Render("basic-auth username: ") + m.publishInput.View() +
+			helpStyle.Render("  (enter: next, esc: cancel)")
+	case entryPublishCredPass:
+		return helpStyle.Render("basic-auth password: ") + m.publishInput.View() +
+			helpStyle.Render("  (enter: confirm, esc: cancel)")
+	case entryConfirmPublish:
+		url := "https://" + m.publishHostname
+		lines := []string{
+			warnStyle.Render(fmt.Sprintf("⚠ Publish :%d to the PUBLIC INTERNET via the caddy edge?", m.publishPort)),
+			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
+		}
+		if m.publishWithAuth {
+			lines = append(lines, helpStyle.Render("   protected by basic auth at the edge"))
+		} else {
+			lines = append(lines, warnStyle.Render("   no basic auth — anyone with the URL can reach it"))
+		}
+		if m.publishEnableServe {
+			lines = append(lines, helpStyle.Render(fmt.Sprintf("   will also turn tailscale serve on for :%d", m.publishPort)))
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")

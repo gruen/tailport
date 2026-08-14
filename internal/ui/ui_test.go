@@ -1,19 +1,26 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gruen/tailport/internal/caddyedge"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
 	"github.com/gruen/tailport/internal/tsserve"
@@ -3696,7 +3703,7 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
 	// documents it even though barGroups hides it from the bottom bar.
 	wantKeys := [][]string{
-		{"space", "p", "C", "x"},
+		{"space", "p", "P", "C", "x"},
 		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "?", "q"},
@@ -3887,10 +3894,15 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
-	// Expose folded too (tied at 3 with View, but earlier in group order so
-	// tried first): space serve | x lock/unlock on one row.
-	if r1, r2 := lineOf(wideLines, "space serve"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
-		t.Errorf("Expose should fold space serve/x lock/unlock onto the same row; space serve row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+	// Expose folded too (4 bindings since kata v1z5 added P publish edge, so
+	// it's now taller than View's 3 and tried right after Favorites). Its 2/2
+	// top-heavy split puts space serve | P publish edge on one row and
+	// p funnel public | x lock/unlock on the next.
+	if r1, r2 := lineOf(wideLines, "space serve"), lineOf(wideLines, "P publish edge"); r1 < 0 || r1 != r2 {
+		t.Errorf("Expose should fold space serve/P publish edge onto the same row; space serve row %d, P publish edge row %d:\n%s", r1, r2, wide)
+	}
+	if r1, r2 := lineOf(wideLines, "funnel public"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
+		t.Errorf("Expose should fold p funnel public/x lock/unlock onto the same row; p funnel public row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
 
 	// App (3 bar bindings since 3cwx -- u undo, ? help, q quit; ctrl+r redo is
@@ -4039,9 +4051,10 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
 // Protect is folded into Expose: with no dangling the Expose column ends at
-// "x lock/unlock" (space/p/x, no clean, no reserved blank slot); when a
+// "x lock/unlock" (space/p/P/x, no clean, no reserved blank slot); when a
 // dangling forward exists it gains "C clean stale" -- inserted just ABOVE lock
 // so "x lock/unlock" stays the last item in the column in either state.
+// (kata v1z5 added P publish edge to Expose, after p funnel.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.help.Width = 100
@@ -4063,11 +4076,11 @@ func TestExposeContextualClean(t *testing.T) {
 		return g.bindings[len(g.bindings)-1].Help().Key
 	}
 
-	// No dangling -> Expose is space/p/x (clean dropped), lock last, and the
+	// No dangling -> Expose is space/p/P/x (clean dropped), lock last, and the
 	// rendered bar omits "clean".
 	noClean := expose(m.barGroups(false))
-	if got := len(noClean.bindings); got != 3 {
-		t.Errorf("Expose should be 3 bindings (space/p/x) with no dangling; got %d", got)
+	if got := len(noClean.bindings); got != 4 {
+		t.Errorf("Expose should be 4 bindings (space/p/P/x) with no dangling; got %d", got)
 	}
 	if k := lastKey(noClean); k != "x" {
 		t.Errorf("lock (x) should be the last Expose binding with no dangling; got %q", k)
@@ -4083,8 +4096,8 @@ func TestExposeContextualClean(t *testing.T) {
 		t.Fatal("setup: expected a dangling forward")
 	}
 	withClean := expose(m.barGroups(true))
-	if got := len(withClean.bindings); got != 4 {
-		t.Errorf("Expose should be 4 bindings (space/p/C/x) with a dangling; got %d", got)
+	if got := len(withClean.bindings); got != 5 {
+		t.Errorf("Expose should be 5 bindings (space/p/P/C/x) with a dangling; got %d", got)
 	}
 	if k := lastKey(withClean); k != "x" {
 		t.Errorf("lock (x) should STILL be the last Expose binding with a dangling; got %q", k)
@@ -4160,30 +4173,29 @@ func TestLegendSizingNoClip(t *testing.T) {
 //
 // Before 04rb this held trivially: maxRows was always Favorites' fixed 5
 // bindings, independent of width or the Clean row. After 04rb, bar height is
-// width- and fold-dependent, and folding is keyed off each group's
-// UNFOLDED binding count, which differs between the two calls (Expose: 4
-// bindings reserved vs 3 live). It still holds today, but only because
-// ceil(4/2) == ceil(3/2) == 2 and "clean stale"/"lock/unlock" happen to be
-// the same length (11 chars), so Expose's rendered width AND row count come
-// out identical either way, and every other group's fold decision (driven by
-// the shared total-width budget) is therefore unaffected by cleanEnabled too.
-// That's an incidental tie in today's copy, not something the code enforces
-// -- a future edit to keyLegendDescs/newKeyMap's Expose text or binding count
-// could silently break it and reintroduce the exact clipping bug the
-// reservation exists to prevent. Brute-forcing width here (rather than
-// TestLegendSizingNoClip's few sampled widths) is what would actually catch
-// that regression. (79xb: this brute-force scan is also what caught the
-// second-hint "space serve" contextual polish breaking the reservation at
-// width 54 -- see the TODO(79xb) on renderLegendWith -- so it stays a
-// single-hint scan, matching the shipped single-hint (cleanEnabled) code.)
+// width- and fold-dependent, and folding is keyed off each group's UNFOLDED
+// binding count, which differs between the two cleanEnabled calls (Expose: 5
+// bindings reserved-with-clean vs 4 live-no-clean since kata v1z5 added P
+// publish edge). That difference USED to net out to an incidental tie, but P
+// broke it: at some widths the no-clean render is actually TALLER than the
+// with-clean one (folding is non-monotonic -- one more binding can push a
+// group over a fold threshold and SHRINK it). So the reservation no longer
+// assumes cleanEnabled=true dominates: listBodyHeight reserves the MAX of both
+// states (legendReservationLines). This test pins that the reservation the
+// code actually uses is never shorter than EITHER live render, brute-forcing
+// width rather than sampling a few. (79xb: this brute-force scan is also what
+// caught the second-hint "space serve" contextual polish breaking the
+// reservation at width 54 -- see the TODO(79xb) on renderLegendWith.)
 func TestLegendReservationDominatesLive(t *testing.T) {
 	m := New(config.Config{})
 	for w := 1; w <= 300; w++ {
 		m.help.Width = w
-		reserved := strings.Count(m.renderLegendWith(true), "\n") + 1
-		live := strings.Count(m.renderLegendWith(false), "\n") + 1
-		if reserved < live {
-			t.Fatalf("width %d: reserved height %d < live height %d -- the worst-case reservation no longer dominates, WindowSizeMsg would under-reserve and clip the list", w, reserved, live)
+		reserved := m.legendReservationLines()
+		for _, cleanEnabled := range []bool{true, false} {
+			live := strings.Count(m.renderLegendWith(cleanEnabled), "\n") + 1
+			if reserved < live {
+				t.Fatalf("width %d: reserved height %d < live height %d (cleanEnabled=%v) -- the reservation no longer dominates, WindowSizeMsg would under-reserve and clip the list", w, reserved, live, cleanEnabled)
+			}
 		}
 	}
 }
@@ -4828,5 +4840,774 @@ func TestRenderGridPageIndicator(t *testing.T) {
 	grid = stripANSI(m.renderGrid())
 	if strings.Contains(grid, "page 1/") {
 		t.Errorf("selecting the last item should move off page 1, got:\n%s", grid)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Publish (`P`) path -- kata v1z5 steps 3/4/5. These are the primary
+// verification for w7k4: bubbletea Model.Update walks driving the whole dialog
+// state machine, the requestPublish guards in order, funnel<->publish mutual
+// exclusion in both directions, drift surfaced-not-ranked, the quiet poll
+// degrade, and the edge round-trips against an in-process httptest fake (no
+// real caddy, no bound port). `caddy` is intentionally NOT installed here, so
+// the live tmux-against-real-caddy walk is deliberately out of scope.
+// ---------------------------------------------------------------------------
+
+// fakeCaddy is a minimal in-process stand-in for the Caddy admin API: enough of
+// GET/POST/PATCH/DELETE on /id/<id> and /config/.../routes to drive the UI's
+// publish/unpublish/poll flows. It stores routes by @id and records mutations
+// for assertions. It ignores If-Match (never 412) -- the ETag/concurrency paths
+// are caddyedge's own tests, not the UI's.
+type fakeCaddy struct {
+	mu        sync.Mutex
+	routes    map[string]caddyedge.Route
+	mutations []caddyedge.Route // POST/PATCH bodies, in order
+	deletes   []string          // @ids DELETEd, in order
+}
+
+func newFakeCaddy() *fakeCaddy {
+	return &fakeCaddy{routes: map[string]caddyedge.Route{}}
+}
+
+func (fc *fakeCaddy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	w.Header().Set("Etag", `"v1"`)
+	path := r.URL.Path
+	switch {
+	case strings.HasPrefix(path, "/id/"):
+		id := strings.TrimPrefix(path, "/id/")
+		switch r.Method {
+		case http.MethodGet:
+			rt, ok := fc.routes[id]
+			if !ok {
+				http.Error(w, "unknown object", http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(rt)
+		case http.MethodPatch:
+			var rt caddyedge.Route
+			_ = json.NewDecoder(r.Body).Decode(&rt)
+			fc.routes[id] = rt
+			fc.mutations = append(fc.mutations, rt)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			delete(fc.routes, id)
+			fc.deletes = append(fc.deletes, id)
+			w.WriteHeader(http.StatusOK)
+		}
+	case strings.HasSuffix(path, "/routes"):
+		switch r.Method {
+		case http.MethodGet:
+			out := make([]caddyedge.Route, 0, len(fc.routes))
+			for _, rt := range fc.routes {
+				out = append(out, rt)
+			}
+			_ = json.NewEncoder(w).Encode(out)
+		case http.MethodPost:
+			var rt caddyedge.Route
+			_ = json.NewDecoder(r.Body).Decode(&rt)
+			fc.routes[rt.ID] = rt
+			fc.mutations = append(fc.mutations, rt)
+			w.WriteHeader(http.StatusOK)
+		}
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// routeDial returns a route's reverse_proxy backend dial ("<label>:<port>").
+func routeDial(rt caddyedge.Route) string {
+	for _, h := range rt.Handle {
+		if h.Handler == "reverse_proxy" && len(h.Upstreams) > 0 {
+			return h.Upstreams[0].Dial
+		}
+	}
+	return ""
+}
+
+// routeHasAuth reports whether a route carries an authentication handler.
+func routeHasAuth(rt caddyedge.Route) bool {
+	for _, h := range rt.Handle {
+		if h.Handler == "authentication" {
+			return true
+		}
+	}
+	return false
+}
+
+var enterKey = tea.KeyMsg{Type: tea.KeyEnter}
+var escKey = tea.KeyMsg{Type: tea.KeyEsc}
+
+// rkey builds a rune KeyMsg from a string ("P", "y", "n", or typed text).
+func rkey(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+
+// newPublishModel builds a model wired for the publish path: publish
+// configured (domain/hostname/server_name/admin_port), a known fqdn (so the
+// short backend label is "dev-box"), one listening favorite :8080, and -- when
+// srv is non-nil -- a caddyClientOverride pointed at that fake edge. serve is
+// already on for :8080 by default so publishEnableServe is false (a publish cmd
+// can then run without shelling out to tailscale).
+func newPublishModel(t *testing.T, srv *httptest.Server) model {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate saveConfig
+	cfg := config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.Hostname = "caddy"
+	cfg.Caddy.ServerName = "tailport"
+	cfg.Caddy.AdminPort = 2019
+	m := New(cfg)
+	m.fqdn = "dev-box.tailnet.ts.net"
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+	m.active = map[int]bool{8080: true}
+	m.showAllPorts = true
+	if srv != nil {
+		m.caddyClientOverride = &caddyedge.Client{AdminURL: srv.URL, ServerName: "tailport", HTTPClient: srv.Client()}
+	}
+	m.rebuildItems()
+	return m
+}
+
+// TestShortLabel pins the backend-label derivation: the FIRST dot-component of
+// the fqdn (from Self.DNSName), not the whole name and not HostName.
+func TestShortLabel(t *testing.T) {
+	for _, c := range []struct{ fqdn, want string }{
+		{"dev-box.tailnet.ts.net", "dev-box"},
+		{"host", "host"},
+		{"", ""},
+	} {
+		if got := shortLabel(c.fqdn); got != c.want {
+			t.Errorf("shortLabel(%q) = %q, want %q", c.fqdn, got, c.want)
+		}
+	}
+}
+
+// TestPublishFlowWalkNoAuth walks P -> host -> auth(n) -> confirm(y) with no
+// auth, asserting every transition and that the confirm arms a publish
+// (pending set, back to entryNone) without a credential.
+func TestPublishFlowWalkNoAuth(t *testing.T) {
+	m := newPublishModel(t, nil)
+
+	m = mustUpdate(t, m, rkey("P"))
+	if m.mode != entryPublishHost {
+		t.Fatalf("after P, mode = %v, want entryPublishHost", m.mode)
+	}
+	// Prefill precedence: no label, process "web" -> "web.example.com".
+	if got := m.publishInput.Value(); got != "web.example.com" {
+		t.Errorf("host prefill = %q, want web.example.com", got)
+	}
+
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishAuth {
+		t.Fatalf("after host enter, mode = %v, want entryPublishAuth", m.mode)
+	}
+	if m.publishHostname != "web.example.com" {
+		t.Errorf("publishHostname = %q, want web.example.com", m.publishHostname)
+	}
+
+	m = mustUpdate(t, m, rkey("n")) // no auth (distinct from esc/abort)
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("after auth 'n', mode = %v, want entryConfirmPublish", m.mode)
+	}
+	if m.publishWithAuth {
+		t.Error("auth 'n' should leave publishWithAuth false")
+	}
+	// serve already on for :8080 -> confirm won't also enable serve.
+	if m.publishEnableServe {
+		t.Error("publishEnableServe should be false when serve is already on")
+	}
+
+	res, cmd := m.Update(rkey("y"))
+	got := res.(model)
+	if got.mode != entryNone {
+		t.Errorf("after confirm, mode = %v, want entryNone", got.mode)
+	}
+	if got.pending != 8080 {
+		t.Errorf("after confirm, pending = %d, want 8080", got.pending)
+	}
+	if cmd == nil {
+		t.Error("confirm should return a publish cmd")
+	}
+	if got.cfg.Caddy.AuthHash != "" {
+		t.Error("a no-auth publish must not set an auth hash")
+	}
+}
+
+// TestPublishConfirmViewEnablesServe covers the confirm line that warns serve
+// will also be turned on when it isn't already, and that the exact https URL
+// and public-internet warning are shown.
+func TestPublishConfirmViewEnablesServe(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.active = map[int]bool{} // serve OFF -> confirm should say it'll turn serve on
+	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, enterKey) // accept prefill host
+	m = mustUpdate(t, m, rkey("n"))
+	if !m.publishEnableServe {
+		t.Fatal("publishEnableServe should be true when serve is off")
+	}
+	view := stripANSI(m.renderBottom())
+	for _, want := range []string{
+		"https://web.example.com",
+		"PUBLIC INTERNET",
+		"will also turn tailscale serve on for :8080",
+		"no basic auth",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("confirm view missing %q; got:\n%s", want, view)
+		}
+	}
+}
+
+// TestPublishFlowWithAuthPersistsHash walks the first authed publish end to
+// end: the password is bcrypt-hashed at confirm-time, persisted to config (so a
+// later publish reuses it), the plaintext is dropped, and the password step is
+// masked.
+func TestPublishFlowWithAuthPersistsHash(t *testing.T) {
+	m := newPublishModel(t, nil)
+
+	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, enterKey)  // host -> auth
+	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user (no stored cred yet)
+	if m.mode != entryPublishCredUser {
+		t.Fatalf("auth 'y' with no stored cred -> mode %v, want entryPublishCredUser", m.mode)
+	}
+	m = mustUpdate(t, m, rkey("admin"))
+	m = mustUpdate(t, m, enterKey) // user -> pass
+	if m.mode != entryPublishCredPass {
+		t.Fatalf("after username, mode = %v, want entryPublishCredPass", m.mode)
+	}
+	if m.publishCredUser != "admin" {
+		t.Errorf("publishCredUser = %q, want admin", m.publishCredUser)
+	}
+	if m.publishInput.EchoMode != textinput.EchoPassword {
+		t.Error("password step should mask input (EchoPassword)")
+	}
+	m = mustUpdate(t, m, rkey("s3cr3t"))
+	m = mustUpdate(t, m, enterKey) // pass -> confirm
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("after password, mode = %v, want entryConfirmPublish", m.mode)
+	}
+
+	res, _ := m.Update(rkey("y"))
+	got := res.(model)
+	if got.cfg.Caddy.AuthUser != "admin" {
+		t.Errorf("persisted AuthUser = %q, want admin", got.cfg.Caddy.AuthUser)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(got.cfg.Caddy.AuthHash), []byte("s3cr3t")); err != nil {
+		t.Errorf("stored AuthHash does not verify against the password: %v", err)
+	}
+	if got.publishCredPass != "" || got.publishCredUser != "" {
+		t.Errorf("plaintext credential not cleared after confirm: user=%q pass=%q", got.publishCredUser, got.publishCredPass)
+	}
+	// Persisted to disk via the explicit saveConfig (remember() would skip).
+	loaded, err := config.Load("")
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if loaded.Caddy.AuthHash != got.cfg.Caddy.AuthHash || loaded.Caddy.AuthUser != "admin" {
+		t.Errorf("credential not persisted: loaded user=%q hash set=%v", loaded.Caddy.AuthUser, loaded.Caddy.AuthHash != "")
+	}
+}
+
+// TestPublishAuthReusesStoredCredential covers the "first authed publish only"
+// rule: once a shared credential exists, auth 'y' skips the cred steps and
+// goes straight to the confirm, reusing the stored hash unchanged.
+func TestPublishAuthReusesStoredCredential(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.AuthUser = "admin"
+	m.cfg.Caddy.AuthHash = "$2a$10$abcdefghijklmnopqrstuv" // opaque stored hash
+	before := m.cfg.Caddy.AuthHash
+
+	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, enterKey)  // host -> auth
+	m = mustUpdate(t, m, rkey("y")) // auth yes -> should SKIP cred steps
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("auth 'y' with a stored cred should skip to confirm; mode = %v", m.mode)
+	}
+	if !m.publishWithAuth {
+		t.Error("publishWithAuth should be true")
+	}
+	res, _ := m.Update(rkey("y"))
+	got := res.(model)
+	if got.cfg.Caddy.AuthHash != before {
+		t.Error("reusing a stored credential must not rewrite the hash")
+	}
+}
+
+// TestPublishEscClearsPlaintext exercises esc at every publish step, and
+// crucially that esc after the password is typed drops the plaintext (both at
+// the password step and at the confirm step).
+func TestPublishEscClearsPlaintext(t *testing.T) {
+	// esc at each step returns to entryNone with a clean flow.
+	steps := []struct {
+		name string
+		walk []tea.KeyMsg // keys to reach the step (before the esc)
+	}{
+		{"host", []tea.KeyMsg{rkey("P")}},
+		{"auth", []tea.KeyMsg{rkey("P"), enterKey}},
+		{"credUser", []tea.KeyMsg{rkey("P"), enterKey, rkey("y")}},
+		{"credPass", []tea.KeyMsg{rkey("P"), enterKey, rkey("y"), rkey("bob"), enterKey}},
+		{"confirm", []tea.KeyMsg{rkey("P"), enterKey, rkey("y"), rkey("bob"), enterKey, rkey("hunter2"), enterKey}},
+	}
+	for _, s := range steps {
+		t.Run(s.name, func(t *testing.T) {
+			m := newPublishModel(t, nil)
+			for _, k := range s.walk {
+				m = mustUpdate(t, m, k)
+			}
+			m = mustUpdate(t, m, escKey)
+			if m.mode != entryNone {
+				t.Errorf("esc at %s -> mode %v, want entryNone", s.name, m.mode)
+			}
+			if m.publishCredPass != "" || m.publishCredUser != "" {
+				t.Errorf("esc at %s left plaintext: user=%q pass=%q", s.name, m.publishCredUser, m.publishCredPass)
+			}
+			if m.publishHostname != "" || m.publishPort != 0 {
+				t.Errorf("esc at %s left flow state: host=%q port=%d", s.name, m.publishHostname, m.publishPort)
+			}
+			if m.publishInput.EchoMode != textinput.EchoNormal {
+				t.Errorf("esc at %s left the input masked", s.name)
+			}
+		})
+	}
+}
+
+// TestRequestPublishGuards drives every requestPublish guard, in the order they
+// fire, asserting the refusal (or de-escalation) each produces.
+func TestRequestPublishGuards(t *testing.T) {
+	base := func() model {
+		t.Helper()
+		m := newPublishModel(t, nil)
+		return m
+	}
+
+	// :22 hard-block.
+	t.Run("ssh hard-block", func(t *testing.T) {
+		m := base()
+		m.allPorts = append(m.allPorts, portscan.Port{Number: 22})
+		cmd := m.requestPublish(22)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, ":22") {
+			t.Errorf(":22 publish: mode=%v flash=%q level=%v (want refuse)", m.mode, m.flash, m.flashLevel)
+		}
+		_ = cmd
+	})
+
+	// empty fqdn: no backend label derivable.
+	t.Run("empty fqdn", func(t *testing.T) {
+		m := base()
+		m.fqdn = ""
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "tailnet name") {
+			t.Errorf("empty fqdn: mode=%v flash=%q (want refuse)", m.mode, m.flash)
+		}
+	})
+
+	// mutual exclusion: a funnelled port is refused, message names the funnel.
+	t.Run("funnelled port refused", func(t *testing.T) {
+		m := base()
+		m.funnel = map[int]int{8080: 443}
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "funnel") {
+			t.Errorf("funnelled: mode=%v flash=%q (want refuse naming the funnel)", m.mode, m.flash)
+		}
+	})
+
+	// missing caddy.domain.
+	t.Run("no domain configured", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Domain = ""
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "caddy.domain") {
+			t.Errorf("no domain: mode=%v flash=%q (want refuse naming caddy.domain)", m.mode, m.flash)
+		}
+		if !strings.Contains(m.flash, "caddy-edge.md") {
+			t.Errorf("no-domain refusal should point at the docs; flash=%q", m.flash)
+		}
+	})
+
+	// unresolvable caddy.hostname.
+	t.Run("no hostname configured", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Hostname = ""
+		m.requestPublish(8080)
+		if m.mode != entryNone || !strings.Contains(m.flash, "caddy.hostname") {
+			t.Errorf("no hostname: mode=%v flash=%q (want refuse naming caddy.hostname)", m.mode, m.flash)
+		}
+	})
+
+	// locked port: publish must not bypass the x lock.
+	t.Run("locked port refused", func(t *testing.T) {
+		m := base()
+		m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Locked: true}
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "locked") {
+			t.Errorf("locked: mode=%v flash=%q (want refuse)", m.mode, m.flash)
+		}
+	})
+
+	// busy: an in-flight op no-ops.
+	t.Run("busy no-op", func(t *testing.T) {
+		m := base()
+		m.pending = 3000
+		if cmd := m.requestPublish(8080); cmd != nil {
+			t.Error("busy publish should be a nil no-op")
+		}
+		if m.mode != entryNone {
+			t.Errorf("busy publish should not open a dialog; mode=%v", m.mode)
+		}
+	})
+
+	// happy path: opens the dialog with the prefilled host.
+	t.Run("happy path opens dialog", func(t *testing.T) {
+		m := base()
+		if cmd := m.requestPublish(8080); cmd != nil {
+			t.Error("opening the dialog should return a nil cmd")
+		}
+		if m.mode != entryPublishHost {
+			t.Errorf("happy path: mode=%v, want entryPublishHost", m.mode)
+		}
+		if m.publishPort != 8080 {
+			t.Errorf("publishPort = %d, want 8080", m.publishPort)
+		}
+	})
+}
+
+// TestPublishPrefillPrecedence pins the host prefill: label > process >
+// machine short-label, then "."+domain.
+func TestPublishPrefillPrecedence(t *testing.T) {
+	// user label wins.
+	m := newPublishModel(t, nil)
+	m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Label: "dashboard"}
+	m.requestPublish(8080)
+	if got := m.publishInput.Value(); got != "dashboard.example.com" {
+		t.Errorf("label prefill = %q, want dashboard.example.com", got)
+	}
+
+	// no label, process name.
+	m = newPublishModel(t, nil)
+	m.requestPublish(8080)
+	if got := m.publishInput.Value(); got != "web.example.com" {
+		t.Errorf("process prefill = %q, want web.example.com", got)
+	}
+
+	// no label, no process -> machine short-label.
+	m = newPublishModel(t, nil)
+	m.allPorts = []portscan.Port{{Number: 8080}} // no Process
+	m.requestPublish(8080)
+	if got := m.publishInput.Value(); got != "dev-box.example.com" {
+		t.Errorf("short-label prefill = %q, want dev-box.example.com", got)
+	}
+}
+
+// TestPublishInvalidHostnameRefused: an invalid hostname at the host step stays
+// on the step with an error, never advancing to the auth gate.
+func TestPublishInvalidHostnameRefused(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m = mustUpdate(t, m, rkey("P"))
+	m.publishInput.SetValue("not a host") // spaces are invalid
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishHost {
+		t.Errorf("invalid hostname should stay on the host step; mode=%v", m.mode)
+	}
+	if m.flashLevel != flashError {
+		t.Errorf("invalid hostname should raise an error toast; level=%v flash=%q", m.flashLevel, m.flash)
+	}
+}
+
+// TestDeEscalationImmediateUnpublish: P on a port THIS machine already publishes
+// unpublishes immediately -- no confirm, no dialog -- and the edge round-trip
+// actually deletes the route (re-verifying ownership first).
+func TestDeEscalationImmediateUnpublish(t *testing.T) {
+	fc := newFakeCaddy()
+	rt := caddyedge.BuildRoute("web.example.com", "dev-box", 8080, nil)
+	fc.routes[rt.ID] = rt
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := newPublishModel(t, srv)
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+
+	cmd := m.requestPublish(8080)
+	if m.mode != entryNone {
+		t.Errorf("de-escalation must not open a dialog; mode=%v", m.mode)
+	}
+	if m.pending != 8080 {
+		t.Errorf("de-escalation should set pending; got %d", m.pending)
+	}
+	if cmd == nil {
+		t.Fatal("de-escalation should return an unpublish cmd")
+	}
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("unpublish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	if _, still := fc.routes[rt.ID]; still {
+		t.Error("de-escalation should have DELETEd the published route")
+	}
+	if len(fc.deletes) != 1 {
+		t.Errorf("expected exactly one DELETE; got %d", len(fc.deletes))
+	}
+}
+
+// TestFunnelRefusesPublished is the OTHER mutual-exclusion direction: the p
+// funnel key refuses a port that is currently Caddy-published.
+func TestFunnelRefusesPublished(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	cmd := m.requestFunnel(8080)
+	if m.mode != entryNone {
+		t.Errorf("funnel on a published port must not open a confirm; mode=%v", m.mode)
+	}
+	if m.flashLevel != flashError || !strings.Contains(m.flash, "published") || !strings.Contains(m.flash, "unpublish") {
+		t.Errorf("funnel-on-published flash=%q level=%v, want a refusal naming publish", m.flash, m.flashLevel)
+	}
+	_ = cmd
+}
+
+// TestPublishReachDriftSurfaced covers step 4's reach() rules: a published-only
+// port shows the ◆ marker and its https description; a port carrying BOTH
+// public paths (external drift) is NOT silently collapsed to one marker -- it
+// reuses the ▲ warning affordance and a distinct "funnelled AND published"
+// description, with no bespoke drift state.
+func TestPublishReachDriftSurfaced(t *testing.T) {
+	// Published only -> reachPublish, ◆, https description with an auth note.
+	pub := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com", publishAuth: true}
+	if got := pub.reach(); got != reachPublish {
+		t.Errorf("published-only reach() = %v, want reachPublish", got)
+	}
+	if got := stripANSI(pub.markerGlyph()); got != "◆" {
+		t.Errorf("published marker = %q, want ◆", got)
+	}
+	if d := pub.plainDescription(); !strings.Contains(d, "published to the internet · https://web.example.com") || !strings.Contains(d, "basic auth") {
+		t.Errorf("published description = %q", d)
+	}
+
+	// Drift: both funnel AND publish (external mutation) -> reachStale (warning
+	// affordance), distinct description, NOT reachPublish/reachFunnel.
+	drift := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", fqdn: "dev-box.tailnet.ts.net", active: true, listening: true, funnelPublic: 443, publishHostname: "web.example.com"}
+	if got := drift.reach(); got != reachStale {
+		t.Errorf("drift reach() = %v, want reachStale (warning affordance, not a silent collapse)", got)
+	}
+	if got := stripANSI(drift.markerGlyph()); got != "▲" {
+		t.Errorf("drift marker = %q, want ▲ (the existing warn affordance)", got)
+	}
+	if d := drift.plainDescription(); !strings.Contains(d, "funnelled AND published") {
+		t.Errorf("drift description = %q, want it to name the dual exposure", d)
+	}
+}
+
+// TestPublishPollQuietDegrade covers step 5: a failed poll keeps last-known
+// state and flips publishReachable false with a persistent status fragment
+// (never a toast); a later good poll restores it.
+func TestPublishPollQuietDegrade(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.Hostname = "caddy"
+	m := New(cfg)
+	m.width = 200
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m.publishReachable = true
+
+	// A poll failure: keep the published map, mark unreachable, NO toast.
+	res, _ := m.Update(publishPollMsg{err: fmt.Errorf("dial tcp: refused")})
+	got := res.(model)
+	if got.publishReachable {
+		t.Error("a failed poll should set publishReachable=false")
+	}
+	if len(got.published) != 1 {
+		t.Errorf("a failed poll must keep last-known state; got %d entries", len(got.published))
+	}
+	if got.flash != "" {
+		t.Errorf("a failed poll must NOT raise a toast; flash=%q", got.flash)
+	}
+	if !strings.Contains(got.statusText(), "edge unreachable") {
+		t.Errorf("status line should carry the persistent degrade fragment; got %q", got.statusText())
+	}
+
+	// A subsequent good poll restores reachability and replaces the map.
+	res, _ = got.Update(publishPollMsg{published: map[int]publishInfo{9090: {hostname: "api.example.com"}}})
+	got = res.(model)
+	if !got.publishReachable {
+		t.Error("a good poll should restore publishReachable=true")
+	}
+	if _, ok := got.published[9090]; !ok || len(got.published) != 1 {
+		t.Errorf("a good poll should replace the published map; got %#v", got.published)
+	}
+	if strings.Contains(got.statusText(), "edge unreachable") {
+		t.Error("status fragment should clear once the edge is reachable again")
+	}
+}
+
+// TestStatusFragmentGatedOnConfig: the degrade fragment never appears when
+// publishing is unconfigured (blank caddy.domain), even if publishReachable is
+// false, since the poll is suppressed entirely there.
+func TestStatusFragmentGatedOnConfig(t *testing.T) {
+	m := New(config.Config{}) // Domain == ""
+	m.width = 200
+	m.publishReachable = false
+	if strings.Contains(m.statusText(), "edge unreachable") {
+		t.Errorf("unconfigured publish must not show the degrade fragment; got %q", m.statusText())
+	}
+}
+
+// TestPollPublishedFiltersByLabel: the poll keeps only routes whose backend
+// label matches THIS machine's short label, and is a nil (zero-cost) cmd when
+// publishing is unconfigured.
+func TestPollPublishedFiltersByLabel(t *testing.T) {
+	fc := newFakeCaddy()
+	ours := caddyedge.BuildRoute("a.example.com", "dev-box", 8080, nil)
+	theirs := caddyedge.BuildRoute("b.example.com", "other-box", 9090, nil)
+	fc.routes[ours.ID] = ours
+	fc.routes[theirs.ID] = theirs
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := newPublishModel(t, srv)
+	cmd := m.pollPublishedCmd()
+	if cmd == nil {
+		t.Fatal("a configured edge should return a poll cmd")
+	}
+	msg, ok := cmd().(publishPollMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("poll = %#v, want a clean publishPollMsg", msg)
+	}
+	if len(msg.published) != 1 {
+		t.Fatalf("poll should keep only our machine's routes; got %#v", msg.published)
+	}
+	if info := msg.published[8080]; info.hostname != "a.example.com" {
+		t.Errorf("poll[8080] = %#v, want a.example.com", info)
+	}
+	if _, ok := msg.published[9090]; ok {
+		t.Error("poll must NOT include another machine's route")
+	}
+
+	// Unconfigured -> nil cmd, zero cost.
+	m.cfg.Caddy.Domain = ""
+	if m.pollPublishedCmd() != nil {
+		t.Error("a blank caddy.domain should suppress the poll (nil cmd)")
+	}
+}
+
+// TestPublishCmdRoundTrip: a publish cmd built with auth POSTs a route whose
+// backend dials <label>:<port> plainly and carries the auth handler.
+func TestPublishCmdRoundTrip(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	client := &caddyedge.Client{AdminURL: srv.URL, ServerName: "tailport", HTTPClient: srv.Client()}
+
+	auth := &caddyedge.BasicAuth{User: "admin", Hash: "$2a$10$deadbeefdeadbeefdeadbe"}
+	cmd := publishCmd(client, "app.example.com", "dev-box", 8080, auth, false) // enableServe false: no tailscale
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	if len(fc.mutations) != 1 {
+		t.Fatalf("expected one POST; got %d", len(fc.mutations))
+	}
+	rt := fc.mutations[0]
+	if rt.ID != caddyedge.IDFor("app.example.com") {
+		t.Errorf("route @id = %q, want %q", rt.ID, caddyedge.IDFor("app.example.com"))
+	}
+	if dial := routeDial(rt); dial != "dev-box:8080" {
+		t.Errorf("backend dial = %q, want dev-box:8080", dial)
+	}
+	if !routeHasAuth(rt) {
+		t.Error("route should carry the basic-auth handler")
+	}
+}
+
+// TestUnpublishCmdRoundTrip: an unpublish cmd DELETEs the route after the
+// client re-verifies ownership.
+func TestUnpublishCmdRoundTrip(t *testing.T) {
+	fc := newFakeCaddy()
+	rt := caddyedge.BuildRoute("app.example.com", "dev-box", 8080, nil)
+	fc.routes[rt.ID] = rt
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	client := &caddyedge.Client{AdminURL: srv.URL, ServerName: "tailport", HTTPClient: srv.Client()}
+
+	cmd := unpublishCmd(client, "app.example.com", "dev-box", 8080)
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("unpublish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	if _, still := fc.routes[rt.ID]; still {
+		t.Error("unpublish should have deleted the route")
+	}
+}
+
+// TestPublishDoneMsgReFetches: publishDoneMsg mirrors toggleDoneMsg -- clear
+// pending and re-fetch (never hand-set the published map); an error surfaces a
+// mapped toast.
+func TestPublishDoneMsgReFetches(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.pending = 8080
+	res, cmd := m.Update(publishDoneMsg{port: 8080})
+	got := res.(model)
+	if got.pending != 0 {
+		t.Errorf("publishDoneMsg should clear pending; got %d", got.pending)
+	}
+	if cmd == nil {
+		t.Error("publishDoneMsg should return a re-fetch cmd")
+	}
+
+	// Error variant maps the sentinel to a friendly toast.
+	m.pending = 8080
+	res, _ = m.Update(publishDoneMsg{port: 8080, err: caddyedge.ErrUnreachable})
+	got = res.(model)
+	if got.pending != 0 {
+		t.Errorf("errored publishDoneMsg should still clear pending; got %d", got.pending)
+	}
+	if got.flashLevel != flashError || !strings.Contains(got.flash, "unreachable") {
+		t.Errorf("errored publishDoneMsg flash=%q level=%v, want a mapped error toast", got.flash, got.flashLevel)
+	}
+}
+
+// TestPublishErrText maps caddyedge sentinels to friendly text.
+func TestPublishErrText(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{caddyedge.ErrUnreachable, "unreachable"},
+		{caddyedge.ErrNotFound, "not found"},
+		{caddyedge.ErrConcurrentUpdate, "concurrently"},
+		{caddyedge.ErrHostnameConflict, "already published"},
+	}
+	for _, c := range cases {
+		if got := publishErrText(c.err); !strings.Contains(got, c.want) {
+			t.Errorf("publishErrText(%v) = %q, want it to contain %q", c.err, got, c.want)
+		}
+	}
+}
+
+// TestPublishTickNeverStops: the poll ticker reschedules on every tick,
+// configured or not (the poll itself is what's suppressed when unconfigured).
+func TestPublishTickNeverStops(t *testing.T) {
+	m := newPublishModel(t, nil)
+	_, cmd := m.Update(publishTickMsg{})
+	if cmd == nil {
+		t.Error("publishTickMsg should always reschedule the ticker")
+	}
+	// Even while an op is in flight, the ticker keeps going (poll is skipped).
+	m.pending = 8080
+	if _, cmd := m.Update(publishTickMsg{}); cmd == nil {
+		t.Error("publishTickMsg should reschedule even while pending")
+	}
+}
+
+// TestPublishKeyLeavesLabelInputAlone guards the fallthrough: typing in the
+// publish host step feeds publishInput, never labelInput.
+func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m = mustUpdate(t, m, rkey("P"))
+	m.publishInput.SetValue("") // clear the prefill to type fresh
+	m = mustUpdate(t, m, rkey("abc"))
+	if got := m.publishInput.Value(); got != "abc" {
+		t.Errorf("typed text should land in publishInput; got %q", got)
+	}
+	if m.labelInput.Value() != "" {
+		t.Errorf("publish keystrokes leaked into labelInput: %q", m.labelInput.Value())
 	}
 }
