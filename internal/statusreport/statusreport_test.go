@@ -571,14 +571,15 @@ func TestGatherPublishedFiltersToThisMachinesLabel(t *testing.T) {
 	}
 }
 
-// TestGatherPublishedIncludesForeignRouteMatchingLabel pins the deliberate
-// choice documented on gatherPublished: filtering is by backend Label only,
-// NOT RouteInfo.Owned. A route with no tailport-<hostname> @id (e.g.
-// hand-edited into Caddy's admin config, or created by some other tool) that
-// still points at this machine's label:port is exactly the kind of
-// external-mutation drift a status report exists to surface, so it must
-// still appear.
-func TestGatherPublishedIncludesForeignRouteMatchingLabel(t *testing.T) {
+// TestGatherPublishedIgnoresForeignRouteMatchingLabel pins the deliberate
+// choice documented on gatherPublished: filtering requires BOTH backend
+// Label match AND RouteInfo.Owned. Published state is defined by
+// tailport-owned routes (@id = tailport-*, per v1z5's spec). A route with no
+// tailport-<hostname> @id (e.g. hand-edited into Caddy's admin config, or
+// created by some other tool) that happens to point at this machine's
+// label:port is NOT a tailport publish -- reporting it as one would be a
+// false publish/drift signal, so it must be ignored.
+func TestGatherPublishedIgnoresForeignRouteMatchingLabel(t *testing.T) {
 	foreign := caddyedge.Route{
 		ID:     "hand-edited",
 		Match:  []caddyedge.Match{{Host: []string{"manual.example.com"}}},
@@ -590,8 +591,8 @@ func TestGatherPublishedIncludesForeignRouteMatchingLabel(t *testing.T) {
 		Domain: "example.com", Hostname: h, AdminPort: p, ServerName: "tailport",
 	}}
 	got := gatherPublished(cfg, "host-a.tailnet.ts.net")
-	if len(got) != 1 || got[5000].Hostname != "manual.example.com" {
-		t.Errorf("gatherPublished() = %+v, want the foreign (non-tailport-owned) route surfaced too", got)
+	if len(got) != 0 {
+		t.Errorf("gatherPublished() = %+v, want empty (foreign non-owned route must be ignored, not reported as published)", got)
 	}
 }
 

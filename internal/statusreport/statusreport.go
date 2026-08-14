@@ -176,15 +176,16 @@ func gatherPublished(cfg config.Config, fqdn string) map[int]Published {
 	}
 
 	// Filter to routes whose backend is THIS machine (Label matches the
-	// short MagicDNS label) -- other tailport computers publishing through
-	// the same shared Caddy edge write routes too, and those aren't ours to
-	// report. Deliberately not filtered on RouteInfo.Owned: a route matching
-	// this machine's backend that ISN'T tailport-owned (a foreign/manual
-	// Caddy edit) is exactly the kind of external-mutation drift a status
-	// report should surface, not hide.
+	// short MagicDNS label) AND that tailport itself owns (r.Owned, i.e. the
+	// @id carries the tailport- prefix -- see caddyedge.RouteInfo.Owned).
+	// Published state is defined by tailport-owned routes (kata v1z5); a
+	// route that merely targets this machine's label:port but was NOT
+	// created by tailport (a hand-edited or foreign Caddy config) is not a
+	// tailport publish and must not be reported as one -- doing so would be
+	// a false publish/drift signal, not a real one.
 	published := make(map[int]Published, len(routes))
 	for _, r := range routes {
-		if r.Label != label {
+		if r.Label != label || !r.Owned {
 			continue
 		}
 		published[r.Port] = Published{Hostname: r.Hostname, Auth: r.Auth}
