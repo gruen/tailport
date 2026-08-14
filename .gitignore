@@ -3,3 +3,18 @@
 /dist/
 /tailport
 *.test
+
+# --- Caddy edge (v1z5): repo keeps only *.example templates + placeholder docs ---
+# Real Fly app config from `fly launch` (commit fly.toml.example instead):
+fly.toml
+# Local env files that may hold FLY_API_TOKEN / TS_AUTHKEY:
+.env
+.env.*
+*.env
+# Tailscale node state, if the edge is run/tested locally:
+tailscaled.state
+*.tsstate
+# Scratch dir for keys staged before `fly secrets set`:
+secrets/
+# roborev snapshots
+/.roborev/
