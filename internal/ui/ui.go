@@ -683,10 +683,14 @@ type publishDoneMsg struct {
 
 // publishPollMsg carries one edge-poll result (kata v1z5 step 5). On err the
 // poll degrades quietly: last-known m.published is kept and publishReachable
-// goes false. On success published replaces m.published wholesale.
+// goes false. On success published replaces m.published wholesale. gen is the
+// poll's version stamp (roborev 0k12 #1): the handler ignores any result older
+// than the newest already applied, so out-of-order completions can't clobber
+// newer state.
 type publishPollMsg struct {
 	published map[int]publishInfo
 	err       error
+	gen       int
 }
 
 // publishTickMsg fires the separate 15s published-state poll timer. The ticker
@@ -857,6 +861,16 @@ type model struct {
 	// degrade) and a small persistent " · edge unreachable" fragment is shown --
 	// never a toast (kata v1z5 step 5).
 	publishReachable bool
+	// publishPollGen / publishPollApplied VERSION the async edge polls (roborev
+	// 0k12 #1): pollPublishedCmd stamps each issued poll with an incrementing
+	// publishPollGen, and the publishPollMsg handler DROPS any result whose gen
+	// is older than the newest already applied (publishPollApplied). Polls are
+	// remote round-trips that can complete out of order -- without this, a slow
+	// stale poll (e.g. an older periodic read landing after the post-publish
+	// refresh) would clobber newer state, transiently hiding exposure and
+	// bypassing the funnel/publish mutual-exclusion guards.
+	publishPollGen     int
+	publishPollApplied int
 	// caddyClientOverride, when non-nil, replaces the client built from
 	// cfg.Caddy for every edge call. Production leaves it nil (caddyClient builds
 	// AdminURL/ServerName from config); tests inject a client pointed at an
@@ -1419,27 +1433,44 @@ func (m model) caddyClient() *caddyedge.Client {
 // config semantics. A failure degrades quietly (publishPollMsg carries the err;
 // the handler keeps last-known state and sets publishReachable=false), never a
 // toast.
-func (m model) pollPublishedCmd() tea.Cmd {
+func (m *model) pollPublishedCmd() tea.Cmd {
 	if m.cfg.Caddy.Domain == "" {
 		return nil
 	}
-	client := m.caddyClient()
+	// Don't poll until we know our short backend label (roborev 0k12 #1a): the
+	// Init poll races fqdn resolution, and a label-less poll would return an
+	// empty map that -- landing after the fqdn-triggered poll -- overwrites
+	// valid routes with nothing. fqdnMsg re-polls once the label is known.
 	label := shortLabel(m.fqdn)
+	if label == "" {
+		return nil
+	}
+	client := m.caddyClient()
+	// VERSION this poll so an out-of-order completion can't clobber newer state
+	// (roborev 0k12 #1b). The bump persists: pollPublishedCmd has a pointer
+	// receiver and every caller returns the mutated model.
+	m.publishPollGen++
+	gen := m.publishPollGen
 	return func() tea.Msg {
 		infos, err := client.List(context.Background())
 		if err != nil {
-			return publishPollMsg{err: err}
+			return publishPollMsg{err: err, gen: gen}
 		}
 		published := make(map[int]publishInfo, len(infos))
 		for _, r := range infos {
-			// Filter to OUR machine's routes: multiple tailport computers share
-			// one Caddy server, distinguished by backend label + port.
-			if label == "" || r.Label != label {
+			// Filter to OUR machine's routes AND only routes tailport owns
+			// (roborev 0k12 #2): multiple tailport computers share one Caddy
+			// server, distinguished by backend label + port; and a FOREIGN
+			// route targeting this same backend (a manual Caddy edit, not an
+			// @id-tagged tailport route) must not be mistaken for published --
+			// it would block funnel and, on de-escalation, try to unpublish a
+			// synthesized tailport-<host> id that doesn't exist.
+			if label == "" || r.Label != label || !r.Owned {
 				continue
 			}
 			published[r.Port] = publishInfo{hostname: r.Hostname, auth: r.Auth}
 		}
-		return publishPollMsg{published: published}
+		return publishPollMsg{published: published, gen: gen}
 	}
 }
 
@@ -2330,17 +2361,26 @@ func (m *model) enterConfirmPublish() tea.Cmd {
 
 // confirmPublish is the entryConfirmPublish "yes" path. On a first authed
 // publish it bcrypt-hashes the gathered password AT CONFIRM-TIME (sync, one-off)
-// and persists the shared credential via an explicit saveConfig -- remember()
-// is a no-op for an already-known port and would skip writing the hash. It then
-// hands off to a single sequential publish cmd (serve-then-publish). The
-// plaintext password is dropped by clearPublishFlow before the op runs.
+// and persists the shared credential SYNCHRONOUSLY -- a save failure ABORTS the
+// publish (roborev 0k12 #3) rather than leaving a live authenticated route whose
+// credential exists only in memory. remember() can't do this write (it's a no-op
+// for an already-known port and would skip the hash), hence the explicit Save.
+// Only after a successful save does it hand off to the single sequential publish
+// cmd (serve-then-publish). The plaintext password is dropped by clearPublishFlow
+// before the op runs.
 func (m *model) confirmPublish() tea.Cmd {
 	port := m.publishPort
 	hostname := m.publishHostname
 	enableServe := m.publishEnableServe
 
+	// Guard 3 re-check FIRST: never build a route dialling ":port" with no
+	// label -- and never persist a credential for a publish we'd then abort.
+	if m.fqdn == "" {
+		m.clearPublishFlow()
+		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
+	}
+
 	var auth *caddyedge.BasicAuth
-	var saveCmd tea.Cmd
 	if m.publishWithAuth {
 		if m.publishCredPass != "" {
 			// First authed publish gathered a new shared credential: hash it now.
@@ -2349,25 +2389,29 @@ func (m *model) confirmPublish() tea.Cmd {
 				m.clearPublishFlow()
 				return m.setErr("could not hash password: " + err.Error())
 			}
+			// Persist BEFORE publishing (roborev 0k12 #3): if the save fails,
+			// restore the previous in-memory credential so the model isn't left
+			// half-set, surface the error, and do NOT publish -- so a lost
+			// on-disk credential can never accompany a live public route.
+			prevUser, prevHash := m.cfg.Caddy.AuthUser, m.cfg.Caddy.AuthHash
 			m.cfg.Caddy.AuthUser = m.publishCredUser
 			m.cfg.Caddy.AuthHash = string(hash)
-			saveCmd = m.saveConfig() // explicit -- remember() would skip a known port
+			if err := m.cfg.Save(); err != nil {
+				m.cfg.Caddy.AuthUser, m.cfg.Caddy.AuthHash = prevUser, prevHash
+				m.clearPublishFlow()
+				return m.setErr(err.Error())
+			}
 		}
 		auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
 	}
 
-	// Guard 3 re-check: never build a route dialling ":port" with no label.
-	if m.fqdn == "" {
-		m.clearPublishFlow()
-		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
-	}
 	label := shortLabel(m.fqdn)
 	client := m.caddyClient()
 
 	// Drop the flow state (esp. the plaintext password) BEFORE the op runs.
 	m.clearPublishFlow()
 	m.pending = port
-	return tea.Batch(saveCmd, publishCmd(client, hostname, label, port, auth, enableServe))
+	return publishCmd(client, hostname, label, port, auth, enableServe)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -2518,6 +2562,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
 	case publishPollMsg:
+		// Drop a stale result (roborev 0k12 #1): polls are remote round-trips
+		// that can finish out of order, so ignore anything older than the
+		// newest already applied -- otherwise an older periodic poll could
+		// clobber the post-publish refresh (hiding exposure, bypassing the
+		// mutual-exclusion guards) or a startup label-less poll could wipe the
+		// fqdn-triggered one. The guard covers the err path too, so a stale
+		// failure can't flip publishReachable=false after a newer success.
+		if msg.gen < m.publishPollApplied {
+			return m, nil
+		}
+		m.publishPollApplied = msg.gen
 		if msg.err != nil {
 			// Quiet degrade (kata v1z5 step 5): keep the last-known published
 			// map, just mark the edge unreachable. No toast -- a persistent
@@ -5238,30 +5293,50 @@ func (m model) statusText() string {
 	if m.host != "" {
 		withHost = fmt.Sprintf("%d listening on %s · %d on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
 	}
-	// Widest form that fits, degrading host -> shorter labels -> initials.
+	// Persistent quiet-degrade fragment (kata v1z5 step 5): only when publishing
+	// is configured (a blank caddy.domain suppresses the poll entirely) and the
+	// last edge poll failed. Never a toast -- a small trailing status fragment.
+	// It MUST be sized into the width fit below (roborev 0k12 #4): ordinary
+	// status text isn't wrapped (unlike toasts), so a suffix appended after the
+	// variant is chosen would overflow m.width and get truncated -- silently
+	// dropping the health warning on narrow terminals. On a very narrow line we
+	// shorten "edge unreachable" to "edge down" before sacrificing any of it.
+	suffix := ""
+	if m.cfg.Caddy.Domain != "" && !m.publishReachable {
+		suffix = " · edge unreachable"
+		initials := fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
+		if m.width > 0 && lipgloss.Width(initials)+lipgloss.Width(suffix) > m.width {
+			suffix = " · edge down"
+		}
+	}
+	// avail is the width the base variant must fit within, after reserving room
+	// for the (possibly shortened) suffix.
+	avail := m.width
+	if suffix != "" && m.width > 0 {
+		avail -= lipgloss.Width(suffix)
+	}
+	// Widest form that fits, degrading host -> shorter labels -> initials. A
+	// width of 0 means "unknown" (pre-first-resize): fall back to the fullest
+	// form, same as before the suffix accounting. A positive width whose room
+	// the suffix has entirely consumed (avail <= 0) instead falls through to the
+	// most compact variant rather than overflowing with the longest.
 	var base string
 	switch {
-	case m.width <= 0 || lipgloss.Width(withHost) <= m.width:
+	case m.width <= 0 || lipgloss.Width(withHost) <= avail:
 		base = withHost
-	case lipgloss.Width(full) <= m.width:
+	case lipgloss.Width(full) <= avail:
 		base = full
 	default:
 		// Medium drops the host and shortens labels; "funnel" stands in for
 		// "public (funnel)" for compactness while staying precise.
 		medium := fmt.Sprintf("%d listening · %d tailnet · %d funnel", listening, tailnet, public)
-		if lipgloss.Width(medium) <= m.width {
+		if lipgloss.Width(medium) <= avail {
 			base = medium
 		} else {
 			base = fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 		}
 	}
-	// Persistent quiet-degrade fragment (kata v1z5 step 5): only when publishing
-	// is configured (a blank caddy.domain suppresses the poll entirely) and the
-	// last edge poll failed. Never a toast -- a small trailing status fragment.
-	if m.cfg.Caddy.Domain != "" && !m.publishReachable {
-		base += " · edge unreachable"
-	}
-	return base
+	return base + suffix
 }
 
 // operatorHintText returns the STICKY banner guiding the user through

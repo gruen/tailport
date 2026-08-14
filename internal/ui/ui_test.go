@@ -6,6 +6,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -1745,6 +1747,43 @@ func TestStatusText(t *testing.T) {
 	}
 	if !strings.Contains(got, "5") { // still conveys the listening count
 		t.Errorf("narrow statusText = %q, expected to keep the counts", got)
+	}
+}
+
+// TestStatusLineFitsEdgeWarning pins roborev 0k12 #4: the " · edge unreachable"
+// health suffix is now sized INTO the width fit (not appended after the variant
+// is chosen), so on narrow terminals -- where ordinary status text isn't
+// wrapped -- the whole line stays within m.width and the warning is never
+// truncated away; it degrades to a shorter "edge down" fragment instead.
+func TestStatusLineFitsEdgeWarning(t *testing.T) {
+	mk := func(width int) string {
+		cfg := config.Config{}
+		cfg.Caddy.Domain = "example.com"
+		cfg.Caddy.Hostname = "caddy"
+		m := New(cfg)
+		m.width = width
+		m.publishReachable = false // a failed edge poll -> warning suffix present
+		return m.statusText()
+	}
+
+	// At every width the line stays within m.width AND keeps the warning
+	// (possibly shortened) rather than truncating it away.
+	for _, w := range []int{120, 60, 40, 30, 24} {
+		got := mk(w)
+		if lipgloss.Width(got) > w {
+			t.Errorf("width %d: status %q width %d overflows", w, got, lipgloss.Width(got))
+		}
+		if !strings.Contains(got, "edge") {
+			t.Errorf("width %d: the edge-health warning was truncated away; got %q", w, got)
+		}
+	}
+	// A comfortable width keeps the full phrasing; a very narrow one uses the
+	// shorter fallback rather than dropping the warning.
+	if wide := mk(120); !strings.Contains(wide, "edge unreachable") {
+		t.Errorf("wide status should carry the full 'edge unreachable'; got %q", wide)
+	}
+	if narrow := mk(24); !strings.Contains(narrow, "edge down") {
+		t.Errorf("narrow status should degrade to 'edge down'; got %q", narrow)
 	}
 }
 
@@ -5109,6 +5148,64 @@ func TestPublishFlowWithAuthPersistsHash(t *testing.T) {
 	}
 }
 
+// TestPublishSaveFailureAbortsPublish covers roborev 0k12 #3: when persisting a
+// newly-gathered shared credential fails at confirm-time, the publish must be
+// ABORTED -- otherwise a live authenticated public route would exist whose
+// credential is only in memory and lost on restart. On failure the prior
+// in-memory credential is restored (not left half-set), the error is surfaced,
+// the flow is cleared, and no publish is armed.
+func TestPublishSaveFailureAbortsPublish(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	m := newPublishModel(t, srv)
+
+	// Force the credential Save to fail: point XDG_CONFIG_HOME at a regular
+	// file so Save's MkdirAll(<file>/tailport) errors with ENOTDIR.
+	badXDG := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(badXDG, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", badXDG)
+
+	// Walk P -> host -> auth(y) -> user -> pass -> confirm, gathering a NEW
+	// shared credential (none stored yet, so confirm must Save).
+	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, enterKey)  // host -> auth
+	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user
+	m = mustUpdate(t, m, rkey("admin"))
+	m = mustUpdate(t, m, enterKey) // user -> pass
+	m = mustUpdate(t, m, rkey("s3cr3t"))
+	m = mustUpdate(t, m, enterKey) // pass -> confirm
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("pre-confirm mode = %v, want entryConfirmPublish", m.mode)
+	}
+
+	res, _ := m.Update(rkey("y")) // confirm 'y' -> save fails -> abort
+	got := res.(model)
+
+	// No publish was armed: pending stays 0 (publishCmd is only reached after a
+	// successful save), and the fake edge received no route mutation.
+	if got.pending != 0 {
+		t.Errorf("a failed credential save must NOT arm a publish; pending=%d", got.pending)
+	}
+	if len(fc.mutations) != 0 {
+		t.Errorf("a failed credential save must NOT publish; got %d edge mutations", len(fc.mutations))
+	}
+	// The prior (empty) credential is restored, not left half-set from the
+	// in-flight assignment.
+	if got.cfg.Caddy.AuthHash != "" || got.cfg.Caddy.AuthUser != "" {
+		t.Errorf("failed save must restore the prior credential; user=%q hashSet=%v", got.cfg.Caddy.AuthUser, got.cfg.Caddy.AuthHash != "")
+	}
+	// The error is surfaced and the flow is cleared (plaintext dropped).
+	if got.flashLevel != flashError || got.flash == "" {
+		t.Errorf("failed save must surface an error toast; flash=%q level=%v", got.flash, got.flashLevel)
+	}
+	if got.mode != entryNone || got.publishCredPass != "" || got.publishCredUser != "" {
+		t.Errorf("failed save must clear the flow; mode=%v userSet=%v passSet=%v", got.mode, got.publishCredUser != "", got.publishCredPass != "")
+	}
+}
+
 // TestPublishAuthReusesStoredCredential covers the "first authed publish only"
 // rule: once a shared credential exists, auth 'y' skips the cred steps and
 // goes straight to the confirm, reusing the stored hash unchanged.
@@ -5485,6 +5582,119 @@ func TestPollPublishedFiltersByLabel(t *testing.T) {
 	m.cfg.Caddy.Domain = ""
 	if m.pollPublishedCmd() != nil {
 		t.Error("a blank caddy.domain should suppress the poll (nil cmd)")
+	}
+}
+
+// TestPollPublishedGatedOnLabel: no poll is issued until the short backend
+// label is known (roborev 0k12 #1a) -- a label-less poll would return an empty
+// map that, landing after the fqdn-triggered poll, wipes valid routes. Each
+// issued poll also carries a strictly increasing generation stamp (#1b) so
+// out-of-order results can be ordered.
+func TestPollPublishedGatedOnLabel(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	m := newPublishModel(t, srv)
+
+	// fqdn not yet resolved -> no short label -> nil cmd, even though the edge
+	// is fully configured.
+	m.fqdn = ""
+	if m.pollPublishedCmd() != nil {
+		t.Error("a label-less (fqdn unresolved) poll must be suppressed (nil cmd)")
+	}
+
+	// Once the label is known, successive polls carry increasing generations.
+	m.fqdn = "dev-box.tailnet.ts.net"
+	cmd1 := m.pollPublishedCmd()
+	if cmd1 == nil {
+		t.Fatal("a configured edge with a known label should return a poll cmd")
+	}
+	msg1 := cmd1().(publishPollMsg)
+	msg2 := m.pollPublishedCmd()().(publishPollMsg)
+	if msg1.gen <= 0 || msg2.gen <= msg1.gen {
+		t.Errorf("poll generations must strictly increase; got gen1=%d gen2=%d", msg1.gen, msg2.gen)
+	}
+}
+
+// TestPublishPollOutOfOrderDropsStale drives two versioned poll results in
+// REVERSE order (roborev 0k12 #1): a newer poll (gen 2) with populated routes
+// applies, and a stale poll (gen 1) carrying an empty map arriving afterward is
+// DROPPED so it can't wipe the fresh state -- which would transiently hide
+// exposure and bypass the funnel/publish mutual-exclusion guards. The drop also
+// covers the err path, so a stale failure can't flip reachability false after a
+// newer success.
+func TestPublishPollOutOfOrderDropsStale(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.Hostname = "caddy"
+	m := New(cfg)
+	m.width = 200
+
+	// The newer poll lands first: populated routes.
+	fresh := map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m = mustUpdate(t, m, publishPollMsg{gen: 2, published: fresh})
+	if _, ok := m.published[8080]; !ok || len(m.published) != 1 {
+		t.Fatalf("newer poll (gen 2) should populate published; got %#v", m.published)
+	}
+
+	// The older poll arrives late with an EMPTY map: it must be dropped.
+	m = mustUpdate(t, m, publishPollMsg{gen: 1, published: map[int]publishInfo{}})
+	if _, ok := m.published[8080]; !ok || len(m.published) != 1 {
+		t.Errorf("stale poll (gen 1) must NOT overwrite fresh state; got %#v", m.published)
+	}
+
+	// A stale FAILURE likewise can't flip reachability false after the newer
+	// success already set it true.
+	m.publishReachable = true
+	m = mustUpdate(t, m, publishPollMsg{gen: 1, err: fmt.Errorf("dial tcp: refused")})
+	if !m.publishReachable {
+		t.Error("a stale failure poll must not flip publishReachable=false")
+	}
+
+	// A genuinely newer poll (gen 3) still applies normally.
+	m = mustUpdate(t, m, publishPollMsg{gen: 3, published: map[int]publishInfo{9090: {hostname: "api.example.com"}}})
+	if _, ok := m.published[9090]; !ok || len(m.published) != 1 {
+		t.Errorf("newer poll (gen 3) should apply; got %#v", m.published)
+	}
+}
+
+// TestPollPublishedIgnoresForeignRoute: a FOREIGN route -- one whose @id lacks
+// the tailport- prefix, so RouteInfo.Owned is false -- targeting THIS machine's
+// backend label:port must NOT be treated as published (roborev 0k12 #2). Left
+// unfiltered it would show the port published, block funnel, and on
+// de-escalation try to unpublish a synthesized id that doesn't exist.
+func TestPollPublishedIgnoresForeignRoute(t *testing.T) {
+	fc := newFakeCaddy()
+	// An owned tailport route on :8080, plus a foreign (hand-added) route
+	// targeting the SAME backend label on :9090.
+	ours := caddyedge.BuildRoute("a.example.com", "dev-box", 8080, nil)
+	foreign := caddyedge.BuildRoute("b.example.com", "dev-box", 9090, nil)
+	foreign.ID = "manual-b.example.com" // not the tailport- prefix -> Owned=false
+	fc.routes[ours.ID] = ours
+	fc.routes[foreign.ID] = foreign
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := newPublishModel(t, srv)
+	msg := m.pollPublishedCmd()().(publishPollMsg)
+	if _, ok := msg.published[9090]; ok {
+		t.Error("a foreign (non-owned) route must NOT be treated as published")
+	}
+	if info := msg.published[8080]; info.hostname != "a.example.com" || len(msg.published) != 1 {
+		t.Errorf("only our owned route should be published; got %#v", msg.published)
+	}
+
+	// Applying the poll, the foreign :9090 must not block funnel: requestFunnel
+	// should proceed to the confirm, not refuse with a "published" message.
+	m.published = msg.published
+	m.allPorts = append(m.allPorts, portscan.Port{Number: 9090, Process: "svc"})
+	m.active = map[int]bool{8080: true, 9090: true}
+	m.requestFunnel(9090)
+	if strings.Contains(m.flash, "published") {
+		t.Errorf("a foreign route must not block funnel on :9090; flash=%q", m.flash)
+	}
+	if m.mode != entryConfirmFunnel {
+		t.Errorf("funnel on a non-published port should reach the confirm; mode=%v", m.mode)
 	}
 }
 
