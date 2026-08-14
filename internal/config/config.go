@@ -196,12 +196,22 @@ func Load(override string) (Config, error) {
 // changed an unrelated field (e.g. a port label) -- without needing to
 // retain a parsed Node tree across calls.
 //
-// The file is written 0600 (and any pre-existing config tightened to it):
-// the caddy block can hold a bcrypt auth_hash, and a world-readable hash
-// invites offline cracking by other local users. c is a value receiver, so
-// applying the caddy defaults here is local to this copy and just makes the
-// "saved caddy block always carries visible defaults" invariant hold even
-// for a Config literal that never went through Default()/Load().
+// The file is written 0600 from creation, never written-then-chmod'd: the
+// caddy block can hold a bcrypt auth_hash, and a world-readable hash invites
+// offline cracking by other local users. roborev mzvh found that the
+// original write-then-chmod sequence left a window (and, if Chmod failed, an
+// indefinite window) where a pre-existing 0644 config held the freshly
+// written hash before its mode was tightened. Save now writes the new
+// content to a 0600 temp file in the SAME directory as path and renames it
+// over path -- an atomic same-filesystem swap (mirroring
+// selfupdate.ReplaceExecutable) that is secure from the first byte and also
+// eliminates any torn-write risk. On any error the temp file is removed and
+// the existing config is left byte-for-byte untouched.
+//
+// c is a value receiver, so applying the caddy defaults here is local to
+// this copy and just makes the "saved caddy block always carries visible
+// defaults" invariant hold even for a Config literal that never went through
+// Default()/Load().
 func (c Config) Save() error {
 	c.Caddy.applyDefaults()
 	path := c.path
@@ -212,7 +222,8 @@ func (c Config) Save() error {
 			return err
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	var root yaml.Node
@@ -224,13 +235,34 @@ func (c Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+
+	// os.CreateTemp creates the file 0600 already, but the umask can still
+	// widen that in principle, so Chmod explicitly rather than relying on
+	// the creation mode alone.
+	tmp, err := os.CreateTemp(dir, ".config-*.yaml.tmp")
+	if err != nil {
 		return err
 	}
-	// WriteFile only sets the mode when it creates the file; an existing
-	// config written before the 0600 default would keep its old (possibly
-	// 0644) mode, so tighten it explicitly now that it can hold a credential.
-	return os.Chmod(path, 0o600)
+	tmpName := tmp.Name()
+	remove := func() { _ = tmp.Close(); _ = os.Remove(tmpName) }
+
+	if _, err := tmp.Write(data); err != nil {
+		remove()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		remove()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // applyCaddyComments sets the explanatory head comments on the caddy:

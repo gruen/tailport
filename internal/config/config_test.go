@@ -325,11 +325,17 @@ func TestCaddyCommentsSurviveUnrelatedFieldSave(t *testing.T) {
 	}
 }
 
-// TestSaveWritesOwnerOnlyMode covers roborev 4ejm finding #2: the config can
-// hold a bcrypt auth_hash, so Save must not leave it group/world-readable.
-// Both a freshly-created file AND a pre-existing 0644 file must end up 0600.
+// TestSaveWritesOwnerOnlyMode covers roborev 4ejm finding #2 (mode) and
+// mzvh finding (atomicity): the config can hold a bcrypt auth_hash, so Save
+// must never leave it group/world-readable -- not even transiently. Both a
+// freshly-created file AND a pre-existing 0644 file must end up 0600, the
+// resave must not corrupt content (proving the temp-file+rename swap is
+// sound), and no ".config-*.yaml.tmp" scratch file may survive a
+// successful Save (mzvh: Save writes via a same-directory temp file that's
+// renamed over the target, never written-then-chmod'd in place).
 func TestSaveWritesOwnerOnlyMode(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
 	path, err := Path("")
 	if err != nil {
 		t.Fatalf("Path(\"\") error: %v", err)
@@ -344,6 +350,7 @@ func TestSaveWritesOwnerOnlyMode(t *testing.T) {
 	} else if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("freshly saved config mode = %o, want 600", got)
 	}
+	assertNoLeftoverTempFiles(t, filepath.Dir(path))
 
 	// A pre-existing world-readable file must be tightened on the next Save.
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -361,6 +368,35 @@ func TestSaveWritesOwnerOnlyMode(t *testing.T) {
 		t.Fatalf("stat after resave: %v", err)
 	} else if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("resaved config mode = %o, want 600 (existing 0644 not tightened)", got)
+	}
+	assertNoLeftoverTempFiles(t, filepath.Dir(path))
+
+	// The atomic rename must not have corrupted content: the port set right
+	// before the resave must round-trip intact.
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() after resave error: %v", err)
+	}
+	if meta, ok := got.Ports[3000]; !ok || meta.Label != "x" {
+		t.Errorf("Load().Ports[3000] after resave = %+v (ok=%v), want Label=\"x\" present (atomic rename must preserve content)", meta, ok)
+	}
+	if _, ok := got.Ports[22]; !ok {
+		t.Errorf("Load().Ports[22] missing after resave, want the seeded default (Default()'s locked SSH port) preserved")
+	}
+}
+
+// assertNoLeftoverTempFiles fails the test if any Save-created scratch file
+// (the ".config-*.yaml.tmp" pattern os.CreateTemp is given in Save) is still
+// present in dir. A successful Save renames its temp file over the target,
+// so nothing matching that pattern should ever survive.
+func assertNoLeftoverTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".config-*.yaml.tmp"))
+	if err != nil {
+		t.Fatalf("glob for leftover temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("leftover temp file(s) after Save: %v", matches)
 	}
 }
 
