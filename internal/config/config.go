@@ -195,7 +195,15 @@ func Load(override string) (Config, error) {
 // values and comments both survive every save -- including one that only
 // changed an unrelated field (e.g. a port label) -- without needing to
 // retain a parsed Node tree across calls.
+//
+// The file is written 0600 (and any pre-existing config tightened to it):
+// the caddy block can hold a bcrypt auth_hash, and a world-readable hash
+// invites offline cracking by other local users. c is a value receiver, so
+// applying the caddy defaults here is local to this copy and just makes the
+// "saved caddy block always carries visible defaults" invariant hold even
+// for a Config literal that never went through Default()/Load().
 func (c Config) Save() error {
+	c.Caddy.applyDefaults()
 	path := c.path
 	if path == "" {
 		var err error
@@ -216,7 +224,13 @@ func (c Config) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	// WriteFile only sets the mode when it creates the file; an existing
+	// config written before the 0600 default would keep its old (possibly
+	// 0644) mode, so tighten it explicitly now that it can hold a credential.
+	return os.Chmod(path, 0o600)
 }
 
 // applyCaddyComments sets the explanatory head comments on the caddy:

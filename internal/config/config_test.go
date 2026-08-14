@@ -324,3 +324,78 @@ func TestCaddyCommentsSurviveUnrelatedFieldSave(t *testing.T) {
 		t.Errorf("Load().Ports[3000] = %+v (ok=%v), want Label=\"x\" present", meta, ok)
 	}
 }
+
+// TestSaveWritesOwnerOnlyMode covers roborev 4ejm finding #2: the config can
+// hold a bcrypt auth_hash, so Save must not leave it group/world-readable.
+// Both a freshly-created file AND a pre-existing 0644 file must end up 0600.
+func TestSaveWritesOwnerOnlyMode(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+
+	// Fresh create via Save.
+	if err := Default().Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("stat after create: %v", err)
+	} else if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("freshly saved config mode = %o, want 600", got)
+	}
+
+	// A pre-existing world-readable file must be tightened on the next Save.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod 0644: %v", err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	cfg.Ports[3000] = PortMeta{Label: "x"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("stat after resave: %v", err)
+	} else if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("resaved config mode = %o, want 600 (existing 0644 not tightened)", got)
+	}
+}
+
+// TestSaveAppliesCaddyDefaultsForLiteral covers roborev 4ejm finding #3: a
+// Config literal built directly (never through Default()/Load(), which apply
+// the defaults) must still write visible caddy defaults, not empty/zero values.
+func TestSaveAppliesCaddyDefaultsForLiteral(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// A bare literal: no caddy fields set, no Default()/Load() in the path.
+	cfg := Config{Ports: map[int]PortMeta{8080: {Favorite: true}}}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("literal Save() then Load().Caddy = %+v, want visible defaults (caddy/tailport/2019)", got.Caddy)
+	}
+
+	path, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading saved config: %v", err)
+	}
+	// The file itself must show the defaults, not hostname:"" / admin_port:0.
+	for _, want := range []string{"hostname: caddy", "server_name: tailport", "admin_port: 2019"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("expected saved literal config to contain %q, got:\n%s", want, raw)
+		}
+	}
+}
