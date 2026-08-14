@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,147 @@ func TestOverridePathIsolatesFromXDGDefault(t *testing.T) {
 	}
 	if _, err := os.Stat(xdgDefault); !os.IsNotExist(err) {
 		t.Fatalf("Save() after Load(override) must not create the XDG default; stat err = %v", err)
+	}
+}
+
+// TestFreshSeedIncludesCaddyBlockAndComments covers v1z5/hhha: a newly
+// seeded config file always carries the caddy: block, its default values,
+// and the seeded explanatory comments -- not just when the user touches
+// caddy settings.
+func TestFreshSeedIncludesCaddyBlockAndComments(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if err := WriteDefault(""); err != nil {
+		t.Fatalf("WriteDefault() error: %v", err)
+	}
+	path, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading seeded config: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "caddy:") {
+		t.Errorf("expected seeded config to contain a caddy: block, got:\n%s", text)
+	}
+	for _, want := range []string{
+		`hostname: caddy`,
+		`domain: ""`,
+		`server_name: tailport`,
+		`admin_port: 2019`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected seeded config to contain %q, got:\n%s", want, text)
+		}
+	}
+	for _, want := range []string{
+		"Tailnet name of the Caddy edge node",
+		"Public base domain used to build publish hostnames",
+		"Name of the shared Caddy JSON HTTP server under apps.http.servers",
+		"Port of the Caddy admin API on the edge",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected seeded config to contain comment %q, got:\n%s", want, text)
+		}
+	}
+
+	// The in-struct defaults (from Load, which a caller uses right after
+	// WriteDefault) must match what's on disk.
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	want := CaddyConfig{Hostname: "caddy", ServerName: "tailport", AdminPort: 2019}
+	if cfg.Caddy != want {
+		t.Errorf("Load().Caddy = %+v, want %+v", cfg.Caddy, want)
+	}
+}
+
+// TestCaddyRoundTrip covers v1z5/hhha: caddy settings persist across a
+// Save/Load cycle like any other config field.
+func TestCaddyRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	cfg := Default()
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.AuthUser = "mg"
+	cfg.Caddy.AuthHash = "$2a$10$examplebcrypthashvalueexamplebcrypthash"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Domain != "example.com" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "example.com")
+	}
+	if got.Caddy.AuthUser != "mg" {
+		t.Errorf("Load().Caddy.AuthUser = %q, want %q", got.Caddy.AuthUser, "mg")
+	}
+	if got.Caddy.AuthHash != cfg.Caddy.AuthHash {
+		t.Errorf("Load().Caddy.AuthHash = %q, want %q", got.Caddy.AuthHash, cfg.Caddy.AuthHash)
+	}
+	// Untouched fields still carry their defaults.
+	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("Load().Caddy = %+v, want defaults for hostname/server_name/admin_port", got.Caddy)
+	}
+}
+
+// TestCaddyCommentsSurviveUnrelatedFieldSave is the dedicated
+// comment-preservation test v1z5/hhha specifically demands: the seeded
+// caddy: comments (and values) must survive a Save that changes a field
+// that has nothing to do with caddy -- proving Save's encode-then-reapply
+// mechanism (see the comment on Save) isn't just a fresh-seed artifact.
+func TestCaddyCommentsSurviveUnrelatedFieldSave(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if err := WriteDefault(""); err != nil {
+		t.Fatalf("WriteDefault() error: %v", err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	// An unrelated mutation: register a new port. Nothing about the caddy
+	// block changes.
+	cfg.Ports[3000] = PortMeta{Label: "x"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	path, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading saved config: %v", err)
+	}
+	text := string(raw)
+
+	for _, want := range []string{
+		"Public base domain used to build publish hostnames",
+		"Name of the shared Caddy JSON HTTP server under apps.http.servers",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected saved config to still contain comment %q after an unrelated save, got:\n%s", want, text)
+		}
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("Load().Caddy = %+v, want defaults intact after unrelated save", got.Caddy)
+	}
+	if meta, ok := got.Ports[3000]; !ok || meta.Label != "x" {
+		t.Errorf("Load().Ports[3000] = %+v (ok=%v), want Label=\"x\" present", meta, ok)
 	}
 }
