@@ -600,6 +600,76 @@ func TestPublishWildcardForeignConflictsNoMutation(t *testing.T) {
 	}
 }
 
+// TestExtraMatcherKeyRefusesMutation covers finding #1: a live route under OUR
+// deterministic @id and OUR backend, but whose sole match block carries an
+// extra matcher key (path) alongside host. Decoding used to drop the path, so
+// the route passed the ownership check — Publish would then broaden it (PATCH
+// dropping the path constraint) and Unpublish would delete it, mutating a route
+// that is NOT purely our hostname. Both must now refuse with zero mutation.
+func TestExtraMatcherKeyRefusesMutation(t *testing.T) {
+	// A route tailport built (our @id, dev-box:3000), then foreign-edited to add
+	// a path matcher to its sole match block. json.Unmarshal populates Match.raw
+	// with both keys, and Match.MarshalJSON preserves them across the fake's GET.
+	seed := func() Route {
+		r := BuildRoute("myapp.example.com", "dev-box", 3000, nil)
+		var m Match
+		if err := json.Unmarshal([]byte(`{"host":["myapp.example.com"],"path":["/admin"]}`), &m); err != nil {
+			t.Fatalf("seed unmarshal: %v", err)
+		}
+		r.Match = []Match{m}
+		return r
+	}
+
+	t.Run("publish refuses", func(t *testing.T) {
+		c, f := newFake(t, seed())
+		err := c.Publish(context.Background(), "myapp.example.com", "dev-box", 3000, nil)
+		if !errors.Is(err, ErrHostnameConflict) {
+			t.Fatalf("err = %v, want ErrHostnameConflict", err)
+		}
+		if f.mutations != 0 {
+			t.Errorf("extra matcher key must not mutate, got %d mutations", f.mutations)
+		}
+	})
+
+	t.Run("unpublish refuses", func(t *testing.T) {
+		c, f := newFake(t, seed())
+		err := c.Unpublish(context.Background(), "myapp.example.com", "dev-box", 3000)
+		if !errors.Is(err, ErrHostnameConflict) {
+			t.Fatalf("err = %v, want ErrHostnameConflict", err)
+		}
+		if f.del != 0 || f.mutations != 0 {
+			t.Errorf("extra matcher key must not delete, got del=%d mutations=%d", f.del, f.mutations)
+		}
+		if len(f.routes) != 1 {
+			t.Errorf("route must survive a refused unpublish, got %d", len(f.routes))
+		}
+	})
+}
+
+// TestPublishBareWildcardForeignConflictsNoMutation covers finding #3: a foreign
+// route matches EVERY hostname via a bare "*" host matcher. It overlaps the
+// requested hostname, so Publish must refuse without mutating.
+func TestPublishBareWildcardForeignConflictsNoMutation(t *testing.T) {
+	foreign := Route{
+		ID:    "catch-all",
+		Match: []Match{{Host: []string{"*"}}},
+		Handle: []Handler{{
+			Handler:   "reverse_proxy",
+			Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}},
+		}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign)
+
+	err := c.Publish(context.Background(), "app.example.com", "dev-box", 3000, nil)
+	if !errors.Is(err, ErrHostnameConflict) {
+		t.Fatalf("err = %v, want ErrHostnameConflict", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("bare-* conflict must not mutate, got %d mutations", f.mutations)
+	}
+}
+
 // TestHostsOverlap locks the overlap predicate directly, including the
 // requested-wildcard direction and the single-label boundary (a "*.suffix"
 // wildcard matches exactly one deeper label, not two).
@@ -609,6 +679,8 @@ func TestHostsOverlap(t *testing.T) {
 		want bool
 	}{
 		{"app.example.com", "app.example.com", true},    // exact
+		{"*", "app.example.com", true},                  // bare "*" matches any host
+		{"app.example.com", "*", true},                  // bare "*" in either position
 		{"*.example.com", "app.example.com", true},      // existing wildcard covers requested
 		{"app.example.com", "*.example.com", true},      // requested wildcard covers existing
 		{"*.example.com", "a.b.example.com", false},     // single-label wildcard: not two labels deep

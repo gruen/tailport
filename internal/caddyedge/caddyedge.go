@@ -102,9 +102,53 @@ type Route struct {
 	Terminal bool      `json:"terminal"`
 }
 
-// Match is a Caddy request matcher; only the host matcher is used here.
+// Match is one Caddy request-matcher object. Only the host matcher is used to
+// BUILD routes, but a LIVE route's match block can carry any matcher keys
+// (path, method, header, …). Decoding must NOT silently drop them: a route
+// whose sole match block is {"host":[...],"path":[...]} is more than just our
+// hostname, and treating it as ours would let Publish broaden it (dropping the
+// path constraint) or Unpublish delete it. So on decode we retain the raw
+// key/value pairs of the match object in raw; ownership checks (hostMatcherIs)
+// then demand the shape be exactly {host} and nothing more, and re-marshaling a
+// decoded foreign route preserves its other matchers verbatim.
+//
+// Host is the decoded value of the "host" key, kept as a typed field because
+// callers (parseRoute, findHostConflict) reason over hostnames directly.
 type Match struct {
-	Host []string `json:"host"`
+	Host []string
+	// raw is every key of the match object as decoded, so the key SET is
+	// recoverable and a round-trip preserves foreign matchers. It is nil for a
+	// Match constructed in-process (BuildRoute), which marshals as a plain
+	// {"host":[...]} and is never fed back through hostMatcherIs.
+	raw map[string]json.RawMessage
+}
+
+// UnmarshalJSON records the full set of matcher keys present on the wire (in
+// raw) and extracts the host list, so an ownership check can insist the match
+// object is EXACTLY {host} rather than silently ignoring extra matchers.
+func (m *Match) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.raw = raw
+	m.Host = nil
+	if h, ok := raw["host"]; ok {
+		if err := json.Unmarshal(h, &m.Host); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MarshalJSON emits a plain {"host":[...]} matcher for an in-process Match (the
+// shape BuildRoute must produce), and for a decoded Match re-emits every key it
+// carried, so a foreign route's other matchers survive a round-trip untouched.
+func (m Match) MarshalJSON() ([]byte, error) {
+	if m.raw != nil {
+		return json.Marshal(m.raw)
+	}
+	return json.Marshal(map[string][]string{"host": m.Host})
 }
 
 // Handler is one entry in a route's handle chain. It carries every field any of
@@ -595,15 +639,29 @@ func splitDial(dial string) (label string, port int, ok bool) {
 	return dial[:i], p, true
 }
 
-// hostMatcherIs reports whether route's matcher is exactly the single expected
-// public hostname: one match block, one host entry, equal after
-// canonicalization. A foreign edit that kept our @id but changed or added host
-// matchers fails this check, so Publish/Unpublish can refuse rather than
-// mutate an unrelated route they no longer actually own the shape of.
+// hostMatcherIs reports whether route's matcher is EXACTLY the single expected
+// public hostname and nothing else: one match block whose only matcher key is
+// host, carrying one host entry equal after canonicalization. A foreign edit
+// that kept our @id but changed the host, added a second match block, or added
+// any other matcher key (path, method, header, …) alongside host fails this
+// check — so Publish/Unpublish refuse rather than mutate a route that is no
+// longer purely our hostname. The extra-key check relies on Match.raw, which
+// records every matcher key seen on decode.
 func hostMatcherIs(route Route, hostname string) bool {
-	return len(route.Match) == 1 &&
-		len(route.Match[0].Host) == 1 &&
-		canonHost(route.Match[0].Host[0]) == canonHost(hostname)
+	if len(route.Match) != 1 {
+		return false
+	}
+	m := route.Match[0]
+	// The sole match block must contain exactly one key, and it must be host.
+	// Any additional matcher (path, method, …) means this is more than our
+	// hostname.
+	if len(m.raw) != 1 {
+		return false
+	}
+	if _, ok := m.raw["host"]; !ok {
+		return false
+	}
+	return len(m.Host) == 1 && canonHost(m.Host[0]) == canonHost(hostname)
 }
 
 // findHostConflict returns a human description of the first route whose host
@@ -611,17 +669,20 @@ func hostMatcherIs(route Route, hostname string) bool {
 // path, where any match is by definition foreign or differently-owned.
 //
 // Overlap is judged the way Caddy's host matcher actually matches: hostnames
-// are compared case-insensitively (via canonHost), and the common single-label
-// leading wildcard "*.<suffix>" is honored — an existing "*.example.com"
-// conflicts with a requested "app.example.com", and vice versa. hostname is
-// expected already canonicalized by the caller.
+// are compared case-insensitively (via canonHost), the bare "*" matcher that
+// matches every hostname is honored, and the common single-label leading
+// wildcard "*.<suffix>" is honored — an existing "*.example.com" conflicts with
+// a requested "app.example.com", and vice versa. hostname is expected already
+// canonicalized by the caller.
 //
-// Boundary: this deliberately models only exact (case-insensitive) matches and
-// the single-label "*.<suffix>" wildcard, which is the form tailport can emit
-// and the overwhelmingly common foreign form. It does NOT model Caddy's full
-// matcher grammar — a bare "*", multi-label wildcards, or path/expression
-// matchers can still overlap without being reported here; those broader cases
-// are left for Caddy itself to resolve.
+// Boundary: this models exact (case-insensitive) matches, the bare "*"
+// match-any matcher, and the single-label "*.<suffix>" wildcard (the form
+// tailport can emit and the overwhelmingly common foreign form). It does NOT
+// model MULTI-label wildcards, path/expression matchers, or routes with NO host
+// matcher at all (catch-alls): Caddy resolves overlapping routes by route
+// order, and treating "some catch-all exists" as a hard conflict for every
+// publish would wrongly block legitimate publishes. Those broader cases are
+// deliberately left for Caddy itself to resolve.
 func findHostConflict(routes []Route, hostname string) string {
 	for _, r := range routes {
 		for _, m := range r.Match {
@@ -639,11 +700,17 @@ func findHostConflict(routes []Route, hostname string) string {
 }
 
 // hostsOverlap reports whether two already-canonicalized Caddy host matchers
-// can match the same request, covering case-insensitive exact equality and the
-// single-label leading wildcard "*.<suffix>" in either position. See
-// findHostConflict for the boundary on which matcher forms are modeled.
+// can match the same request, covering case-insensitive exact equality, the
+// bare "*" match-any matcher, and the single-label leading wildcard
+// "*.<suffix>" in either position. See findHostConflict for the boundary on
+// which matcher forms are modeled.
 func hostsOverlap(a, b string) bool {
 	if a == b {
+		return true
+	}
+	// A bare "*" host matcher matches every hostname, so it overlaps whatever
+	// sits in the other position.
+	if a == "*" || b == "*" {
 		return true
 	}
 	if suffix, ok := wildcardSuffix(a); ok && oneLabelUnder(b, suffix) {
