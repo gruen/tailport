@@ -1,0 +1,77 @@
+name: caddy-integration
+
+# Opt-in job: exercises internal/caddyedge's real-caddy integration test
+# (caddyedge_integration_test.go, kata pxrx) against an ACTUAL caddy binary,
+# not the in-process httptest fakes the rest of the package's tests use. That
+# test t.Skip()s itself whenever `caddy` is not on PATH -- which is true on
+# the dev box and on every OTHER CI job here -- so this job exists solely to
+# put a real caddy on PATH and let those assertions run for real. Same
+# economics/gate style as darwin-tests.yml and brew-test.yml: it runs ONLY
+# when explicitly asked -- either a pushed commit whose message contains the
+# literal token `[ci caddy]`, or a manual run from the Actions tab
+# (workflow_dispatch). A normal push does NOT start it.
+#
+# Note: the `[ci caddy]` gate reads github.event.head_commit.message, which is
+# populated on PUSH events (not pull_request). Trigger it on a branch push or
+# via manual dispatch.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  caddy:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci caddy]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          # go.mod is a floor (`go 1.26`), not the toolchain to test with
+          # (tvyh). Test on the newest patch: check-latest at its default
+          # (false) would resolve the bare minor against the runner's cache
+          # first and quietly pin us to whatever 1.26.x the image ships, so a
+          # toolchain-level regression would not show up here until the image
+          # moved. Matches build.yml / darwin-tests.yml.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: install caddy
+        # The official apt repository (caddyserver.com/docs/install), not a
+        # hand-picked GitHub release asset: it's the documented, most-used
+        # install path, gives us a real signed package rather than a bare
+        # binary we'd have to fetch/extract/chmod ourselves, and needs no
+        # guessing at an asset filename or architecture string. This installs
+        # caddy as a systemd service too, but the integration test never talks
+        # to that service -- it launches its own `caddy run` against an
+        # isolated, ephemeral-port config (see caddyedge_integration_test.go)
+        # and ignores whatever the packaged service is doing.
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+          sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+          sudo apt-get update
+          sudo apt-get install -y caddy
+          caddy version
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+      - name: caddy integration test (verbose)
+        # Re-runs just the real-caddy assertions with -v -count=1 so the CI
+        # log shows explicit PASS lines for each subtest (Host rewrite,
+        # basic_auth 401/200, idempotent PATCH republish, DELETE, and the
+        # bootstrap-caddy.json validate) -- proof this job actually exercised
+        # them for real, not just that the `test` step above stayed green.
+        run: go test ./internal/caddyedge/ -run 'TestCaddyIntegration|TestBootstrapConfigAcceptedByCaddy' -v -count=1
