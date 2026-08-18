@@ -231,12 +231,18 @@ Then, from a machine that is **not** on your tailnet (confirming the public
 path end to end, cert included):
 
 ```sh
-curl -I https://<published-hostname>/
+curl -sS -o /dev/null -w '%{http_code}\n' https://<published-hostname>/
 ```
 
-For a route published **without** basic auth, a `200`/`3xx` with a valid
-certificate here means DNS, the dedicated IP, Caddy's automatic HTTPS, the
-route, the Host rewrite, and the backend are all correctly wired together.
+This is a GET with the body discarded (`-o /dev/null`) and only the status
+code printed (`-w '%{http_code}\n'`) — deliberately not `curl -I` (a HEAD
+request): a backend that serves GET but doesn't support HEAD would answer
+`405` there, which reads as a broken deployment when it isn't.
+
+For a route published **without** basic auth, a `2xx`/`3xx` status with a
+valid certificate here means DNS, the dedicated IP, Caddy's automatic
+HTTPS, the route, the Host rewrite, and the backend are all correctly
+wired together.
 
 For a route published **with** basic auth (tailport's shared,
 bcrypt-hashed `auth_user`/`auth_hash` credential — see the root
@@ -247,13 +253,19 @@ request ever reaches the backend. Confirm the backend is actually
 reachable by retrying with the credential:
 
 ```sh
-curl -I -u <auth_user>:<password> https://<published-hostname>/
+curl -sS -o /dev/null -w '%{http_code}\n' -u '<auth_user>' https://<published-hostname>/
 ```
 
-A `200`/`3xx` on *this* authenticated request is what confirms the full
+Pass only the username to `-u`, with no `:<password>` after it — curl
+then prompts for the password interactively instead of taking it on the
+command line, where it would land in your shell history and be visible
+to other processes on the machine (e.g. `ps`) for as long as it survives
+there.
+
+A `2xx`/`3xx` on *this* authenticated request is what confirms the full
 chain end to end for a protected route. A `401` on the unauthenticated
 request above is expected on its own and not itself evidence of a
-problem; something other than `401`/`200`/`3xx` on either request (a
+problem; something other than `401`/`2xx`/`3xx` on either request (a
 `502`, a TLS error, a hang) means work through Troubleshooting below.
 
 ## 5. Troubleshooting
