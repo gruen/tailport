@@ -208,6 +208,16 @@ func Load(override string) (Config, error) {
 // eliminates any torn-write risk. On any error the temp file is removed and
 // the existing config is left byte-for-byte untouched.
 //
+// If path is itself a symlink (e.g. a user symlinks config.yaml into a
+// dotfiles repo), renaming onto path would replace the link with a plain
+// file, silently breaking it -- unlike the pre-atomic-write os.WriteFile,
+// which wrote through the symlink to its target. roborev 3f5t/870 caught
+// this regression. resolveSaveTarget resolves that case: the temp file is
+// created in the REAL target's directory and the rename lands on the real
+// target path, leaving the symlink itself untouched and now pointing at the
+// freshly written file. A non-symlink or not-yet-existing path resolves to
+// itself, matching the prior behavior exactly.
+//
 // c is a value receiver, so applying the caddy defaults here is local to
 // this copy and just makes the "saved caddy block always carries visible
 // defaults" invariant hold even for a Config literal that never went through
@@ -222,7 +232,11 @@ func (c Config) Save() error {
 			return err
 		}
 	}
-	dir := filepath.Dir(path)
+	target, err := resolveSaveTarget(path)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -258,11 +272,45 @@ func (c Config) Save() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpName, target); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
 	return nil
+}
+
+// resolveSaveTarget returns the path Save should actually write to. For a
+// plain file or a not-yet-existing path, that's path itself -- preserving
+// Save's pre-3f5t behavior exactly. If path is a symlink, it resolves to the
+// link's real target so the atomic rename lands there instead of replacing
+// the symlink with a regular file (see the symlink paragraph on Save's doc
+// comment).
+func resolveSaveTarget(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return path, nil
+		}
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return path, nil
+	}
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		return target, nil
+	}
+	// EvalSymlinks failed -- most likely a dangling symlink (its target
+	// doesn't exist yet, e.g. a fresh dotfiles checkout). Fall back to the
+	// immediate link target, resolved relative to the symlink's own
+	// directory if it's relative, rather than refusing to save.
+	link, err := os.Readlink(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(link) {
+		link = filepath.Join(filepath.Dir(path), link)
+	}
+	return link, nil
 }
 
 // applyCaddyComments sets the explanatory head comments on the caddy:

@@ -400,6 +400,68 @@ func assertNoLeftoverTempFiles(t *testing.T, dir string) {
 	}
 }
 
+// TestSaveWritesThroughSymlink covers roborev 3f5t/870: the atomic
+// temp-file+rename Save (mzvh) introduced a regression where, if the
+// resolved config path is itself a symlink (e.g. a user's dotfiles repo
+// symlinks config.yaml into place), the rename would replace the symlink
+// with a plain file -- silently breaking the link, unlike the pre-atomic
+// os.WriteFile which wrote through it. Save must instead write through the
+// link to its real target, leaving the symlink itself intact.
+func TestSaveWritesThroughSymlink(t *testing.T) {
+	dirA := t.TempDir()
+	realPath := filepath.Join(dirA, "real.yaml")
+	if err := os.WriteFile(realPath, []byte("stale: marker\n"), 0o644); err != nil {
+		t.Fatalf("seeding real file: %v", err)
+	}
+
+	dirB := t.TempDir()
+	linkPath := filepath.Join(dirB, "config.yaml")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	cfg := Default()
+	cfg.path = linkPath
+	cfg.Ports[4242] = PortMeta{Label: "through-symlink"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// The config path must still be a symlink, pointing at the same target.
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("Lstat(linkPath): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected %s to still be a symlink after Save, got mode %v", linkPath, info.Mode())
+	}
+	if got, err := os.Readlink(linkPath); err != nil {
+		t.Fatalf("Readlink(linkPath): %v", err)
+	} else if got != realPath {
+		t.Errorf("Readlink(linkPath) = %q, want %q (symlink target must be unchanged)", got, realPath)
+	}
+
+	// The real target must hold the new content, at mode 0600.
+	realInfo, err := os.Stat(realPath)
+	if err != nil {
+		t.Fatalf("Stat(realPath): %v", err)
+	}
+	if got := realInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("real file mode = %o, want 600", got)
+	}
+	raw, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("ReadFile(realPath): %v", err)
+	}
+	text := string(raw)
+	if strings.Contains(text, "stale: marker") {
+		t.Errorf("expected real file content to be replaced by Save, still contains stale marker:\n%s", text)
+	}
+	if !strings.Contains(text, "through-symlink") {
+		t.Errorf("expected real file to contain the new content, got:\n%s", text)
+	}
+}
+
 // TestSaveAppliesCaddyDefaultsForLiteral covers roborev 4ejm finding #3: a
 // Config literal built directly (never through Default()/Load(), which apply
 // the defaults) must still write visible caddy defaults, not empty/zero values.
