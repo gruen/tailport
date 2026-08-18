@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -279,6 +280,13 @@ func (c Config) Save() error {
 	return nil
 }
 
+// maxSymlinkHops bounds the manual chain-walk in resolveSaveTarget's
+// dangling-symlink fallback, matching typical kernel symlink-loop limits. It
+// exists so a genuine loop (a -> b -> a) errors out instead of looping
+// forever or (worse) getting silently truncated at an arbitrary intermediate
+// link.
+const maxSymlinkHops = 255
+
 // resolveSaveTarget returns the path Save should actually write to. For a
 // plain file or a not-yet-existing path, that's path itself -- preserving
 // Save's pre-3f5t behavior exactly. If path is a symlink, it resolves to the
@@ -299,18 +307,38 @@ func resolveSaveTarget(path string) (string, error) {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		return target, nil
 	}
-	// EvalSymlinks failed -- most likely a dangling symlink (its target
-	// doesn't exist yet, e.g. a fresh dotfiles checkout). Fall back to the
-	// immediate link target, resolved relative to the symlink's own
-	// directory if it's relative, rather than refusing to save.
-	link, err := os.Readlink(path)
-	if err != nil {
-		return "", err
+	// EvalSymlinks failed -- most likely a dangling symlink chain (the
+	// eventual target doesn't exist yet, e.g. a fresh dotfiles checkout) or
+	// a symlink loop. Walk the chain by hand, one hop at a time, stopping at
+	// the first component that either doesn't exist (that's the intended
+	// save target -- and, for a multi-hop chain like
+	// config.yaml -> second-link -> missing.yaml, that's missing.yaml, not
+	// second-link) or isn't a symlink (a real file/dir to write through).
+	// roborev kg6f: a single-hop fallback here renamed over an intermediate
+	// symlink instead of resolving through it, and replaced a symlink loop
+	// with a plain file instead of erroring.
+	current := path
+	for hop := 0; hop < maxSymlinkHops; hop++ {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return current, nil
+			}
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return current, nil
+		}
+		link, err := os.Readlink(current)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(link) {
+			link = filepath.Join(filepath.Dir(current), link)
+		}
+		current = link
 	}
-	if !filepath.IsAbs(link) {
-		link = filepath.Join(filepath.Dir(path), link)
-	}
-	return link, nil
+	return "", fmt.Errorf("resolveSaveTarget: too many levels of symbolic links: %s", path)
 }
 
 // applyCaddyComments sets the explanatory head comments on the caddy:

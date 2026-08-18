@@ -462,6 +462,104 @@ func TestSaveWritesThroughSymlink(t *testing.T) {
 	}
 }
 
+// TestSaveWritesThroughMultiHopDanglingSymlinkChain covers roborev kg6f/920:
+// resolveSaveTarget's dangling-symlink fallback used to do a single
+// os.Readlink hop, so a multi-hop dangling chain (cfg -> link2 ->
+// missing.yaml, where missing.yaml doesn't exist yet) renamed over link2 --
+// destroying the intermediate symlink -- instead of resolving through to
+// missing.yaml. Save must write to missing.yaml (creating it) and leave both
+// cfg and link2 intact as symlinks.
+func TestSaveWritesThroughMultiHopDanglingSymlinkChain(t *testing.T) {
+	dir := t.TempDir()
+	missingPath := filepath.Join(dir, "missing.yaml")
+	link2Path := filepath.Join(dir, "link2")
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	if err := os.Symlink(missingPath, link2Path); err != nil {
+		t.Fatalf("Symlink(link2 -> missing): %v", err)
+	}
+	if err := os.Symlink(link2Path, cfgPath); err != nil {
+		t.Fatalf("Symlink(cfg -> link2): %v", err)
+	}
+
+	cfg := Default()
+	cfg.path = cfgPath
+	cfg.Ports[4242] = PortMeta{Label: "multi-hop-dangling"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// Both links in the chain must still be symlinks, pointing at their
+	// original (unchanged) targets.
+	cfgInfo, err := os.Lstat(cfgPath)
+	if err != nil {
+		t.Fatalf("Lstat(cfgPath): %v", err)
+	}
+	if cfgInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected %s to still be a symlink after Save, got mode %v", cfgPath, cfgInfo.Mode())
+	}
+	if got, err := os.Readlink(cfgPath); err != nil {
+		t.Fatalf("Readlink(cfgPath): %v", err)
+	} else if got != link2Path {
+		t.Errorf("Readlink(cfgPath) = %q, want %q (cfg symlink must be unchanged)", got, link2Path)
+	}
+
+	link2Info, err := os.Lstat(link2Path)
+	if err != nil {
+		t.Fatalf("Lstat(link2Path): %v", err)
+	}
+	if link2Info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected %s to still be a symlink after Save, got mode %v", link2Path, link2Info.Mode())
+	}
+	if got, err := os.Readlink(link2Path); err != nil {
+		t.Fatalf("Readlink(link2Path): %v", err)
+	} else if got != missingPath {
+		t.Errorf("Readlink(link2Path) = %q, want %q (link2 symlink must be unchanged)", got, missingPath)
+	}
+
+	// The final target must now exist, holding the new content.
+	raw, err := os.ReadFile(missingPath)
+	if err != nil {
+		t.Fatalf("ReadFile(missingPath): %v", err)
+	}
+	if !strings.Contains(string(raw), "multi-hop-dangling") {
+		t.Errorf("expected missing.yaml to contain the new content, got:\n%s", raw)
+	}
+}
+
+// TestSaveErrorsOnSymlinkLoop covers roborev kg6f/920: a symlink loop
+// (a -> b -> a) must not be silently replaced with a plain file by Save's
+// dangling-symlink fallback -- it must return an error instead.
+func TestSaveErrorsOnSymlinkLoop(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a")
+	bPath := filepath.Join(dir, "b")
+
+	if err := os.Symlink(bPath, aPath); err != nil {
+		t.Fatalf("Symlink(a -> b): %v", err)
+	}
+	if err := os.Symlink(aPath, bPath); err != nil {
+		t.Fatalf("Symlink(b -> a): %v", err)
+	}
+
+	cfg := Default()
+	cfg.path = aPath
+	if err := cfg.Save(); err == nil {
+		t.Fatal("Save() error = nil, want error for symlink loop")
+	}
+
+	// Neither link may have been replaced.
+	for _, p := range []string{aPath, bPath} {
+		info, err := os.Lstat(p)
+		if err != nil {
+			t.Fatalf("Lstat(%s): %v", p, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("expected %s to still be a symlink after failed Save, got mode %v", p, info.Mode())
+		}
+	}
+}
+
 // TestSaveAppliesCaddyDefaultsForLiteral covers roborev 4ejm finding #3: a
 // Config literal built directly (never through Default()/Load(), which apply
 // the defaults) must still write visible caddy defaults, not empty/zero values.
