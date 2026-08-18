@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3121,12 +3122,24 @@ func TestFireworkBurstReachesTopButClusters(t *testing.T) {
 func TestFireworkBurstStaysOnScreen(t *testing.T) {
 	const margin = 2.0
 	const eps = 1e-6
+	// fwRand is package-level and auto-seeded per process in production (see
+	// its declaration), so an unfixed seed made the clamp-bind assertion below
+	// seed-dependent: the clamp is a rare event (empirically ~1-in-6000 shots
+	// at w=60), so an unlucky auto-seed could draw 20000 shots without ever
+	// tripping it. Pin fwRand to a fixed seed for this test's duration
+	// (save/restore) for bit-for-bit repeatability, and also widen the sample
+	// size well past what a single lucky seed would need, so the property
+	// holds for essentially any seed -- not one cherry-picked to pass.
+	prevRand := fwRand
+	defer func() { fwRand = prevRand }()
+	fwRand = rand.New(rand.NewSource(1))
 	// Narrow width where the clamp actually binds: the invariant must hold for
 	// EVERY sample, including the tallest (largest tExp) shots.
+	const narrowSamples = 200000 // >>20000: makes a zero-clamp draw astronomically unlikely
 	for _, w := range []int{52, 60} {
 		const h = 40
 		clamped := false
-		for i := 0; i < 20000; i++ {
+		for i := 0; i < narrowSamples; i++ {
 			fw := newFirework(w, h, i%2 == 0)
 			xExp := fw.posX(fw.tExp)
 			if xExp < margin-eps || xExp > float64(w-1)-margin+eps {

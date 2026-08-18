@@ -4151,6 +4151,13 @@ const (
 	fwSmokeLifeMax = 12 // puff-particle life in frames (inclusive hi)
 )
 
+// fwRand is the sole source of randomness for the fireworks code below
+// (bellUnit, newFirework, explode, addFlourish). It's a package-level
+// *rand.Rand rather than the bare package-level rand.* funcs so tests can
+// swap in a fixed seed for determinism; production seeds it once, here, from
+// the global auto-seeded rand, so real fireworks stay random every run.
+var fwRand = rand.New(rand.NewSource(rand.Int63()))
+
 type fwStage int
 
 const (
@@ -4204,7 +4211,7 @@ type firework struct {
 // uniforms (a bell/triangular shape). Bounded by construction, so unlike a
 // clamped NormFloat64 there is no tail to trim: "most values cluster central".
 func bellUnit() float64 {
-	return (rand.Float64()+rand.Float64()+rand.Float64())/3*2 - 1
+	return (fwRand.Float64()+fwRand.Float64()+fwRand.Float64())/3*2 - 1
 }
 
 // bellRange maps bellUnit onto [lo,hi], central-biased toward the midpoint.
@@ -4290,7 +4297,7 @@ func newFirework(w, h int, emoji bool) firework {
 	// Muzzle smoke: a few gray particles at the launch point with small
 	// upward+outward velocity and a short life. Origins are all within +/-8% of
 	// centre, so simultaneous puffs overlap heavily and compound (smokeDensity).
-	nSmoke := fwSmokeMin + rand.Intn(fwSmokeMax-fwSmokeMin+1)
+	nSmoke := fwSmokeMin + fwRand.Intn(fwSmokeMax-fwSmokeMin+1)
 	smoke := make([]fwParticle, 0, nSmoke)
 	for i := 0; i < nSmoke; i++ {
 		smoke = append(smoke, fwParticle{
@@ -4298,7 +4305,7 @@ func newFirework(w, h int, emoji bool) firework {
 			y:   y0,
 			vx:  bellRange(-0.2, 0.2),
 			vy:  bellRange(-0.35, -0.1),
-			ttl: fwSmokeLifeMin + rand.Intn(fwSmokeLifeMax-fwSmokeLifeMin+1),
+			ttl: fwSmokeLifeMin + fwRand.Intn(fwSmokeLifeMax-fwSmokeLifeMin+1),
 		})
 	}
 
@@ -4313,9 +4320,9 @@ func newFirework(w, h int, emoji bool) firework {
 		stage:      fwRising,
 		count:      int(bellRange(fwCountMin, fwCountMax)),
 		radius:     bellRange(fwRadiusMin, fwRadiusMax),
-		scheme:     rand.Intn(len(fwSchemes)),
-		flourish:   rand.Float64() < fwFlourishChance,
-		flourishAt: 3 + rand.Intn(4),
+		scheme:     fwRand.Intn(len(fwSchemes)),
+		flourish:   fwRand.Float64() < fwFlourishChance,
+		flourishAt: 3 + fwRand.Intn(4),
 		smoke:      smoke,
 		emoji:      emoji,
 	}
@@ -4389,8 +4396,8 @@ func (f *firework) explode() {
 		n = 1
 	}
 	for i := 0; i < n; i++ {
-		ang := 2*math.Pi*float64(i)/float64(n) + (rand.Float64()-0.5)*0.6
-		speed := f.radius * (0.45 + 0.55*rand.Float64())
+		ang := 2*math.Pi*float64(i)/float64(n) + (fwRand.Float64()-0.5)*0.6
+		speed := f.radius * (0.45 + 0.55*fwRand.Float64())
 		f.particles = append(f.particles, fwParticle{
 			x:   f.xExp,
 			y:   f.yExp,
@@ -4403,16 +4410,16 @@ func (f *firework) explode() {
 
 // addFlourish emits a brief bright secondary crackle from the burst centre.
 func (f *firework) addFlourish() {
-	n := 6 + rand.Intn(6)
+	n := 6 + fwRand.Intn(6)
 	for i := 0; i < n; i++ {
-		ang := 2*math.Pi*float64(i)/float64(n) + rand.Float64()
-		speed := f.radius * 1.4 * (0.5 + 0.6*rand.Float64())
+		ang := 2*math.Pi*float64(i)/float64(n) + fwRand.Float64()
+		speed := f.radius * 1.4 * (0.5 + 0.6*fwRand.Float64())
 		f.particles = append(f.particles, fwParticle{
 			x:       f.xExp,
 			y:       f.yExp,
 			vx:      math.Cos(ang) * speed * fwAspect,
 			vy:      math.Sin(ang) * speed,
-			ttl:     4 + rand.Intn(4),
+			ttl:     4 + fwRand.Intn(4),
 			crackle: true,
 		})
 	}
