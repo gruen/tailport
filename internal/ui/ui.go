@@ -1465,6 +1465,22 @@ func (m *model) pollPublishedCmd() tea.Cmd {
 			// @id-tagged tailport route) must not be mistaken for published --
 			// it would block funnel and, on de-escalation, try to unpublish a
 			// synthesized tailport-<host> id that doesn't exist.
+			//
+			// DELIBERATE v1 LIMITATION (roborev bps9 #1, mg's call): a foreign
+			// route -- one that matches this backend's label:port but isn't
+			// tailport's own @id-tagged route -- is filtered out here, not
+			// merely unpublishable. That means it never lands in m.published,
+			// so it can't participate in drift detection either: tailport
+			// surfaces funnel<->tailport-publish dual exposure (both sides
+			// under tailport's control), but a manual/foreign Caddy route is
+			// not tracked at all, because "published" is defined solely as
+			// "has a tailport-owned @id route" -- Caddy's foreign routes are
+			// simply out of tailport's view in v1. roborev 874 flagged this as
+			// a gap (funnelling an already-foreign-published port raises no
+			// warning); mg decided to keep the owned-only filter rather than
+			// add foreign-route surfacing / an ownership flag / a
+			// funnel-block-on-foreign, so this comment documents that as an
+			// intentional scope boundary, not an oversight.
 			if label == "" || r.Label != label || !r.Owned {
 				continue
 			}
@@ -5335,6 +5351,28 @@ func (m model) statusText() string {
 		} else {
 			base = fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 		}
+	}
+	// Even the most compact base plus the (possibly already-shortened) suffix
+	// can still overflow (roborev bps9 #2): the compact fallback above is
+	// chosen unconditionally when nothing else fits, without itself being
+	// checked against avail, so on terminals under ~24 columns -- or with
+	// multi-digit port counts widening the compact form -- base+suffix can
+	// exceed m.width. The health warning is the one thing that must survive
+	// at any width the terminal actually gives us, so when the combined form
+	// still doesn't fit, drop the base entirely and show the warning alone
+	// rather than let it be clipped from the end.
+	if suffix != "" && m.width > 0 && lipgloss.Width(base)+lipgloss.Width(suffix) > m.width {
+		warning := strings.TrimPrefix(suffix, " · ")
+		if lipgloss.Width(warning) > m.width {
+			// Even the bare warning doesn't fit an extreme width; keep as
+			// much of it (from the left) as fits rather than show nothing.
+			runes := []rune(warning)
+			if m.width < len(runes) {
+				runes = runes[:m.width]
+			}
+			warning = string(runes)
+		}
+		return warning
 	}
 	return base + suffix
 }

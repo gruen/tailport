@@ -1787,6 +1787,61 @@ func TestStatusLineFitsEdgeWarning(t *testing.T) {
 	}
 }
 
+// TestStatusLineWarningSurvivesVeryNarrowWidth pins roborev bps9 #2: even
+// after 0k12 #4 sized the suffix into the width fit, the compact
+// "NL · NT · NP" fallback is chosen unconditionally when nothing wider fits
+// -- it is never itself checked against avail -- so on terminals under ~24
+// columns, or once the counts go multi-digit, "compact base + edge down" can
+// still exceed m.width and clip the warning. The health warning must survive
+// at any width the terminal actually gives us, so once even that minimum
+// combined form doesn't fit, statusText drops the base and shows the warning
+// alone (further truncated if even the bare warning can't fit).
+func TestStatusLineWarningSurvivesVeryNarrowWidth(t *testing.T) {
+	mk := func(width int) string {
+		cfg := config.Config{}
+		cfg.Caddy.Domain = "example.com"
+		cfg.Caddy.Hostname = "caddy"
+		m := New(cfg)
+		// Double-digit counts on every segment (bps9's "port counts have
+		// multiple digits" case) widen the compact fallback ("12L · 11T ·
+		// 10P" -- 15 columns) past what fits alongside "· edge down" (12
+		// columns) at widths well above the single-digit case's threshold.
+		ports := make([]portscan.Port, 12)
+		active := map[int]bool{}
+		for i := range ports {
+			port := 3000 + i
+			ports[i] = portscan.Port{Number: port}
+			if i < 11 {
+				active[port] = true
+			}
+		}
+		m.allPorts = ports
+		m.active = active
+		m.funnel = map[int]int{4000: 443, 4001: 443, 4002: 443, 4003: 443, 4004: 443,
+			4005: 443, 4006: 443, 4007: 443, 4008: 443, 4009: 443}
+		m.width = width
+		m.publishReachable = false // failed edge poll -> warning suffix present
+		return m.statusText()
+	}
+
+	for w := 10; w <= 20; w++ {
+		got := mk(w)
+		if lipgloss.Width(got) > w {
+			t.Errorf("width %d: status %q width %d overflows", w, got, lipgloss.Width(got))
+		}
+		if !strings.Contains(got, "edge") {
+			t.Errorf("width %d: the edge-health warning was clipped; got %q", w, got)
+		}
+	}
+
+	// Even a width too narrow for the bare "edge down" fallback (9 columns)
+	// must not panic and must never exceed the given width -- the fragment
+	// is truncated from the right rather than dropped entirely.
+	if got := mk(6); lipgloss.Width(got) > 6 {
+		t.Errorf("width 6: status %q width %d overflows", got, lipgloss.Width(got))
+	}
+}
+
 // TestRequestFunnel covers yt69's escalation gate: :22 is hard-blocked, a
 // normal turn-on defers to the entryConfirmFunnel prompt with the auto-assigned
 // public port, a 4th funnel is refused, and turning an already-funnelled port
