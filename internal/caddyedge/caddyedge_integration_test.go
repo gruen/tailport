@@ -389,6 +389,23 @@ func TestCaddyIntegration(t *testing.T) {
 			t.Fatalf("PATCH with fresh Etag E1 status = %d, want 2xx; body = %s", status, body)
 		}
 
+		// 3b. Confirm the setup is genuinely stale before depending on it: GET
+		// the id again and assert its Etag actually moved off E1. The step-3
+		// content change is designed to guarantee this under any Caddy Etag
+		// model, but asserting it here turns a broken assumption into a clear
+		// failure at its source rather than a confusing "want 412, got 2xx" at
+		// step 4 -- important because this whole subtest only ever runs in CI.
+		_, status, e2, err := client.do(ctx, http.MethodGet, client.idURL(id), nil, "")
+		if err != nil {
+			t.Fatalf("re-GET %s: %v", id, err)
+		}
+		if status != http.StatusOK {
+			t.Fatalf("re-GET %s status = %d, want 200", id, status)
+		}
+		if e2 == "" || e2 == e1 {
+			t.Fatalf("Etag did not move after step 3 (e1=%q, e2=%q); the stale-replay setup is not actually stale", e1, e2)
+		}
+
 		// 4. Replay a PATCH on the SAME id, still carrying the now-STALE E1.
 		// The id's Etag moved to E2 in step 3, so E1 no longer matches
 		// what's live. Real Caddy must reject this with 412 Precondition
