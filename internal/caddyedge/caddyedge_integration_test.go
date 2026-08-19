@@ -126,9 +126,17 @@ func startCaddy(t *testing.T, cfg any, adminURL string) {
 		}
 	})
 
+	// A dedicated client with a short per-request timeout for the readiness
+	// probe: plain http.Get has no timeout of its own, so a socket that
+	// accepts a connection but never replies (caddy wedged mid-startup)
+	// would hang the probe past the overall 10s deadline below instead of
+	// failing fast and looping again. Defined once and reused so we're not
+	// allocating a client (and its idle-connection pool) every 50ms.
+	probeClient := &http.Client{Timeout: 2 * time.Second}
+
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		resp, err := http.Get(adminURL + "/config/")
+		resp, err := probeClient.Get(adminURL + "/config/")
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -318,6 +326,117 @@ func TestCaddyIntegration(t *testing.T) {
 		resp2.Body.Close()
 		if resp2.StatusCode == http.StatusOK {
 			t.Errorf("myapp.example.com still proxies (status 200) after Unpublish")
+		}
+	})
+
+	t.Run("stale If-Match PATCH gets a real 412 from Caddy, then Publish reconciles to one clean route", func(t *testing.T) {
+		// This is the one subtest in the suite that induces and observes an
+		// ACTUAL 412 Precondition Failed from a real Caddy admin API -- the
+		// optimistic-concurrency response caddyedge_test.go's httptest fakes
+		// can only approximate by hand-returning a canned 412 status. Because
+		// this file is white-box (package caddyedge), it drives the same raw
+		// primitives Publish's internal read-then-mutate loop uses (do,
+		// mutate, idURL) directly, so the stale write is forced
+		// deterministically instead of racing two goroutines and hoping one
+		// loses.
+		//
+		// A separate hostname from the rest of this test keeps this subtest
+		// independent of the routes the earlier subtests created/removed.
+		ctx := context.Background()
+		const hostname = "concurrent.example.com"
+		id := IDFor(hostname)
+
+		// 1. Publish once so /id/tailport-concurrent.example.com exists.
+		if err := client.Publish(ctx, hostname, label, backendPort, nil); err != nil {
+			t.Fatalf("initial Publish: %v", err)
+		}
+
+		// 2. GET the route directly (bypassing Publish) to capture its
+		// current Etag, E1 -- the read half of the same read-then-mutate
+		// dance Publish performs internally.
+		_, status, e1, err := client.do(ctx, http.MethodGet, client.idURL(id), nil, "")
+		if err != nil {
+			t.Fatalf("GET %s: %v", id, err)
+		}
+		if status != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", id, status)
+		}
+		if e1 == "" {
+			t.Fatalf("GET %s returned no Etag", id)
+		}
+
+		// 3. A VALID mutation using E1 must succeed AND genuinely change the
+		// route's content, so the id's Etag is guaranteed to move off E1 no
+		// matter how Caddy derives it. A byte-identical (no-op) PATCH can hash
+		// to the SAME Etag, which would leave E1 still live and silently defeat
+		// step 4's 412. The one field we can change WITHOUT tripping Publish's
+		// different-backend ErrHostnameConflict guard in step 5 is auth: the
+		// backend label:port must stay identical (Publish refuses to overwrite
+		// a route whose backend differs -- see caddyedge.go), so we add
+		// http_basic here and let Publish drop it again below. This is exactly
+		// what a second tailport computer sharing this edge would do between
+		// our GET and our next PATCH.
+		bumpHash, err := bcrypt.GenerateFromPassword([]byte("etag-bump-password"), bcrypt.DefaultCost)
+		if err != nil {
+			t.Fatalf("bcrypt hash: %v", err)
+		}
+		bumpAuth := &BasicAuth{User: "tester", Hash: string(bumpHash)}
+		status, body, err := client.mutate(ctx, http.MethodPatch, client.idURL(id), BuildRoute(hostname, label, backendPort, bumpAuth), e1)
+		if err != nil {
+			t.Fatalf("PATCH with fresh Etag E1: %v", err)
+		}
+		if status < 200 || status >= 300 {
+			t.Fatalf("PATCH with fresh Etag E1 status = %d, want 2xx; body = %s", status, body)
+		}
+
+		// 4. Replay a PATCH on the SAME id, still carrying the now-STALE E1.
+		// The id's Etag moved to E2 in step 3, so E1 no longer matches
+		// what's live. Real Caddy must reject this with 412 Precondition
+		// Failed -- the exact optimistic-concurrency check Publish's retry
+		// loop (caddyedge.go) relies on, here coming from a real caddy
+		// process evaluating a real If-Match header instead of a fake
+		// hand-coding the status.
+		status, body, err = client.mutate(ctx, http.MethodPatch, client.idURL(id), BuildRoute(hostname, label, backendPort, nil), e1)
+		if err != nil {
+			t.Fatalf("PATCH with stale Etag E1: %v", err)
+		}
+		if status != http.StatusPreconditionFailed {
+			t.Fatalf("PATCH with stale Etag E1 status = %d, want %d (real Caddy 412)", status, http.StatusPreconditionFailed)
+		}
+
+		// 5. Publish again through the public API. Internally this re-reads
+		// the route (picking up the CURRENT Etag, never the stale E1) and its
+		// PATCH must therefore succeed on the first attempt rather than
+		// looping into ErrConcurrentUpdate. List must show exactly one route
+		// for this hostname afterward, and it must still proxy -- proving
+		// the client reconciles to a single clean route after the
+		// concurrency event instead of leaving duplicate or broken state.
+		if err := client.Publish(ctx, hostname, label, backendPort, nil); err != nil {
+			t.Fatalf("Publish after concurrency event: %v", err)
+		}
+		routes, err := client.List(ctx)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		count := 0
+		for _, r := range routes {
+			if r.Hostname == hostname {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("routes for %s after concurrency event = %d, want exactly 1", hostname, count)
+		}
+
+		req, _ := http.NewRequest(http.MethodGet, proxyBase+"/", nil)
+		req.Host = hostname
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request after concurrency event: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status after concurrency event = %d, want 200", resp.StatusCode)
 		}
 	})
 }

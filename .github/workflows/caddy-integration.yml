@@ -42,11 +42,21 @@ jobs:
         # hand-picked GitHub release asset: it's the documented, most-used
         # install path, gives us a real signed package rather than a bare
         # binary we'd have to fetch/extract/chmod ourselves, and needs no
-        # guessing at an asset filename or architecture string. This installs
-        # caddy as a systemd service too, but the integration test never talks
-        # to that service -- it launches its own `caddy run` against an
-        # isolated, ephemeral-port config (see caddyedge_integration_test.go)
-        # and ignores whatever the packaged service is doing.
+        # guessing at an asset filename or architecture string.
+        #
+        # The Debian package's maintainer scripts auto-start caddy.service on
+        # install, and that packaged service binds :80 by default -- directly
+        # contradicting this job's guarantee that nothing here ever binds
+        # 80/443. A policy-rc.d that unconditionally refuses service-start
+        # requests (exit 101 is the documented "action forbidden" code
+        # invoke-rc.d honors) makes dpkg's postinst a no-op for starting the
+        # service, so the packaged service is prevented from EVER starting
+        # during install -- it's removed again right after so it doesn't
+        # affect any later step. `systemctl stop` afterward is
+        # belt-and-suspenders in case something still starts it. With the
+        # packaged service kept off, the only caddy that ever runs in this
+        # job is the test's own ephemeral-port instance (see
+        # caddyedge_integration_test.go).
         run: |
           set -eux
           sudo apt-get update
@@ -56,7 +66,11 @@ jobs:
           sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
           sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
           sudo apt-get update
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d
+          sudo chmod +x /usr/sbin/policy-rc.d
           sudo apt-get install -y caddy
+          sudo rm -f /usr/sbin/policy-rc.d
+          sudo systemctl stop caddy 2>/dev/null || true
           caddy version
 
       - name: build
