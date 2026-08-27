@@ -144,7 +144,11 @@ already documents this).
   ```sh
   gh workflow run brew-test.yml --ref main
   ```
-  (or push a commit carrying `[ci brew]`). Confirm **all five steps** pass —
+  Dispatch against `main` specifically — **not** a `[ci brew]` branch push: the
+  workflow tests the *triggering ref's* checked-out formula, so a push from any
+  branch not already carrying the `X.Y.Z` bump would defeat the precondition
+  above and pass against the old release. `--ref main` is the only invocation
+  that honors it. Confirm **all five steps** pass —
   tap-stage, `brew install --build-from-source`, `brew test` (proves the
   `-X main.version` stamp survives a tarball build), `brew audit --strict`, and
   the installed binary running from `PATH`. This is the only place

@@ -283,9 +283,10 @@ Consequences for you:
   sync-to-`main` is `continue-on-error` and `brew-test` builds from `main`'s
   `packaging/brew/tailport.rb` (not the live tap), so an unsynced formula would
   pass against the previous release; verify the `chore(brew): bump formula …`
-  commit landed. Then dispatch the opt-in macOS smoke test —
-  `gh workflow run brew-test.yml --ref main` (or a commit carrying `[ci brew]`)
-  — and confirm all five steps pass. Mechanics + the precondition in full:
+  commit landed. Then dispatch the opt-in macOS smoke test with
+  `gh workflow run brew-test.yml --ref main` — dispatch against `main`, **not** a
+  `[ci brew]` branch push, which tests that branch's formula and would defeat
+  the precondition — and confirm all five steps pass. Mechanics + the precondition in full:
   `RELEASING.md` step 8 (Verify). A failure is a formula bug to fix forward
   against `nqmn`/`s3wn`, not a release re-cut. Record the run URL + verdict on
   the release ticket **before closing it (step 10)**.
