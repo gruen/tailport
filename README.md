@@ -286,9 +286,11 @@ reading docs:
 
 > **Upgraded from an older tailport?** A `config.yaml` written before this
 > feature landed has **no `caddy:` block yet** — that's expected, and it's why
-> you won't find a `domain:` line to edit. It appears on the next save: publish
-> a port, or make any change that writes the file (favouriting/labelling a
-> port), or just paste the block below in by hand.
+> you won't find a `domain:` line to edit. It appears on the next save — any
+> change that writes the file, e.g. favouriting or labelling a port — or just
+> paste the block below in by hand and set `domain:` there. (Publishing can't
+> be the trigger: `P` is refused until `domain` is set, which is the very thing
+> you're trying to add.)
 
 ```yaml
 caddy:

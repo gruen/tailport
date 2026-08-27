@@ -227,9 +227,11 @@ and the background published-state poll stays off (zero cost until you opt in).
 tailport writes this block with commented defaults the first time it saves the
 config, so normally you only edit the `domain:` line. **If your `config.yaml`
 predates the publish feature the block won't be there yet** — trigger one save
-(publish a port, or any change that writes the file such as favouriting or
-labelling one), or paste the block above in by hand. Full field reference:
-the root README's [Configuration](../README.md#configuration) section.
+with any change that writes the file (favouriting or labelling a port), or
+paste the block above in by hand, then set `domain:`. (Publishing a port can't
+seed it: `P` is refused while `domain` is blank, which is exactly the state
+you're in.) Full field reference: the root README's
+[Configuration](../README.md#configuration) section.
 
 `hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
 tailport can find its admin API over the tailnet — it is unrelated to any
