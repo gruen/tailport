@@ -279,10 +279,16 @@ existing dark-terminal setups see no change either way.
 
 A `caddy` block configures the optional publish-to-the-internet path (see
 [Publishing to the public internet](#publishing-to-the-public-internet-caddy-edge)
-below). Unlike the port registry, this block is **always present** in the
-saved config file, seeded with visible defaults and explanatory comments the
-first time tailport writes it, so the available knobs are discoverable
-without reading docs:
+below). Unlike the port registry, tailport writes this block in full — with
+visible defaults and explanatory comments — the first time it saves the config
+once the feature is present, so the available knobs are discoverable without
+reading docs:
+
+> **Upgraded from an older tailport?** A `config.yaml` written before this
+> feature landed has **no `caddy:` block yet** — that's expected, and it's why
+> you won't find a `domain:` line to edit. It appears on the next save: publish
+> a port, or make any change that writes the file (favouriting/labelling a
+> port), or just paste the block below in by hand.
 
 ```yaml
 caddy:

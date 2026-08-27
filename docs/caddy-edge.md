@@ -195,15 +195,49 @@ explicit record:
 - `*.apps.example.com` → covers `foo.apps.example.com`, not
   `foo.bar.apps.example.com`.
 
-Pick the base you'll set as `caddy.domain` in tailport's config (see the
-root README's [Configuration](../README.md#configuration) section) and make
-sure your wildcard depth matches how you actually intend to publish.
+Pick the base you'll set as `caddy.domain` on each publishing machine (step 4
+below) and make sure your wildcard depth matches how you actually intend to
+publish.
 
 DNS propagation can take minutes to hours depending on your provider and
 prior TTLs; `dig +short A app.example.com` (or your OS's equivalent) to
 confirm before moving on.
 
-## 4. First-publish smoke test
+## 4. Point tailport at the edge
+
+Steps 1–3 stand up the shared edge once. This step is per-machine: every
+tailport computer that will publish needs to know where the edge is and what
+base domain to build public hostnames from. That lives in tailport's own
+config — `~/.config/tailport/config.yaml` (or `$XDG_CONFIG_HOME/tailport/...`) —
+under a `caddy:` block:
+
+```yaml
+caddy:
+    hostname: caddy            # the edge's PRIVATE tailnet name; tailport reaches its admin API here
+    domain: apps.example.com   # the base domain from step 3 -- public hostnames are built from this
+    server_name: tailport      # must match on every computer publishing through this same edge
+    admin_port: 2019
+```
+
+Set **`domain`** to the base whose DNS you pointed at the edge in step 3, at the
+wildcard depth you actually publish at (`*.apps.example.com` → `domain:
+apps.example.com`). Until it's set, `P` refuses with an error naming this field
+and the background published-state poll stays off (zero cost until you opt in).
+
+tailport writes this block with commented defaults the first time it saves the
+config, so normally you only edit the `domain:` line. **If your `config.yaml`
+predates the publish feature the block won't be there yet** — trigger one save
+(publish a port, or any change that writes the file such as favouriting or
+labelling one), or paste the block above in by hand. Full field reference:
+the root README's [Configuration](../README.md#configuration) section.
+
+`hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
+tailport can find its admin API over the tailnet — it is unrelated to any
+published *public* hostname. `server_name` must be identical on every tailport
+computer sharing this edge (it selects the shared routes array); it does not
+identify the source machine.
+
+## 5. First-publish smoke test
 
 Do this once, after the edge is deployed, DNS points at it, and you've
 published at least one port from a tailport-managed backend machine (press
@@ -268,7 +302,7 @@ request above is expected on its own and not itself evidence of a
 problem; something other than `401`/`2xx`/`3xx` on either request (a
 `502`, a TLS error, a hang) means work through Troubleshooting below.
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 **Certificate issuance fails or never completes.** Automatic HTTPS needs
 `:80` (ACME HTTP-01 challenge) and `:443` reachable from the public internet
@@ -308,10 +342,10 @@ tailscale ping <label>     # does the short label resolve and respond at all?
 
 If the search domain is missing or `tailscale ping <label>` fails here even
 though the backend is otherwise fine, the edge's own tailnet DNS setup is
-the problem — this is what step 4's smoke test exists to catch before it
+the problem — this is what step 5's smoke test exists to catch before it
 ever surfaces as a confusing 502 to an end user.
 
-## 6. Updating the edge
+## 7. Updating the edge
 
 ```sh
 fly deploy
