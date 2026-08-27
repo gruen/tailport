@@ -254,6 +254,13 @@ Linux host; say that plainly rather than implying coverage you don't have.
 
 **10. Close the ticket.**
 
+The release's final gate — do it **after** step 11's packaging has published
+*and* its Homebrew smoke test is recorded on the ticket (or explicitly deferred
+there with a note, if you're waiting on a macOS runner). Don't close on the
+binary checks alone; the formula is a required, separately-verified artifact,
+and step 11 runs after this step's position in the list only because packaging
+finishes last — the close still waits for it.
+
 ```
 kata close <ref> --done --message "<scope + what you actually observed>" --commit <sha>
 ```
@@ -272,12 +279,16 @@ Consequences for you:
 
 - **Watch both jobs.** They're the last in the run, after `release`.
 - **Then prove the Homebrew formula.** The `brew` job publishes the formula
-  but never installs it. Once it's pushed the bump to the tap, dispatch the
-  opt-in macOS smoke test — `gh workflow run brew-test.yml --ref main` (or a
-  commit carrying `[ci brew]`) — and confirm all five steps pass. Mechanics and
-  what each step proves: `RELEASING.md` step 8 (Verify). A failure is a formula
-  bug to fix forward against `nqmn`/`s3wn`, not a release re-cut — same rule as
-  any packaging failure. Record the run URL + verdict on the release ticket.
+  but never installs it. **First confirm `main` carries the bump** — the
+  sync-to-`main` is `continue-on-error` and `brew-test` builds from `main`'s
+  `packaging/brew/tailport.rb` (not the live tap), so an unsynced formula would
+  pass against the previous release; verify the `chore(brew): bump formula …`
+  commit landed. Then dispatch the opt-in macOS smoke test —
+  `gh workflow run brew-test.yml --ref main` (or a commit carrying `[ci brew]`)
+  — and confirm all five steps pass. Mechanics + the precondition in full:
+  `RELEASING.md` step 8 (Verify). A failure is a formula bug to fix forward
+  against `nqmn`/`s3wn`, not a release re-cut. Record the run URL + verdict on
+  the release ticket **before closing it (step 10)**.
 - **`main` moves under you after a tag** — two bot commits,
   `chore(aur): bump PKGBUILDs to X.Y.Z (18cr)` and
   `chore(brew): bump formula to X.Y.Z (nqmn)`. Fetch before touching the

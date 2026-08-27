@@ -133,8 +133,14 @@ already documents this).
   release.
 - **Prove the Homebrew formula installs from the published tarball.** The
   `brew` job in step 5 only *publishes* the formula to the tap; it never
-  installs it. Once that job has pushed the bump, dispatch the opt-in macOS
-  smoke test:
+  installs it. **First confirm `main` actually carries the new formula:** that
+  job's sync-to-`main` is `continue-on-error`, and `brew-test` builds from
+  `packaging/brew/tailport.rb` on `main` (it copies the repo file into a local
+  tap — it does *not* pull the live `gruen/homebrew-tap`), so a
+  published-but-unsynced formula would make this pass against the *previous*
+  release. Check the `chore(brew): bump formula to X.Y.Z (nqmn)` commit landed
+  and that formula's version reads `X.Y.Z` before dispatching. Then run the
+  opt-in macOS smoke test:
   ```sh
   gh workflow run brew-test.yml --ref main
   ```
