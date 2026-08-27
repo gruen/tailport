@@ -468,10 +468,13 @@ fly ips list                                               # the v4/v6 you point
 ```
 
 > ⚠️ `bootstrap-caddy.json` is a **tracked** file, so that `sed` leaves your
-> real tailnet in the working tree. It's baked into the image at `fly deploy`,
-> so afterward run `git checkout packaging/caddy-edge/bootstrap-caddy.json` to
-> keep it out of git (re-run the `sed` before a redeploy). `fly.toml` is already
-> gitignored.
+> real tailnet name in the working tree — do **not** `git commit` it. `fly
+> deploy` bakes it into the image, so once the deploy has built you can restore
+> the template. You are in `packaging/caddy-edge/`, so the revert is
+> `git checkout -- bootstrap-caddy.json` — a repo-root-relative path like
+> `packaging/caddy-edge/bootstrap-caddy.json` would **not** resolve from here.
+> Re-run the `sed` before any redeploy. (`fly.toml` is already gitignored, so it
+> needs none of this.)
 
 ### DNS (§3)
 
@@ -484,18 +487,21 @@ echo "*.$DOMAIN   AAAA   <v6>"
 ```
 
 A wildcard matches exactly one label: `*.$DOMAIN` covers `foo.$DOMAIN` but not
-`foo.bar.$DOMAIN`. tailport publishes one level deep (`<label>.$DOMAIN`), so one
-wildcard fits — deeper nesting would each need its own record.
+`foo.bar.$DOMAIN`, so `*.$DOMAIN` suffices **only** for hostnames exactly one
+label beneath `$DOMAIN`. The publish hostname is editable in the `P` flow and
+its prefill can nest (e.g. `<label>.<group>.$DOMAIN`), so if you publish nested
+names, add a matching wildcard/record for each level — §3 covers this in full.
 
 ### tailport: point at the edge, then verify (§4, §5)
 
 On **each** machine that will publish, set in `~/.config/tailport/config.yaml`:
 `caddy.domain: <your DOMAIN>` (and `caddy.hostname: <your HOSTNAME>` if you
-changed it off `caddy`). Restart tailport, publish a port with `P`, then from a
-host **not** on your tailnet:
+changed it off `caddy`). Restart tailport, publish a port with `P` — note the
+**exact** hostname it confirms (that's what DNS must cover and what you test,
+not an assumed `<label>.$DOMAIN`) — then from a host **not** on your tailnet:
 
 ```sh
-curl -sS -o /dev/null -w '%{http_code}\n' https://<label>.$DOMAIN/
+curl -sS -o /dev/null -w '%{http_code}\n' https://<the-hostname-P-confirmed>/
 ```
 
 `2xx`/`3xx` with a valid certificate means the whole chain — DNS, the dedicated
