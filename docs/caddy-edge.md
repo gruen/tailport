@@ -13,7 +13,7 @@ the `caddy.*` config fields this deploy has to line up with.
 day-to-day tailport use — everything else (`tailscale serve`/`space`,
 Funnel/`p`) needs no edge at all. Do it once per edge, not once per
 tailport machine: several tailport computers can publish through the same
-edge (see step 3).
+edge (see step 4).
 
 `example.com`, `<tailnet>`, and `<your-fly-app-name>` below are
 placeholders throughout — substitute your own domain, tailnet name (from the
@@ -21,6 +21,12 @@ Tailscale admin console or `tailscale status`), and Fly app name. Nothing in
 this repo ever holds your real values — see
 [`packaging/caddy-edge/fly.toml.example`](../packaging/caddy-edge/fly.toml.example)'s
 header and `.gitignore`.
+
+**Just want the whole thing to copy-paste?** The [scripted
+appendix](#appendix-the-whole-deploy-as-one-scripted-sequence) at the end is
+every step below collapsed into one parameterized sequence — fill a few shell
+variables and run it, each command explained inline. The numbered sections
+remain the reference for *why* each piece is there.
 
 ## 1. Tailscale ACL and auth key
 
@@ -383,3 +389,116 @@ acceptable trade-off for a personal tool serving a handful of machines, not
 a production SLA. If you want a recovery story beyond "republish," Fly
 volume snapshots (`fly volumes snapshots create`) are the mechanism, but
 setting up a snapshot schedule is outside this runbook's scope.
+
+## Appendix: the whole deploy as one scripted sequence
+
+The seven sections above are the reference — each carries the *why*. This
+appendix collapses them into one parameterized flow, for when you've done it
+once and want to copy-paste, or just want the whole shape on one screen. Every
+value is a shell variable set once up front; the two Tailscale **admin-console**
+steps (ACL, key) aren't shell and are marked as such. The `§N` links point back
+to the full rationale.
+
+### Set these once (shell variables)
+
+These are ordinary shell variables — they live only in the terminal session you
+set them in (not written anywhere, gone when that shell closes), so set them in
+the **same** shell you run the rest from, and re-run this block if you open a
+new one.
+
+```sh
+APP=my-tailport-edge      # Fly app name — globally unique across all of Fly; pick anything free
+REGION=iad                # Fly region id (`fly platform regions`), near your visitors
+DOMAIN=example.com        # your public base domain → tailport's caddy.domain (§4)
+HOSTNAME=caddy            # the edge's TAILNET name → tailport's caddy.hostname (§4); default `caddy`
+TAG=tag:tailport-edge     # the Tailscale ACL tag the edge registers under (§1)
+
+# your tailnet's MagicDNS suffix (the `<x>.ts.net` all your nodes share):
+TAILNET=$(tailscale status --json | sed -n 's/.*"MagicDNSSuffix": *"\([^"]*\)".*/\1/p')
+
+echo "APP=$APP REGION=$REGION DOMAIN=$DOMAIN HOSTNAME=$HOSTNAME TAG=$TAG TAILNET=$TAILNET"
+# ↑ all six must be non-empty before you continue.
+```
+
+### Tailscale: ACL, then key — admin console (§1)
+
+**ACL first** — Tailscale refuses to register a node under a tag it doesn't yet
+own. In the [admin console](https://login.tailscale.com/admin/acls): add a
+`tagOwners` entry for `$TAG`, plus two ACL rules — (a) let `$TAG` reach the
+backend machines on the ports they serve, and (b) restrict the admin API
+(`:2019`) to only the user/node you drive tailport from (Caddy's admin API has
+no auth of its own). Full JSON and the "ACLs are additive, no deny" caveat: §1.
+
+Then **mint an auth key** (Settings → Keys): **reusable**, **non-ephemeral**,
+tagged `$TAG` — tagging is what disables key expiry. Copy the `tskey-auth-…`; it
+becomes a Fly secret below, never a file in the repo.
+
+### Fly: files, resources, deploy — shell, from `packaging/caddy-edge/` (§2)
+
+```sh
+cd packaging/caddy-edge
+
+# fly.toml is gitignored — generate it from the template with your app + region:
+cp fly.toml.example fly.toml
+sed -i -e "s|<your-fly-app-name>|$APP|" -e "s|<fly-region>|$REGION|g" fly.toml
+
+# Only if HOSTNAME isn't the default `caddy`: register the node under it, or
+# tailport can't find the admin API at http://$HOSTNAME:2019 :
+if [ "$HOSTNAME" != caddy ]; then
+  printf '\n[env]\n  TS_HOSTNAME = "%s"\n' "$HOSTNAME" >> fly.toml
+fi
+
+# bootstrap-caddy.json is Caddy's first-boot config; admin.origins is a Host
+# allow-list guarding the admin API (anti-DNS-rebinding, NOT authentication).
+# Substitute your real tailnet — and hostname, if you changed it off `caddy`:
+sed -i \
+  -e "s|caddy:2019|${HOSTNAME}:2019|" \
+  -e "s|caddy.<tailnet>.ts.net:2019|${HOSTNAME}.${TAILNET}:2019|" \
+  bootstrap-caddy.json
+python3 -m json.tool bootstrap-caddy.json >/dev/null && echo "bootstrap JSON valid"
+
+fly apps create "$APP"                                     # the Fly app itself
+fly volumes create caddy_data --region "$REGION" --size 1  # persists tailscaled state + Caddy's live config/certs
+fly ips allocate-v4                                        # DEDICATED IPv4 (~$2/mo). OMIT for IPv6-only.
+fly ips allocate-v6                                        # free, dedicated by default
+fly secrets set TS_AUTHKEY=tskey-auth-...                  # the key from the ACL step (Fly-side only)
+fly deploy                                                 # builds the image (baking bootstrap-caddy.json) and boots it
+fly logs                                                   # follow: tailscaled → up → serve → caddy run
+fly ips list                                               # the v4/v6 you point DNS at
+```
+
+> ⚠️ `bootstrap-caddy.json` is a **tracked** file, so that `sed` leaves your
+> real tailnet in the working tree. It's baked into the image at `fly deploy`,
+> so afterward run `git checkout packaging/caddy-edge/bootstrap-caddy.json` to
+> keep it out of git (re-run the `sed` before a redeploy). `fly.toml` is already
+> gitignored.
+
+### DNS (§3)
+
+Point a wildcard at the addresses `fly ips list` printed. Print the exact record
+names to type into your DNS provider with:
+
+```sh
+echo "*.$DOMAIN   A      <dedicated-v4>   # omit for IPv6-only"
+echo "*.$DOMAIN   AAAA   <v6>"
+```
+
+A wildcard matches exactly one label: `*.$DOMAIN` covers `foo.$DOMAIN` but not
+`foo.bar.$DOMAIN`. tailport publishes one level deep (`<label>.$DOMAIN`), so one
+wildcard fits — deeper nesting would each need its own record.
+
+### tailport: point at the edge, then verify (§4, §5)
+
+On **each** machine that will publish, set in `~/.config/tailport/config.yaml`:
+`caddy.domain: <your DOMAIN>` (and `caddy.hostname: <your HOSTNAME>` if you
+changed it off `caddy`). Restart tailport, publish a port with `P`, then from a
+host **not** on your tailnet:
+
+```sh
+curl -sS -o /dev/null -w '%{http_code}\n' https://<label>.$DOMAIN/
+```
+
+`2xx`/`3xx` with a valid certificate means the whole chain — DNS, the dedicated
+IP, Caddy's automatic HTTPS, the route, the Host rewrite, the backend — is wired
+correctly. A `401` is the *expected* answer for a route you published behind
+basic auth; retry with `-u <user>` to confirm the backend beyond it.
