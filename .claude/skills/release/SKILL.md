@@ -271,6 +271,13 @@ with a deploy key. Both bot-commit their bump back to `main`. `brew` needs
 Consequences for you:
 
 - **Watch both jobs.** They're the last in the run, after `release`.
+- **Then prove the Homebrew formula.** The `brew` job publishes the formula
+  but never installs it. Once it's pushed the bump to the tap, dispatch the
+  opt-in macOS smoke test — `gh workflow run brew-test.yml --ref main` (or a
+  commit carrying `[ci brew]`) — and confirm all five steps pass. Mechanics and
+  what each step proves: `RELEASING.md` step 8 (Verify). A failure is a formula
+  bug to fix forward against `nqmn`/`s3wn`, not a release re-cut — same rule as
+  any packaging failure. Record the run URL + verdict on the release ticket.
 - **`main` moves under you after a tag** — two bot commits,
   `chore(aur): bump PKGBUILDs to X.Y.Z (18cr)` and
   `chore(brew): bump formula to X.Y.Z (nqmn)`. Fetch before touching the

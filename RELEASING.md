@@ -131,3 +131,18 @@ already documents this).
   `tailport --version` matches `vX.Y.Z`.
 - Confirm the self-update path (`internal/selfupdate`) also sees the new
   release.
+- **Prove the Homebrew formula installs from the published tarball.** The
+  `brew` job in step 5 only *publishes* the formula to the tap; it never
+  installs it. Once that job has pushed the bump, dispatch the opt-in macOS
+  smoke test:
+  ```sh
+  gh workflow run brew-test.yml --ref main
+  ```
+  (or push a commit carrying `[ci brew]`). Confirm **all five steps** pass —
+  tap-stage, `brew install --build-from-source`, `brew test` (proves the
+  `-X main.version` stamp survives a tarball build), `brew audit --strict`, and
+  the installed binary running from `PATH`. This is the only place
+  `brew install gruen/tap/tailport` actually compiles the release tarball
+  against its `go 1.26` go.mod, so it's the real proof the packaged path works;
+  a failure is a formula bug to fix forward against `nqmn`/`s3wn`, never a
+  release re-cut. Record the run URL + verdict on the release ticket.
