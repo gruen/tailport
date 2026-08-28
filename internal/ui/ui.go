@@ -695,6 +695,19 @@ type inspectConflictMsg struct {
 	err      error
 }
 
+// purgeDoneMsg reports a completed force-purge / take-over delete (kata 6n15).
+// On success captured carries the deleted route's exact bytes (meaningful for an
+// OWNED purge only — the ttfh undo seam) and the handler resumes the takeover
+// publish; err carries a caddyedge sentinel (ErrConflictChanged / ErrNoConflict /
+// ErrUnreachable / …) the handler maps to a re-classify or a toast. port/hostname
+// identify the attempted takeover so the resume can re-issue it.
+type purgeDoneMsg struct {
+	captured caddyedge.Captured
+	hostname string
+	port     int
+	err      error
+}
+
 // pendingPublish is the carry described on model.pendingPublish: the minimal
 // parameters needed to re-issue an in-flight publish after the flow state is
 // cleared, holding no plaintext secret.
@@ -786,6 +799,17 @@ const (
 	entryPublishCredUser // text: shared basic-auth username (first authed publish)
 	entryPublishCredPass // text (masked): shared basic-auth password (first authed publish)
 	entryConfirmPublish  // funnel-grade y/n naming the exact https://<hostname>
+	// The force-purge / take-over confirm ladders (kata 6n15; design §3.4). A
+	// publish that collided with an existing edge route can, for the two purgeable
+	// conflict kinds, be escalated to "delete that route and take the hostname
+	// over". An OWNED conflict (our own @id, another local port or another
+	// machine) is a NORMAL y/n; a FOREIGN route (drift AGENTS.md never silently
+	// overrides) is a SCARY two-gate: a y/n drift warning, then a typed-"purge"
+	// commit modeled exactly on the entryConfirmUnlockSSH gate. IdHijacked STAYS a
+	// refusal (never a blind delete of drift).
+	entryConfirmPurgeOwned       // y/n: force-purge an owned conflicting route, then take over
+	entryConfirmPurgeForeign     // y/n: scary drift warning before purging a foreign route
+	entryConfirmPurgeForeignType // typed-"purge" commit gate for a foreign route
 )
 
 type model struct {
@@ -952,6 +976,21 @@ type model struct {
 	publishCredUser    string // plaintext username (first authed publish only)
 	publishCredPass    string // plaintext password (first authed publish only; hashed + dropped at confirm)
 	publishEnableServe bool   // this confirm will also turn tailscale serve on
+	// Force-purge / take-over state (kata 6n15), carried from the
+	// inspectConflictMsg classification through the confirm ladder into the purge
+	// cmd, and cleared by clearPurgeFlow. purgeInfo drives the confirm text (naming
+	// the backend / a cross-machine route); purgeExpect is the re-verify identity
+	// PurgeConflict pins so the approved route can't be swapped out from under the
+	// confirm. purgeInput is the typed-"purge" gate for a foreign route (its own
+	// field, kept out of the publish flow's input-reset logic). takeoverHost is set
+	// on a successful purge so the resumed takeover publish can toast "took over
+	// <host>"; the secret-free resume params ride m.pendingPublish.
+	purgeHostname string
+	purgePort     int
+	purgeInfo     caddyedge.ConflictInfo
+	purgeExpect   caddyedge.PurgeExpect
+	purgeInput    textinput.Model
+	takeoverHost  string
 	// flash is the single transient notification shown in the bottom bar --
 	// copy confirmations, refusals, and errors alike (q89g). flashLevel tints
 	// it (info green / warn amber / error red). It clears on the next keypress
@@ -1206,6 +1245,13 @@ func New(cfg config.Config, markersOverride ...string) model {
 	pi.CharLimit = 253 // max DNS name length
 	pi.Width = 40
 
+	// The typed-"purge" gate for a foreign force-purge (kata 6n15), modeled on the
+	// type-"ssh" unlock gate (si above).
+	pui := textinput.New()
+	pui.Placeholder = "purge"
+	pui.CharLimit = 8
+	pui.Width = 10
+
 	if cfg.Ports == nil {
 		cfg.Ports = map[int]config.PortMeta{}
 	}
@@ -1240,7 +1286,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 
 	return model{
 		list: l, delegate: del, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
-		portInput: ti, labelInput: li, sshInput: si, publishInput: pi, configPath: configPath,
+		portInput: ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
 		// Optimistic until the first edge poll actually fails (see the field
 		// doc), so a configured-but-not-yet-polled edge doesn't flash
 		// "unreachable" on startup.
@@ -1578,6 +1624,19 @@ func inspectConflictCmd(client *caddyedge.Client, port int, hostname string) tea
 	return func() tea.Msg {
 		info, err := client.InspectConflict(context.Background(), hostname)
 		return inspectConflictMsg{port: port, hostname: hostname, info: info, err: err}
+	}
+}
+
+// purgeCmd force-deletes the conflicting route holding hostname and reports the
+// captured bytes (kata 6n15). PurgeConflict re-verifies the live route against
+// expect just before deleting, so a route approved under one confirm can't be
+// silently deleted after it changed. It is reached ONLY behind the escalated
+// confirm ladders; it never enables serve (that already happened) and never
+// touches funnel state.
+func purgeCmd(client *caddyedge.Client, hostname string, port int, expect caddyedge.PurgeExpect) tea.Cmd {
+	return func() tea.Msg {
+		captured, err := client.PurgeConflict(context.Background(), hostname, expect)
+		return purgeDoneMsg{captured: captured, hostname: hostname, port: port, err: err}
 	}
 }
 
@@ -2622,6 +2681,90 @@ func (m *model) confirmPublish() tea.Cmd {
 	return publishCmd(client, hostname, label, port, auth, enableServe)
 }
 
+// clearPurgeFlow resets the force-purge / take-over confirm state (kata 6n15) to
+// zero and returns the input to entryNone. It does NOT clear m.pendingPublish:
+// on CONFIRM that carry resumes the takeover; on CANCEL it is harmless (stale
+// only until the next confirmPublish, which overwrites it, and it is consulted
+// only on a fresh publishDoneMsg conflict). Called on cancel at every gate and
+// at confirm-time.
+func (m *model) clearPurgeFlow() {
+	m.mode = entryNone
+	m.purgeHostname = ""
+	m.purgePort = 0
+	m.purgeInfo = caddyedge.ConflictInfo{}
+	m.purgeExpect = caddyedge.PurgeExpect{}
+	m.purgeInput.Reset()
+}
+
+// updatePurgeEntry drives the two force-purge confirm ladders (kata 6n15; design
+// §3.4), owning every key for the purge modes so keystrokes never leak into
+// another input. OwnedDiffBackend is a single normal y/n; ForeignOverlap is the
+// scary two-gate (a y/n drift warning, then a typed-"purge" commit modeled
+// EXACTLY on entryConfirmUnlockSSH — only an exact, trimmed, case-insensitive
+// "purge" commits; anything else, including empty/enter, cancels with no
+// mutation).
+func (m *model) updatePurgeEntry(msg tea.KeyMsg) tea.Cmd {
+	switch m.mode {
+	case entryConfirmPurgeOwned:
+		// Normal y/n: y force-purges and takes over, every other key cancels.
+		switch msg.String() {
+		case "y", "Y":
+			return m.confirmPurge()
+		default:
+			m.clearPurgeFlow()
+			return nil
+		}
+	case entryConfirmPurgeForeign:
+		// Scary first gate: y advances to the typed-word commit, every other key
+		// cancels with no mutation.
+		switch msg.String() {
+		case "y", "Y":
+			m.purgeInput.Reset()
+			m.purgeInput.Focus()
+			m.mode = entryConfirmPurgeForeignType
+			return nil
+		default:
+			m.clearPurgeFlow()
+			return nil
+		}
+	case entryConfirmPurgeForeignType:
+		// Typed-word commit (mirror entryConfirmUnlockSSH): commit only on enter
+		// with an exact "purge"; esc cancels; anything else feeds the input.
+		switch msg.String() {
+		case "enter":
+			typed := strings.ToLower(strings.TrimSpace(m.purgeInput.Value()))
+			if typed != "purge" {
+				m.clearPurgeFlow() // wrong word (incl. empty): cancel, no mutation
+				return nil
+			}
+			return m.confirmPurge()
+		case "esc":
+			m.clearPurgeFlow()
+			return nil
+		default:
+			var cmd tea.Cmd
+			m.purgeInput, cmd = m.purgeInput.Update(msg)
+			return cmd
+		}
+	}
+	return nil
+}
+
+// confirmPurge fires the force-purge on the final gate of either ladder: it
+// launches purgeCmd with the re-verify identity (m.purgeExpect) and marks the
+// port in-flight. m.pendingPublish (already set at confirmPublish-time, untouched
+// through the conflict path) carries the secret-free params the purgeDoneMsg
+// success handler resumes the takeover with.
+func (m *model) confirmPurge() tea.Cmd {
+	hostname := m.purgeHostname
+	port := m.purgePort
+	expect := m.purgeExpect
+	client := m.caddyClient()
+	m.clearPurgeFlow()
+	m.pending = port
+	return purgeCmd(client, hostname, port, expect)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -2756,6 +2899,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// (refresh reconciles serve state; pollPublishedCmd re-reads the live
 		// routes) so the UI reflects Caddy's actual state.
 		m.pending = 0
+		// Consume any pending "took over <host>" flag now (kata 6n15): a takeover
+		// publish that FAILS clears it too, so a later ordinary publish can't emit a
+		// stale "took over" toast. Only a success below uses it.
+		tookOver := m.takeoverHost
+		m.takeoverHost = ""
 		if msg.err != nil {
 			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
 				// The auto-enable-serve step hit tailscale's operator gate --
@@ -2787,6 +2935,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// setup (DNS + a deployed edge) is demonstrably working, so retire the
 		// sticky setup reminder (kata w131).
 		m.domainSetupPending = false
+		if tookOver != "" {
+			// This publish resumed a force-purge take-over (kata 6n15): a plain
+			// success toast naming the host we took over.
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s", tookOver), flashInfo), refresh, m.pollPublishedCmd())
+		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
 	case inspectConflictMsg:
@@ -2820,19 +2973,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				refresh, m.pollPublishedCmd())
 		}
 
-		// ── SEAM (kata 6n15): force-purge + take-over ─────────────────────────
-		// The conflict is fully classified in msg.info (Kind / Owned / ID /
-		// backend label:port / handler). Pillar 1 (qfbf) REFUSES with attribution
-		// here. 6n15 inserts, BEFORE the refusal below, a "press <key> to
-		// force-purge and take over" affordance driven off this classification:
-		//   - OwnedDiffBackend -> a normal y/n confirm (design entryConfirmPurgeOwned);
-		//   - ForeignOverlap   -> the scary two-gate confirm (entryConfirmPurgeForeign[Type]);
-		//   - IdHijacked       -> STAYS a refusal (never a blind delete of drift).
-		// The resume-after-purge carry is m.pendingPublish (secret-free). Do NOT
-		// implement the purge affordance in this pillar.
-		// ──────────────────────────────────────────────────────────────────────
-		refusal := conflictRefusalText(msg.info, msg.hostname, shortLabel(m.fqdn))
-		return m, tea.Batch(m.setErr(refusal), refresh, m.pollPublishedCmd())
+		// ── force-purge + take-over (kata 6n15; design §3.4) ──────────────────
+		// The conflict is fully classified in msg.info. For the two PURGEABLE
+		// kinds, replace qfbf's flat refusal with an escalated confirm ladder that,
+		// on confirmation, deletes the offending route and RESUMES the publish
+		// (m.pendingPublish carries the secret-free params). IdHijacked and any
+		// other kind stay a refusal — a re-pointed @id is drift, never a blind
+		// delete.
+		switch msg.info.Kind {
+		case caddyedge.OwnedDiffBackend:
+			// A tailport-owned route (this machine's other port, or another
+			// machine's) — a NORMAL y/n whose text names the backend.
+			m.purgeHostname, m.purgePort = msg.hostname, msg.port
+			m.purgeInfo = msg.info
+			m.purgeExpect = caddyedge.ExpectFromConflict(msg.info)
+			m.mode = entryConfirmPurgeOwned
+			return m, nil
+		case caddyedge.ForeignOverlap:
+			// A route tailport did NOT create (drift) — the SCARY first gate: a
+			// y/n drift warning, which on y advances to the typed-"purge" commit.
+			m.purgeHostname, m.purgePort = msg.hostname, msg.port
+			m.purgeInfo = msg.info
+			m.purgeExpect = caddyedge.ExpectFromConflict(msg.info)
+			m.mode = entryConfirmPurgeForeign
+			return m, nil
+		default:
+			// IdHijacked (and any defensive fallthrough): refuse with attribution.
+			refusal := conflictRefusalText(msg.info, msg.hostname, shortLabel(m.fqdn))
+			return m, tea.Batch(m.setErr(refusal), refresh, m.pollPublishedCmd())
+		}
+
+	case purgeDoneMsg:
+		// A force-purge / take-over delete finished (kata 6n15). Clear the in-flight
+		// marker the confirmPurge launch set.
+		m.pending = 0
+		if msg.err != nil {
+			switch {
+			case errors.Is(msg.err, caddyedge.ErrConflictChanged):
+				// The route changed between classify and purge (possibly an
+				// owned→foreign escalation, or an owned backend swap). NOTHING was
+				// deleted. Re-classify and re-open the correct — possibly scarier —
+				// ladder: a route approved as owned must never be deleted under only
+				// the normal confirm once it became foreign.
+				m.pending = msg.port
+				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname)
+			case errors.Is(msg.err, caddyedge.ErrNoConflict):
+				// The conflict cleared before we deleted anything. Reuse the qfbf None
+				// path: re-classify, which returns None and retries the plain publish
+				// once (bounded). retried starts false on this fresh pendingPublish.
+				m.pendingPublish.retried = false
+				m.pending = msg.port
+				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname)
+			default:
+				// ErrUnreachable / ErrConcurrentUpdate / any other: a toast, nothing
+				// half-done. The (possibly) deleted route, if any, is reflected by the
+				// re-fetch; on these errors PurgeConflict deletes nothing.
+				return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+			}
+		}
+
+		// The purge succeeded: the offending route is gone. RESUME THE TAKEOVER —
+		// republish OUR route, rebuilding auth from cfg (no plaintext survives; the
+		// serve is already on, so enableServe=false). takeoverHost lets the takeover
+		// publish's success toast say "took over <host>".
+		//
+		// ── SEAM (kata dw57): trigger the "poof" delete animation for the purged
+		//    route HERE, on the success path, before/alongside the resume publish.
+		//    6n15 shows only a plain toast — do NOT build the poof here.
+		// ── SEAM (kata ttfh): for an OWNED purge (msg.captured.HadID &&
+		//    m.purgeExpect.Owned — capture is undoable only for an owned route,
+		//    design OQ8), arm m.lastPurge with msg.captured and expose the restore
+		//    affordance HERE. 6n15 does NEITHER: no arm, no undo — leave this seam.
+		var auth *caddyedge.BasicAuth
+		if m.pendingPublish.withAuth {
+			auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
+		}
+		m.takeoverHost = msg.hostname
+		m.pending = msg.port
+		return m, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false)
 
 	case publishPollMsg:
 		// Drop a stale result (roborev 0k12 #1): polls are remote round-trips
@@ -3039,6 +3257,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case entryPublishDomain, entryPublishHost, entryPublishAuth,
 				entryPublishCredUser, entryPublishCredPass, entryConfirmPublish:
 				return m, m.updatePublishEntry(msg)
+			case entryConfirmPurgeOwned, entryConfirmPurgeForeign, entryConfirmPurgeForeignType:
+				// The force-purge / take-over ladders (kata 6n15) are their own
+				// self-contained state machine, dispatched here for the same reason
+				// as the publish flow: keystrokes reach purgeInput, never labelInput.
+				return m, m.updatePurgeEntry(msg)
 			}
 			switch msg.String() {
 			case "esc":
@@ -5952,6 +6175,38 @@ func (m model) renderBottom() string {
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
+	case entryConfirmPurgeOwned:
+		// Normal y/n force-purge of an owned route. Name the backend; for a
+		// cross-machine owned route (backend label != this machine's short label),
+		// name that it belongs to another machine so a take-over is never invisible.
+		desc := backendDesc(m.purgeInfo)
+		var head string
+		if m.purgeInfo.BackendParseable && m.purgeInfo.Label != shortLabel(m.fqdn) {
+			head = fmt.Sprintf("⚠ Take over %s from ANOTHER machine (%s)?", m.purgeHostname, desc)
+		} else {
+			head = fmt.Sprintf("⚠ Take over %s from your %s?", m.purgeHostname, desc)
+		}
+		lines := []string{
+			warnStyle.Render(head),
+			helpStyle.Render("   force-purges that edge route and republishes it to this port"),
+			helpStyle.Render("   (y: confirm, any other key: cancel)"),
+		}
+		return strings.Join(lines, "\n")
+	case entryConfirmPurgeForeign:
+		// Scary first gate: a y/n drift warning naming that the route wasn't created
+		// by tailport (AGENTS.md treats foreign routes as drift, never silently
+		// overridden).
+		lines := []string{
+			warnStyle.Render(fmt.Sprintf("⚠ %s is held by a route tailport did NOT create (%s).", m.purgeHostname, backendDesc(m.purgeInfo))),
+			warnStyle.Render("   Force-purging deletes a route you didn't make through tailport — this is drift."),
+			helpStyle.Render("   (y: continue to the typed confirm, any other key: cancel)"),
+		}
+		return strings.Join(lines, "\n")
+	case entryConfirmPurgeForeignType:
+		// Typed-word commit (mirror entryConfirmUnlockSSH's shape).
+		return warnStyle.Render(fmt.Sprintf("⚠ permanently delete the foreign route holding %s — ", m.purgeHostname)) +
+			helpStyle.Render("type ") + helpKeyStyle.Render("purge") + helpStyle.Render(" to confirm: ") +
+			m.purgeInput.View() + helpStyle.Render("  (esc: cancel)")
 	}
 	bar := m.renderStatusLine()
 	// The sticky banners, when active, sit ABOVE the status line -- unlike the

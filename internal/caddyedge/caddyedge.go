@@ -38,6 +38,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strconv"
@@ -80,6 +81,16 @@ var (
 	// ErrConcurrentUpdate means the shared config kept moving under us: the
 	// If-Match retry budget was exhausted without a clean mutation.
 	ErrConcurrentUpdate = errors.New("caddy config changed concurrently; retries exhausted")
+	// ErrNoConflict means PurgeConflict re-read the routes array and found nothing
+	// overlapping the hostname any more: the conflict cleared between classify and
+	// purge, so there is nothing to delete. The caller may retry the plain publish.
+	ErrNoConflict = errors.New("no route overlaps the hostname; nothing to purge")
+	// ErrConflictChanged means the route PurgeConflict re-located no longer matches
+	// the identity classified at confirm time (an owned→foreign escalation, an owned
+	// backend swap, or a foreign route that changed under us). The caller must
+	// re-classify and re-confirm with the correct (possibly scarier) ladder rather
+	// than delete a route approved under a now-stale, weaker confirm.
+	ErrConflictChanged = errors.New("the conflicting route changed since it was classified")
 )
 
 // BasicAuth is a single http_basic credential for the edge. Hash is a bcrypt
@@ -733,6 +744,234 @@ func (c *Client) InspectConflict(ctx context.Context, hostname string) (Conflict
 
 	// Nothing overlaps and our @id is clean: the conflict cleared.
 	return ConflictInfo{Kind: None}, nil
+}
+
+// Captured is the byte-faithful record of a route PurgeConflict deleted, so a
+// later undo (kata ttfh) can re-POST the EXACT bytes Caddy held rather than a
+// lossy re-serialization (design §3.3 — Route/Handler have no raw catch-all, so
+// a decode+re-marshal would silently drop any field tailport doesn't model). Raw
+// is meaningful for undo only when the purge was OWNED (design OQ8); it is
+// returned for every purge (harmless) and the caller decides whether to arm undo.
+type Captured struct {
+	// Raw is the exact JSON element bytes of the deleted route.
+	Raw json.RawMessage
+	// Hostname is the public hostname whose conflict was purged (canonicalized).
+	Hostname string
+	// HadID reports whether the deleted route carried an @id (so it was deleted by
+	// /id/<id>, and an owned capture is undoable by re-POST); false for a truly
+	// id-less foreign route deleted by array index.
+	HadID bool
+}
+
+// PurgeExpect is the identity of the conflicting route as classified at confirm
+// time. PurgeConflict re-verifies the live route against it just before deleting,
+// so a route the user approved under one confirm can never be silently deleted
+// after it changed underneath them (design §3.2, review r1-F8). The load-bearing
+// safety property is Owned: a route approved as OWNED (the normal confirm) that
+// has since become FOREIGN fails this check → ErrConflictChanged → the UI
+// re-classifies and re-opens the scarier ladder rather than deleting drift under
+// a weaker confirm.
+//
+// It is built from a ConflictInfo (ExpectFromConflict). Because ConflictInfo
+// carries no raw bytes by design (§3.1), the default identity is STRUCTURAL —
+// owned-ness, @id, and the backend (label:port for a proxy, else the handler
+// name). A caller that has the raw element bytes may instead pin RawHash for an
+// exact-bytes identity of an id-less foreign route; when RawHash is set it, plus
+// owned-ness, is the whole check.
+type PurgeExpect struct {
+	Owned            bool
+	ID               string
+	BackendParseable bool
+	Label            string
+	Port             int
+	Handler          string
+	// RawHash, when non-empty, replaces the structural backend/@id check with an
+	// exact hash of the element's raw bytes (design §3.2, for an id-less foreign
+	// route). Owned-ness is still checked alongside it.
+	RawHash string
+}
+
+// ExpectFromConflict builds the re-verify identity from a read-only conflict
+// classification (the identity the UI showed the user at confirm time). It uses
+// the structural fields ConflictInfo carries; it does not set RawHash (§3.1 keeps
+// raw bytes out of the classifier).
+func ExpectFromConflict(info ConflictInfo) PurgeExpect {
+	return PurgeExpect{
+		Owned:            info.Owned,
+		ID:               info.ID,
+		BackendParseable: info.BackendParseable,
+		Label:            info.Label,
+		Port:             info.Port,
+		Handler:          info.Handler,
+	}
+}
+
+// matches reports whether the live route (decoded r, raw bytes raw) still has the
+// classified identity. owned-ness is always required to be stable (the escalation
+// guard); then either the RawHash exact-bytes identity or the structural
+// @id+backend identity must hold.
+func (e PurgeExpect) matches(r Route, raw json.RawMessage) bool {
+	if strings.HasPrefix(r.ID, idPrefix) != e.Owned {
+		return false // owned↔foreign escalation: never delete under a stale confirm
+	}
+	if e.RawHash != "" {
+		return raw != nil && rawIdentityHash(raw) == e.RawHash
+	}
+	if r.ID != e.ID {
+		return false
+	}
+	label, port, ok := backendOf(r)
+	if ok != e.BackendParseable {
+		return false
+	}
+	if ok {
+		return label == e.Label && port == e.Port
+	}
+	// A non-proxy route the backend dial can't name: pin the handler instead.
+	return firstHandler(r) == e.Handler
+}
+
+// PurgeConflict force-deletes the route currently holding hostname and returns
+// its captured bytes, so the caller can take the hostname over (design §3.2). It
+// is the destructive counterpart to InspectConflict and is only ever reached
+// behind the UI's escalated confirm ladders.
+//
+// Each attempt (≤ maxRetries) re-reads the shared routes array with a FRESH
+// path-scoped etag, re-locates the host-overlapping route, and re-verifies it
+// still matches expect — the identity classified at confirm time. If nothing
+// overlaps → ErrNoConflict; if the live route drifted from expect (an
+// owned→foreign escalation or an owned backend swap) → ErrConflictChanged. Only
+// then does it capture the exact raw element bytes and delete: by /id/<id> under
+// the id-scope etag when the route carries an @id (stable across index shifts),
+// else by DELETE .../routes/<index> under the routes-array etag (the id-less
+// foreign case; the parent-scope If-Match re-hashes the whole array, so any
+// concurrent add/remove/reorder → 412 → re-read). A 412 or a vanished route
+// re-reads and retries; the retry budget exhausting yields ErrConcurrentUpdate.
+func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect PurgeExpect) (Captured, error) {
+	hostname = canonHost(hostname)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		raws, arrEtag, err := c.fetchRoutesRaw(ctx)
+		if err != nil {
+			return Captured{}, err
+		}
+
+		idx := -1
+		var raw json.RawMessage
+		var route Route
+		for i, elem := range raws {
+			var r Route
+			if err := json.Unmarshal(elem, &r); err != nil {
+				continue // an element we can't even decode can't be our overlap
+			}
+			if routeOverlaps(r, hostname) {
+				idx, raw, route = i, elem, r
+				break
+			}
+		}
+		if idx < 0 {
+			return Captured{}, ErrNoConflict
+		}
+		if !expect.matches(route, raw) {
+			return Captured{}, ErrConflictChanged
+		}
+
+		// Capture the EXACT bytes before deleting (a copy — raw aliases the fetch
+		// buffer). This is byte-faithful even if the route accreted fields tailport
+		// doesn't model.
+		captured := Captured{
+			Raw:      append(json.RawMessage(nil), raw...),
+			Hostname: hostname,
+			HadID:    route.ID != "",
+		}
+
+		var body []byte
+		var status int
+		if route.ID != "" {
+			// Prefer stable @id deletion. Fetch the id-scope etag; a 404 means the
+			// route vanished between the array read and now → re-read and retry.
+			live, idEtag, found, err := c.fetchByID(ctx, route.ID)
+			if err != nil {
+				return Captured{}, err
+			}
+			if !found {
+				continue
+			}
+			// Re-verify against the id-read too, closing the array-read→id-read
+			// window: if it drifted from expect here, don't delete it.
+			if !expect.matches(live, raw) {
+				return Captured{}, ErrConflictChanged
+			}
+			body, status, _, err = c.do(ctx, http.MethodDelete, c.idURL(route.ID), nil, idEtag)
+			if err != nil {
+				return Captured{}, err
+			}
+		} else {
+			// Truly id-less foreign route: delete by array index under the
+			// routes-array etag. The parent-scope If-Match re-hashes the whole
+			// array, so an index-shifting concurrent edit → 412 → re-read.
+			body, status, _, err = c.do(ctx, http.MethodDelete, c.routesURL()+"/"+strconv.Itoa(idx), nil, arrEtag)
+			if err != nil {
+				return Captured{}, err
+			}
+		}
+		if status == http.StatusPreconditionFailed {
+			continue // config moved under us; re-read, re-verify, retry
+		}
+		if status == http.StatusNotFound {
+			continue // already gone; re-read (a subsequent no-overlap → ErrNoConflict)
+		}
+		if status < 200 || status >= 300 {
+			return Captured{}, c.statusError(status, body)
+		}
+		return captured, nil
+	}
+	return Captured{}, ErrConcurrentUpdate
+}
+
+// fetchRoutesRaw GETs the shared routes array as raw elements (each preserving
+// any field tailport doesn't model) and the array's path-scoped Etag for a
+// subsequent index-DELETE If-Match. A 404 or empty body is an empty array. It is
+// the raw-fidelity twin of fetchRoutes, used by PurgeConflict so capture is
+// byte-faithful and per-element @id/host reads only what they need.
+func (c *Client) fetchRoutesRaw(ctx context.Context) (routes []json.RawMessage, etag string, err error) {
+	body, status, etag, err := c.do(ctx, http.MethodGet, c.routesURL(), nil, "")
+	if err != nil {
+		return nil, "", err
+	}
+	if status == http.StatusNotFound {
+		return nil, etag, nil
+	}
+	if status < 200 || status >= 300 {
+		return nil, "", c.statusError(status, body)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, etag, nil
+	}
+	if err := json.Unmarshal(body, &routes); err != nil {
+		return nil, "", fmt.Errorf("parsing caddy routes: %w", err)
+	}
+	return routes, etag, nil
+}
+
+// rawRouteID extracts a route element's @id, reading only that key ("" if absent
+// or the element doesn't parse). Cheaper and more forgiving than a full Route
+// decode when only ownership/identity is needed.
+func rawRouteID(raw json.RawMessage) string {
+	var m struct {
+		ID string `json:"@id"`
+	}
+	_ = json.Unmarshal(raw, &m)
+	return m.ID
+}
+
+// rawIdentityHash is a stable, opaque fingerprint of a route element's exact
+// bytes, used as an id-less foreign route's PurgeExpect identity (PurgeExpect.
+// RawHash). It is not cryptographic — only a change detector — so a non-crypto
+// hash keeps the zero-dep rule and is plenty.
+func rawIdentityHash(raw json.RawMessage) string {
+	h := fnv.New64a()
+	_, _ = h.Write(raw)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // firstHandler returns the name of a route's first handler ("" if it has none),

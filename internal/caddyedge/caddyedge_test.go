@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -121,18 +122,30 @@ func TestBuildRouteAuthOrdering(t *testing.T) {
 // --- fake admin API ---------------------------------------------------------
 
 // fakeAdmin is an in-process model of the Caddy admin API surface caddyedge
-// uses. It models /id/<id> (GET/PATCH/DELETE), the routes array (GET/POST),
-// Etag emission, If-Match -> 412 on mismatch, and — crucially — records whether
-// any client mutation actually occurred, so "no mutation" assertions are real.
+// uses, rebuilt for kata 6n15 (design §7 / review r1-F7) to faithfully mirror
+// the mechanics purge/capture/If-Match rest on:
+//
+//   - Routes are stored as raw json.RawMessage ELEMENTS, so a route carrying a
+//     field tailport doesn't model round-trips byte-for-byte (capture fidelity).
+//   - ETags are PATH-SCOPED the way real Caddy emits them (PR #4579): a GET or a
+//     mutation returns Etag "<path> <hash>"; a mutating request's If-Match carries
+//     "<path> <hash>", and precheck re-hashes the config AT THE PATH EMBEDDED IN
+//     THE If-Match VALUE (not the request URL) — which is exactly what lets a
+//     parent routes-array If-Match guard a child index DELETE.
+//   - POST rejects a duplicate @id with a Caddy-style 4xx (an @id is unique).
+//   - It supports index-DELETE (.../routes/<i>, delete-and-shift, bounds-checked)
+//     alongside /id DELETE, so the id-less-foreign purge path is real.
+//
+// It still records whether any client mutation actually occurred, so "no
+// mutation" assertions remain real.
 type fakeAdmin struct {
-	mu      sync.Mutex
-	server  string  // server name embedded in the routes path
-	routes  []Route // the shared routes array
-	version int     // drives the Etag; every accepted mutation bumps it
+	mu     sync.Mutex
+	server string            // server name embedded in the routes path
+	routes []json.RawMessage // the shared routes array, raw elements
 
 	// force412, when > 0, injects a precondition failure on each of the next
-	// N client mutations (simulating a concurrent edit that also bumps the
-	// Etag), letting tests exercise the 412 re-read/retry loop deterministically.
+	// N client mutations (simulating a concurrent edit), letting tests exercise
+	// the 412 re-read/retry loop deterministically.
 	force412 int
 	// deleteReturns404, when true, makes DELETE answer 404 without removing the
 	// route, to exercise the "404 on DELETE = success" branch.
@@ -143,33 +156,90 @@ type fakeAdmin struct {
 	post      int
 	patch     int
 	del       int
-	put       int // any PUT attempt at all — the code must never issue one
+	put       int      // any PUT attempt at all — the code must never issue one
+	delPaths  []string // request paths of accepted DELETEs, to assert /id vs index
 }
 
-func (f *fakeAdmin) etag() string { return `"` + strconv.Itoa(f.version) + `"` }
+func (f *fakeAdmin) routesPath() string {
+	return "/config/apps/http/servers/" + f.server + "/routes"
+}
 
 func (f *fakeAdmin) indexOf(id string) int {
-	for i, r := range f.routes {
-		if r.ID == id {
+	for i, raw := range f.routes {
+		if rawRouteID(raw) == id {
 			return i
 		}
 	}
 	return -1
 }
 
-// precheck enforces optimistic concurrency for a mutation. It returns false
-// (having written a 412 response) when a forced failure is pending or the
-// client's If-Match doesn't match the current Etag.
+// routeAt decodes the i-th stored element into a typed Route, for the few
+// existing assertions that reach past len() into a route's fields.
+func (f *fakeAdmin) routeAt(i int) Route {
+	var r Route
+	_ = json.Unmarshal(f.routes[i], &r)
+	return r
+}
+
+// hashAt returns a stable hash of the config at path — the whole routes array,
+// an /id element, or an index element — mirroring how real Caddy scopes an ETag
+// to a config path. exists is false when the path names nothing.
+func (f *fakeAdmin) hashAt(path string) (hash string, exists bool) {
+	switch {
+	case path == f.routesPath():
+		b, _ := json.Marshal(f.routes)
+		return rawIdentityHash(b), true
+	case strings.HasPrefix(path, "/id/"):
+		idx := f.indexOf(strings.TrimPrefix(path, "/id/"))
+		if idx < 0 {
+			return "", false
+		}
+		return rawIdentityHash(f.routes[idx]), true
+	case strings.HasPrefix(path, f.routesPath()+"/"):
+		i, err := strconv.Atoi(strings.TrimPrefix(path, f.routesPath()+"/"))
+		if err != nil || i < 0 || i >= len(f.routes) {
+			return "", false
+		}
+		return rawIdentityHash(f.routes[i]), true
+	}
+	return "", false
+}
+
+// etagFor renders the path-scoped ETag real Caddy emits: "<path> <hash>".
+func (f *fakeAdmin) etagFor(path string) string {
+	h, _ := f.hashAt(path)
+	return `"` + path + " " + h + `"`
+}
+
+// splitIfMatch splits a `"<path> <hash>"` If-Match value into its path and hash.
+// Both halves are space-free (a URL path and a hex hash), so a single Cut on the
+// first space is unambiguous.
+func splitIfMatch(im string) (path, hash string, ok bool) {
+	im = strings.Trim(im, `"`)
+	return strings.Cut(im, " ")
+}
+
+// precheck enforces PATH-SCOPED optimistic concurrency for a mutation. It parses
+// the client's If-Match ("<path> <hash>") and re-hashes the config at the
+// EMBEDDED path (not the request URL — this is what makes a parent routes-array
+// If-Match correctly guard a child index DELETE), writing a 412 on mismatch. A
+// pending force412 injects a precondition failure to exercise the retry loop. An
+// empty If-Match is allowed (an unconditional write / a pre-2.5.2 edge).
 func (f *fakeAdmin) precheck(w http.ResponseWriter, r *http.Request) bool {
 	if f.force412 > 0 {
 		f.force412--
-		f.version++ // a concurrent editor moved the config
-		w.Header().Set("Etag", f.etag())
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
 		http.Error(w, "config changed under you", http.StatusPreconditionFailed)
 		return false
 	}
-	if im := r.Header.Get("If-Match"); im != "" && im != f.etag() {
-		w.Header().Set("Etag", f.etag())
+	im := r.Header.Get("If-Match")
+	if im == "" {
+		return true
+	}
+	path, hash, ok := splitIfMatch(im)
+	cur, exists := f.hashAt(path)
+	if !ok || !exists || cur != hash {
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
 		http.Error(w, "etag mismatch", http.StatusPreconditionFailed)
 		return false
 	}
@@ -188,8 +258,10 @@ func (f *fakeAdmin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/id/"):
 		f.handleID(w, r, strings.TrimPrefix(r.URL.Path, "/id/"))
-	case r.URL.Path == "/config/apps/http/servers/"+f.server+"/routes":
+	case r.URL.Path == f.routesPath():
 		f.handleRoutes(w, r)
+	case strings.HasPrefix(r.URL.Path, f.routesPath()+"/"):
+		f.handleRouteIndex(w, r, strings.TrimPrefix(r.URL.Path, f.routesPath()+"/"))
 	default:
 		http.Error(w, "unknown path", http.StatusNotFound)
 	}
@@ -203,7 +275,7 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 			http.Error(w, "unknown object id", http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Etag", f.etag())
+		w.Header().Set("Etag", f.etagFor("/id/"+id))
 		f.writeJSON(w, f.routes[idx])
 	case http.MethodPatch:
 		if !f.precheck(w, r) {
@@ -213,16 +285,15 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 			http.Error(w, "unknown object id", http.StatusNotFound)
 			return
 		}
-		var nr Route
-		if err := json.NewDecoder(r.Body).Decode(&nr); err != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		f.routes[idx] = nr
-		f.version++
+		f.routes[idx] = json.RawMessage(body) // store raw bytes verbatim
 		f.mutations++
 		f.patch++
-		w.Header().Set("Etag", f.etag())
+		w.Header().Set("Etag", f.etagFor("/id/"+id))
 	case http.MethodDelete:
 		if !f.precheck(w, r) {
 			return
@@ -236,10 +307,10 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 			return
 		}
 		f.routes = append(f.routes[:idx], f.routes[idx+1:]...)
-		f.version++
 		f.mutations++
 		f.del++
-		w.Header().Set("Etag", f.etag())
+		f.delPaths = append(f.delPaths, "/id/"+id)
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
 	case http.MethodPut:
 		// PUT is strict-create in Caddy and would clobber a sibling's edit;
 		// caddyedge must never issue it. Record and reject.
@@ -253,32 +324,77 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 func (f *fakeAdmin) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		w.Header().Set("Etag", f.etag())
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
 		f.writeJSON(w, f.routes)
 	case http.MethodPost:
 		if !f.precheck(w, r) {
 			return
 		}
-		var nr Route
-		if err := json.NewDecoder(r.Body).Decode(&nr); err != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		f.routes = append(f.routes, nr)
-		f.version++
+		// An @id is unique across the whole config; a duplicate POST is rejected
+		// by real Caddy with a 4xx, not appended.
+		if id := rawRouteID(body); id != "" && f.indexOf(id) >= 0 {
+			http.Error(w, "loading config: duplicate id: "+id, http.StatusBadRequest)
+			return
+		}
+		f.routes = append(f.routes, json.RawMessage(body)) // append raw bytes verbatim
 		f.mutations++
 		f.post++
-		w.Header().Set("Etag", f.etag())
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// newFake starts a fakeAdmin httptest.Server seeded with routes and returns a
-// Client wired to it plus the fake (for mutation assertions).
+// handleRouteIndex serves DELETE /config/.../routes/<index>: delete-and-shift,
+// bounds-checked, under the parent routes-array If-Match (precheck).
+func (f *fakeAdmin) handleRouteIndex(w http.ResponseWriter, r *http.Request, idxStr string) {
+	switch r.Method {
+	case http.MethodDelete:
+		if !f.precheck(w, r) {
+			return
+		}
+		i, err := strconv.Atoi(idxStr)
+		if err != nil || i < 0 || i >= len(f.routes) {
+			http.Error(w, "invalid route index", http.StatusBadRequest)
+			return
+		}
+		f.routes = append(f.routes[:i], f.routes[i+1:]...) // delete-and-shift
+		f.mutations++
+		f.del++
+		f.delPaths = append(f.delPaths, f.routesPath()+"/"+idxStr)
+		w.Header().Set("Etag", f.etagFor(f.routesPath()))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// newFake starts a fakeAdmin httptest.Server seeded with typed routes (marshaled
+// to raw at seed time) and returns a Client wired to it plus the fake (for
+// mutation assertions).
 func newFake(t *testing.T, routes ...Route) (*Client, *fakeAdmin) {
 	t.Helper()
-	f := &fakeAdmin{server: "tailport", routes: routes}
+	raws := make([]json.RawMessage, 0, len(routes))
+	for _, r := range routes {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("seed marshal: %v", err)
+		}
+		raws = append(raws, b)
+	}
+	return newFakeRaw(t, raws...)
+}
+
+// newFakeRaw is the raw-seeding path: it seeds the fake with exact element bytes,
+// so a test can hold a route carrying a field tailport doesn't model and assert
+// it round-trips through capture unchanged.
+func newFakeRaw(t *testing.T, raws ...json.RawMessage) (*Client, *fakeAdmin) {
+	t.Helper()
+	f := &fakeAdmin{server: "tailport", routes: append([]json.RawMessage(nil), raws...)}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return &Client{HTTPClient: srv.Client(), AdminURL: srv.URL, ServerName: "tailport"}, f
@@ -294,7 +410,7 @@ func TestPublishCreatesWhenAbsent(t *testing.T) {
 	if f.post != 1 || f.mutations != 1 {
 		t.Errorf("expected exactly one POST, got post=%d mutations=%d", f.post, f.mutations)
 	}
-	if len(f.routes) != 1 || f.routes[0].ID != "tailport-myapp.example.com" {
+	if len(f.routes) != 1 || f.routeAt(0).ID != "tailport-myapp.example.com" {
 		t.Errorf("route not appended correctly: %+v", f.routes)
 	}
 }
@@ -525,7 +641,7 @@ func TestPublishStaleHostMatcherConflictsNoMutation(t *testing.T) {
 	if f.mutations != 0 {
 		t.Errorf("stale host matcher must not mutate, got %d mutations", f.mutations)
 	}
-	if len(f.routes) != 1 || f.routes[0].Match[0].Host[0] != "evil.example.com" {
+	if len(f.routes) != 1 || f.routeAt(0).Match[0].Host[0] != "evil.example.com" {
 		t.Errorf("foreign-edited route must survive untouched, got %+v", f.routes)
 	}
 }
@@ -949,5 +1065,346 @@ func TestInspectConflictUnreachable(t *testing.T) {
 	_, err := c.InspectConflict(context.Background(), "myapp.example.com")
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+// --- PurgeConflict + capture (kata 6n15) ------------------------------------
+
+// TestPurgeConflictOwnedDeletesByID: an owned conflicting route (our @id) is
+// deleted by /id/<id> (stable across index shifts), and the capture carries the
+// @id (HadID true).
+func TestPurgeConflictOwnedDeletesByID(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil)) // OwnedDiffBackend
+
+	info, err := c.InspectConflict(context.Background(), host)
+	if err != nil || info.Kind != OwnedDiffBackend {
+		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
+	}
+	captured, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if err != nil {
+		t.Fatalf("PurgeConflict: %v", err)
+	}
+	if !captured.HadID {
+		t.Errorf("an owned route carries an @id; HadID should be true")
+	}
+	if captured.Hostname != host {
+		t.Errorf("captured hostname = %q, want %q", captured.Hostname, host)
+	}
+	if rawRouteID(captured.Raw) != IDFor(host) {
+		t.Errorf("captured @id = %q, want %q", rawRouteID(captured.Raw), IDFor(host))
+	}
+	if f.del != 1 || f.mutations != 1 {
+		t.Errorf("expected exactly one DELETE; del=%d mutations=%d", f.del, f.mutations)
+	}
+	if len(f.delPaths) != 1 || f.delPaths[0] != "/id/"+IDFor(host) {
+		t.Errorf("owned purge must delete by /id; delPaths=%v", f.delPaths)
+	}
+	if len(f.routes) != 0 {
+		t.Errorf("route should be gone; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictIdlessForeignDeletesByIndex: a truly id-less foreign route is
+// deleted by array index under the parent routes-array If-Match, and HadID false.
+func TestPurgeConflictIdlessForeignDeletesByIndex(t *testing.T) {
+	const host = "app.example.com"
+	foreign := Route{
+		Match:  []Match{{Host: []string{host}}},
+		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.1:80"}}}},
+	}
+	c, f := newFake(t, foreign)
+
+	info, err := c.InspectConflict(context.Background(), host)
+	if err != nil || info.Kind != ForeignOverlap || info.ID != "" {
+		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want id-less ForeignOverlap", info.Kind, info.ID, err)
+	}
+	captured, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if err != nil {
+		t.Fatalf("PurgeConflict: %v", err)
+	}
+	if captured.HadID {
+		t.Errorf("an id-less route has no @id; HadID should be false")
+	}
+	if f.del != 1 || len(f.delPaths) != 1 || f.delPaths[0] != f.routesPath()+"/0" {
+		t.Errorf("id-less foreign purge must delete by index; del=%d delPaths=%v", f.del, f.delPaths)
+	}
+	if len(f.routes) != 0 {
+		t.Errorf("route should be gone; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictByteFaithfulCapture: an OWNED route seeded raw with a field
+// tailport doesn't model round-trips through capture BYTE-FOR-BYTE (this now
+// works only because the fake stores raw). A decode+re-marshal would silently
+// drop the unmodeled field.
+func TestPurgeConflictByteFaithfulCapture(t *testing.T) {
+	const host = "app.example.com"
+	// Compact, owned, and carrying an unmodeled "metadata" object.
+	seed := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"hand-edited"}}`)
+	c, _ := newFakeRaw(t, seed)
+
+	info, err := c.InspectConflict(context.Background(), host)
+	if err != nil || info.Kind != OwnedDiffBackend {
+		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
+	}
+	captured, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if err != nil {
+		t.Fatalf("PurgeConflict: %v", err)
+	}
+	if string(captured.Raw) != string(seed) {
+		t.Errorf("capture is not byte-faithful:\n got %s\nwant %s", captured.Raw, seed)
+	}
+	// The unmodeled field really is present in the captured bytes.
+	if !strings.Contains(string(captured.Raw), `"metadata":{"note":"hand-edited"}`) {
+		t.Errorf("captured bytes dropped the unmodeled field: %s", captured.Raw)
+	}
+}
+
+// TestPurgeConflictNoConflictWhenCleared: the conflict cleared before the purge
+// (nothing overlaps any more) → ErrNoConflict, no mutation.
+func TestPurgeConflictNoConflictWhenCleared(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+	info, _ := c.InspectConflict(context.Background(), host)
+	expect := ExpectFromConflict(info)
+
+	f.mu.Lock()
+	f.routes = nil // the holder vanished
+	f.mu.Unlock()
+
+	_, err := c.PurgeConflict(context.Background(), host, expect)
+	if !errors.Is(err, ErrNoConflict) {
+		t.Fatalf("err = %v, want ErrNoConflict", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("nothing to purge must not mutate; got %d", f.mutations)
+	}
+}
+
+// TestPurgeConflictOwnedBackendSwapChanged: the owned route's backend was swapped
+// between classify and purge (kept our @id + host) → ErrConflictChanged, so the
+// UI re-confirms rather than deleting a route pinned to a different backend.
+func TestPurgeConflictOwnedBackendSwapChanged(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+	info, _ := c.InspectConflict(context.Background(), host)
+	expect := ExpectFromConflict(info) // pins other-box:9090
+
+	swapped, _ := json.Marshal(BuildRoute(host, "sneaky-box", 1234, nil)) // same @id, new backend
+	f.mu.Lock()
+	f.routes[0] = swapped
+	f.mu.Unlock()
+
+	_, err := c.PurgeConflict(context.Background(), host, expect)
+	if !errors.Is(err, ErrConflictChanged) {
+		t.Fatalf("err = %v, want ErrConflictChanged", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("a swapped-backend route must not be purged; got %d mutations", f.mutations)
+	}
+}
+
+// TestPurgeConflictOwnedToForeignChanged is the escalation guard: a route
+// approved as OWNED that became FOREIGN (its @id was stripped by a foreign edit)
+// must NOT be deleted under the owned confirm → ErrConflictChanged.
+func TestPurgeConflictOwnedToForeignChanged(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+	info, _ := c.InspectConflict(context.Background(), host)
+	expect := ExpectFromConflict(info) // Owned=true
+
+	foreignified := BuildRoute(host, "other-box", 9090, nil)
+	foreignified.ID = "someone-elses-route" // no tailport- prefix → now foreign
+	raw, _ := json.Marshal(foreignified)
+	f.mu.Lock()
+	f.routes[0] = raw
+	f.mu.Unlock()
+
+	_, err := c.PurgeConflict(context.Background(), host, expect)
+	if !errors.Is(err, ErrConflictChanged) {
+		t.Fatalf("err = %v, want ErrConflictChanged (owned→foreign escalation)", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("an escalated route must not be purged under the owned confirm; got %d mutations", f.mutations)
+	}
+}
+
+// TestPurgeConflict412ThenSucceedByID proves the /id delete path retries on a 412
+// and then succeeds (the successful attempt's If-Match is the id-scope etag the
+// fake genuinely validates).
+func TestPurgeConflict412ThenSucceedByID(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+	info, _ := c.InspectConflict(context.Background(), host)
+	f.force412 = 1 // first DELETE loses the race, the retry wins
+
+	if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); err != nil {
+		t.Fatalf("PurgeConflict should retry and succeed: %v", err)
+	}
+	if f.force412 != 0 {
+		t.Errorf("the injected 412 was not consumed (force412=%d)", f.force412)
+	}
+	if f.del != 1 || len(f.delPaths) != 1 || f.delPaths[0] != "/id/"+IDFor(host) {
+		t.Errorf("expected exactly one accepted /id DELETE after retry; del=%d delPaths=%v", f.del, f.delPaths)
+	}
+	if len(f.routes) != 0 {
+		t.Errorf("route should be gone after the retry; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeConflict412ThenSucceedByIndex proves the index delete path retries on
+// a 412 and then succeeds (the successful attempt carries the parent routes-array
+// If-Match, which the fake re-hashes at the embedded path).
+func TestPurgeConflict412ThenSucceedByIndex(t *testing.T) {
+	const host = "app.example.com"
+	foreign := Route{
+		Match:  []Match{{Host: []string{host}}},
+		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.1:80"}}}},
+	}
+	c, f := newFake(t, foreign)
+	info, _ := c.InspectConflict(context.Background(), host)
+	f.force412 = 1
+
+	if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); err != nil {
+		t.Fatalf("PurgeConflict should retry and succeed: %v", err)
+	}
+	if f.force412 != 0 {
+		t.Errorf("the injected 412 was not consumed (force412=%d)", f.force412)
+	}
+	if f.del != 1 || len(f.delPaths) != 1 || f.delPaths[0] != f.routesPath()+"/0" {
+		t.Errorf("expected exactly one accepted index DELETE after retry; del=%d delPaths=%v", f.del, f.delPaths)
+	}
+	if len(f.routes) != 0 {
+		t.Errorf("route should be gone after the retry; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeIndexDeleteParentEtagGuards drives the raw primitives to prove the
+// fake genuinely models a PARENT-scope If-Match on an index DELETE: a stale
+// routes-array etag is rejected 412 (the array hash moved), a fresh one succeeds.
+func TestPurgeIndexDeleteParentEtagGuards(t *testing.T) {
+	ctx := context.Background()
+	foreign := Route{
+		Match:  []Match{{Host: []string{"a.example.com"}}},
+		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.1:80"}}}},
+	}
+	c, _ := newFake(t, foreign)
+
+	_, e1, err := c.fetchRoutesRaw(ctx) // read the routes-array etag E1
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent editor appends a route with the (still-fresh) E1, moving the
+	// array hash off E1.
+	extra := Route{ID: "extra", Match: []Match{{Host: []string{"z.example.com"}}}, Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.2:80"}}}}}
+	if status, body, err := c.mutate(ctx, http.MethodPost, c.routesURL(), extra, e1); err != nil || status < 200 || status >= 300 {
+		t.Fatalf("seed append status=%d body=%s err=%v", status, body, err)
+	}
+
+	// DELETE index 0 carrying the now-STALE E1 → 412 (the fake re-hashed the array
+	// at the embedded parent path and saw it move).
+	_, status, _, err := c.do(ctx, http.MethodDelete, c.routesURL()+"/0", nil, e1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusPreconditionFailed {
+		t.Fatalf("stale-parent-etag index DELETE status = %d, want 412", status)
+	}
+	// With a fresh array etag the same index DELETE succeeds.
+	_, e2, err := c.fetchRoutesRaw(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2 == e1 {
+		t.Fatalf("the array etag did not move after the append (e1=%q e2=%q)", e1, e2)
+	}
+	_, status, _, err = c.do(ctx, http.MethodDelete, c.routesURL()+"/0", nil, e2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status < 200 || status >= 300 {
+		t.Fatalf("fresh-parent-etag index DELETE status = %d, want 2xx", status)
+	}
+}
+
+// TestFakeRejectsDuplicateIDPost: POSTing a route whose @id already exists is
+// rejected with a Caddy-style 4xx and nothing is appended (so a purge/capture
+// test can't pass for the wrong reason on a blind-append fake).
+func TestFakeRejectsDuplicateIDPost(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "dev-box", 8080, nil))
+	ctx := context.Background()
+
+	_, arrEtag, err := c.fetchRoutesRaw(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, err := c.mutate(ctx, http.MethodPost, c.routesURL(), BuildRoute(host, "dev-box", 8080, nil), arrEtag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status < 400 || status >= 500 {
+		t.Fatalf("duplicate @id POST status = %d, want a 4xx", status)
+	}
+	if !strings.Contains(string(body), "duplicate") {
+		t.Errorf("dup-@id body = %q, want it to name the duplicate", body)
+	}
+	if f.post != 0 || len(f.routes) != 1 {
+		t.Errorf("a duplicate @id must not append; post=%d routes=%d", f.post, len(f.routes))
+	}
+}
+
+// TestPurgeConflictRawHashIdlessForeign exercises the PurgeExpect.RawHash exact-
+// bytes identity for an id-less foreign route: an unchanged route purges, a route
+// whose bytes drifted (still overlapping) is refused with ErrConflictChanged.
+func TestPurgeConflictRawHashIdlessForeign(t *testing.T) {
+	const host = "a.example.com"
+	seed := json.RawMessage(`{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.1:80"}]}]}`)
+
+	t.Run("unchanged purges", func(t *testing.T) {
+		c, _ := newFakeRaw(t, seed)
+		expect := PurgeExpect{Owned: false, RawHash: rawIdentityHash(seed)}
+		captured, err := c.PurgeConflict(context.Background(), host, expect)
+		if err != nil {
+			t.Fatalf("PurgeConflict: %v", err)
+		}
+		if string(captured.Raw) != string(seed) {
+			t.Errorf("captured %s, want %s", captured.Raw, seed)
+		}
+	})
+
+	t.Run("drifted refuses", func(t *testing.T) {
+		c, f := newFakeRaw(t, seed)
+		expect := PurgeExpect{Owned: false, RawHash: rawIdentityHash(seed)}
+		f.mu.Lock()
+		f.routes[0] = json.RawMessage(`{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.9:80"}]}]}`)
+		f.mu.Unlock()
+		if _, err := c.PurgeConflict(context.Background(), host, expect); !errors.Is(err, ErrConflictChanged) {
+			t.Fatalf("err = %v, want ErrConflictChanged", err)
+		}
+		if f.mutations != 0 {
+			t.Errorf("a drifted route must not be purged; got %d mutations", f.mutations)
+		}
+	})
+}
+
+// TestPurgeConflictConcurrentUpdateExhausted: every DELETE loses the If-Match
+// race → ErrConcurrentUpdate, nothing deleted.
+func TestPurgeConflictConcurrentUpdateExhausted(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+	info, _ := c.InspectConflict(context.Background(), host)
+	f.force412 = maxRetries + 2
+
+	_, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if !errors.Is(err, ErrConcurrentUpdate) {
+		t.Fatalf("err = %v, want ErrConcurrentUpdate", err)
+	}
+	if f.del != 0 || f.mutations != 0 {
+		t.Errorf("no delete should have been accepted; del=%d mutations=%d", f.del, f.mutations)
+	}
+	if len(f.routes) != 1 {
+		t.Errorf("route must survive an exhausted purge; got %d", len(f.routes))
 	}
 }

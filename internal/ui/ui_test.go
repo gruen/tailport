@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -6147,19 +6148,20 @@ func TestPublishDoneMsgReFetches(t *testing.T) {
 	}
 }
 
-// TestPublishConflictRefusalPerKind drives a hostname conflict end to end
+// TestPublishConflictClassificationPerKind drives a hostname conflict end to end
 // (publishDoneMsg{ErrHostnameConflict} -> inspectConflictCmd -> inspectConflictMsg)
-// and asserts each Kind renders its specific refusal while mutating NOTHING
-// (kata qfbf). The classification read is real (against the fake edge); the
-// refusal is a toast, not a purge.
-func TestPublishConflictRefusalPerKind(t *testing.T) {
+// and asserts each Kind is handled correctly. Under 6n15 the two PURGEABLE kinds
+// (OwnedDiffBackend, ForeignOverlap) now OPEN A CONFIRM LADDER instead of a flat
+// refusal; IdHijacked still refuses. Classification itself never mutates — the
+// delete only fires on the final confirm.
+func TestPublishConflictClassificationPerKind(t *testing.T) {
 	const host = "app.example.com"
 	id := caddyedge.IDFor(host)
 
 	// drive seeds the fake, runs the conflict classification round trip for an
-	// attempted publish of :8080 -> host, and returns the resulting model. It
-	// asserts pending discipline and that no mutation ever occurred.
-	drive := func(t *testing.T, seed func(fc *fakeCaddy)) model {
+	// attempted publish of :8080 -> host, and returns the resulting model + fake.
+	// It asserts pending discipline and that classification mutated nothing.
+	drive := func(t *testing.T, seed func(fc *fakeCaddy)) (model, *fakeCaddy) {
 		t.Helper()
 		fc := newFakeCaddy()
 		seed(fc)
@@ -6188,59 +6190,71 @@ func TestPublishConflictRefusalPerKind(t *testing.T) {
 		if m.pending != 0 {
 			t.Errorf("inspectConflictMsg should clear pending; got %d", m.pending)
 		}
-		if m.flashLevel != flashError {
-			t.Errorf("a refusal should be an error toast; level=%v flash=%q", m.flashLevel, m.flash)
-		}
 		if len(fc.mutations) != 0 || len(fc.deletes) != 0 {
-			t.Errorf("refuse-on-conflict must not mutate: mutations=%d deletes=%d", len(fc.mutations), len(fc.deletes))
+			t.Errorf("classification must not mutate: mutations=%d deletes=%d", len(fc.mutations), len(fc.deletes))
 		}
-		return m
+		return m, fc
 	}
 
-	t.Run("owned same machine (different local port)", func(t *testing.T) {
-		m := drive(t, func(fc *fakeCaddy) {
+	t.Run("owned same machine opens the purge-owned confirm naming your backend", func(t *testing.T) {
+		m, _ := drive(t, func(fc *fakeCaddy) {
 			fc.routes[id] = caddyedge.BuildRoute(host, "dev-box", 3000, nil) // our label, other port
 		})
-		if !strings.Contains(m.flash, "unpublish it first") || !strings.Contains(m.flash, "dev-box:3000") {
-			t.Errorf("same-machine refusal = %q, want it to name your dev-box:3000 and say unpublish first", m.flash)
+		if m.mode != entryConfirmPurgeOwned {
+			t.Fatalf("owned conflict should open entryConfirmPurgeOwned; mode=%v flash=%q", m.mode, m.flash)
+		}
+		prompt := stripANSI(m.renderBottom())
+		if !strings.Contains(prompt, "your dev-box:3000") {
+			t.Errorf("same-machine purge prompt = %q, want it to name your dev-box:3000", prompt)
+		}
+		if strings.Contains(prompt, "ANOTHER machine") {
+			t.Errorf("same-machine prompt must not say ANOTHER machine: %q", prompt)
 		}
 	})
 
-	t.Run("owned another machine", func(t *testing.T) {
-		m := drive(t, func(fc *fakeCaddy) {
+	t.Run("owned another machine opens the purge-owned confirm naming it as another machine's", func(t *testing.T) {
+		m, _ := drive(t, func(fc *fakeCaddy) {
 			fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil) // NOT our label
 		})
-		if !strings.Contains(m.flash, "another machine") || !strings.Contains(m.flash, "other-box:9090") {
-			t.Errorf("cross-machine refusal = %q, want it to name it another machine's other-box:9090", m.flash)
+		if m.mode != entryConfirmPurgeOwned {
+			t.Fatalf("owned conflict should open entryConfirmPurgeOwned; mode=%v", m.mode)
 		}
-		if strings.Contains(m.flash, "unpublish it first") {
-			t.Errorf("cross-machine refusal must NOT tell the user to unpublish locally: %q", m.flash)
+		prompt := stripANSI(m.renderBottom())
+		if !strings.Contains(prompt, "ANOTHER machine") || !strings.Contains(prompt, "other-box:9090") {
+			t.Errorf("cross-machine purge prompt = %q, want it to name another machine's other-box:9090", prompt)
 		}
 	})
 
-	t.Run("id hijacked", func(t *testing.T) {
-		m := drive(t, func(fc *fakeCaddy) {
+	t.Run("id hijacked stays a refusal (never a purge)", func(t *testing.T) {
+		m, _ := drive(t, func(fc *fakeCaddy) {
 			rt := caddyedge.BuildRoute(host, "dev-box", 8080, nil)
 			rt.Match = []caddyedge.Match{{Host: []string{"evil.example.com"}}} // @id kept, matcher repointed
 			fc.routes[id] = rt
 		})
-		if !strings.Contains(m.flash, "re-pointed at evil.example.com") || !strings.Contains(m.flash, "resolve it in Caddy") {
-			t.Errorf("hijacked refusal = %q, want it to name the re-point and send the user to Caddy", m.flash)
+		if m.mode != entryNone {
+			t.Fatalf("a hijacked @id must NOT open a purge confirm; mode=%v", m.mode)
+		}
+		if m.flashLevel != flashError || !strings.Contains(m.flash, "re-pointed at evil.example.com") || !strings.Contains(m.flash, "resolve it in Caddy") {
+			t.Errorf("hijacked refusal = %q level=%v, want it to name the re-point and send the user to Caddy", m.flash, m.flashLevel)
 		}
 	})
 
-	t.Run("foreign overlap (non-proxy route)", func(t *testing.T) {
+	t.Run("foreign overlap (non-proxy route) opens the scary first gate", func(t *testing.T) {
 		// A foreign static_response with no @id of ours and no reverse_proxy dial:
-		// List would drop it, but the refusal must still name it by its handler.
-		m := drive(t, func(fc *fakeCaddy) {
+		// List would drop it, but the confirm must still name it by its handler.
+		m, _ := drive(t, func(fc *fakeCaddy) {
 			fc.routes["foreign-static"] = caddyedge.Route{
 				ID:     "foreign-static",
 				Match:  []caddyedge.Match{{Host: []string{host}}},
 				Handle: []caddyedge.Handler{{Handler: "static_response"}},
 			}
 		})
-		if !strings.Contains(m.flash, "tailport didn't create") || !strings.Contains(m.flash, "static_response") {
-			t.Errorf("foreign refusal = %q, want it to name the foreign static_response route", m.flash)
+		if m.mode != entryConfirmPurgeForeign {
+			t.Fatalf("a foreign overlap should open entryConfirmPurgeForeign; mode=%v", m.mode)
+		}
+		prompt := stripANSI(m.renderBottom())
+		if !strings.Contains(prompt, "did NOT create") || !strings.Contains(prompt, "static_response") {
+			t.Errorf("foreign purge prompt = %q, want it to name the foreign static_response route", prompt)
 		}
 	})
 }
@@ -6342,5 +6356,309 @@ func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
 	}
 	if m.labelInput.Value() != "" {
 		t.Errorf("publish keystrokes leaked into labelInput: %q", m.labelInput.Value())
+	}
+}
+
+// --- force-purge / take-over confirm ladders + resume (kata 6n15) ------------
+
+// reachConflictLadder drives an attempted publish of :8080 -> host into the
+// confirm ladder for a seeded conflict and returns the model (in its confirm
+// mode) plus the fake edge, asserting classification mutated nothing.
+func reachConflictLadder(t *testing.T, host string, withAuth bool, seed func(fc *fakeCaddy)) (model, *fakeCaddy) {
+	t.Helper()
+	fc := newFakeCaddy()
+	seed(fc)
+	srv := httptest.NewServer(fc)
+	t.Cleanup(srv.Close)
+
+	m := newPublishModel(t, srv)
+	if withAuth {
+		m.cfg.Caddy.AuthUser = "admin"
+		m.cfg.Caddy.AuthHash = "$2a$10$abcdefghijklmnopqrstuv"
+	}
+	m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080, withAuth: withAuth}
+	m.pending = 8080
+
+	res, cmd := m.Update(publishDoneMsg{port: 8080, err: caddyedge.ErrHostnameConflict})
+	m = res.(model)
+	icm, ok := cmd().(inspectConflictMsg)
+	if !ok {
+		t.Fatalf("a conflicted publish should classify; got %#v", cmd())
+	}
+	m = mustUpdate(t, m, icm)
+	if len(fc.mutations) != 0 || len(fc.deletes) != 0 {
+		t.Fatalf("opening the ladder must not mutate: mutations=%d deletes=%d", len(fc.mutations), len(fc.deletes))
+	}
+	return m, fc
+}
+
+// TestPurgeOwnedTakeoverResumes: an OwnedDiffBackend conflict, confirmed with a
+// single y, deletes the owned route and RESUMES the publish (enableServe=false),
+// which republishes OUR backend with auth rebuilt from cfg — no plaintext in the
+// model — and toasts "took over <host>".
+func TestPurgeOwnedTakeoverResumes(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+
+	m, fc := reachConflictLadder(t, host, true, func(fc *fakeCaddy) {
+		fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil) // OwnedDiffBackend
+	})
+	if m.mode != entryConfirmPurgeOwned {
+		t.Fatalf("owned conflict should open entryConfirmPurgeOwned; mode=%v", m.mode)
+	}
+
+	// One y confirms → the purge fires (mode clears, pending re-armed).
+	res, cmd := m.Update(rkey("y"))
+	m = res.(model)
+	if m.mode != entryNone || m.pending != 8080 {
+		t.Fatalf("y should commit the owned purge; mode=%v pending=%d", m.mode, m.pending)
+	}
+	pdm, ok := cmd().(purgeDoneMsg)
+	if !ok || pdm.err != nil {
+		t.Fatalf("purge cmd = %#v, want a clean purgeDoneMsg", cmd())
+	}
+	if !pdm.captured.HadID {
+		t.Errorf("an owned route capture should have HadID=true")
+	}
+	if len(fc.deletes) != 1 || fc.deletes[0] != id {
+		t.Errorf("the owned route should be deleted by its @id; deletes=%v", fc.deletes)
+	}
+
+	// Feeding purgeDoneMsg resumes the takeover publish (enableServe is baked into
+	// publishCmd; here we assert the model carries the takeover flag and no secret).
+	res, cmd = m.Update(pdm)
+	m = res.(model)
+	if m.takeoverHost != host || m.pending != 8080 {
+		t.Fatalf("purge success should resume the takeover; takeoverHost=%q pending=%d", m.takeoverHost, m.pending)
+	}
+	if m.publishCredPass != "" || m.publishCredUser != "" {
+		t.Errorf("no plaintext credential may survive into the takeover resume")
+	}
+	pubdone, ok := cmd().(publishDoneMsg)
+	if !ok || pubdone.err != nil {
+		t.Fatalf("resume cmd = %#v, want a clean publishDoneMsg", cmd())
+	}
+	// The route now points at OUR backend and carries auth rebuilt from cfg.
+	rt, present := fc.routes[id]
+	if !present {
+		t.Fatalf("takeover should have republished our route")
+	}
+	if got := routeDial(rt); got != "dev-box:8080" {
+		t.Errorf("takeover route dial = %q, want dev-box:8080", got)
+	}
+	if !routeHasAuth(rt) {
+		t.Errorf("takeover route should carry auth rebuilt from cfg (withAuth)")
+	}
+
+	// The takeover publish's success toasts "took over <host>" and clears the flag.
+	res, _ = m.Update(pubdone)
+	m = res.(model)
+	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "took over "+host) {
+		t.Errorf("takeover success toast = %q level=%v, want a plain 'took over %s'", m.flash, m.flashLevel, host)
+	}
+	if m.takeoverHost != "" {
+		t.Errorf("takeoverHost should be cleared after the toast; got %q", m.takeoverHost)
+	}
+}
+
+// TestPurgeForeignLadderTypedGate: a ForeignOverlap opens the scary TWO-gate
+// ladder — a y/n drift warning, then a typed-"purge" commit. Only an exact
+// "purge" fires; a wrong word or an empty enter cancels with no mutation.
+func TestPurgeForeignLadderTypedGate(t *testing.T) {
+	const host = "app.example.com"
+	seedForeign := func(fc *fakeCaddy) {
+		foreign := caddyedge.BuildRoute(host, "3rd-party", 7000, nil)
+		foreign.ID = "foreign-app" // a non-tailport @id → foreign
+		fc.routes[foreign.ID] = foreign
+	}
+
+	t.Run("y advances to the typed gate; a wrong word cancels with no mutation", func(t *testing.T) {
+		m, fc := reachConflictLadder(t, host, false, seedForeign)
+		if m.mode != entryConfirmPurgeForeign {
+			t.Fatalf("foreign conflict should open entryConfirmPurgeForeign; mode=%v", m.mode)
+		}
+		m = mustUpdate(t, m, rkey("y"))
+		if m.mode != entryConfirmPurgeForeignType {
+			t.Fatalf("y on the drift warning should advance to the typed gate; mode=%v", m.mode)
+		}
+		m = mustUpdate(t, m, rkey("nope")) // wrong word feeds the input
+		res, cmd := m.Update(enterKey)
+		m = res.(model)
+		if m.mode != entryNone {
+			t.Errorf("a wrong typed word must cancel; mode=%v", m.mode)
+		}
+		if cmd != nil {
+			if _, isPurge := cmd().(purgeDoneMsg); isPurge {
+				t.Error("a wrong typed word must NOT fire a purge")
+			}
+		}
+		if len(fc.deletes) != 0 || len(fc.mutations) != 0 {
+			t.Errorf("a cancelled foreign purge must not mutate; deletes=%d mutations=%d", len(fc.deletes), len(fc.mutations))
+		}
+	})
+
+	t.Run("empty enter cancels the typed gate", func(t *testing.T) {
+		m, fc := reachConflictLadder(t, host, false, seedForeign)
+		m = mustUpdate(t, m, rkey("y"))
+		m = mustUpdate(t, m, enterKey) // empty input, enter
+		if m.mode != entryNone {
+			t.Errorf("empty enter must cancel the typed gate; mode=%v", m.mode)
+		}
+		if len(fc.deletes) != 0 {
+			t.Errorf("empty enter must not purge; deletes=%d", len(fc.deletes))
+		}
+	})
+
+	t.Run("exact purge commits, deletes the foreign route, and resumes the takeover", func(t *testing.T) {
+		m, fc := reachConflictLadder(t, host, false, seedForeign)
+		m = mustUpdate(t, m, rkey("y"))
+		m = mustUpdate(t, m, rkey("purge")) // exact word feeds the input
+		res, cmd := m.Update(enterKey)
+		m = res.(model)
+		if m.mode != entryNone || m.pending != 8080 {
+			t.Fatalf("exact purge should commit; mode=%v pending=%d", m.mode, m.pending)
+		}
+		pdm, ok := cmd().(purgeDoneMsg)
+		if !ok || pdm.err != nil {
+			t.Fatalf("purge cmd = %#v, want a clean purgeDoneMsg", cmd())
+		}
+		if len(fc.deletes) != 1 || fc.deletes[0] != "foreign-app" {
+			t.Errorf("the foreign route should be deleted by its @id; deletes=%v", fc.deletes)
+		}
+		res, cmd = m.Update(pdm)
+		m = res.(model)
+		if m.takeoverHost != host {
+			t.Fatalf("purge success should resume the takeover; takeoverHost=%q", m.takeoverHost)
+		}
+		pubdone, ok := cmd().(publishDoneMsg)
+		if !ok || pubdone.err != nil {
+			t.Fatalf("resume cmd = %#v, want a clean publishDoneMsg", cmd())
+		}
+		if got := routeDial(fc.routes[caddyedge.IDFor(host)]); got != "dev-box:8080" {
+			t.Errorf("takeover route dial = %q, want dev-box:8080", got)
+		}
+	})
+}
+
+// TestPurgeCaseInsensitiveTypedWord: the typed gate accepts "PURGE"/" Purge "
+// (trimmed, case-insensitive), mirroring the SSH unlock gate exactly.
+func TestPurgeCaseInsensitiveTypedWord(t *testing.T) {
+	const host = "app.example.com"
+	m, fc := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+		foreign := caddyedge.BuildRoute(host, "3rd-party", 7000, nil)
+		foreign.ID = "foreign-app"
+		fc.routes[foreign.ID] = foreign
+	})
+	m = mustUpdate(t, m, rkey("y"))
+	m.purgeInput.SetValue("  PuRgE  ") // trimmed + case-folded should still commit
+	res, cmd := m.Update(enterKey)
+	m = res.(model)
+	if m.mode != entryNone || m.pending != 8080 {
+		t.Fatalf("a trimmed/case-variant 'purge' should commit; mode=%v pending=%d", m.mode, m.pending)
+	}
+	if _, ok := cmd().(purgeDoneMsg); !ok {
+		t.Fatalf("commit should fire a purge; got %#v", cmd())
+	}
+	_ = fc
+}
+
+// TestPurgeConflictChangedReopensLadder: if the route escalates owned→foreign
+// between the owned confirm and the delete, PurgeConflict returns
+// ErrConflictChanged, nothing is deleted, and the handler re-classifies and
+// re-opens the SCARIER foreign ladder rather than deleting drift under the
+// weaker confirm.
+func TestPurgeConflictChangedReopensLadder(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+
+	m, fc := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+		fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil) // owned
+	})
+	if m.mode != entryConfirmPurgeOwned {
+		t.Fatalf("want entryConfirmPurgeOwned; got %v", m.mode)
+	}
+
+	// Confirm → purge cmd. Between confirm and execution the route becomes FOREIGN
+	// (its @id was replaced by a hand edit).
+	res, cmd := m.Update(rkey("y"))
+	m = res.(model)
+	delete(fc.routes, id)
+	foreign := caddyedge.BuildRoute(host, "3rd-party", 7000, nil)
+	foreign.ID = "foreign-app"
+	fc.routes["foreign-app"] = foreign
+
+	pdm, ok := cmd().(purgeDoneMsg)
+	if !ok || !errors.Is(pdm.err, caddyedge.ErrConflictChanged) {
+		t.Fatalf("purge should report ErrConflictChanged; got %#v", cmd())
+	}
+	if len(fc.deletes) != 0 {
+		t.Errorf("an escalated route must not be deleted; deletes=%v", fc.deletes)
+	}
+
+	// The handler re-classifies → re-opens the scarier foreign ladder.
+	res, cmd = m.Update(pdm)
+	m = res.(model)
+	if m.pending != 8080 {
+		t.Errorf("re-classify should re-arm pending; got %d", m.pending)
+	}
+	icm, ok := cmd().(inspectConflictMsg)
+	if !ok {
+		t.Fatalf("ErrConflictChanged should re-issue inspectConflictCmd; got %#v", cmd())
+	}
+	m = mustUpdate(t, m, icm)
+	if m.mode != entryConfirmPurgeForeign {
+		t.Errorf("a route that became foreign must re-open the scarier foreign ladder; mode=%v", m.mode)
+	}
+}
+
+// TestPurgeNoConflictRetriesPublish: if the conflict cleared before the delete
+// (ErrNoConflict), the handler reuses the qfbf None path — re-classify, which
+// finds nothing and retries the plain publish once.
+func TestPurgeNoConflictRetriesPublish(t *testing.T) {
+	const host = "app.example.com"
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080, retried: false}
+	m.pending = 8080
+
+	// Feed an ErrNoConflict purgeDoneMsg directly (no edge needed): it re-issues a
+	// classification cmd and re-arms pending.
+	res, cmd := m.Update(purgeDoneMsg{hostname: host, port: 8080, err: caddyedge.ErrNoConflict})
+	m = res.(model)
+	if m.pending != 8080 {
+		t.Errorf("ErrNoConflict should re-arm pending for the re-classify; got %d", m.pending)
+	}
+	if cmd == nil {
+		t.Fatal("ErrNoConflict should re-issue a classification cmd")
+	}
+
+	// A None classification then retries the plain publish once (the qfbf path).
+	res, cmd = m.Update(inspectConflictMsg{port: 8080, hostname: host, info: caddyedge.ConflictInfo{Kind: caddyedge.None}})
+	m = res.(model)
+	if !m.pendingPublish.retried {
+		t.Error("the None path should mark the retry as fired")
+	}
+	if cmd == nil {
+		t.Error("the None path should retry the plain publish")
+	}
+}
+
+// TestPurgeUnreachableToasts: a transport failure on the purge is a toast with
+// nothing half-done (no re-classify loop).
+func TestPurgeUnreachableToasts(t *testing.T) {
+	const host = "app.example.com"
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080}
+	m.pending = 8080
+
+	res, _ := m.Update(purgeDoneMsg{hostname: host, port: 8080, err: caddyedge.ErrUnreachable})
+	m = res.(model)
+	if m.pending != 0 {
+		t.Errorf("a failed purge should clear pending; got %d", m.pending)
+	}
+	if m.flashLevel != flashError || !strings.Contains(m.flash, "unreachable") {
+		t.Errorf("purge failure flash=%q level=%v, want the mapped transport error", m.flash, m.flashLevel)
+	}
+	if m.mode != entryNone {
+		t.Errorf("a failed purge must not leave a confirm mode open; mode=%v", m.mode)
 	}
 }
