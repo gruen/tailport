@@ -379,7 +379,9 @@ func (c Config) SaveCaddyDomain(domain string) error {
 	if err := yaml.Unmarshal(current, &root); err != nil {
 		return err
 	}
-	setCaddyDomainNode(&root, domain)
+	if err := setCaddyDomainNode(&root, domain); err != nil {
+		return err
+	}
 	data, err := yaml.Marshal(&root)
 	if err != nil {
 		return err
@@ -397,19 +399,38 @@ func (c Config) SaveCaddyDomain(domain string) error {
 // caddy.domain equals domain, touching nothing else. doc is what
 // yaml.Unmarshal produced (a DocumentNode, or a bare node for an empty file).
 // If the caddy mapping and/or the domain key are absent (a hand-minimal file),
-// they are inserted so the value lands. It then re-applies the caddy
-// head-comments (applyCaddyComments) so a freshly inserted domain key still
-// carries its explanatory comment, exactly as Save keeps the caddy block
+// they are inserted so the value lands. A present-but-empty `caddy:` block
+// (which YAML parses as a null scalar, not a mapping) is converted to a mapping
+// first -- otherwise appending children to a scalar node is silently dropped on
+// marshal and the domain would not persist despite a nil-error return (roborev
+// 2ex0). A present caddy value that is some OTHER non-mapping (e.g. `caddy: 42`)
+// is malformed; it is rejected rather than destroyed. It then re-applies the
+// caddy head-comments (applyCaddyComments) so a freshly inserted domain key
+// still carries its explanatory comment, exactly as Save keeps the caddy block
 // self-documenting on every write.
-func setCaddyDomainNode(doc *yaml.Node, domain string) {
+func setCaddyDomainNode(doc *yaml.Node, domain string) error {
 	root := documentRootMapping(doc)
 	caddy := mappingValueNode(root, "caddy")
-	if caddy == nil {
+	switch {
+	case caddy == nil:
 		caddy = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 		root.Content = append(root.Content,
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "caddy"},
 			caddy,
 		)
+	case caddy.Kind != yaml.MappingNode:
+		// An empty `caddy:` block parses to a null scalar -- convert it in
+		// place to an empty mapping so the domain key has somewhere to land.
+		// Any non-null, non-mapping value is malformed; refuse rather than
+		// silently overwrite whatever the user put there.
+		if caddy.Kind == yaml.ScalarNode && (caddy.Tag == "!!null" || (caddy.Tag == "" && caddy.Value == "")) {
+			caddy.Kind = yaml.MappingNode
+			caddy.Tag = "!!map"
+			caddy.Value = ""
+			caddy.Content = nil
+		} else {
+			return fmt.Errorf("config: caddy is not a mapping (found %s); refusing to overwrite it", caddy.Tag)
+		}
 	}
 	if v := mappingValueNode(caddy, "domain"); v != nil {
 		// Update in place; reset Style so a real domain renders plain
@@ -426,6 +447,7 @@ func setCaddyDomainNode(doc *yaml.Node, domain string) {
 		)
 	}
 	applyCaddyComments(root)
+	return nil
 }
 
 // documentRootMapping returns the mapping node setCaddyDomainNode should mutate:

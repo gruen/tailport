@@ -982,3 +982,62 @@ func TestSaveAppliesCaddyDefaultsForLiteral(t *testing.T) {
 		}
 	}
 }
+
+// TestSaveCaddyDomainPersistsIntoEmptyCaddyBlock covers roborev 2ex0: a config
+// with a present-but-empty `caddy:` block parses that value as a null scalar,
+// not a mapping. An earlier version appended the domain key to that scalar node,
+// which yaml.Marshal silently drops -- so SaveCaddyDomain returned nil while the
+// domain never hit disk. The node must be converted to a mapping first.
+func TestSaveCaddyDomainPersistsIntoEmptyCaddyBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// Empty caddy: block (null value) alongside an unrelated port entry.
+	if err := os.WriteFile(path, []byte("ports:\n  3000:\n    label: dev\ncaddy:\n"), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("re-Load: %v", err)
+	}
+	if got.Caddy.Domain != "apps.example.com" {
+		raw, _ := os.ReadFile(path)
+		t.Errorf("domain not persisted into empty caddy: block, got %q; file:\n%s", got.Caddy.Domain, raw)
+	}
+	// The unrelated port entry must survive the merge.
+	if meta, ok := got.Ports[3000]; !ok || meta.Label != "dev" {
+		t.Errorf("Ports[3000] = %+v (ok=%v), want the port entry preserved", meta, ok)
+	}
+}
+
+// TestSaveCaddyDomainRejectsNonMappingCaddy covers the other half of roborev
+// 2ex0: a malformed non-null, non-mapping caddy value (e.g. a scalar string)
+// must be refused, not silently overwritten. (Such a file would not Load into
+// the struct, but SaveCaddyDomain re-reads raw bytes into a Node tree, so it
+// must guard the case itself.)
+func TestSaveCaddyDomainRejectsNonMappingCaddy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("caddy: not-a-mapping\n"), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err == nil {
+		t.Fatalf("expected an error for a non-mapping caddy value, got nil")
+	}
+	// The original file must be left untouched (no clobber, no .bak needed to
+	// recover since we refused before writing).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading config after refusal: %v", err)
+	}
+	if string(raw) != "caddy: not-a-mapping\n" {
+		t.Errorf("config was modified despite refusal, got:\n%s", raw)
+	}
+}
