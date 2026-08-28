@@ -6640,6 +6640,42 @@ func TestPublishConflictForeignDisclosableGate(t *testing.T) {
 	})
 }
 
+// TestConflictRefusalReconcilesRowForSpaceStop (roborev 2wts): a conflict refusal
+// reconciles serve state so the "space to stop" hint actually stops it. The space
+// toggle reads the cached portItem.active, not m.active, so the refusal must
+// rebuild the list immediately -- otherwise, with a stale row reading serve=OFF,
+// space would turn serve ON before the async refresh lands.
+func TestConflictRefusalReconcilesRowForSpaceStop(t *testing.T) {
+	cfg := config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}
+	cfg.Caddy.Domain, cfg.Caddy.Hostname, cfg.Caddy.ServerName, cfg.Caddy.AdminPort = "example.com", "caddy", "tailport", 2019
+	m := New(cfg)
+	m.fqdn = "dev-box.tailnet.ts.net"
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+	m.active = map[int]bool{8080: false} // STALE: the cached row will show serve OFF
+	m.showAllPorts = true
+	m.rebuildItems()
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080}
+	m.pending = 8080
+
+	// A non-disclosable foreign conflict → refuseConflict reconciles serve.
+	info := caddyedge.ConflictInfo{Kind: caddyedge.ForeignOverlap, Hosts: []string{"app.example.com"}, Disclosable: false}
+	res, _ := m.Update(inspectConflictMsg{port: 8080, hostname: "app.example.com", info: info})
+	m2 := res.(model)
+
+	found := false
+	for _, it := range m2.list.Items() {
+		if pi, ok := it.(portItem); ok && pi.port.Number == 8080 {
+			found = true
+			if !pi.active {
+				t.Error("after a conflict refusal the cached :8080 row must read serve=ON, so space stops it (roborev 2wts)")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("port 8080 row not found in the rebuilt list")
+	}
+}
+
 // TestPublishConflictNoneRetriesOnce: when the classification finds nothing (the
 // conflict cleared between Publish's refusal and the read), the model retries the
 // plain publish exactly ONCE. A second None gives up with a refusal instead of

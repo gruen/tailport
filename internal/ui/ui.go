@@ -3043,12 +3043,17 @@ func (m *model) beginRestore() tea.Cmd {
 func (m *model) cancelPurgeFlow() tea.Cmd {
 	port := m.purgePort
 	m.clearPurgeFlow()
+	var rebuild tea.Cmd
 	if port != 0 {
 		m.active[port] = true
+		// Reflect serve=on in the cached row now so "space to stop" works before
+		// the async refresh lands (roborev 2wts — the space toggle reads the
+		// cached portItem.active, not m.active).
+		rebuild = m.rebuildItems()
 	}
 	return tea.Batch(
 		m.setFlash(fmt.Sprintf("serve left on for :%d — space to stop", port), flashWarn),
-		refresh,
+		rebuild, refresh,
 	)
 }
 
@@ -3061,14 +3066,18 @@ func (m *model) cancelPurgeFlow() tea.Cmd {
 // state rather than leaving serve on silently (roborev xzns). refresh + the
 // published-state poll ride along.
 func (m *model) refuseConflict(port int, msg string) tea.Cmd {
+	full := msg
+	var rebuild tea.Cmd
 	if port != 0 {
 		m.active[port] = true
-	}
-	full := msg
-	if port != 0 {
+		// Reflect serve=on in the CACHED row now (roborev 2wts): the space toggle
+		// reads the selected portItem.active, not m.active, so without an immediate
+		// rebuild pressing space before the async refresh lands would still see the
+		// row as inactive and turn serve ON instead of stopping it.
+		rebuild = m.rebuildItems()
 		full = fmt.Sprintf("%s (serve left on for :%d — space to stop)", msg, port)
 	}
-	return tea.Batch(m.setErr(full), refresh, m.pollPublishedCmd())
+	return tea.Batch(m.setErr(full), rebuild, refresh, m.pollPublishedCmd())
 }
 
 // purgeBlastRadiusLines renders the extra exposure a foreign purge would remove
