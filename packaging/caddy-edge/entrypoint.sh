@@ -69,18 +69,23 @@ tailscale --socket="$TS_SOCKET" serve --bg --http="$CADDY_ADMIN_PORT" "$CADDY_AD
 # bootstrap-caddy.json.example (COPYied into the image by the Dockerfile) is a
 # tracked TEMPLATE -- it carries a placeholder token in admin.origins instead
 # of a real tailnet value, so no dev has to hand-fill it before building. Fill
-# it in here, at boot, from env: the token becomes tailport's actual admin
-# Host (`$TS_HOSTNAME:$CADDY_ADMIN_PORT`, matching internal/ui's AdminURL),
-# and every literal `:2019` (admin.listen plus the localhost/127.0.0.1
-# origins) is repointed at the real admin port -- a no-op when
-# CADDY_ADMIN_PORT is left at its default. Order matters: substitute the
-# token FIRST (while it still injects a literal ":2019" when the port is
-# default) and the global `:2019` rewrite SECOND, so a non-default port lands
-# in the token's injected origin too, with no double-substitution.
+# it in here, at boot, from env: every literal `:2019` (admin.listen plus the
+# localhost/127.0.0.1 origins) is repointed at the real admin port, and the
+# token becomes tailport's actual admin Host (`$TS_HOSTNAME:$CADDY_ADMIN_PORT`,
+# matching internal/ui's AdminURL). Both are a no-op when CADDY_ADMIN_PORT is
+# left at its default.
+#
+# Order matters -- do the literal `:2019` port rewrite FIRST, then inject the
+# token. The token expands to `<hostname>:<CADDY_ADMIN_PORT>`, already carrying
+# the real port, so injecting it LAST keeps the global `:2019` rewrite from
+# touching it. Doing it the other way round corrupts the injected origin
+# whenever CADDY_ADMIN_PORT itself begins with "2019" (e.g. 20190 -> the
+# `:2019` inside the just-injected `<host>:20190` would be rewritten to
+# `:20190`, yielding `<host>:201900`). roborev bdm6.
 BOOTSTRAP_TEMPLATE=/etc/caddy/bootstrap-caddy.json.example
 BOOTSTRAP_RUNTIME=/tmp/bootstrap-caddy.generated.json
 echo "entrypoint: templating $BOOTSTRAP_TEMPLATE -> $BOOTSTRAP_RUNTIME (admin origin = $TS_HOSTNAME:$CADDY_ADMIN_PORT) ..."
-sed 's|__TAILPORT_ADMIN_ORIGIN__|'"${TS_HOSTNAME}:${CADDY_ADMIN_PORT}"'|; s|:2019|:'"${CADDY_ADMIN_PORT}"'|g' \
+sed 's|:2019|:'"${CADDY_ADMIN_PORT}"'|g; s|__TAILPORT_ADMIN_ORIGIN__|'"${TS_HOSTNAME}:${CADDY_ADMIN_PORT}"'|' \
   "$BOOTSTRAP_TEMPLATE" > "$BOOTSTRAP_RUNTIME"
 
 echo "entrypoint: exec caddy run --resume ..."

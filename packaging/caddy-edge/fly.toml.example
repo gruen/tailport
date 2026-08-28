@@ -53,8 +53,9 @@ primary_region = "<fly-region>"   # e.g. "iad" -- pick one near your DNS's expec
 # non-ephemeral key (tagging is what disables its node-key expiry).
 
 # Uncomment and set only if you changed tailport's caddy.hostname or
-# caddy.admin_port away from their defaults (caddy / 2019) -- and update
-# bootstrap-caddy.json's admin.listen/admin.origins to match.
+# caddy.admin_port away from their defaults (caddy / 2019). No bootstrap edit
+# is needed: entrypoint.sh templates the live admin.listen/admin.origins from
+# these env vars at boot (see ../../docs/caddy-edge.md's "admin.origins" flow).
 # [env]
 #   TS_HOSTNAME = "caddy"
 #   CADDY_ADMIN_PORT = "2019"

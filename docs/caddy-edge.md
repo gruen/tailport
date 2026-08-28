@@ -244,17 +244,21 @@ published *public* hostname. `server_name` must be identical on every tailport
 computer sharing this edge (it selects the shared routes array); it does not
 identify the source machine.
 
-**Known limitation:** the edge derives its admin API's allow-list
-(`admin.origins`) from `caddy.hostname`/`TS_HOSTNAME` automatically on its
-*first* boot only (see
+**Known limitation:** the edge derives its admin API's identity — both the
+allow-list (`admin.origins`) and the listener/origin *port* — from
+`caddy.hostname`/`TS_HOSTNAME` and `caddy.admin_port`/`CADDY_ADMIN_PORT`
+automatically on its *first* boot only (see
 [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)'s
-`admin.origins` section) — Caddy's autosave then carries that value forward
-across every later restart. If you change `hostname` here (and the edge's
-`TS_HOSTNAME`) **after** the edge has already booted once, the autosaved
-origin is now stale and tailport's admin requests start 403ing. This isn't
-auto-reconciled; recover with the existing edge-reset procedure in step 7
-(clear the autosave file or recreate the volume) so the edge re-derives the
-origin from the new hostname on its next, effectively-first, boot.
+`admin.origins` section) — Caddy's autosave then carries those values forward
+across every later restart. If you change **either** the hostname **or** the
+admin port **after** the edge has already booted once, the autosaved config is
+now stale: a changed hostname makes tailport's admin requests 403 on a stale
+origin, and a changed admin port leaves Tailscale Serve forwarding to the new
+port while resumed Caddy still listens on the old one — the admin API goes
+unreachable. Neither is auto-reconciled; recover with the existing edge-reset
+procedure in step 7 (clear the autosave file or recreate the volume) so the
+edge re-derives its admin identity from the new env on its next,
+effectively-first, boot.
 
 ## 5. First-publish smoke test
 
