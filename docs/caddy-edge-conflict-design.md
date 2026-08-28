@@ -69,16 +69,18 @@ On `ErrHostnameConflict`, before any confirm, one **classification read**. We **
 New: **`caddyedge.InspectConflict(ctx, hostname) (ConflictInfo, error)`** —
 
 ```
-ConflictInfo{
-    Kind      ConflictKind    // OwnedDiffBackend | IdHijacked | ForeignOverlap | None
-    Owned     bool            // @id carries tailport- prefix
-    ID        string          // @id, "" if id-less foreign
-    Label,Port int; BackendParseable bool
-    Handler   string          // first handler name, for naming a non-proxy foreign route
-    Raw       json.RawMessage // exact bytes (display/identity only — NOT the delete key, see below)
-    Index     int             // classify-time position (display only — NOT the delete index)
+ConflictInfo{                 // as shipped in qfbf
+    Kind       ConflictKind   // None | OwnedDiffBackend | IdHijacked | ForeignOverlap
+    Owned      bool           // @id carries tailport- prefix
+    ID         string         // @id, "" if id-less foreign
+    Label      string         // reverse_proxy dial label (a hostname/IP, hence string)
+    Port       int            // reverse_proxy dial port
+    BackendParseable bool     // false for a non-proxy foreign route (Handler names it)
+    HijackedTo string         // for IdHijacked: where our @id now points
+    Handler    string         // first handler name, for naming a non-proxy foreign route
 }
 ```
+It deliberately carries **no** capture bytes / array index / etag: capture and the delete are `PurgeConflict`'s job on its own fresh read (§3.2, review r1-F9 — a classify-time index/etag is a TOCTOU trap), which keeps the classifier lean and free of any raw-storage dependency.
 
 **It must do TWO reads (review r2-M1 — the hijacked-`@id` hole):**
 1. `fetchByID(IDFor(hostname))` — catches sub-case 2 (**our `@id` re-pointed to a *different, non-overlapping* host**). A pure host-overlap scan for the *requested* name would **miss** this (the route no longer matches our hostname), return `Found==false`, and the old "retry the plain publish" rule would **livelock** (Publish re-refuses on `hostMatcherIs` forever). So: if our `@id` exists but its matcher isn't ours → `Kind=IdHijacked` → a **refusal** ("your tailport route for `<host>` was re-pointed at `<other>` — resolve it in Caddy"), never a retry, never a blind `DELETE /id` (that would delete drift AGENTS.md forbids touching).
@@ -109,7 +111,7 @@ else:         DELETE .../routes/<i> If-Match=<routes-array etag>   // id-less fo
 
 ### 3.3 Capture must be raw bytes — **confirmed necessary** (both reviewers)
 
-`Match` carries `raw map[string]json.RawMessage` and round-trips every matcher key (caddyedge.go:123/147–152), but **`Route`/`Handler` have no raw catch-all** (caddyedge.go:98–103/158–193, all `omitempty`). A foreign `static_response`/`file_server`/multi-field-`reverse_proxy`/route-level-`group` decoded into `[]Route` and re-marshaled is **silently mutilated** (its `body`/`status_code`/`transport`/… gone). So capture keeps the exact `json.RawMessage` of the element, and `RestoreRoute` POSTs *those bytes*. The capture/restore path therefore never needs tailport to model the foreign route — only to *locate* it (match-block overlap) and *move its bytes*. Both reviewers tried to break this and could not.
+**Capture happens only for an OWNED purge** — the only kind that is undoable (OQ8; a foreign force-purge is one-way and captures nothing). But raw bytes are still the right capture even for an owned route: `Match` round-trips its matcher keys (caddyedge.go:123/147–152), yet **`Route`/`Handler` have no raw catch-all** (caddyedge.go:98–103/158–193, all `omitempty`), so a route decoded into `[]Route` and re-marshaled is **silently mutilated** if it carries any field tailport doesn't model. A tailport-`@id`'d route *usually* holds only modeled handlers (reverse_proxy + optional http_basic), but a foreign edit can add unmodeled fields to it while keeping the `@id` (the matcher guard `hostMatcherIs` does not police the handler chain). So capture keeps the exact `json.RawMessage` of the element and `RestoreRoute` POSTs *those bytes* — byte-faithful regardless of what the owned route accreted. (This is a weaker necessity than rev-1's foreign-`static_response` scenario, since we no longer restore foreign routes, but it is still the correct, robust choice.)
 
 ### 3.4 The confirm ladders
 
@@ -136,19 +138,19 @@ Rev-1 proposed the poof as a bottom line *and* a third sticky banner for restore
 
 **The mechanics (order is load-bearing — A before B):**
 - (A) **remove our takeover** — `Unpublish(hostname, ourLabel, ourPort)` (re-verifies it's still ours + our backend, caddyedge.go:543).
-- (B) **restore the captured bytes** — `RestoreRoute(ctx, captured)` = POST-append raw, fresh `If-Match`, retry on 412.
-- (C) **NEW — a mandatory final re-read** (`InspectConflict`) that decides the message.
+- (B) **restore the captured bytes** — `RestoreRoute(ctx, captured)` = **scan-then-append under one array `If-Match`** (review roborev-ew0q-#1): read the routes array (fresh etag), scan it for a host-overlap with `<hostname>` **or** a duplicate `@id`, and if the name is **already claimed refuse** (do not append — Caddy permits overlapping host matchers, so a blind POST-append would silently create *dual exposure* the C-read could only report after the fact); only when the name is genuinely free, POST-append the raw bytes with **that same array etag** as `If-Match`. A concurrent append between the scan and the POST moves the array hash → 412 → re-read, re-scan, retry. So refuse-before-append under the array `If-Match` is atomic against the overlap race, rather than append-then-discover.
+- (C) a final re-read (`InspectConflict`) that **confirms** the resulting state for the message (belt-and-suspenders with B's own scan).
 
 **A-before-B** (confirmed sound by both reviewers): an owned captured route shares our takeover's `@id`, so B-first risks a duplicate-`@id`; A-first also guarantees no rogue duplicate of ours, and its failure window ("hostname briefly unclaimed") is safer than "two overlapping routes."
 
 **Corrected failure handling (rev-2):**
 - **Split A's outcomes** (r1-F1): `Unpublish → ErrNotFound` ⇒ our route is truly gone ⇒ safe to proceed to B. `Unpublish → ErrHostnameConflict` ⇒ **our route is still live** (matcher hijacked or backend changed; it *refused* to delete) ⇒ **do NOT append** (that creates overlap) — abort with "your takeover changed under you — resolve in Caddy; not restoring." (Rev-1 wrongly treated these as identical.)
-- **B failure is classified by the (C) re-read** (r1-F2/F3): if B was rejected because the name got re-claimed (duplicate-`@id` from a third machine, or an overlapping foreign route), the message says "another route now claims `<host>` — resolve the drift in Caddy," **not** "UNCLAIMED." Only a (C)-confirmed empty name says "now UNCLAIMED."
+- **B refuses on a re-claim, up front** (r1-F2/F3 + roborev-ew0q-#1): if B's scan finds the name re-claimed (a duplicate `@id` from a third machine, or an overlapping foreign route), it does **not** append — it reports "another route now claims `<host>` — resolve the drift in Caddy," leaving our takeover already removed by A. Only a genuinely free name is appended; only then, and only if the C-read confirms it empty-then-ours, do we say "restored."
 - **Retryable modes re-arm** (r1-F11): on `ErrUnreachable` (A or B), keep the slot+banner and say "edge unreachable — press `<key>` to retry"; the ~60s clear timer is **suspended while a restore is in flight** and re-armed on a retryable outcome.
 - **In-flight guard** (r1-F5): restore sets `m.pending` (or a `restoring` flag) on launch and refuses a second launch until `restoreDoneMsg` — the discipline every other remote op follows; without it, double-`<key>` fires concurrent A/B and can append the captured route twice.
-- **Order-fidelity loss** (id-less foreign only): POST-append can't restore the original array index, and order *is* precedence in Caddy — an accepted loss, or refuse id-less-foreign undo outright (**OQ5**).
+- **Order-fidelity is a non-issue** now that undo is owned-only (OQ8): an owned captured route always has an `@id`, so it is never restored by array-index and there is no precedence loss to accept — the id-less-foreign case (rev-1's OQ5) simply never occurs.
 
-**Arming point** (r1-F4): arm `m.lastPurge` **after the takeover `publishDoneMsg`** (and arm it even if the takeover *fails* — the purge succeeded, so restore must be offered), and **exempt the in-transaction takeover publish from the "new publish clears the banner" trigger** — otherwise the takeover wipes the affordance microseconds after arming it.
+**Arming point** (r1-F4): arm `m.lastPurge` **only for an OWNED purge** (OQ8 — a foreign force-purge is one-way: no arm, no capture stored, no restore offered), and **after the takeover `publishDoneMsg`** (arm even if the takeover *fails* — the purge succeeded, so restore must be offered), and **exempt the in-transaction takeover publish from the "new publish clears the banner" trigger** — otherwise the takeover wipes the affordance microseconds after arming it.
 
 **Binding + clear-triggers.** Restore binds to a **key shown in the action line**. Rev-1 leaned to contextual `u`; round 1 (F6) showed that overloads the registry-undo key (a "shadow window" that silently disables documented `u`, and a `u,u` chain that restore-then-registry-undoes) → **rev-2 recommends a distinct key**, keeping `u` purely registry (still add a one-line pointer in the `u` help). Clears on: successful restore; a *new* (non-takeover) publish/purge; a poll/(C)-read showing third-party re-take; **de-escalation of our takeover** (r1-F10, new); navigation; or a ~60s timeout (**OQ1**).
 
@@ -179,7 +181,7 @@ Rev-1 proposed the poof as a bottom line *and* a third sticky banner for restore
 2. **OQ2 — undo ordering:** confirm **A-before-B** (both reviewers endorse), accepting the blunt "now UNCLAIMED"/"another route claims it" messages computed from the final re-read.
 3. **OQ3 — which key restores:** rev-2 recommends a **distinct key** shown in the action line (round 1 showed contextual `u` shadows registry-undo and enables a `u,u` footgun). Confirm.
 4. **OQ4 — the scary keystroke:** type `purge` (draft) vs the hostname vs `force`; two gates (y/n → type) vs one typed gate.
-5. **OQ5 — id-less-foreign order fidelity:** accept precedence loss on re-append (with caveat), or **refuse** id-less-foreign undo as un-restorable-faithfully?
+5. ~~**OQ5 — id-less-foreign order fidelity**~~ — **DISSOLVED by OQ8**: undo is owned-only, an owned route always has an `@id`, so nothing is ever restored by array-index and there is no precedence loss.
 7. **OQ7 — cross-machine owned takeover:** one normal confirm for all owned (draft), or a distinct/scarier confirm when the owned route belongs to *another* machine/user (detectable; review r2-m2 pushes here)?
 8. **OQ8 — foreign-route undo vs the drift philosophy** *(the sharpest)*: undoing a *foreign* purge **re-creates drift** on the user's behalf. Offer undo only for **owned** purges (foreign purge = deliberate, one-way)? This also dissolves OQ5's worst case.
 9. **OQ-Poof (new) — restore-affordance primitive:** one transient status-slot action line carrying poof→restore (rev-2), vs a distinct sticky banner, vs the poof slot? (Rev-2 picks the status-slot line to avoid a permanent reserved row.)
@@ -188,7 +190,7 @@ Rev-1 proposed the poof as a bottom line *and* a third sticky banner for restore
 
 ## 7. Verification plan
 
-**Unit-testable against the `httptest` fake — but the fake MUST be rebuilt first (review r1-F7):** the current fake stores `[]Route` (itself lossy — can't even *seed* a foreign `static_response` with fields tailport doesn't model), uses a single **global** etag string (no path scope), and blindly `append`s on POST (no `@id`-uniqueness). So today a "byte-faithful capture" test, a "parent-scope If-Match" test, and a "duplicate-`@id`-on-POST" test would all pass **for the wrong reason or be impossible**. Rebuild the fake to store **`[]json.RawMessage`**, model **path-scoped etags**, and reject **duplicate `@id` on POST**, then test: `InspectConflict` classification (incl. non-proxy foreign *found*, and the `IdHijacked` case); `PurgeConflict` `@id`-vs-index selection, `expect` re-verify → `ErrConflictChanged`, 412-retry; **byte-faithful** capture→restore of an unmodeled foreign route (exact bytes); undo message selection driven by the (C) re-read across unclaimed/claimed-by-us/claimed-by-third/overlap; in-flight restore guard; the confirm ladders; the action-line/status-slot reservation.
+**Unit-testable against the `httptest` fake — but the fake MUST be rebuilt first (review r1-F7):** the current fake stores `[]Route` (itself lossy — can't even *seed* a foreign `static_response` with fields tailport doesn't model), uses a single **global** etag string (no path scope), and blindly `append`s on POST (no `@id`-uniqueness). So today a "byte-faithful capture" test, a "parent-scope If-Match" test, and a "duplicate-`@id`-on-POST" test would all pass **for the wrong reason or be impossible**. Rebuild the fake to store **`[]json.RawMessage`**, model **path-scoped etags**, and reject **duplicate `@id` on POST**, then test: `InspectConflict` classification (incl. non-proxy foreign *found*, and the `IdHijacked` case); `PurgeConflict` `@id`-vs-index selection, `expect` re-verify → `ErrConflictChanged`, 412-retry; **byte-faithful** capture→restore of an OWNED route that carries a foreign-added field tailport doesn't model (exact bytes — proves raw capture is robust even for an owned route; we never restore a foreign route, per OQ8); **B refuses-before-append** when the name is re-claimed (an overlapping foreign route or a duplicate `@id`) rather than creating dual exposure; undo message selection driven by B's scan + the (C) re-read across unclaimed/claimed-by-us/claimed-by-third; in-flight restore guard; the confirm ladders; the action-line/status-slot reservation.
 
 **Honest CI-vs-live line:** the Caddy *mechanics* are now **source-verified** (§3.2) — CI needn't pretend to prove them, but tailport's **own** code has never exercised a **parent-scope `If-Match`** or **index-DELETE** against a real Caddy, so extend the opt-in `pxrx` integration test to cover an id-less-foreign index-delete-under-parent-ETag, and prove the version-floor behavior. Live-9kgt end-to-end: two machines racing a takeover; force-purge of a genuinely hand-authored foreign route; undo across a real edge; a real duplicate-`@id`-on-POST rejection. **Do not claim the fake proves the mechanics.**
 
