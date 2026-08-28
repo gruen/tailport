@@ -144,6 +144,12 @@ when you deploy it.
 From [`packaging/caddy-edge/`](../packaging/caddy-edge/):
 
 ```sh
+# Create your Caddy bootstrap config from the tracked template. It's gitignored
+# (like fly.toml) and baked into the image, so it must exist before `fly deploy`.
+# Fill in <tailnet> (and your hostname if you changed it) -- see
+# packaging/caddy-edge/README.md's admin.origins section.
+cp bootstrap-caddy.json.example bootstrap-caddy.json
+
 fly launch --no-deploy   # generates the real fly.toml; answer "no" to any
                           # prompt that would deploy before the volume/secret
                           # below exist. Reconcile the generated fly.toml
@@ -450,7 +456,9 @@ fi
 
 # bootstrap-caddy.json is Caddy's first-boot config; admin.origins is a Host
 # allow-list guarding the admin API (anti-DNS-rebinding, NOT authentication).
-# Substitute your real tailnet — and hostname, if you changed it off `caddy`:
+# Generate it from the tracked template (gitignored, like fly.toml), then
+# substitute your real tailnet — and hostname, if you changed it off `caddy`:
+cp bootstrap-caddy.json.example bootstrap-caddy.json
 sed -i \
   -e "s|caddy:2019|${HOSTNAME}:2019|" \
   -e "s|caddy.<tailnet>.ts.net:2019|${HOSTNAME}.${TAILNET}:2019|" \
@@ -467,14 +475,9 @@ fly logs                                                   # follow: tailscaled 
 fly ips list                                               # the v4/v6 you point DNS at
 ```
 
-> ⚠️ `bootstrap-caddy.json` is a **tracked** file, so that `sed` leaves your
-> real tailnet name in the working tree — do **not** `git commit` it. `fly
-> deploy` bakes it into the image, so once the deploy has built you can restore
-> the template. You are in `packaging/caddy-edge/`, so the revert is
-> `git checkout -- bootstrap-caddy.json` — a repo-root-relative path like
-> `packaging/caddy-edge/bootstrap-caddy.json` would **not** resolve from here.
-> Re-run the `sed` before any redeploy. (`fly.toml` is already gitignored, so it
-> needs none of this.)
+> `bootstrap-caddy.json` is **gitignored** — generated from the tracked
+> `bootstrap-caddy.json.example`, exactly like `fly.toml` — so fill it in freely:
+> your real tailnet never touches a tracked file, and there's nothing to revert.
 
 ### DNS (§3)
 

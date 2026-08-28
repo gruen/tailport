@@ -459,9 +459,9 @@ func TestCaddyIntegration(t *testing.T) {
 }
 
 // TestBootstrapConfigAcceptedByCaddy validates that
-// packaging/caddy-edge/bootstrap-caddy.json -- the exact config the edge
-// boots from in production (server_name "tailport", widened admin origins,
-// empty routes) -- is accepted by a real caddy binary.
+// packaging/caddy-edge/bootstrap-caddy.json.example -- the tracked template the
+// edge's boot config is generated from (server_name "tailport", widened admin
+// origins, empty routes) -- is accepted by a real caddy binary.
 //
 // It uses `caddy validate`, not `caddy run`, deliberately: validate loads and
 // PROVISIONS the config end to end (checking it is well-formed and every
@@ -473,7 +473,7 @@ func TestCaddyIntegration(t *testing.T) {
 func TestBootstrapConfigAcceptedByCaddy(t *testing.T) {
 	skipUnlessCaddy(t)
 
-	bootstrapPath, err := filepath.Abs(filepath.Join("..", "..", "packaging", "caddy-edge", "bootstrap-caddy.json"))
+	bootstrapPath, err := filepath.Abs(filepath.Join("..", "..", "packaging", "caddy-edge", "bootstrap-caddy.json.example"))
 	if err != nil {
 		t.Fatal(err)
 	}

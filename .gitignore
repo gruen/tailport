@@ -7,6 +7,9 @@
 # --- Caddy edge (v1z5): repo keeps only *.example templates + placeholder docs ---
 # Real Fly app config from `fly launch` (commit fly.toml.example instead):
 fly.toml
+# Real Caddy bootstrap config with your tailnet/hostname filled in
+# (commit bootstrap-caddy.json.example instead):
+packaging/caddy-edge/bootstrap-caddy.json
 # Local env files that may hold FLY_API_TOKEN / TS_AUTHKEY:
 .env
 .env.*
