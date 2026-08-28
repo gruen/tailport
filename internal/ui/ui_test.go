@@ -932,6 +932,44 @@ func mustUpdate(t *testing.T, m model, msg tea.Msg) model {
 	return res.(model)
 }
 
+// resumePublishDone unpacks the resume cmd a successful purgeDoneMsg returns
+// (kata dw57): since the purge success now ALSO fires the fire-and-forget poof
+// (batched alongside the resume publish -- see the dw57 seam), cmd() no longer
+// yields a bare publishDoneMsg but a tea.BatchMsg carrying both the poof's own
+// tick and the resume publish. This finds and returns the publishDoneMsg,
+// asserting the batch also carries exactly the poof tick fire-and-forget --
+// i.e. that the resume publish is issued UNCHANGED alongside it.
+func resumePublishDone(t *testing.T, cmd tea.Cmd) publishDoneMsg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("resume cmd is nil, want a batch carrying the resume publish")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("resume cmd = %#v, want a tea.BatchMsg (poof tick + resume publish)", cmd())
+	}
+	var pubdone publishDoneMsg
+	var gotPublish, gotPoofTick bool
+	for _, c := range batch {
+		switch msg := c().(type) {
+		case publishDoneMsg:
+			pubdone = msg
+			gotPublish = true
+		case poofTickMsg:
+			gotPoofTick = true
+		default:
+			t.Fatalf("unexpected msg in resume batch: %#v", msg)
+		}
+	}
+	if !gotPublish {
+		t.Fatal("resume batch should contain the resume publish's publishDoneMsg")
+	}
+	if !gotPoofTick {
+		t.Error("resume batch should contain the poof's own fire-and-forget tick")
+	}
+	return pubdone
+}
+
 // TestLabelPrefill covers vgn5: the 'l' label input prefills with the current
 // label if set, else the process name, else empty; confirming the prefill
 // persists it, editing replaces it, and esc leaves the existing label alone.
@@ -3462,6 +3500,88 @@ func TestFireworkCap(t *testing.T) {
 	}
 }
 
+// TestStepPoofAdvancesFrameAndTTL covers the pure step function: frame counts
+// up, ttl counts down, one tick at a time.
+func TestStepPoofAdvancesFrameAndTTL(t *testing.T) {
+	p := poofState{text: "app.example.com → dev-box:8080", ttl: poofTTL, emoji: false}
+	next := stepPoof(p)
+	if next.frame != 1 {
+		t.Errorf("frame = %d, want 1", next.frame)
+	}
+	if next.ttl != poofTTL-1 {
+		t.Errorf("ttl = %d, want %d", next.ttl, poofTTL-1)
+	}
+	if next.text != p.text || next.emoji != p.emoji {
+		t.Error("stepPoof must not touch text/emoji, only frame/ttl")
+	}
+}
+
+// TestPoofTickerSelfStopsNoLeak mirrors TestFireworkCap's ticker discipline for
+// the poof's sibling ticker (kata dw57): startPoof arms exactly one ticker,
+// draining poofTickMsg advances it to completion, and once ttl is exhausted
+// m.poof is cleared and poofTicking goes false with NO reschedule -- an idle
+// tick afterward is a no-op, never a busy loop.
+func TestPoofTickerSelfStopsNoLeak(t *testing.T) {
+	m := New(config.Config{})
+	m.width, m.height = 100, 40
+
+	cmd := m.startPoof("app.example.com → dev-box:8080")
+	if m.poof == nil {
+		t.Fatal("startPoof should set m.poof")
+	}
+	if !m.poofTicking || cmd == nil {
+		t.Fatalf("startPoof should start the ticker: poofTicking=%v cmd=%v", m.poofTicking, cmd != nil)
+	}
+
+	guard := 0
+	for m.poof != nil {
+		res, _ := m.Update(poofTickMsg{})
+		m = res.(model)
+		if guard++; guard > poofTTL+5 {
+			t.Fatal("poof never drained under the tick")
+		}
+	}
+	if m.poofTicking {
+		t.Error("poofTicking should be false once the poof completes")
+	}
+
+	// An idle tick afterward (e.g. a stray already-scheduled tick landing after
+	// completion) must not reschedule and must not resurrect m.poof.
+	res, cmd := m.Update(poofTickMsg{})
+	m = res.(model)
+	if cmd != nil {
+		t.Error("an idle poof tick must not reschedule (no busy loop)")
+	}
+	if m.poof != nil || m.poofTicking {
+		t.Error("an idle poof tick must not resurrect m.poof or poofTicking")
+	}
+}
+
+// TestPoofDoesNotStackTickers covers the no-stacking guard: a second trigger
+// while a poof is already in flight (e.g. two purges in quick succession)
+// replaces the descriptor but must NOT start a second ticker (mirrors the 'f'
+// key's fwTicking guard under repeated presses).
+func TestPoofDoesNotStackTickers(t *testing.T) {
+	m := New(config.Config{})
+	m.width, m.height = 100, 40
+
+	first := m.startPoof("a.example.com → dev-box:8080")
+	if first == nil || !m.poofTicking {
+		t.Fatalf("first trigger should start the ticker: cmd=%v poofTicking=%v", first != nil, m.poofTicking)
+	}
+
+	second := m.startPoof("b.example.com → dev-box:9090")
+	if second != nil {
+		t.Error("a second trigger while already ticking must not start a second ticker")
+	}
+	if m.poof == nil || m.poof.text != "b.example.com → dev-box:9090" {
+		t.Errorf("a second trigger should still replace the descriptor; got %#v", m.poof)
+	}
+	if m.poof.frame != 0 || m.poof.ttl != poofTTL {
+		t.Errorf("a replaced poof should restart at frame 0/full ttl; got frame=%d ttl=%d", m.poof.frame, m.poof.ttl)
+	}
+}
+
 // TestFireworkKeyLifecycle covers the 'f' handler and ticker discipline: launch,
 // no double-ticker, and esc clearing the fireworks + stopping the tick.
 func TestFireworkKeyLifecycle(t *testing.T) {
@@ -4305,6 +4425,67 @@ func TestLegendReservationDominatesLive(t *testing.T) {
 				t.Fatalf("width %d: reserved height %d < live height %d (cleanEnabled=%v) -- the reservation no longer dominates, WindowSizeMsg would under-reserve and clip the list", w, reserved, live, cleanEnabled)
 			}
 		}
+	}
+}
+
+// TestRenderStatusLineShowsPoof covers dw57's status-slot render: an active
+// m.poof renders through renderStatusLine (never a list-row animation, never
+// a separate banner), never exceeds m.width (renderPoofLine truncates rather
+// than wraps, so there's no horizontal scroll), and self-reserves through the
+// SAME live statusLines measurement listBodyHeight already uses for m.flash
+// -- so the list body height never drops below 1 while a poof is animating,
+// even on a short terminal.
+func TestRenderStatusLineShowsPoof(t *testing.T) {
+	m := New(config.Config{})
+	m.active = map[int]bool{}
+	m.width, m.height = 80, 24
+	m.rebuildItems()
+
+	longDescriptor := "a-very-long-hostname.internal.example.com → some-machine-label:65535"
+	for _, width := range []int{10, 40, 80, 120} {
+		m.width = width
+		m.poof = &poofState{text: longDescriptor, ttl: poofTTL, emoji: false}
+		m.resizeList()
+
+		out := m.renderStatusLine()
+		if lipgloss.Height(out) != 1 {
+			t.Errorf("width %d: poof status line height = %d, want exactly 1 (no wrap)", width, lipgloss.Height(out))
+		}
+		if w := lipgloss.Width(out); w > width {
+			t.Errorf("width %d: poof status line width = %d, exceeds the terminal", width, w)
+		}
+		if h := m.listBodyHeight(); h < 1 {
+			t.Errorf("width %d: listBodyHeight = %d with an active poof, want >=1 (no clip)", width, h)
+		}
+	}
+
+	// A short terminal (small m.height) is the tightest case for the "never
+	// clips below 1" floor.
+	m.width, m.height = 80, 6
+	m.poof = &poofState{text: longDescriptor, ttl: poofTTL, emoji: false}
+	m.resizeList()
+	if h := m.listBodyHeight(); h < 1 {
+		t.Errorf("short terminal: listBodyHeight = %d with an active poof, want >=1 (no clip)", h)
+	}
+}
+
+// TestRenderStatusLinePoofFlashPrecedence pins the documented precedence in
+// renderStatusLine (dw57 §3.5: "keep it simple and documented"): when both a
+// flash and a poof are active, the flash wins the slot; the poof itself is
+// untouched by this (it keeps ticking underneath, just isn't drawn).
+func TestRenderStatusLinePoofFlashPrecedence(t *testing.T) {
+	m := New(config.Config{})
+	m.width = 80
+	m.poof = &poofState{text: "app.example.com → dev-box:8080", ttl: poofTTL, emoji: false}
+	m.flash = "took over app.example.com"
+	m.flashLevel = flashInfo
+
+	out := stripANSI(m.renderStatusLine())
+	if !strings.Contains(out, "took over app.example.com") {
+		t.Errorf("renderStatusLine = %q, want the flash to win over the poof", out)
+	}
+	if strings.Contains(out, "example.com → dev-box") {
+		t.Errorf("renderStatusLine = %q, the poof should not also render while a flash is active", out)
 	}
 }
 
@@ -6500,9 +6681,20 @@ func TestPurgeOwnedTakeoverResumes(t *testing.T) {
 	if m.publishCredPass != "" || m.publishCredUser != "" {
 		t.Errorf("no plaintext credential may survive into the takeover resume")
 	}
-	pubdone, ok := cmd().(publishDoneMsg)
-	if !ok || pubdone.err != nil {
-		t.Fatalf("resume cmd = %#v, want a clean publishDoneMsg", cmd())
+	// (kata dw57) The same purge success ALSO starts the poof, fire-and-forget,
+	// WITHOUT altering the control flow just asserted above.
+	if m.poof == nil {
+		t.Fatal("purge success should start the poof")
+	}
+	if !strings.Contains(m.poof.text, host) {
+		t.Errorf("poof descriptor = %q, want it to name %s", m.poof.text, host)
+	}
+	if !m.poofTicking {
+		t.Error("purge success should start the poof ticker")
+	}
+	pubdone := resumePublishDone(t, cmd)
+	if pubdone.err != nil {
+		t.Fatalf("resume publish = %#v, want a clean publishDoneMsg", pubdone)
 	}
 	// The route now points at OUR backend and carries auth rebuilt from cfg.
 	rt, present := fc.routes[id]
@@ -6596,9 +6788,12 @@ func TestPurgeForeignLadderTypedGate(t *testing.T) {
 		if m.takeoverHost != host {
 			t.Fatalf("purge success should resume the takeover; takeoverHost=%q", m.takeoverHost)
 		}
-		pubdone, ok := cmd().(publishDoneMsg)
-		if !ok || pubdone.err != nil {
-			t.Fatalf("resume cmd = %#v, want a clean publishDoneMsg", cmd())
+		if m.poof == nil || !strings.Contains(m.poof.text, host) {
+			t.Errorf("purge success should start the poof naming %s; got %#v", host, m.poof)
+		}
+		pubdone := resumePublishDone(t, cmd)
+		if pubdone.err != nil {
+			t.Fatalf("resume publish = %#v, want a clean publishDoneMsg", pubdone)
 		}
 		if got := routeDial(fc.routes[caddyedge.IDFor(host)]); got != "dev-box:8080" {
 			t.Errorf("takeover route dial = %q, want dev-box:8080", got)

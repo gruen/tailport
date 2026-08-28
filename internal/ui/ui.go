@@ -657,6 +657,39 @@ type eggTickMsg struct{}
 // (eggInterval) to speed up too -- the two tickers are deliberately decoupled.
 type fwTickMsg struct{}
 
+// poofTickMsg advances the "poof" dissipation animation for a just-purged edge
+// route (kata dw57). It is a SIBLING of fwTickMsg, NOT a reuse of it: the
+// fwTickMsg handler hard-stops whenever !m.showEgg (see that case below), but
+// a poof legitimately fires with the egg overlay closed (it's triggered by a
+// force-purge/take-over, nothing to do with the Easter egg) -- relaxing the
+// egg guard instead would entangle the fireworks lag-clutch for no reason
+// (design doc §3.5). So the poof gets its own message, its own ticker
+// (poofTick, same fwInterval cadence), and its own no-leak guard (poofTicking,
+// mirroring fwTicking) rather than hooking into the fireworks'.
+type poofTickMsg struct{}
+
+// poofState is the in-flight "poof" dissolve for a just-purged route's
+// descriptor (kata dw57) -- purely cosmetic, decoupled from the purge/undo
+// control flow. text is the descriptor being dissolved (e.g.
+// "<host> → <label>:<port>"); frame counts ticks elapsed and ttl counts ticks
+// remaining (poofTickMsg's handler clears m.poof once ttl reaches 0); emoji is
+// captured at trigger time (mirrors *firework.emoji, set once at newFirework)
+// so the glyph vocabulary stays consistent for the animation's whole ~500ms
+// life even if terminal capability detection were re-run mid-flight. Rendering
+// is derived from frame/ttl at render time (renderPoofLine) rather than baked
+// in here, mirroring how stepFireworks advances physics separately from the
+// grid-time draw.
+type poofState struct {
+	text  string
+	frame int
+	ttl   int
+	emoji bool
+}
+
+// poofTTL is the poof's total lifetime in ticks at fwInterval (50ms) -- 10
+// frames = ~500ms, inside the design's ~6-12 frame target (§3.5).
+const poofTTL = 10
+
 type toggleDoneMsg struct {
 	port int
 	err  error
@@ -888,6 +921,18 @@ type model struct {
 	// or the overlay closes. Kept adjacent to showEgg/eggFrame on purpose.
 	fireworks []firework
 	fwTicking bool
+	// poof holds the in-flight "poof" dissolve animation for a just-purged edge
+	// route (kata dw57) -- nil when idle. It is triggered fire-and-forget from
+	// the purgeDoneMsg success handler and rendered as ONE transient line
+	// through the status slot (renderStatusLine), never a list-row animation or
+	// a sticky banner (design §3.5). poofTicking guards its SIBLING ticker
+	// (poofTick/poofTickMsg) exactly like fwTicking guards fwTick: scheduled at
+	// most once, and stopped the instant the poof completes. Every mutation of
+	// m.poof (set OR clear) calls resizeList, mirroring m.flash's discipline, so
+	// the live-measured status-slot reservation (statusLines in
+	// listBodyHeight) always tracks it and the list never clips.
+	poof        *poofState
+	poofTicking bool
 	// (3e8b) adaptive intake clutch: lastFwTick is the wall-clock time of the
 	// previous fwTickMsg (zero when idle/warming up); fwLagEWMA is the EWMA
 	// (ms) of the OBSERVED inter-tick interval, our proxy for event-loop /
@@ -1397,6 +1442,35 @@ func eggTick() tea.Cmd {
 // fwTickMsg handler), so an idle overlay and a closed overlay both stop it.
 func fwTick() tea.Cmd {
 	return tea.Tick(fwInterval, func(time.Time) tea.Msg { return fwTickMsg{} })
+}
+
+// poofTick schedules the next poof-dissolve frame, on the SAME cadence as
+// fwTick (fwInterval) but as an entirely separate ticker (kata dw57) -- see
+// poofTickMsg's doc for why it can't reuse fwTick/fwTickMsg. Rescheduled only
+// while the poof is still alive; see the poofTickMsg handler.
+func poofTick() tea.Cmd {
+	return tea.Tick(fwInterval, func(time.Time) tea.Msg { return poofTickMsg{} })
+}
+
+// startPoof begins (or restarts) the "poof" dissolve for a just-purged route's
+// descriptor (kata dw57). It is fire-and-forget by design: every call site
+// folds the returned cmd into whatever tea.Batch it already returns and never
+// branches on it -- the poof never alters control flow. A poof already in
+// flight is simply replaced with the fresh descriptor at frame 0 (a rapid
+// second purge doesn't stack animations), but poofTicking (mirroring
+// fwTicking) ensures AT MOST ONE ticker is ever scheduled: if one is already
+// running, startPoof returns nil and the existing ticker picks up the new
+// state on its next tick. Calls resizeList so the status-slot reservation
+// (renderStatusLine via listBodyHeight's live statusLines measurement) tracks
+// the new poof immediately, exactly like every m.flash mutation site does.
+func (m *model) startPoof(text string) tea.Cmd {
+	m.poof = &poofState{text: text, ttl: poofTTL, emoji: m.emoji}
+	m.resizeList()
+	if m.poofTicking {
+		return nil
+	}
+	m.poofTicking = true
+	return poofTick()
 }
 
 // fwClutchNext is the adaptive intake clutch's hysteresis gate (3e8b): engage
@@ -2925,6 +2999,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fwTick()
 
+	case poofTickMsg:
+		// Step the poof on its own cadence, independent of showEgg/fwTicking
+		// (kata dw57 -- see poofTickMsg's doc: it must NOT hook into the
+		// fireworks handler above). Mirrors fwTick's no-leak discipline
+		// exactly: stop (poofTicking=false) the moment the poof completes --
+		// or if it's already gone (defensive: cleared elsewhere between
+		// scheduling and firing) -- otherwise reschedule. startPoof's guard
+		// ensures exactly one poofTicker is ever live, so this never
+		// busy-loops or stacks under repeated triggers.
+		if m.poof == nil {
+			m.poofTicking = false
+			return m, nil
+		}
+		next := stepPoof(*m.poof)
+		if next.ttl <= 0 {
+			m.poof = nil
+			m.poofTicking = false
+			m.resizeList() // give the status slot back the row the poof held
+			return m, nil
+		}
+		m.poof = &next
+		return m, poofTick()
+
 	case toggleDoneMsg:
 		m.pending = 0
 		if msg.err != nil {
@@ -3119,20 +3216,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// serve is already on, so enableServe=false). takeoverHost lets the takeover
 		// publish's success toast say "took over <host>".
 		//
-		// ── SEAM (kata dw57): trigger the "poof" delete animation for the purged
-		//    route HERE, on the success path, before/alongside the resume publish.
-		//    6n15 shows only a plain toast — do NOT build the poof here.
+		// (kata dw57) Trigger the "poof" dissolve for the just-purged route's
+		// descriptor HERE, on the success path. This is fire-and-forget and
+		// decoupled: startPoof only sets m.poof + (maybe) starts the sibling
+		// poof ticker, it never branches on outcome, and the cmd it returns
+		// just rides in the same tea.Batch as the resume publish below --
+		// nothing about the takeover resume changes because of it.
+		poofCmd := m.startPoof(fmt.Sprintf("%s → %s:%d", msg.hostname, m.pendingPublish.label, msg.port))
 		// ── SEAM (kata ttfh): for an OWNED purge (msg.captured.HadID &&
 		//    m.purgeExpect.Owned — capture is undoable only for an owned route,
 		//    design OQ8), arm m.lastPurge with msg.captured and expose the restore
-		//    affordance HERE. 6n15 does NEITHER: no arm, no undo — leave this seam.
+		//    affordance HERE, sharing this SAME status-slot action line once the
+		//    poof above finishes (it becomes the "press <key> to restore" prompt --
+		//    see renderStatusLine's flash/poof precedence doc). 6n15 does NEITHER:
+		//    no arm, no undo — leave this seam.
 		var auth *caddyedge.BasicAuth
 		if m.pendingPublish.withAuth {
 			auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
 		}
 		m.takeoverHost = msg.hostname
 		m.pending = msg.port
-		return m, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false)
+		return m, tea.Batch(poofCmd, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false))
 
 	case publishPollMsg:
 		// Drop a stale result (roborev 0k12 #1): polls are remote round-trips
@@ -5004,6 +5108,89 @@ func stepFireworks(fws []firework) []firework {
 	return kept
 }
 
+// stepPoof advances the poof dissolve by one frame -- pure, like
+// stepFireworks: it only advances the counters (frame up, ttl down). The
+// actual dissolve glyphs are derived at render time (renderPoofLine) from
+// frame/ttl rather than baked into the model here, so there's a single source
+// of truth for "how dissolved is it right now."
+func stepPoof(p poofState) poofState {
+	p.frame++
+	p.ttl--
+	return p
+}
+
+// renderPoofLine renders one frame of the poof's dissolve (kata dw57): the
+// descriptor's characters fade via the SAME glyph vocabulary + colour ramp the
+// hidden fireworks reuse -- fwGlyphsUnicode/ASCII gated on emoji, and
+// eggRampColor for the dim-out -- reusing the fireworks AESTHETIC only (never
+// its ticker or *firework methods; the poof is a sibling animation, design
+// §3.5). Each rune dissolves on its own small deterministic offset
+// (poofCharPhase) so the descriptor crumbles unevenly rather than fading as
+// one flat block; a rune whose own progress has run out renders as a blank
+// space. width, when > 0, truncates the descriptor BEFORE rendering so the
+// line can never exceed the terminal width -- no wrap, no horizontal scroll,
+// mirroring how renderStatusLine bounds m.flash to m.width.
+func renderPoofLine(p poofState, width int) string {
+	text := p.text
+	if width > 0 {
+		if r := []rune(text); len(r) > width {
+			text = string(r[:width])
+		}
+	}
+
+	total := p.frame + p.ttl
+	if total <= 0 {
+		total = 1
+	}
+	progress := float64(p.frame) / float64(total)
+
+	set := fwGlyphsASCII
+	if p.emoji {
+		set = fwGlyphsUnicode
+	}
+
+	runes := []rune(text)
+	out := make([]string, len(runes))
+	for i, r := range runes {
+		if r == ' ' {
+			out[i] = " "
+			continue
+		}
+		// Stagger this rune's own fade around the shared progress so
+		// neighbouring characters don't all wink out on the same frame.
+		jitter := (poofCharPhase(i) - 0.5) * 0.5
+		br := eggClamp01(1 - progress - jitter)
+		switch {
+		case br <= 0:
+			out[i] = " "
+		case br >= 0.8:
+			// Still bright enough to read as itself -- the descriptor gets a
+			// beat to register before it starts crumbling into glyphs.
+			out[i] = lipgloss.NewStyle().Foreground(eggRampColor(br)).Render(string(r))
+		default:
+			idx := int(br / 0.8 * float64(len(set)-1))
+			if idx < 0 {
+				idx = 0
+			} else if idx > len(set)-1 {
+				idx = len(set) - 1
+			}
+			out[i] = lipgloss.NewStyle().Foreground(eggRampColor(br)).Render(string(set[idx]))
+		}
+	}
+	return strings.Join(out, "")
+}
+
+// poofCharPhase is a deterministic per-index offset in [0,1) -- mirrors
+// eggCellPhase's role for the egg shimmer -- so each character of the poof
+// dissolves on its own stagger instead of every character changing glyph on
+// the exact same frame.
+func poofCharPhase(i int) float64 {
+	s := uint32(i)*2654435761 + 1
+	s = (s ^ (s >> 15)) * 0x85ebca6b
+	s = s ^ (s >> 13)
+	return float64(s%1000) / 1000
+}
+
 var (
 	fwGlyphsUnicode = []rune{'·', '░', '▒', '▓', '█'} // dot · light/medium/dark shade · full block
 	fwGlyphsASCII   = []rune{'.', ':', '+', '#', '@'}
@@ -6171,20 +6358,37 @@ func (m *model) resizeList() {
 // only reachable pre-resize, when there's no real terminal width to wrap to
 // anyway).
 func (m model) renderStatusLine() string {
-	if m.flash == "" {
-		return helpStyle.Render(m.statusText())
+	if m.flash != "" {
+		toast := activeStyle
+		switch m.flashLevel {
+		case flashWarn:
+			toast = warnStyle
+		case flashError:
+			toast = errStyle
+		}
+		if m.width <= 0 {
+			return toast.Render(m.flash)
+		}
+		return toast.Width(m.width).Render(m.flash)
 	}
-	toast := activeStyle
-	switch m.flashLevel {
-	case flashWarn:
-		toast = warnStyle
-	case flashError:
-		toast = errStyle
+	if m.poof != nil {
+		// (kata dw57) Precedence when both a flash and a poof want the slot:
+		// the flash always wins, kept simple and documented per design §3.5.
+		// In practice a purge success itself never sets m.flash (its own
+		// "took over <host>" toast fires later, from the RESUMED takeover's
+		// own publishDoneMsg -- see the dw57 seam in Update), so the common
+		// case shows the poof cleanly for its whole life. On the rare frame
+		// where some other flash lands while a poof is still dissolving
+		// underneath, the flash simply preempts it for that render; the poof
+		// ticker keeps advancing regardless of what's drawn (it's driven by
+		// its own poofTickMsg loop, not by this function), so it either
+		// resumes showing the moment the flash clears or just finishes unseen.
+		// Renders as ONE line, already width-bounded by renderPoofLine (never
+		// wraps), so it self-reserves through the same live statusLines
+		// measurement as everything else in this function.
+		return renderPoofLine(*m.poof, m.width)
 	}
-	if m.width <= 0 {
-		return toast.Render(m.flash)
-	}
-	return toast.Width(m.width).Render(m.flash)
+	return helpStyle.Render(m.statusText())
 }
 
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
