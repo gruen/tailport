@@ -141,5 +141,12 @@ contract. The short version:
   feature branch. Each subagent claims its kata issue before starting,
   then rebases (not merge-commit) into `main` once that issue is closed
   with verification.
+- Match the subagent's model to the task. Default to **sonnet** for
+  implementation work. Use **opus** for planning and design — the hard
+  reasoning, subtle-correctness, and architectural-tradeoff work (e.g.
+  the design constraints above). Use **haiku** for cheap, mechanical
+  work (rote edits, formatting, boilerplate, log/output grep). Don't
+  default everything to the top tier; reserve opus for a compelling
+  reason.
 - No force-push, no `git reset --hard`, no skipping hooks, without
   explicit user authorization for that specific action.
