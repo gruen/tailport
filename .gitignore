@@ -21,3 +21,5 @@ tailscaled.state
 secrets/
 # roborev snapshots
 /.roborev/
+# Scratch handoff/prompt docs (not committed):
+docs/tmp/
