@@ -3448,6 +3448,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = entryConfirmPurgeOwned
 			return m, nil
 		case caddyedge.ForeignOverlap:
+			if !msg.info.Disclosable {
+				// The foreign route matches on MORE than a hostname (a hostless OR
+				// block, an extra path/method matcher, or a bare catch-all), so its
+				// Hosts list is NOT its full blast radius. Offering a force-delete
+				// would let the user delete a route matching traffic the confirm
+				// never named (roborev en3n-#1). Refuse and send them to Caddy.
+				return m, tea.Batch(
+					m.setErr(fmt.Sprintf("%s is held by a route that matches more than a hostname — resolve it in Caddy", msg.hostname)),
+					refresh, m.pollPublishedCmd())
+			}
 			// A route tailport did NOT create (drift) — the SCARY first gate: a
 			// y/n drift warning, which on y advances to the typed-"purge" commit.
 			m.purgeHostname, m.purgePort = msg.hostname, msg.port

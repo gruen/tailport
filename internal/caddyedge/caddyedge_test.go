@@ -1094,6 +1094,36 @@ func TestInspectConflictFindsNonProxyForeign(t *testing.T) {
 	}
 }
 
+// TestInspectConflictForeignDisclosable (roborev en3n-#1): a ForeignOverlap is
+// Disclosable only when every match block is host-only, so its Hosts list is its
+// COMPLETE blast radius. A route matching on more than a hostname (a hostless OR
+// block) is NOT disclosable, so the UI can refuse to offer a force-delete for it.
+func TestInspectConflictForeignDisclosable(t *testing.T) {
+	t.Run("host-only foreign route is disclosable", func(t *testing.T) {
+		raw := json.RawMessage(`{"@id":"fp","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.5:80"}]}],"terminal":true}`)
+		c, _ := newFakeRaw(t, raw)
+		info, err := c.InspectConflict(context.Background(), "app.example.com", "dev-box", 8080)
+		if err != nil || info.Kind != ForeignOverlap {
+			t.Fatalf("kind=%v err=%v, want ForeignOverlap", info.Kind, err)
+		}
+		if !info.Disclosable {
+			t.Errorf("a host-only foreign route must be Disclosable")
+		}
+	})
+	t.Run("hostless OR block is NOT disclosable", func(t *testing.T) {
+		// Same host list, plus a second HOSTLESS block that matches every request.
+		raw := json.RawMessage(`{"@id":"fp","match":[{"host":["app.example.com"]},{"path":["/*"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.5:80"}]}],"terminal":true}`)
+		c, _ := newFakeRaw(t, raw)
+		info, err := c.InspectConflict(context.Background(), "app.example.com", "dev-box", 8080)
+		if err != nil || info.Kind != ForeignOverlap {
+			t.Fatalf("kind=%v err=%v, want ForeignOverlap", info.Kind, err)
+		}
+		if info.Disclosable {
+			t.Errorf("a route with a hostless OR block must NOT be Disclosable (its Hosts list hides the catch-all)")
+		}
+	})
+}
+
 // TestInspectConflictCaseAndWildcard: the scan overlaps case-insensitively and
 // honors the single-label "*.suffix" wildcard, matching Publish's own conflict
 // detection.

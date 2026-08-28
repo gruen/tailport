@@ -312,6 +312,16 @@ type ConflictInfo struct {
 	// "static_response"), used to name a non-proxy foreign route the backend
 	// dial can't.
 	Handler string
+	// Disclosable reports whether a ForeignOverlap route's match is EXACTLY
+	// host-based (every match block is a bare {host:[...]}), so Hosts is its
+	// COMPLETE blast radius. False when the route also matches on something the
+	// host list can't show -- a hostless OR block that matches every hostname, an
+	// extra matcher key (path/method/header), or no match block at all. tailport
+	// only OFFERS a force-delete for a Disclosable foreign route; a non-disclosable
+	// one is refused ("matches more than a hostname -- resolve it in Caddy") so the
+	// user can never delete a catch-all under a confirm that named one hostname
+	// (roborev en3n-#1). Always true for owned conflicts (pinned host-only).
+	Disclosable bool
 	// Hosts is the holder's FULL host-matcher list (every host pattern across
 	// every match block), populated for a ForeignOverlap so the UI can disclose
 	// the true blast radius of a force-purge (kata 6n15 / roborev hped #3): a
@@ -835,12 +845,13 @@ func (c *Client) scanOverlap(ctx context.Context, hostname, excludeID string) (C
 			continue
 		}
 		info := ConflictInfo{
-			Kind:    ForeignOverlap,
-			Owned:   strings.HasPrefix(r.ID, idPrefix),
-			ID:      r.ID,
-			Handler: firstHandler(r),
-			Hosts:   matcherHostList(r),
-			RawHash: rawIdentityHash(elem),
+			Kind:        ForeignOverlap,
+			Owned:       strings.HasPrefix(r.ID, idPrefix),
+			ID:          r.ID,
+			Handler:     firstHandler(r),
+			Hosts:       matcherHostList(r),
+			RawHash:     rawIdentityHash(elem),
+			Disclosable: matchFullyHostOnly(r),
 		}
 		if label, port, ok := backendOf(r); ok {
 			info.Label, info.Port, info.BackendParseable = label, port, true
@@ -1518,6 +1529,29 @@ func splitDial(dial string) (label string, port int, ok bool) {
 // check — so Publish/Unpublish refuse rather than mutate a route that is no
 // longer purely our hostname. The extra-key check relies on Match.raw, which
 // records every matcher key seen on decode.
+// matchFullyHostOnly reports whether EVERY one of route's match blocks is exactly
+// a host matcher and nothing else, so matcherHostList captures the route's
+// COMPLETE matching semantics and a disclosed blast radius is the whole truth. A
+// route with a hostless OR block (a bare path/method matcher, which matches every
+// hostname), an extra matcher key alongside host, or no match block at all (a
+// catch-all) is NOT fully host-disclosable -- deleting it would hit traffic the
+// host list never named. tailport refuses to offer a force-delete for such a
+// route (roborev en3n-#1). Relies on Match.raw, populated on decode.
+func matchFullyHostOnly(r Route) bool {
+	if len(r.Match) == 0 {
+		return false // no matcher = matches everything; not host-disclosable
+	}
+	for _, m := range r.Match {
+		if len(m.raw) != 1 {
+			return false // an extra matcher key alongside host, or a hostless block
+		}
+		if _, ok := m.raw["host"]; !ok {
+			return false // the sole key isn't host (a bare path/method/… block)
+		}
+	}
+	return true
+}
+
 func hostMatcherIs(route Route, hostname string) bool {
 	if len(route.Match) != 1 {
 		return false

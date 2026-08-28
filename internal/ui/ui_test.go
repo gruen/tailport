@@ -6587,6 +6587,38 @@ func TestPublishConflictClassificationPerKind(t *testing.T) {
 	})
 }
 
+// TestPublishConflictForeignDisclosableGate (roborev en3n-#1): a ForeignOverlap
+// route tailport can FULLY disclose (Disclosable) opens the scary force-delete
+// ladder; one it CANNOT (a hostless OR block / extra matcher) is REFUSED instead,
+// so the user never force-deletes a catch-all under a confirm that named one host.
+func TestPublishConflictForeignDisclosableGate(t *testing.T) {
+	const host = "app.example.com"
+	drive := func(disclosable bool) model {
+		m := New(config.Config{})
+		m.fqdn = "dev-box.tailnet.ts.net"
+		m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080}
+		m.pending = 8080
+		info := caddyedge.ConflictInfo{Kind: caddyedge.ForeignOverlap, Hosts: []string{host}, Disclosable: disclosable}
+		res, _ := m.Update(inspectConflictMsg{port: 8080, hostname: host, info: info})
+		return res.(model)
+	}
+
+	t.Run("disclosable opens the scary ladder", func(t *testing.T) {
+		if m := drive(true); m.mode != entryConfirmPurgeForeign {
+			t.Errorf("a disclosable foreign route should open the scary confirm; mode=%v", m.mode)
+		}
+	})
+	t.Run("non-disclosable is refused, no ladder", func(t *testing.T) {
+		m := drive(false)
+		if m.mode == entryConfirmPurgeForeign || m.mode == entryConfirmPurgeForeignType {
+			t.Errorf("a non-disclosable foreign route must NOT open a force-delete ladder; mode=%v", m.mode)
+		}
+		if !strings.Contains(m.flash, "matches more than a hostname") {
+			t.Errorf("want the refusal naming why; flash=%q", m.flash)
+		}
+	})
+}
+
 // TestPublishConflictNoneRetriesOnce: when the classification finds nothing (the
 // conflict cleared between Publish's refusal and the read), the model retries the
 // plain publish exactly ONCE. A second None gives up with a refusal instead of
