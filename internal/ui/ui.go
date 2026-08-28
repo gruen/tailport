@@ -1847,8 +1847,10 @@ func restoreCmd(client *caddyedge.Client, hostname, label string, port int, capt
 		// uniform and idempotent: on the FIRST attempt our take-over (a different
 		// backend under the same @id) is present, so VerifyRestore returns a
 		// non-Restored state and the flow proceeds A→B→C normally; only after a
-		// lost-response commit is it Restored. Any non-Restored outcome (including a
-		// read error) falls through to A, which surfaces the right result.
+		// lost-response commit is it Restored. A preflight READ error, however, does
+		// NOT fall through to A (roborev nk3b-#1): it stops here (retryable on a
+		// transport error), because falling through would let A misreport a
+		// committed-but-lost restore as a changed take-over.
 		state, verr := client.VerifyRestore(ctx, hostname, captured)
 		if verr != nil {
 			// The preflight couldn't read the edge. Do NOT fall through to A
@@ -3050,6 +3052,25 @@ func (m *model) cancelPurgeFlow() tea.Cmd {
 	)
 }
 
+// refuseConflict builds the terminal toast for a conflict the user can't resolve
+// through tailport (a hijacked @id, a non-disclosable foreign route, a
+// cleared-then-returned conflict, or a failed classification). publishCmd enabled
+// serve for the port BEFORE the conflict surfaced, so -- like cancelPurgeFlow --
+// this reconciles m.active[port] and appends "serve left on … space to stop" to
+// the refusal, so a single toast carries both the reason and the honest serve
+// state rather than leaving serve on silently (roborev xzns). refresh + the
+// published-state poll ride along.
+func (m *model) refuseConflict(port int, msg string) tea.Cmd {
+	if port != 0 {
+		m.active[port] = true
+	}
+	full := msg
+	if port != 0 {
+		full = fmt.Sprintf("%s (serve left on for :%d — space to stop)", msg, port)
+	}
+	return tea.Batch(m.setErr(full), refresh, m.pollPublishedCmd())
+}
+
 // purgeBlastRadiusLines renders the extra exposure a foreign purge would remove
 // (roborev hped #3): a foreign route may match a bare "*" catch-all, a "*.suffix"
 // wildcard, or several hostnames, but the confirm names only the requested host —
@@ -3423,8 +3444,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			// The classification read itself failed (edge unreachable, etc.). We
 			// can't name the holder, so surface the transport error; nothing was
-			// mutated.
-			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+			// mutated. Serve is on from the publish attempt (roborev xzns).
+			return m, m.refuseConflict(msg.port, publishErrText(msg.err))
 		}
 		if msg.info.Kind == caddyedge.None {
 			// The conflict cleared between Publish's refusal and this read. Retry
@@ -3441,9 +3462,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// before Publish), so don't re-run it here: enableServe=false.
 				return m, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false)
 			}
-			return m, tea.Batch(
-				m.setErr(fmt.Sprintf("%s: the conflict cleared then returned — try again", msg.hostname)),
-				refresh, m.pollPublishedCmd())
+			return m, m.refuseConflict(msg.port, fmt.Sprintf("%s: the conflict cleared then returned — try again", msg.hostname))
 		}
 
 		// ── force-purge + take-over (kata 6n15; design §3.4) ──────────────────
@@ -3469,9 +3488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Hosts list is NOT its full blast radius. Offering a force-delete
 				// would let the user delete a route matching traffic the confirm
 				// never named (roborev en3n-#1). Refuse and send them to Caddy.
-				return m, tea.Batch(
-					m.setErr(fmt.Sprintf("%s is held by a route that matches more than a hostname — resolve it in Caddy", msg.hostname)),
-					refresh, m.pollPublishedCmd())
+				return m, m.refuseConflict(msg.port, fmt.Sprintf("%s is held by a route that matches more than a hostname — resolve it in Caddy", msg.hostname))
 			}
 			// A route tailport did NOT create (drift) — the SCARY first gate: a
 			// y/n drift warning, which on y advances to the typed-"purge" commit.
@@ -3483,7 +3500,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			// IdHijacked (and any defensive fallthrough): refuse with attribution.
 			refusal := conflictRefusalText(msg.info, msg.hostname, shortLabel(m.fqdn))
-			return m, tea.Batch(m.setErr(refusal), refresh, m.pollPublishedCmd())
+			return m, m.refuseConflict(msg.port, refusal)
 		}
 
 	case purgeDoneMsg:

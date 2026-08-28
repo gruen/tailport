@@ -6629,6 +6629,14 @@ func TestPublishConflictForeignDisclosableGate(t *testing.T) {
 		if !strings.Contains(m.flash, "matches more than a hostname") {
 			t.Errorf("want the refusal naming why; flash=%q", m.flash)
 		}
+		// The refusal must reconcile serve and warn it's left on (roborev xzns):
+		// publishCmd enabled serve for the port before the conflict surfaced.
+		if !m.active[8080] {
+			t.Error("a conflict refusal must reconcile serve state (m.active[8080]) so space stops it")
+		}
+		if !strings.Contains(m.flash, "serve left on for :8080") {
+			t.Errorf("the refusal must warn serve is left on; flash=%q", m.flash)
+		}
 	})
 }
 
