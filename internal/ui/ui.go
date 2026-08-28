@@ -748,6 +748,11 @@ type purgeDoneMsg struct {
 	hostname string
 	port     int
 	err      error
+	// deletedDesc names the DELETED route's backend (from the confirmed
+	// identity), so the poof animates the route that was purged -- e.g.
+	// "host-b:3000" -- not this machine's take-over backend (roborev 65qc-#2).
+	// Empty for a route with no nameable backend (its hostname alone is shown).
+	deletedDesc string
 }
 
 // pendingPublish is the carry described on model.pendingPublish: the minimal
@@ -1721,8 +1726,19 @@ func inspectConflictCmd(client *caddyedge.Client, port int, hostname, wantLabel 
 func purgeCmd(client *caddyedge.Client, hostname string, port int, expect caddyedge.PurgeExpect) tea.Cmd {
 	return func() tea.Msg {
 		captured, err := client.PurgeConflict(context.Background(), hostname, expect)
-		return purgeDoneMsg{captured: captured, hostname: hostname, port: port, err: err}
+		return purgeDoneMsg{captured: captured, hostname: hostname, port: port, err: err, deletedDesc: purgeDescOf(expect)}
 	}
+}
+
+// purgeDescOf names the backend of the route a purge deleted, from the confirmed
+// identity: its reverse_proxy dial (label:port) when parseable, else its handler
+// name (a non-proxy foreign route), else "" (hostname alone). Used so the poof
+// animates the DELETED route, not the take-over backend (roborev 65qc-#2).
+func purgeDescOf(e caddyedge.PurgeExpect) string {
+	if e.BackendParseable {
+		return fmt.Sprintf("%s:%d", e.Label, e.Port)
+	}
+	return e.Handler
 }
 
 // conflictRefusalText formats the one-line refusal for a classified hostname
@@ -3243,7 +3259,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// poof ticker, it never branches on outcome, and the cmd it returns
 		// just rides in the same tea.Batch as the resume publish below --
 		// nothing about the takeover resume changes because of it.
-		poofCmd := m.startPoof(fmt.Sprintf("%s → %s:%d", msg.hostname, m.pendingPublish.label, msg.port))
+		poofText := msg.hostname
+		if msg.deletedDesc != "" {
+			poofText = fmt.Sprintf("%s → %s", msg.hostname, msg.deletedDesc)
+		}
+		poofCmd := m.startPoof(poofText)
 		// ── SEAM (kata ttfh): for an OWNED purge (msg.captured.HadID &&
 		//    m.purgeExpect.Owned — capture is undoable only for an owned route,
 		//    design OQ8), arm m.lastPurge with msg.captured and expose the restore
@@ -6379,6 +6399,7 @@ func (m *model) resizeList() {
 // only reachable pre-resize, when there's no real terminal width to wrap to
 // anyway).
 func (m model) renderStatusLine() string {
+	var flashRender string
 	if m.flash != "" {
 		toast := activeStyle
 		switch m.flashLevel {
@@ -6388,26 +6409,29 @@ func (m model) renderStatusLine() string {
 			toast = errStyle
 		}
 		if m.width <= 0 {
-			return toast.Render(m.flash)
+			flashRender = toast.Render(m.flash)
+		} else {
+			flashRender = toast.Width(m.width).Render(m.flash)
 		}
-		return toast.Width(m.width).Render(m.flash)
+	}
+	// Precedence when both a flash and a poof want the slot (kata dw57; corrected
+	// per roborev 65qc-#1): a WARN/ERROR flash ALWAYS wins -- the user must see a
+	// failure/refusal even mid-poof (e.g. a take-over that failed after the
+	// delete). But the poof OUTRANKS an INFO flash: the resumed take-over's "took
+	// over <host>" toast (flashInfo) commonly lands within the poof's ~500ms life,
+	// and the original flash-always-wins rule hid nearly the whole animation.
+	// Now the poof plays out and the info flash -- still within its own, longer
+	// ttl -- shows the moment the poof clears. renderPoofLine is width-bounded
+	// (never wraps), so either branch self-reserves through the same live
+	// statusLines measurement.
+	if flashRender != "" && m.flashLevel != flashInfo {
+		return flashRender
 	}
 	if m.poof != nil {
-		// (kata dw57) Precedence when both a flash and a poof want the slot:
-		// the flash always wins, kept simple and documented per design §3.5.
-		// In practice a purge success itself never sets m.flash (its own
-		// "took over <host>" toast fires later, from the RESUMED takeover's
-		// own publishDoneMsg -- see the dw57 seam in Update), so the common
-		// case shows the poof cleanly for its whole life. On the rare frame
-		// where some other flash lands while a poof is still dissolving
-		// underneath, the flash simply preempts it for that render; the poof
-		// ticker keeps advancing regardless of what's drawn (it's driven by
-		// its own poofTickMsg loop, not by this function), so it either
-		// resumes showing the moment the flash clears or just finishes unseen.
-		// Renders as ONE line, already width-bounded by renderPoofLine (never
-		// wraps), so it self-reserves through the same live statusLines
-		// measurement as everything else in this function.
 		return renderPoofLine(*m.poof, m.width)
+	}
+	if flashRender != "" {
+		return flashRender
 	}
 	return helpStyle.Render(m.statusText())
 }

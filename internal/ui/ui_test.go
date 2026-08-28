@@ -4474,18 +4474,83 @@ func TestRenderStatusLineShowsPoof(t *testing.T) {
 // flash and a poof are active, the flash wins the slot; the poof itself is
 // untouched by this (it keeps ticking underneath, just isn't drawn).
 func TestRenderStatusLinePoofFlashPrecedence(t *testing.T) {
+	// Corrected precedence (roborev 65qc-#1): the poof outranks an INFO flash
+	// (so the resumed take-over's "took over" toast, which lands within the
+	// poof's life, no longer hides the whole animation), but a WARN/ERROR flash
+	// still preempts the poof (the user must see a failure).
+	t.Run("poof outranks an INFO flash", func(t *testing.T) {
+		m := New(config.Config{})
+		m.width = 80
+		m.poof = &poofState{text: "app.example.com → host-b:3000", ttl: poofTTL, emoji: false}
+		m.flash = "took over app.example.com"
+		m.flashLevel = flashInfo
+
+		out := stripANSI(m.renderStatusLine())
+		// The poof dissolves characters as it animates, so the exact text isn't
+		// stable; the load-bearing check is that the INFO flash did NOT preempt
+		// it. ("host-b" — the descriptor tail — is intact at frame 0 too.)
+		if strings.Contains(out, "took over") {
+			t.Errorf("renderStatusLine = %q, an info flash must not preempt the poof", out)
+		}
+		if !strings.Contains(out, "host-b") {
+			t.Errorf("renderStatusLine = %q, want the poof (dissolving the deleted route) to show", out)
+		}
+	})
+
+	t.Run("ERROR flash preempts the poof", func(t *testing.T) {
+		m := New(config.Config{})
+		m.width = 80
+		m.poof = &poofState{text: "app.example.com → host-b:3000", ttl: poofTTL, emoji: false}
+		m.flash = "purged the old route, but the take-over failed"
+		m.flashLevel = flashError
+
+		out := stripANSI(m.renderStatusLine())
+		if !strings.Contains(out, "take-over failed") {
+			t.Errorf("renderStatusLine = %q, want the error flash to preempt the poof", out)
+		}
+		if strings.Contains(out, "host-b") {
+			t.Errorf("renderStatusLine = %q, the poof must not show while an error flash is active", out)
+		}
+	})
+}
+
+// TestPurgeDescOf pins the descriptor logic (roborev 65qc-#2): a parseable
+// backend renders label:port; a non-proxy route falls back to its handler.
+func TestPurgeDescOf(t *testing.T) {
+	if got := purgeDescOf(caddyedge.PurgeExpect{BackendParseable: true, Label: "host-b", Port: 3000}); got != "host-b:3000" {
+		t.Errorf("purgeDescOf(parseable) = %q, want host-b:3000", got)
+	}
+	if got := purgeDescOf(caddyedge.PurgeExpect{BackendParseable: false, Handler: "static_response"}); got != "static_response" {
+		t.Errorf("purgeDescOf(non-proxy) = %q, want static_response", got)
+	}
+}
+
+// TestPoofShowsDeletedBackendNotTakeover covers roborev 65qc-#2 end-to-end: on a
+// purge success the poof must animate the DELETED route's backend (carried on
+// purgeDoneMsg.deletedDesc), not this machine's take-over backend.
+func TestPoofShowsDeletedBackendNotTakeover(t *testing.T) {
 	m := New(config.Config{})
 	m.width = 80
-	m.poof = &poofState{text: "app.example.com → dev-box:8080", ttl: poofTTL, emoji: false}
-	m.flash = "took over app.example.com"
-	m.flashLevel = flashInfo
-
-	out := stripANSI(m.renderStatusLine())
-	if !strings.Contains(out, "took over app.example.com") {
-		t.Errorf("renderStatusLine = %q, want the flash to win over the poof", out)
+	m.fqdn = "dev-box.tailnet.ts.net"
+	// Our take-over will republish app.example.com to dev-box:4000...
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 4000}
+	// ...but the route we purged pointed at host-b:3000.
+	msg := purgeDoneMsg{
+		hostname:    "app.example.com",
+		port:        4000,
+		deletedDesc: "host-b:3000",
+		captured:    caddyedge.Captured{Hostname: "app.example.com", HadID: true},
 	}
-	if strings.Contains(out, "example.com → dev-box") {
-		t.Errorf("renderStatusLine = %q, the poof should not also render while a flash is active", out)
+	updated, _ := m.Update(msg)
+	m2 := updated.(model)
+	if m2.poof == nil {
+		t.Fatal("expected a poof to start on purge success")
+	}
+	if !strings.Contains(m2.poof.text, "host-b:3000") {
+		t.Errorf("poof text = %q, want the DELETED backend host-b:3000", m2.poof.text)
+	}
+	if strings.Contains(m2.poof.text, "dev-box") {
+		t.Errorf("poof text = %q, must NOT show the take-over backend dev-box", m2.poof.text)
 	}
 }
 
