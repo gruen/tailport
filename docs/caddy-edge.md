@@ -15,10 +15,9 @@ Funnel/`p`) needs no edge at all. Do it once per edge, not once per
 tailport machine: several tailport computers can publish through the same
 edge (see step 4).
 
-`example.com`, `<tailnet>`, and `<your-fly-app-name>` below are
-placeholders throughout — substitute your own domain, tailnet name (from the
-Tailscale admin console or `tailscale status`), and Fly app name. Nothing in
-this repo ever holds your real values — see
+`example.com` and `<your-fly-app-name>` below are placeholders throughout —
+substitute your own domain and Fly app name. Nothing in this repo ever holds
+your real values — see
 [`packaging/caddy-edge/fly.toml.example`](../packaging/caddy-edge/fly.toml.example)'s
 header and `.gitignore`.
 
@@ -65,7 +64,7 @@ when you deploy it.
      rule of the two. Caddy's admin API has **no authentication of its
      own** — it's guarded only by (a) whether a caller can reach the port
      over the tailnet at all, and (b) a `Host`-header allow-list
-     (`bootstrap-caddy.json`'s `admin.origins`, see
+     (the live config's `admin.origins`, derived from env at boot -- see
      [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)),
      which is an anti-DNS-rebinding check, not an identity check — anyone
      who can reach the port and send a matching `Host` header can add,
@@ -144,12 +143,6 @@ when you deploy it.
 From [`packaging/caddy-edge/`](../packaging/caddy-edge/):
 
 ```sh
-# Create your Caddy bootstrap config from the tracked template. It's gitignored
-# (like fly.toml) and baked into the image, so it must exist before `fly deploy`.
-# Fill in <tailnet> (and your hostname if you changed it) -- see
-# packaging/caddy-edge/README.md's admin.origins section.
-cp bootstrap-caddy.json.example bootstrap-caddy.json
-
 fly launch --no-deploy   # generates the real fly.toml; answer "no" to any
                           # prompt that would deploy before the volume/secret
                           # below exist. Reconcile the generated fly.toml
@@ -178,8 +171,8 @@ fly deploy
 ```
 
 Watch `fly logs` during the first deploy: `entrypoint.sh` prints each stage
-(`starting tailscaled`, `tailscale up`, `tailscale serve`, `exec caddy run`)
-so a stall is easy to localize. A hang before "tailscale up" usually means
+(`starting tailscaled`, `tailscale up`, `tailscale serve`, `templating`, `exec
+caddy run`) so a stall is easy to localize. A hang before "tailscale up" usually means
 `TS_AUTHKEY` is missing or wrong; a hang after it usually means the ACL
 change from step 1 hasn't propagated or the tag isn't owned correctly.
 
@@ -250,6 +243,18 @@ tailport can find its admin API over the tailnet — it is unrelated to any
 published *public* hostname. `server_name` must be identical on every tailport
 computer sharing this edge (it selects the shared routes array); it does not
 identify the source machine.
+
+**Known limitation:** the edge derives its admin API's allow-list
+(`admin.origins`) from `caddy.hostname`/`TS_HOSTNAME` automatically on its
+*first* boot only (see
+[`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)'s
+`admin.origins` section) — Caddy's autosave then carries that value forward
+across every later restart. If you change `hostname` here (and the edge's
+`TS_HOSTNAME`) **after** the edge has already booted once, the autosaved
+origin is now stale and tailport's admin requests start 403ing. This isn't
+auto-reconciled; recover with the existing edge-reset procedure in step 7
+(clear the autosave file or recreate the volume) so the edge re-derives the
+origin from the new hostname on its next, effectively-first, boot.
 
 ## 5. First-publish smoke test
 
@@ -328,12 +333,15 @@ limits, DNS not yet propagated — Caddy retries with backoff, so a transient
 failure often self-heals).
 
 **tailport reports the admin API returned `403`.** The `Host` header on the
-request tailport made isn't in `bootstrap-caddy.json`'s `admin.origins`.
-Confirm you replaced the `<tailnet>` placeholder before building the image
-(see [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)),
-and that `caddy.hostname` in tailport's config matches what's actually
-registered on the tailnet (`tailscale status` on the edge, or the admin
-console).
+request tailport made isn't in the live config's `admin.origins`. The edge
+derives that list from `$TS_HOSTNAME`/`$CADDY_ADMIN_PORT` at first boot (see
+[`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)'s
+`admin.origins` section), so a `403` almost always means `caddy.hostname` in
+tailport's config doesn't match what's actually registered on the tailnet
+(`tailscale status` on the edge, or the admin console) — **or** you changed
+`caddy.hostname`/`TS_HOSTNAME` *after* the edge's first boot, in which case the
+autosaved live config still has the old origin baked in (see the Known
+limitation in step 4 below; recovery is the reset procedure in step 7).
 
 **Edge unreachable** (tailport reports it can't reach the admin API at
 all, not a `403`). Check, in order: `fly status` / `fly logs` — is the
@@ -367,20 +375,24 @@ fly deploy
 
 from `packaging/caddy-edge/`, after pulling any changes to this directory.
 Because Caddy runs with `--resume`, its **live** config — which is where
-tailport's published routes and issued certs actually live, not
-`bootstrap-caddy.json` — autosaves onto the volume and is what a restart
-resumes from. `bootstrap-caddy.json` is only ever consulted on a true first
-boot, before anything has been autosaved. A normal `fly deploy` (new image,
-same volume) does **not** lose already-published routes.
+tailport's published routes and issued certs actually live, not the
+boot-time template — autosaves onto the volume and is what a restart resumes
+from. `bootstrap-caddy.json.example` (templated by `entrypoint.sh` into a
+runtime config from `$TS_HOSTNAME`/`$CADDY_ADMIN_PORT`, see
+[`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)) is
+only ever consulted on a true first boot, before anything has been
+autosaved. A normal `fly deploy` (new image, same volume) does **not** lose
+already-published routes.
 
-To deliberately reset the edge (wipe every route and cert and start clean
-from `bootstrap-caddy.json`) you have to either clear the autosave file on
-the volume (`fly ssh console`, remove
-`$XDG_CONFIG_HOME/caddy/autosave.json`) or destroy and recreate the volume
-outright. Either way, every previously published route is gone and each
-backend has to republish (press `P` again) — tailport itself keeps no
-per-port publish state to restore from; Caddy's live config is the only
-source of truth (see kata v1z5's Architecture notes).
+To deliberately reset the edge (wipe every route and cert, and start clean
+from the templated boot config again — also the fix if `admin.origins` is
+stale after changing `caddy.hostname`/`TS_HOSTNAME`, per step 4's Known
+limitation) you have to either clear the autosave file on the volume
+(`fly ssh console`, remove `$XDG_CONFIG_HOME/caddy/autosave.json`) or destroy
+and recreate the volume outright. Either way, every previously published
+route is gone and each backend has to republish (press `P` again) — tailport
+itself keeps no per-port publish state to restore from; Caddy's live config
+is the only source of truth (see kata v1z5's Architecture notes).
 
 ## A note on resilience
 
@@ -419,11 +431,8 @@ DOMAIN=example.com        # your public base domain → tailport's caddy.domain 
 HOSTNAME=caddy            # the edge's TAILNET name → tailport's caddy.hostname (§4); default `caddy`
 TAG=tag:tailport-edge     # the Tailscale ACL tag the edge registers under (§1)
 
-# your tailnet's MagicDNS suffix (the `<x>.ts.net` all your nodes share):
-TAILNET=$(tailscale status --json | sed -n 's/.*"MagicDNSSuffix": *"\([^"]*\)".*/\1/p')
-
-echo "APP=$APP REGION=$REGION DOMAIN=$DOMAIN HOSTNAME=$HOSTNAME TAG=$TAG TAILNET=$TAILNET"
-# ↑ all six must be non-empty before you continue.
+echo "APP=$APP REGION=$REGION DOMAIN=$DOMAIN HOSTNAME=$HOSTNAME TAG=$TAG"
+# ↑ all five must be non-empty before you continue.
 ```
 
 ### Tailscale: ACL, then key — admin console (§1)
@@ -454,30 +463,27 @@ if [ "$HOSTNAME" != caddy ]; then
   printf '\n[env]\n  TS_HOSTNAME = "%s"\n' "$HOSTNAME" >> fly.toml
 fi
 
-# bootstrap-caddy.json is Caddy's first-boot config; admin.origins is a Host
-# allow-list guarding the admin API (anti-DNS-rebinding, NOT authentication).
-# Generate it from the tracked template (gitignored, like fly.toml), then
-# substitute your real tailnet — and hostname, if you changed it off `caddy`:
-cp bootstrap-caddy.json.example bootstrap-caddy.json
-sed -i \
-  -e "s|caddy:2019|${HOSTNAME}:2019|" \
-  -e "s|caddy.<tailnet>.ts.net:2019|${HOSTNAME}.${TAILNET}:2019|" \
-  bootstrap-caddy.json
-python3 -m json.tool bootstrap-caddy.json >/dev/null && echo "bootstrap JSON valid"
+# Nothing to generate for bootstrap-caddy.json.example -- it's tracked as-is
+# (a placeholder token in admin.origins, no tailnet/hostname baked in) and
+# COPYied straight into the image. entrypoint.sh fills the token in from
+# TS_HOSTNAME/CADDY_ADMIN_PORT at container boot -- see
+# packaging/caddy-edge/README.md's admin.origins section.
 
 fly apps create "$APP"                                     # the Fly app itself
 fly volumes create caddy_data --region "$REGION" --size 1  # persists tailscaled state + Caddy's live config/certs
 fly ips allocate-v4                                        # DEDICATED IPv4 (~$2/mo). OMIT for IPv6-only.
 fly ips allocate-v6                                        # free, dedicated by default
 fly secrets set TS_AUTHKEY=tskey-auth-...                  # the key from the ACL step (Fly-side only)
-fly deploy                                                 # builds the image (baking bootstrap-caddy.json) and boots it
-fly logs                                                   # follow: tailscaled → up → serve → caddy run
+fly deploy                                                 # builds the image and boots it (entrypoint templates admin.origins from env)
+fly logs                                                   # follow: tailscaled → up → serve → templating → caddy run
 fly ips list                                               # the v4/v6 you point DNS at
 ```
 
-> `bootstrap-caddy.json` is **gitignored** — generated from the tracked
-> `bootstrap-caddy.json.example`, exactly like `fly.toml` — so fill it in freely:
-> your real tailnet never touches a tracked file, and there's nothing to revert.
+> Unlike `fly.toml`, `bootstrap-caddy.json.example` needs no gitignored,
+> filled-in copy any more — the edge derives its admin identity from env at
+> boot instead (previous `bootstrap-caddy.json` files from that older flow
+> are vestigial; safe to delete, see
+> [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)).
 
 ### DNS (§3)
 

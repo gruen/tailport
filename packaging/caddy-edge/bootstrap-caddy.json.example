@@ -4,8 +4,7 @@
         "origins": [
             "localhost:2019",
             "127.0.0.1:2019",
-            "caddy:2019",
-            "caddy.<tailnet>.ts.net:2019"
+            "__TAILPORT_ADMIN_ORIGIN__"
         ]
     },
     "apps": {

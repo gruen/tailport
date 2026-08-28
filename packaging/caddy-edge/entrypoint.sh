@@ -10,8 +10,8 @@ DATA_DIR="${DATA_DIR:-/data}"
 # Must match tailport's caddy.hostname (default: caddy). Override via Fly's
 # [env] in fly.toml if you changed caddy.hostname away from the default.
 TS_HOSTNAME="${TS_HOSTNAME:-caddy}"
-# Must match tailport's caddy.admin_port (default: 2019) AND
-# bootstrap-caddy.json's admin.listen/admin.origins ports.
+# Must match tailport's caddy.admin_port (default: 2019). Templated into the
+# live config below -- see the sed step before `caddy run`.
 CADDY_ADMIN_PORT="${CADDY_ADMIN_PORT:-2019}"
 TS_SOCKET=/var/run/tailscale/tailscaled.sock
 
@@ -66,5 +66,22 @@ tailscale --socket="$TS_SOCKET" up \
 echo "entrypoint: tailscale serve --http=$CADDY_ADMIN_PORT (admin API, tailnet-only) ..."
 tailscale --socket="$TS_SOCKET" serve --bg --http="$CADDY_ADMIN_PORT" "$CADDY_ADMIN_PORT"
 
+# bootstrap-caddy.json.example (COPYied into the image by the Dockerfile) is a
+# tracked TEMPLATE -- it carries a placeholder token in admin.origins instead
+# of a real tailnet value, so no dev has to hand-fill it before building. Fill
+# it in here, at boot, from env: the token becomes tailport's actual admin
+# Host (`$TS_HOSTNAME:$CADDY_ADMIN_PORT`, matching internal/ui's AdminURL),
+# and every literal `:2019` (admin.listen plus the localhost/127.0.0.1
+# origins) is repointed at the real admin port -- a no-op when
+# CADDY_ADMIN_PORT is left at its default. Order matters: substitute the
+# token FIRST (while it still injects a literal ":2019" when the port is
+# default) and the global `:2019` rewrite SECOND, so a non-default port lands
+# in the token's injected origin too, with no double-substitution.
+BOOTSTRAP_TEMPLATE=/etc/caddy/bootstrap-caddy.json.example
+BOOTSTRAP_RUNTIME=/tmp/bootstrap-caddy.generated.json
+echo "entrypoint: templating $BOOTSTRAP_TEMPLATE -> $BOOTSTRAP_RUNTIME (admin origin = $TS_HOSTNAME:$CADDY_ADMIN_PORT) ..."
+sed 's|__TAILPORT_ADMIN_ORIGIN__|'"${TS_HOSTNAME}:${CADDY_ADMIN_PORT}"'|; s|:2019|:'"${CADDY_ADMIN_PORT}"'|g' \
+  "$BOOTSTRAP_TEMPLATE" > "$BOOTSTRAP_RUNTIME"
+
 echo "entrypoint: exec caddy run --resume ..."
-exec caddy run --config /etc/caddy/bootstrap-caddy.json --resume
+exec caddy run --config "$BOOTSTRAP_RUNTIME" --resume

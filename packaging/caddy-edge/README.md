@@ -22,8 +22,8 @@ smoke test, troubleshooting), see
 | File | What it is |
 | --- | --- |
 | [`Dockerfile`](./Dockerfile) | Multistage build: copies `tailscale`/`tailscaled` from the official Tailscale image onto stock `caddy:2-alpine`. Nothing is rebuilt from source. |
-| [`entrypoint.sh`](./entrypoint.sh) | Container entrypoint: starts `tailscaled`, joins the tailnet, exposes Caddy's admin API tailnet-only via `tailscale serve`, then `exec`s `caddy run --resume`. |
-| [`bootstrap-caddy.json.example`](./bootstrap-caddy.json.example) | Template for Caddy's first-boot admin config: an empty `tailport` HTTP server on `:443`/`:80`, plus a widened `admin.origins` list (see below). Copy it to `bootstrap-caddy.json` (gitignored, like `fly.toml`) and fill in your tailnet before building — that copy is what the image bakes in. |
+| [`entrypoint.sh`](./entrypoint.sh) | Container entrypoint: starts `tailscaled`, joins the tailnet, exposes Caddy's admin API tailnet-only via `tailscale serve`, sed-templates the live Caddy config from env (see below), then `exec`s `caddy run --resume`. |
+| [`bootstrap-caddy.json.example`](./bootstrap-caddy.json.example) | Template for Caddy's first-boot admin config: an empty `tailport` HTTP server on `:443`/`:80`, plus a widened `admin.origins` list with a placeholder token (see below). Tracked as-is and `COPY`ied straight into the image — nothing to fill in before building. `entrypoint.sh` fills the token in from env at container boot. |
 | [`fly.toml.example`](./fly.toml.example) | Template for a Fly.io deployment: raw-TCP passthrough on 80/443, the state volume, and deliberately no service for the admin port. |
 
 ## How this maps to tailport's `caddy.*` config
@@ -35,17 +35,23 @@ fields that must agree with what this edge is actually running as:
 | tailport config field | Default | What it must match here |
 | --- | --- | --- |
 | `caddy.hostname` | `caddy` | The `--hostname` `tailscale up` registers (`TS_HOSTNAME` in `entrypoint.sh`, default `caddy`). This is the edge's own tailnet identity — how tailport *finds* the admin API — not any published route's public hostname. |
-| `caddy.admin_port` | `2019` | `bootstrap-caddy.json`'s `admin.listen`/`admin.origins` ports, `entrypoint.sh`'s `CADDY_ADMIN_PORT`, and the `tailscale serve --http=<port> <port>` mapping it sets up. |
-| `caddy.server_name` | `tailport` | `bootstrap-caddy.json`'s `apps.http.servers.<server_name>` key — the one shared Caddy HTTP server every tailport computer publishing through this edge writes routes into. |
+| `caddy.admin_port` | `2019` | `entrypoint.sh`'s `CADDY_ADMIN_PORT` — templated at boot into the live config's `admin.listen`/`admin.origins` ports (see below) — and the `tailscale serve --http=<port> <port>` mapping it sets up. |
+| `caddy.server_name` | `tailport` | `bootstrap-caddy.json.example`'s `apps.http.servers.<server_name>` key — the one shared Caddy HTTP server every tailport computer publishing through this edge writes routes into. |
 | `caddy.domain` | `""` (blank) | Not part of this image at all — it's the public base domain tailport builds *publish* hostnames from (`<prefix>.<domain>`), pointed at this edge's DNS (see the runbook's DNS step). Unrelated to the edge's own tailnet hostname above. |
 
-If you change any of `hostname`/`admin_port`/`server_name` away from their
-defaults in tailport's config, you must change the matching value here too
-(`bootstrap-caddy.json` and/or `fly.toml`'s `[env]`) — they are not read from
-tailport's config file; this image and tailport's config are two independent
-places that must be kept in sync by hand.
+`hostname` and `admin_port` are both plain env vars on the edge side
+(`TS_HOSTNAME`/`CADDY_ADMIN_PORT` in `entrypoint.sh`, set via `fly.toml`'s
+`[env]` if you move either off its default) — `entrypoint.sh` derives the live
+`admin.origins`/`admin.listen` values from them at boot, so there is nothing to
+hand-edit in a config file for either. `server_name` is the one field that
+still lives directly in the template: if you change it away from `tailport`,
+edit the `apps.http.servers` key in `bootstrap-caddy.json.example` itself (safe
+to do — the template carries no tailnet-specific data). None of these three are
+read from tailport's own config file; this image and tailport's config are two
+independent places kept in sync by hand (or, for `hostname`/`admin_port`, by
+matching env vars).
 
-## Why `bootstrap-caddy.json`'s `admin.origins` is widened
+## Why `admin.origins` is widened, and how it's filled in
 
 Caddy's admin API checks the incoming request's `Host` header against an
 allow-list (`admin.origins`) and returns `403` for anything else — a
@@ -55,24 +61,32 @@ DNS-rebinding mitigation. By default that list is just `localhost:2019` /
 the `Host` header on that request is `caddy:2019`, not `localhost:2019` —
 which would 403 against the unmodified default.
 
-The template widens `admin.origins` to include that address (and the full
-`<hostname>.<tailnet>.ts.net:<admin_port>` form, in case a caller addresses the
-edge by its FQDN instead of the short MagicDNS label). JSON has no comment
-syntax, so this note — and the fact that `caddy.<tailnet>.ts.net:2019` is a
-**placeholder you must fill in** before building the image — lives here instead
-of inline. Copy the template to the real (gitignored) config and edit *that*,
-so your tailnet name never lands in a tracked file:
+The tracked template widens `admin.origins` with a placeholder token,
+`__TAILPORT_ADMIN_ORIGIN__`, alongside the `localhost`/`127.0.0.1` entries — no
+tailnet name, no hostname, valid JSON exactly as committed. `entrypoint.sh`
+fills that token in from env, in-shell, right before `caddy run`: the token
+becomes `$TS_HOSTNAME:$CADDY_ADMIN_PORT` (tailport's actual admin `Host`), and
+every literal `:2019` in the template — `admin.listen` plus the
+`localhost`/`127.0.0.1` origins — is repointed at the real admin port in the
+same pass (a no-op if `CADDY_ADMIN_PORT` is left at its default). See the `sed`
+step and its comment in `entrypoint.sh` for the exact substitution and why the
+order (token first, `:2019` second) matters.
 
-```sh
-cp bootstrap-caddy.json.example bootstrap-caddy.json
-```
+There is nothing to fill in before building the image — the tracked
+`bootstrap-caddy.json.example` is exactly what `docker build`/`fly deploy` bake
+in, unmodified. The env-derived value is correct on first boot (`$TS_HOSTNAME`
+is deterministic, no `tailscale status` race), and because Caddy's own
+autosave then carries that live config forward across restarts (`--resume`,
+see [`docs/caddy-edge.md`](../../docs/caddy-edge.md)'s "Updating the edge"
+section), it stays correct without re-templating on every boot.
 
-Replace `<tailnet>` in the copy with your actual tailnet name (visible in the
-Tailscale admin console, or via `tailscale status` on any node — it's the part
-between the hostname and `.ts.net`). If you changed `caddy.hostname` away from
-the default `caddy`, also replace the literal `caddy:2019` / `caddy.<tailnet>...`
-entries with your chosen hostname. `fly deploy` (and `docker build`) bake this
-filled-in `bootstrap-caddy.json` into the image.
+**Known limitation:** if you later change `caddy.hostname`/`TS_HOSTNAME`
+*after* the edge has already booted once, the autosave still holds the old
+origin — the entrypoint only templates a fresh `admin.origins` into a true
+first-boot config, never into the resumed one. Recovery is the existing
+edge-reset procedure (docs/caddy-edge.md's "Updating the edge" section: clear
+the autosave file or recreate the volume), not something this templating
+re-does automatically.
 
 ## Building and deploying
 
@@ -81,9 +95,7 @@ This directory doesn't build or deploy itself — see
 (Tailscale ACL and auth key, `fly launch`, volume, dedicated IPv4, secrets,
 deploy, DNS, first-publish smoke test). In short, once `fly.toml` exists
 (copied from `fly.toml.example` and filled in, or generated by `fly launch`
-and reconciled against it), `bootstrap-caddy.json` exists (copied from
-`bootstrap-caddy.json.example` and filled in, per the section above), and
-`TS_AUTHKEY` is set via `fly secrets set`:
+and reconciled against it) and `TS_AUTHKEY` is set via `fly secrets set`:
 
 ```sh
 fly deploy
@@ -95,19 +107,24 @@ fly deploy
 (`python3 -m json.tool`) and its `server_name`/`admin_port`/`listen` values
 match `internal/config`'s `CaddyConfig` defaults (`tailport`/`2019`);
 `entrypoint.sh` passes `bash -n` syntax check; the Dockerfile, entrypoint,
-bootstrap config, and `fly.toml.example` are internally consistent with each
+bootstrap template, and `fly.toml.example` are internally consistent with each
 other and with the route contract in `internal/caddyedge`
 (`@id: tailport-<hostname>`, plain-`http` backend dial, explicit
-`header_up Host {label}:{port}`, `terminal: true`). This host has `podman`
-(shimmed as `docker`) but no Fly.io account, so `docker build .` in this
-directory was run for real (with `bootstrap-caddy.json` first created from the
-template — the real file is now gitignored, so a fresh clone must
-`cp bootstrap-caddy.json.example bootstrap-caddy.json` before the build's `COPY`
-can find it): both build stages complete, the multistage copy of
-`tailscale`/`tailscaled` off the official Tailscale image onto `caddy:2-alpine`
-succeeds, `bootstrap-caddy.json`/`entrypoint.sh` copy in and `chmod +x` cleanly,
-and the image commits and tags successfully. That test image was then deleted;
-it was never run.
+`header_up Host {label}:{port}`, `terminal: true`). `entrypoint.sh`'s `sed`
+templating step was hand-run against the tracked `.example` for two env cases
+— `TS_HOSTNAME=caddy CADDY_ADMIN_PORT=2019` (the defaults) and
+`TS_HOSTNAME=edge CADDY_ADMIN_PORT=9999` (a non-default hostname and port) —
+and both outputs were confirmed valid JSON (`python3 -m json.tool`) with
+`admin.listen` and every `admin.origins` entry correctly repointed at the
+chosen port, and no double-substitution. This host has `podman` (shimmed as
+`docker`) but no Fly.io account, so `docker build .` in this directory was run
+for real against the *current* Dockerfile: no pre-build fill-in step is needed
+any more — the tracked `bootstrap-caddy.json.example` is `COPY`ied as-is, so a
+fresh clone builds with no manual step first. Both build stages complete, the
+multistage copy of `tailscale`/`tailscaled` off the official Tailscale image
+onto `caddy:2-alpine` succeeds, the template/`entrypoint.sh` copy in and
+`chmod +x` cleanly, and the image commits and tags successfully. That test
+image was then deleted; it was never run.
 
 **Deliberately not run, and not verified here:** the container itself. This
 host has no `caddy` binary and no Fly.io account, and — per this task's

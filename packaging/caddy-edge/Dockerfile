@@ -26,11 +26,15 @@ COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 
 RUN mkdir -p /var/run/tailscale
 
-# bootstrap-caddy.json is generated from the tracked bootstrap-caddy.json.example
-# (gitignored, like fly.toml -- it carries your real tailnet/hostname). Create it
-# before building -- `cp bootstrap-caddy.json.example bootstrap-caddy.json` and
-# fill it in (see ../../docs/caddy-edge.md) -- or this COPY fails on a fresh clone.
-COPY bootstrap-caddy.json /etc/caddy/bootstrap-caddy.json
+# bootstrap-caddy.json.example is the tracked TEMPLATE -- admin.origins carries
+# a placeholder token instead of a real tailnet/hostname, so there is no
+# pre-build fill-in step and nothing dev-specific ever lands in the image at
+# build time. entrypoint.sh sed-templates the live config from
+# $TS_HOSTNAME/$CADDY_ADMIN_PORT at container boot and execs `caddy run`
+# against that generated file, not this one. (A gitignored, hand-filled
+# bootstrap-caddy.json may still exist in older working trees -- it is
+# vestigial and no longer COPYied or used; see ../../docs/caddy-edge.md.)
+COPY bootstrap-caddy.json.example /etc/caddy/bootstrap-caddy.json.example
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
