@@ -5,6 +5,7 @@ package ui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -690,6 +691,33 @@ type poofState struct {
 // frames = ~500ms, inside the design's ~6-12 frame target (§3.5).
 const poofTTL = 10
 
+// lastPurgeState is the single-slot, ephemeral, session-memory record armed after
+// an OWNED force-purge take-over (kata ttfh; design §3.6). It is NOT a persistent
+// undoStack entry and NOT redoable: the local undoStack holds registry deltas
+// (persisted, wouldUnlockSSH-guarded) whose `u` help promises undo "does NOT touch
+// what's exposed" -- a remote mutation to shared edge state has the wrong lifetime
+// and would falsify that promise, so the restore affordance is a DISTINCT key (R)
+// off this one slot. captured is the byte-faithful deleted route to re-POST (undo
+// step B); hostname/ourLabel/ourPort drive step A (Unpublish our take-over) + B/C;
+// deletedDesc names the purged backend shown in the restore prompt; takeoverLive
+// records whether the in-transaction take-over publish actually succeeded, gating
+// the poll-based third-party-re-take clear (a FAILED take-over is armed for retry,
+// so its "no route of ours" poll must NOT be read as a re-take).
+type lastPurgeState struct {
+	captured     json.RawMessage
+	hostname     string
+	ourLabel     string
+	ourPort      int
+	deletedDesc  string
+	takeoverLive bool
+}
+
+// lastPurgeTTL is the restore affordance's idle lifetime (design OQ1: ~60s +
+// competing-action clears). The timer is generation-stamped (a stale expiry is
+// ignored), suspended while a restore is in flight, and re-armed on a retryable
+// (edge-unreachable) restore outcome.
+const lastPurgeTTL = 60 * time.Second
+
 type toggleDoneMsg struct {
 	port int
 	err  error
@@ -753,7 +781,43 @@ type purgeDoneMsg struct {
 	// "host-b:3000" -- not this machine's take-over backend (roborev 65qc-#2).
 	// Empty for a route with no nameable backend (its hostname alone is shown).
 	deletedDesc string
+	// owned carries the confirmed identity's Owned bit (kata ttfh): the undo is
+	// OWNED-only (design OQ8), and by purgeDoneMsg time m.purgeExpect has been
+	// zeroed by clearPurgeFlow, so the owned-ness the arm needs rides the message.
+	owned bool
 }
+
+// restoreResult classifies the outcome of a purge-undo (kata ttfh; design §3.6),
+// so the flash is computed from the FINAL observed edge state (VerifyRestore) or
+// the split step-A/B outcome -- never from a guess about which step failed.
+type restoreResult int
+
+const (
+	restoreRestored        restoreResult = iota // C: Restored
+	restoreUnclaimed                            // C: Unclaimed
+	restoreClaimedByOther                       // C: ClaimedByOther, or B refused (name re-claimed)
+	restoreContentMismatch                      // C: ContentMismatch
+	restoreUnverified                           // B succeeded but C could not be read
+	restoreTakeoverChanged                      // A: our take-over is still live (drifted) -- do NOT append
+	restoreUnreachable                          // A or B: edge unreachable -- retryable, keep the slot
+	restoreError                                // A or B: any other error -- toast, clear the slot
+)
+
+// restoreDoneMsg reports a completed purge-undo (kata ttfh). result classifies the
+// outcome (from VerifyRestore's final read or the split A/B handling); hostname
+// names the route for the message; err carries the underlying transport/edge error
+// for the restoreError toast only.
+type restoreDoneMsg struct {
+	hostname string
+	result   restoreResult
+	err      error
+}
+
+// lastPurgeExpireMsg fires the restore affordance's ~60s idle timeout (kata ttfh;
+// design OQ1). gen matches it to the arming/re-arming that scheduled it, so a
+// superseded timer (the slot cleared, restored, or re-armed) is ignored -- exactly
+// the flashExpireMsg/flashID discipline.
+type lastPurgeExpireMsg struct{ gen int }
 
 // pendingPublish is the carry described on model.pendingPublish: the minimal
 // parameters needed to re-issue an in-flight publish after the flow state is
@@ -1050,6 +1114,17 @@ type model struct {
 	purgeExpect   caddyedge.PurgeExpect
 	purgeInput    textinput.Model
 	takeoverHost  string
+	// Purge-undo state (kata ttfh; design §3.6). lastPurge is the single armed
+	// restore slot (nil = nothing to restore); pendingArm stashes the arm info at
+	// purgeDoneMsg-success so the take-over's own publishDoneMsg ARMS lastPurge
+	// from it (even if the take-over failed) without letting itself clear it;
+	// restoring is the in-flight guard (a second R while a restore is running is a
+	// no-op); lastPurgeGen generation-stamps the ~60s idle timer so a stale expiry
+	// (or one suspended by an in-flight restore) is ignored. All OWNED-only (OQ8).
+	lastPurge    *lastPurgeState
+	pendingArm   *lastPurgeState
+	restoring    bool
+	lastPurgeGen int
 	// flash is the single transient notification shown in the bottom bar --
 	// copy confirmations, refusals, and errors alike (q89g). flashLevel tints
 	// it (info green / warn amber / error red). It clears on the next keypress
@@ -1726,7 +1801,7 @@ func inspectConflictCmd(client *caddyedge.Client, port int, hostname, wantLabel 
 func purgeCmd(client *caddyedge.Client, hostname string, port int, expect caddyedge.PurgeExpect) tea.Cmd {
 	return func() tea.Msg {
 		captured, err := client.PurgeConflict(context.Background(), hostname, expect)
-		return purgeDoneMsg{captured: captured, hostname: hostname, port: port, err: err, deletedDesc: purgeDescOf(expect)}
+		return purgeDoneMsg{captured: captured, hostname: hostname, port: port, err: err, deletedDesc: purgeDescOf(expect), owned: expect.Owned}
 	}
 }
 
@@ -1739,6 +1814,66 @@ func purgeDescOf(e caddyedge.PurgeExpect) string {
 		return fmt.Sprintf("%s:%d", e.Label, e.Port)
 	}
 	return e.Handler
+}
+
+// restoreCmd runs the purge-undo (kata ttfh; design §3.6) as ONE command, in the
+// load-bearing order A-before-B-before-C, classifying its result from the FINAL
+// observed edge state rather than a guess about which step failed:
+//
+//   - (A) Unpublish our take-over. A clean delete or ErrNotFound ⇒ our route is
+//     gone, proceed to B. ErrHostnameConflict ⇒ our take-over is STILL LIVE
+//     (matcher/backend drifted, it refused to delete) ⇒ do NOT append (that
+//     dual-exposes) → restoreTakeoverChanged. ErrUnreachable ⇒ retryable.
+//   - (B) RestoreRoute the captured bytes (scan-refuse-append under one array
+//     If-Match). ErrRestoreNameClaimed ⇒ the name was re-claimed → restoreClaimedByOther.
+//     ErrUnreachable ⇒ retryable.
+//   - (C) VerifyRestore — the full-array, content-verifying final read — maps to
+//     the message. A C read failure after B landed is restoreUnverified (we did
+//     append but can't confirm), never a dishonest "couldn't restore".
+func restoreCmd(client *caddyedge.Client, hostname, label string, port int, captured json.RawMessage) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		// (A) remove our take-over.
+		switch err := client.Unpublish(ctx, hostname, label, port); {
+		case err == nil, errors.Is(err, caddyedge.ErrNotFound):
+			// take-over gone (or it never landed): safe to restore.
+		case errors.Is(err, caddyedge.ErrHostnameConflict):
+			return restoreDoneMsg{hostname: hostname, result: restoreTakeoverChanged}
+		case errors.Is(err, caddyedge.ErrUnreachable):
+			return restoreDoneMsg{hostname: hostname, result: restoreUnreachable}
+		default:
+			return restoreDoneMsg{hostname: hostname, result: restoreError, err: err}
+		}
+		// (B) re-create the captured route.
+		switch err := client.RestoreRoute(ctx, hostname, captured); {
+		case err == nil:
+			// appended; verify the final state below.
+		case errors.Is(err, caddyedge.ErrRestoreNameClaimed):
+			return restoreDoneMsg{hostname: hostname, result: restoreClaimedByOther}
+		case errors.Is(err, caddyedge.ErrUnreachable):
+			return restoreDoneMsg{hostname: hostname, result: restoreUnreachable}
+		default:
+			return restoreDoneMsg{hostname: hostname, result: restoreError, err: err}
+		}
+		// (C) classify the final observed state and compute the message from it.
+		state, err := client.VerifyRestore(ctx, hostname, captured)
+		if err != nil {
+			// B landed but we can't confirm — honest "restored but unverified",
+			// never a dishonest "couldn't". C is deliberately not re-armed for
+			// retry: a re-press would re-run B against our own just-restored route.
+			return restoreDoneMsg{hostname: hostname, result: restoreUnverified}
+		}
+		switch state {
+		case caddyedge.Restored:
+			return restoreDoneMsg{hostname: hostname, result: restoreRestored}
+		case caddyedge.RestoreUnclaimed:
+			return restoreDoneMsg{hostname: hostname, result: restoreUnclaimed}
+		case caddyedge.RestoreContentMismatch:
+			return restoreDoneMsg{hostname: hostname, result: restoreContentMismatch}
+		default: // RestoreClaimedByOther
+			return restoreDoneMsg{hostname: hostname, result: restoreClaimedByOther}
+		}
+	}
 }
 
 // conflictRefusalText formats the one-line refusal for a classified hostname
@@ -2732,6 +2867,10 @@ func (m *model) enterConfirmPublish() tea.Cmd {
 // cmd (serve-then-publish). The plaintext password is dropped by clearPublishFlow
 // before the op runs.
 func (m *model) confirmPublish() tea.Cmd {
+	// A NEW user-initiated publish clears any armed restore affordance (kata ttfh;
+	// design §3.6). The in-transaction take-over resume publishes via publishCmd
+	// directly (never through here), so it is inherently exempt from this trigger.
+	m.clearLastPurge()
 	port := m.publishPort
 	hostname := m.publishHostname
 	enableServe := m.publishEnableServe
@@ -2795,6 +2934,45 @@ func (m *model) clearPurgeFlow() {
 	m.purgeInfo = caddyedge.ConflictInfo{}
 	m.purgeExpect = caddyedge.PurgeExpect{}
 	m.purgeInput.Reset()
+}
+
+// scheduleLastPurgeExpiry bumps the restore-affordance generation and schedules
+// the ~60s idle timeout for it (kata ttfh; design OQ1/F11). Bumping the gen voids
+// any previously scheduled expiry, so an arm, a re-arm, or a clear each supersede
+// the last -- the flashExpireMsg/flashID pattern applied to the restore slot.
+func (m *model) scheduleLastPurgeExpiry() tea.Cmd {
+	m.lastPurgeGen++
+	gen := m.lastPurgeGen
+	return tea.Tick(lastPurgeTTL, func(time.Time) tea.Msg { return lastPurgeExpireMsg{gen: gen} })
+}
+
+// clearLastPurge drops the armed restore slot and its pre-arm stash and voids any
+// pending idle timer (by bumping the gen). It is the single point every clear
+// trigger routes through (kata ttfh; design §3.6): a successful restore, a new
+// non-take-over publish/purge, a poll or C-read showing a third-party re-take,
+// de-escalation of our take-over, navigation, or the ~60s timeout.
+func (m *model) clearLastPurge() {
+	m.lastPurge = nil
+	m.pendingArm = nil
+	m.restoring = false
+	m.lastPurgeGen++ // void any in-flight expiry timer
+	m.resizeList()   // give the status slot back the row the prompt held
+}
+
+// beginRestore launches the purge-undo A→B→C command (kata ttfh; design §3.6). It
+// sets the in-flight guards (restoring + m.pending on our port) so a second R is a
+// no-op and no other remote op races it, marks the take-over no-longer-live (step
+// A is tearing it down, so a poll must not read the coming "no route of ours" as a
+// third-party re-take), and SUSPENDS the idle timer by bumping the gen (re-armed
+// only on a retryable outcome). The caller guards that lastPurge is armed and not
+// already restoring.
+func (m *model) beginRestore() tea.Cmd {
+	lp := m.lastPurge
+	m.restoring = true
+	m.pending = lp.ourPort
+	lp.takeoverLive = false // our take-over is being removed as part of the undo
+	m.lastPurgeGen++        // suspend the idle timer while the restore is in flight
+	return restoreCmd(m.caddyClient(), lp.hostname, lp.ourLabel, lp.ourPort, lp.captured)
 }
 
 // cancelPurgeFlow aborts a purge ladder (esc / any non-commit key at any gate)
@@ -2916,6 +3094,10 @@ func (m *model) updatePurgeEntry(msg tea.KeyMsg) tea.Cmd {
 // through the conflict path) carries the secret-free params the purgeDoneMsg
 // success handler resumes the takeover with.
 func (m *model) confirmPurge() tea.Cmd {
+	// A NEW purge clears any armed restore affordance from a PRIOR take-over (kata
+	// ttfh; design §3.6). This transaction re-arms only later, at its own take-over
+	// publishDoneMsg, so there is nothing of THIS transaction's to wipe here.
+	m.clearLastPurge()
 	hostname := m.purgeHostname
 	port := m.purgePort
 	expect := m.purgeExpect
@@ -3087,6 +3269,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// stale "took over" toast. Only a success below uses it.
 		tookOver := m.takeoverHost
 		m.takeoverHost = ""
+		// ── ttfh stage 2: ARM the restore slot. m.pendingArm is set ONLY just before
+		// the take-over resume publish (purgeDoneMsg success, OWNED), so its presence
+		// marks THIS publishDoneMsg as that resume. Arm whether the take-over
+		// succeeded or FAILED (design F4 — the purge already happened, so restore must
+		// be offered); takeoverLive records which, gating the poll-based re-take clear.
+		// Because the slot is armed HERE (not at purge time) and no generic "publish
+		// clears the slot" trigger exists, this take-over publish is inherently exempt
+		// from clearing the affordance it just armed.
+		var armTimer tea.Cmd
+		if m.pendingArm != nil {
+			m.pendingArm.takeoverLive = msg.err == nil
+			m.lastPurge = m.pendingArm
+			m.pendingArm = nil
+			m.resizeList()                         // reserve the status-slot row the prompt will use
+			armTimer = m.scheduleLastPurgeExpiry() // start the ~60s idle timeout
+		}
+		// De-escalation clear (design F10): the user unpublished our take-over's port
+		// (a distinct unpublishCmd → unpublish:true), so the restore affordance no
+		// longer describes live state — drop it. The restore's OWN step A goes through
+		// restoreCmd (a restoreDoneMsg), never here, so this can't fire on an undo.
+		if msg.unpublish && m.lastPurge != nil && msg.port == m.lastPurge.ourPort {
+			m.clearLastPurge()
+		}
 		if msg.err != nil {
 			if tookOver != "" {
 				// This is the RESUMED take-over publish (kata 6n15) and it FAILED. The
@@ -3101,10 +3306,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// clear the carry and do NOT re-classify/loop; restoring the capture is
 				// ttfh's job (its seam on the success path is untouched).
 				m.pendingPublish = pendingPublish{}
+				// armTimer (ttfh) starts the ~60s idle timeout for the restore slot
+				// armed above: the take-over FAILED but the purge succeeded, so restore
+				// is still offered (design F4) and its timer must run.
 				return m, tea.Batch(
 					m.setErr(fmt.Sprintf("purged the old route for %s, but the take-over publish failed: %s — %s's current state is unknown; the next edge poll will show it",
 						tookOver, publishErrText(msg.err), tookOver)),
-					refresh, m.pollPublishedCmd())
+					armTimer, refresh, m.pollPublishedCmd())
 			}
 			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
 				// The auto-enable-serve step hit tailscale's operator gate --
@@ -3153,8 +3361,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingPublish = pendingPublish{}
 		if tookOver != "" {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
-			// success toast naming the host we took over.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s", tookOver), flashInfo), refresh, m.pollPublishedCmd())
+			// success toast naming the host we took over. armTimer (ttfh) starts the
+			// ~60s idle timeout for the restore slot armed above (nil for a foreign
+			// take-over, which arms nothing).
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
@@ -3264,13 +3474,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			poofText = fmt.Sprintf("%s → %s", msg.hostname, msg.deletedDesc)
 		}
 		poofCmd := m.startPoof(poofText)
-		// ── SEAM (kata ttfh): for an OWNED purge (msg.captured.HadID &&
-		//    m.purgeExpect.Owned — capture is undoable only for an owned route,
-		//    design OQ8), arm m.lastPurge with msg.captured and expose the restore
-		//    affordance HERE, sharing this SAME status-slot action line once the
-		//    poof above finishes (it becomes the "press <key> to restore" prompt --
-		//    see renderStatusLine's flash/poof precedence doc). 6n15 does NEITHER:
-		//    no arm, no undo — leave this seam.
+		// ── SEAM (kata ttfh): the OWNED-only undo arms in TWO stages (design F4).
+		//    Here (stage 1) we STASH the pre-arm info and schedule the ~60s idle
+		//    timer, but do NOT arm the slot yet: the arm must happen AFTER the
+		//    take-over publishDoneMsg (arming even if it FAILS — the purge already
+		//    succeeded, so restore must be offered), and staging it there also
+		//    exempts the in-transaction take-over publish from clearing the slot it
+		//    just armed. Undo is OWNED-only (OQ8): a foreign force-purge is one-way,
+		//    so gate on msg.owned && msg.captured.HadID (m.purgeExpect is already
+		//    zeroed by clearPurgeFlow, so owned-ness rides the message). The take-over
+		//    resume below is UNCHANGED — the stash just rides on the model, and the
+		//    ~60s idle timer is scheduled at stage 2 (so it never lands in this
+		//    resume batch, which other flows unpack as exactly poof-tick + publish).
+		if msg.owned && msg.captured.HadID {
+			m.pendingArm = &lastPurgeState{
+				captured:    msg.captured.Raw,
+				hostname:    msg.hostname,
+				ourLabel:    shortLabel(m.fqdn),
+				ourPort:     msg.port,
+				deletedDesc: msg.deletedDesc,
+			}
+		}
 		var auth *caddyedge.BasicAuth
 		if m.pendingPublish.withAuth {
 			auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
@@ -3278,6 +3502,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.takeoverHost = msg.hostname
 		m.pending = msg.port
 		return m, tea.Batch(poofCmd, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false))
+
+	case restoreDoneMsg:
+		// A purge-undo (kata ttfh; design §3.6) finished. Clear the in-flight
+		// guards; the message is computed from msg.result — the FINAL observed edge
+		// state (VerifyRestore) or the split A/B outcome — never a guess. All modes
+		// except the retryable "edge unreachable" CLEAR the slot; only that one keeps
+		// it armed and re-arms the idle timer (design F11). The success message NEVER
+		// claims positional/routing fidelity — a restored route re-appends at the
+		// array end (an accepted loss, roborev-k7br/he97).
+		m.pending = 0
+		m.restoring = false
+		switch msg.result {
+		case restoreRestored:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored %s", msg.hostname), flashInfo), refresh, m.pollPublishedCmd())
+		case restoreUnclaimed:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("couldn't restore %s — it's now unclaimed", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+		case restoreClaimedByOther:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("another route now claims %s — resolve the drift in Caddy", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+		case restoreContentMismatch:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but its config changed", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+		case restoreUnverified:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but couldn't verify the final state", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+		case restoreTakeoverChanged:
+			m.clearLastPurge()
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("your take-over of %s changed under you — resolve in Caddy; not restoring", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+		case restoreUnreachable:
+			// Retryable (design F11): KEEP the slot armed and re-arm the idle timer.
+			// No poll here — a poll could read the take-over teardown as a re-take and
+			// clear the slot we're deliberately keeping for the retry.
+			var reArm tea.Cmd
+			if m.lastPurge != nil {
+				reArm = m.scheduleLastPurgeExpiry()
+			}
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("couldn't restore %s — edge unreachable; press R to retry", msg.hostname), flashWarn), reArm)
+		default: // restoreError
+			m.clearLastPurge()
+			return m, tea.Batch(m.setErr(fmt.Sprintf("couldn't restore %s: %s", msg.hostname, publishErrText(msg.err))), refresh, m.pollPublishedCmd())
+		}
+
+	case lastPurgeExpireMsg:
+		// The restore affordance's ~60s idle timeout (design OQ1). Honor it only if
+		// it matches the current generation (not superseded by a clear/re-arm) and no
+		// restore is in flight (the timer is suspended while restoring — design F11).
+		if msg.gen == m.lastPurgeGen && m.lastPurge != nil && !m.restoring {
+			m.clearLastPurge()
+		}
+		return m, nil
 
 	case publishPollMsg:
 		// Drop a stale result (roborev 0k12 #1): polls are remote round-trips
@@ -3303,6 +3579,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A successful poll reached the edge admin API -- a real edge is now
 		// working, so the domain-setup reminder has done its job (kata w131).
 		m.domainSetupPending = false
+		// Third-party re-take clear (kata ttfh; design §3.6/§5): if our take-over
+		// was live and the poll now shows our port no longer publishing the armed
+		// hostname, someone re-took (or removed) it — the restore affordance no
+		// longer describes reality, so drop it. Gated on takeoverLive so a FAILED
+		// take-over's armed-for-retry slot (whose expected state is "no route of
+		// ours") is never wrongly cleared by this same signal.
+		if m.lastPurge != nil && m.lastPurge.takeoverLive {
+			if info, ok := m.published[m.lastPurge.ourPort]; !ok || info.hostname != m.lastPurge.hostname {
+				m.clearLastPurge()
+			}
+		}
 		return m, m.rebuildItems()
 
 	case publishTickMsg:
@@ -3600,6 +3887,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Contextual restore key (kata ttfh; design OQ3): R restores a just-purged
+		// OWNED route, but ONLY while the slot is armed. It is a DISTINCT key from the
+		// registry-undo `u` (which shadows nothing here and keeps its "does NOT touch
+		// what's exposed" promise literally true). When UNARMED it is not handled here
+		// at all, so it falls through to the list like any other unbound key and
+		// shadows no binding. The in-flight guard (restoring / m.pending) makes a
+		// second R a no-op so two concurrent A/B can never fire (design F5).
+		if msg.String() == "R" && m.lastPurge != nil {
+			if m.restoring || m.pending != 0 {
+				return m, nil
+			}
+			return m, m.beginRestore()
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -3870,6 +4171,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// otherwise opens the publish dialog (kata v1z5).
 			return m, m.requestPublish(sel.port.Number)
 		}
+	}
+
+	// Navigation intent clears the restore affordance (kata ttfh; design §3.6).
+	// Only keys NOT handled by any case above reach here -- list navigation (arrows,
+	// j/k, home/end, pgup/pgdn) and the like -- so a user who has moved on drops the
+	// transient "press R to restore" prompt. Suppressed while a restore is in flight
+	// (the slot must survive to catch its restoreDoneMsg / retry).
+	if m.lastPurge != nil && !m.restoring {
+		m.clearLastPurge()
 	}
 
 	// Anything not handled above goes to the list. In FilterApplied state this
@@ -5642,7 +5952,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"c":      "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
-		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them.",
+		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them. (To restore a\nforce-purged route is a SEPARATE affordance on its own key — R,\nshown in the status line right after the purge — not this.)",
 		"ctrl+r": "Redo the last undone registry edit. Any new edit clears the redo\nstack, so you can't redo onto a changed registry.",
 		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
 		"l":      "Set a text label for the selected port.",
@@ -6432,6 +6742,23 @@ func (m model) renderStatusLine() string {
 	}
 	if flashRender != "" {
 		return flashRender
+	}
+	// The restore affordance (kata ttfh; design §3.5/§3.6) shares this SAME
+	// status-slot action line the poof used: once the poof and any "took over"
+	// info flash have cleared, the armed slot shows the deleted route's descriptor
+	// and the restore key for the affordance's lifetime. It sits BELOW a flash and
+	// the poof (so a failure or the take-over toast is never hidden) and ABOVE the
+	// plain status text. While a restore is in flight it reads "restoring …".
+	if m.lastPurge != nil {
+		lp := m.lastPurge
+		if m.restoring {
+			return helpStyle.Render(fmt.Sprintf("restoring %s…", lp.hostname))
+		}
+		desc := lp.hostname
+		if lp.deletedDesc != "" {
+			desc = fmt.Sprintf("%s → %s", lp.hostname, lp.deletedDesc)
+		}
+		return helpStyle.Render("purged "+desc+" — press ") + helpKeyStyle.Render("R") + helpStyle.Render(" to restore")
 	}
 	return helpStyle.Render(m.statusText())
 }

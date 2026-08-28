@@ -7195,3 +7195,442 @@ func TestPurgeCancelReconcilesServeState(t *testing.T) {
 		t.Errorf("cancel must reconcile serve state to ON so 'space to stop' is honest; m.active[8080]=%v", m.active[8080])
 	}
 }
+
+// --- purge-undo (kata ttfh, the OWNED-only restore) --------------------------
+
+const ttfhHost = "app.example.com"
+
+// armedRestoreModelWith drives an OWNED purge → take-over sequence and returns a
+// model with m.lastPurge ARMED, so tests can exercise R / the messages / the
+// clears from a clean armed state. takeoverErr is the take-over resume's outcome
+// (nil = it succeeded → takeoverLive true; non-nil = it failed → armed for retry).
+// captured is a plain BuildRoute (no unmodeled field) so the ui-level fakeCaddy —
+// which decodes+re-encodes on POST — round-trips it faithfully for a "Restored".
+func armedRestoreModelWith(t *testing.T, srv *httptest.Server, takeoverErr error) model {
+	t.Helper()
+	m := newPublishModel(t, srv)
+	m.pendingPublish = pendingPublish{hostname: ttfhHost, label: "dev-box", port: 8080}
+	m.pending = 8080
+	captured, _ := json.Marshal(caddyedge.BuildRoute(ttfhHost, "other-box", 9090, nil))
+	m = mustUpdate(t, m, purgeDoneMsg{
+		captured: caddyedge.Captured{Raw: captured, Hostname: ttfhHost, HadID: true},
+		hostname: ttfhHost, port: 8080, deletedDesc: "other-box:9090", owned: true,
+	})
+	if m.pendingArm == nil || m.lastPurge != nil {
+		t.Fatalf("owned purge should stash pending-arm and NOT arm yet; pendingArm=%v lastPurge=%v", m.pendingArm, m.lastPurge)
+	}
+	m = mustUpdate(t, m, publishDoneMsg{port: 8080, err: takeoverErr})
+	if m.lastPurge == nil {
+		t.Fatal("armedRestoreModelWith: slot should be armed after the take-over publishDoneMsg")
+	}
+	// A clean armed state for downstream tests: drop the transient poof/flash the
+	// take-over left, so the restore prompt / next flash is what shows.
+	m.poof, m.poofTicking = nil, false
+	m.flash, m.flashLevel = "", flashInfo
+	return m
+}
+
+func armedRestoreModel(t *testing.T, srv *httptest.Server) model {
+	t.Helper()
+	return armedRestoreModelWith(t, srv, nil)
+}
+
+// TestTtfhArmOnlyForOwnedPurge: the restore slot arms ONLY for an OWNED purge and
+// ONLY after the take-over publishDoneMsg (design OQ8/F4) — even if the take-over
+// FAILS; a FOREIGN purge or an id-less owned purge never arms.
+func TestTtfhArmOnlyForOwnedPurge(t *testing.T) {
+	captured, _ := json.Marshal(caddyedge.BuildRoute(ttfhHost, "other-box", 9090, nil))
+	seed := func() model {
+		m := newPublishModel(t, nil)
+		m.pendingPublish = pendingPublish{hostname: ttfhHost, label: "dev-box", port: 8080}
+		m.pending = 8080
+		return m
+	}
+
+	t.Run("owned arms after the take-over publishDoneMsg", func(t *testing.T) {
+		m := seed()
+		m = mustUpdate(t, m, purgeDoneMsg{captured: caddyedge.Captured{Raw: captured, Hostname: ttfhHost, HadID: true}, hostname: ttfhHost, port: 8080, deletedDesc: "other-box:9090", owned: true})
+		if m.pendingArm == nil {
+			t.Fatal("owned purge should stash pending-arm")
+		}
+		if m.lastPurge != nil {
+			t.Fatal("must NOT arm until the take-over publishDoneMsg (design F4)")
+		}
+		m = mustUpdate(t, m, publishDoneMsg{port: 8080})
+		if m.lastPurge == nil || !m.lastPurge.takeoverLive {
+			t.Fatalf("take-over success should arm a LIVE slot; lastPurge=%v", m.lastPurge)
+		}
+		if m.pendingArm != nil {
+			t.Error("pendingArm should be consumed by the arm")
+		}
+		if m.lastPurge.deletedDesc != "other-box:9090" || m.lastPurge.ourLabel != "dev-box" || m.lastPurge.ourPort != 8080 {
+			t.Errorf("armed slot fields wrong: %+v", m.lastPurge)
+		}
+	})
+
+	t.Run("owned arms even if the take-over FAILS", func(t *testing.T) {
+		m := seed()
+		m = mustUpdate(t, m, purgeDoneMsg{captured: caddyedge.Captured{Raw: captured, Hostname: ttfhHost, HadID: true}, hostname: ttfhHost, port: 8080, owned: true})
+		m = mustUpdate(t, m, publishDoneMsg{port: 8080, err: caddyedge.ErrHostnameConflict})
+		if m.lastPurge == nil {
+			t.Fatal("a FAILED take-over must still arm — the purge already happened (design F4)")
+		}
+		if m.lastPurge.takeoverLive {
+			t.Error("a failed take-over must mark takeoverLive=false (armed for retry, not a live take-over)")
+		}
+	})
+
+	t.Run("foreign purge never arms (OQ8)", func(t *testing.T) {
+		m := seed()
+		m = mustUpdate(t, m, purgeDoneMsg{captured: caddyedge.Captured{Raw: captured, Hostname: ttfhHost, HadID: true}, hostname: ttfhHost, port: 8080, owned: false})
+		if m.pendingArm != nil {
+			t.Fatal("a foreign purge must not stash pending-arm (one-way, OQ8)")
+		}
+		m = mustUpdate(t, m, publishDoneMsg{port: 8080})
+		if m.lastPurge != nil {
+			t.Fatal("a foreign purge must NEVER arm the restore slot")
+		}
+	})
+
+	t.Run("owned but id-less (HadID=false) never arms", func(t *testing.T) {
+		m := seed()
+		m = mustUpdate(t, m, purgeDoneMsg{captured: caddyedge.Captured{Raw: captured, Hostname: ttfhHost, HadID: false}, hostname: ttfhHost, port: 8080, owned: true})
+		if m.pendingArm != nil {
+			t.Fatal("HadID=false must not arm — nothing to re-POST by @id")
+		}
+	})
+}
+
+// TestTtfhRestoreKeyDrivesABC: while armed, R runs step A (Unpublish our take-over)
+// → B (RestoreRoute) → C (VerifyRestore) against a real fake edge, classifying
+// Restored, and the message clears the slot.
+func TestTtfhRestoreKeyDrivesABC(t *testing.T) {
+	fc := newFakeCaddy()
+	fc.routes[caddyedge.IDFor(ttfhHost)] = caddyedge.BuildRoute(ttfhHost, "dev-box", 8080, nil) // our live take-over
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := armedRestoreModel(t, srv)
+	res, cmd := m.Update(rkey("R"))
+	m = res.(model)
+	if !m.restoring || m.pending != 8080 {
+		t.Fatalf("R should launch the restore in-flight; restoring=%v pending=%d", m.restoring, m.pending)
+	}
+	if cmd == nil {
+		t.Fatal("R should launch restoreCmd")
+	}
+	done, ok := cmd().(restoreDoneMsg)
+	if !ok {
+		t.Fatalf("restore cmd should yield restoreDoneMsg; got %#v", cmd())
+	}
+	if done.result != restoreRestored {
+		t.Errorf("A→B→C should classify Restored; got %v", done.result)
+	}
+	// A removed our take-over; B re-created the OLD backend.
+	rt, ok := fc.routes[caddyedge.IDFor(ttfhHost)]
+	if !ok || routeDial(rt) != "other-box:9090" {
+		t.Errorf("restore should re-create the old backend other-box:9090; got %+v", rt)
+	}
+	if len(fc.deletes) != 1 {
+		t.Errorf("step A should have deleted exactly our take-over once; deletes=%v", fc.deletes)
+	}
+	m = mustUpdate(t, m, done)
+	if m.lastPurge != nil {
+		t.Error("a successful restore should clear the slot")
+	}
+	if m.restoring || m.pending != 0 {
+		t.Errorf("restoreDoneMsg should clear the in-flight guards; restoring=%v pending=%d", m.restoring, m.pending)
+	}
+	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "restored "+ttfhHost) {
+		t.Errorf("flash=%q level=%v, want a plain 'restored %s'", m.flash, m.flashLevel, ttfhHost)
+	}
+}
+
+// TestTtfhSplitAOutcomes: step A splits on Unpublish's result — ErrNotFound
+// proceeds to B (our take-over already gone); ErrHostnameConflict ABORTS with no
+// append (our take-over is still live/drifted — appending would dual-expose).
+func TestTtfhSplitAOutcomes(t *testing.T) {
+	t.Run("A ErrNotFound proceeds to B and restores", func(t *testing.T) {
+		fc := newFakeCaddy() // our take-over is NOT present
+		srv := httptest.NewServer(fc)
+		defer srv.Close()
+		m := armedRestoreModel(t, srv)
+		_, cmd := m.Update(rkey("R"))
+		done := cmd().(restoreDoneMsg)
+		if done.result != restoreRestored {
+			t.Errorf("A ErrNotFound should proceed to B → Restored; got %v", done.result)
+		}
+		if rt, ok := fc.routes[caddyedge.IDFor(ttfhHost)]; !ok || routeDial(rt) != "other-box:9090" {
+			t.Errorf("B should append the captured route even when A found nothing; got %+v", rt)
+		}
+	})
+
+	t.Run("A ErrHostnameConflict aborts with NO append", func(t *testing.T) {
+		fc := newFakeCaddy()
+		// our @id is present but drifted to a DIFFERENT backend → Unpublish refuses.
+		fc.routes[caddyedge.IDFor(ttfhHost)] = caddyedge.BuildRoute(ttfhHost, "drifted-box", 1234, nil)
+		srv := httptest.NewServer(fc)
+		defer srv.Close()
+		m := armedRestoreModel(t, srv)
+		_, cmd := m.Update(rkey("R"))
+		done := cmd().(restoreDoneMsg)
+		if done.result != restoreTakeoverChanged {
+			t.Errorf("A ErrHostnameConflict should abort with takeoverChanged; got %v", done.result)
+		}
+		if len(fc.routes) != 1 || routeDial(fc.routes[caddyedge.IDFor(ttfhHost)]) != "drifted-box:1234" {
+			t.Errorf("an aborted restore must NOT append (no dual exposure); routes=%v", fc.routes)
+		}
+		if len(fc.deletes) != 0 {
+			t.Errorf("A refused to delete the drifted route; deletes=%v", fc.deletes)
+		}
+		m = mustUpdate(t, m, done)
+		if m.lastPurge != nil {
+			t.Error("takeoverChanged is terminal → clear the slot")
+		}
+		if !strings.Contains(m.flash, "changed under you") {
+			t.Errorf("flash=%q, want the take-over-changed message", m.flash)
+		}
+	})
+}
+
+// TestTtfhMessagePerState pins each restore outcome's exact message + level and
+// whether it clears or KEEPS (retryable) the slot — computed from the FINAL state,
+// never a guess.
+func TestTtfhMessagePerState(t *testing.T) {
+	cases := []struct {
+		name        string
+		result      restoreResult
+		wantSub     string
+		wantLevel   flashLevel
+		wantCleared bool
+	}{
+		{"restored", restoreRestored, "restored " + ttfhHost, flashInfo, true},
+		{"unclaimed", restoreUnclaimed, "it's now unclaimed", flashWarn, true},
+		{"claimed-by-other", restoreClaimedByOther, "another route now claims", flashWarn, true},
+		{"content-mismatch", restoreContentMismatch, "its config changed", flashWarn, true},
+		{"unverified", restoreUnverified, "couldn't verify the final state", flashWarn, true},
+		{"takeover-changed", restoreTakeoverChanged, "changed under you", flashWarn, true},
+		{"unreachable", restoreUnreachable, "edge unreachable; press R to retry", flashWarn, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := armedRestoreModel(t, nil)
+			m.restoring = true
+			m = mustUpdate(t, m, restoreDoneMsg{hostname: ttfhHost, result: c.result})
+			if !strings.Contains(m.flash, c.wantSub) {
+				t.Errorf("flash=%q, want substring %q", m.flash, c.wantSub)
+			}
+			if m.flashLevel != c.wantLevel {
+				t.Errorf("level=%v, want %v", m.flashLevel, c.wantLevel)
+			}
+			if m.restoring {
+				t.Error("restoreDoneMsg must clear the in-flight flag")
+			}
+			if c.wantCleared && m.lastPurge != nil {
+				t.Errorf("%s should CLEAR the slot", c.name)
+			}
+			if !c.wantCleared && m.lastPurge == nil {
+				t.Errorf("%s (retryable) should KEEP the slot armed", c.name)
+			}
+		})
+	}
+
+	t.Run("error", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, restoreDoneMsg{hostname: ttfhHost, result: restoreError, err: caddyedge.ErrConcurrentUpdate})
+		if m.flashLevel != flashError || !strings.Contains(m.flash, "couldn't restore "+ttfhHost) {
+			t.Errorf("flash=%q level=%v, want an error toast", m.flash, m.flashLevel)
+		}
+		if m.lastPurge != nil {
+			t.Error("restoreError should clear the slot")
+		}
+	})
+}
+
+// TestTtfhRetryableReArms: a retryable (edge-unreachable) outcome KEEPS the slot,
+// re-arms the idle timer (bumps the gen), and R relaunches the restore.
+func TestTtfhRetryableReArms(t *testing.T) {
+	m := armedRestoreModel(t, nil)
+	m.restoring = true
+	genBefore := m.lastPurgeGen
+	res, cmd := m.Update(restoreDoneMsg{hostname: ttfhHost, result: restoreUnreachable})
+	m = res.(model)
+	if m.lastPurge == nil {
+		t.Fatal("unreachable is retryable → the slot must stay armed")
+	}
+	if m.restoring {
+		t.Error("the in-flight flag must clear even on a retryable outcome")
+	}
+	if m.lastPurgeGen == genBefore {
+		t.Error("a retryable outcome should re-arm (bump the idle-timer gen)")
+	}
+	if cmd == nil {
+		t.Error("a retryable outcome should return a (flash + re-arm timer) batch")
+	}
+	res, cmd2 := m.Update(rkey("R"))
+	if cmd2 == nil {
+		t.Error("R should relaunch the restore after a retryable outcome")
+	}
+	if !res.(model).restoring {
+		t.Error("R should re-enter the in-flight state")
+	}
+}
+
+// TestTtfhInFlightGuard: a second R while a restore is in flight is a no-op, so two
+// concurrent A/B can never fire (design F5).
+func TestTtfhInFlightGuard(t *testing.T) {
+	m := armedRestoreModel(t, nil)
+	res, cmd1 := m.Update(rkey("R"))
+	m = res.(model)
+	if !m.restoring || cmd1 == nil {
+		t.Fatal("first R should launch the restore")
+	}
+	res, cmd2 := m.Update(rkey("R"))
+	if cmd2 != nil {
+		t.Error("a second R while restoring must be a no-op (no concurrent A/B)")
+	}
+	if !res.(model).restoring {
+		t.Error("the second R must not disturb the in-flight state")
+	}
+}
+
+// TestTtfhRestoreKeyUnarmedIsInert: R does nothing while unarmed — it shadows no
+// binding (it is not handled here and falls through to the list).
+func TestTtfhRestoreKeyUnarmedIsInert(t *testing.T) {
+	m := newPublishModel(t, nil)
+	res, _ := m.Update(rkey("R"))
+	m2 := res.(model)
+	if m2.restoring || m2.lastPurge != nil {
+		t.Error("R while unarmed must not start or arm a restore")
+	}
+	if m2.flash != "" {
+		t.Errorf("R while unarmed must not raise a toast; got %q", m2.flash)
+	}
+}
+
+// TestTtfhClearTriggers exercises every non-timeout clear trigger.
+func TestTtfhClearTriggers(t *testing.T) {
+	t.Run("de-escalation of our take-over port clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, publishDoneMsg{port: 8080, unpublish: true})
+		if m.lastPurge != nil {
+			t.Error("unpublishing our take-over port should clear the restore slot (design F10)")
+		}
+	})
+
+	t.Run("a new user publish clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m.publishPort = 8080
+		m.publishHostname = "new.example.com"
+		m.publishEnableServe = false
+		_ = m.confirmPublish()
+		if m.lastPurge != nil {
+			t.Error("a new user publish should clear the prior restore slot")
+		}
+	})
+
+	t.Run("a new purge clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m.purgeHostname = "other.example.com"
+		m.purgePort = 8080
+		m.purgeExpect = caddyedge.PurgeExpect{Owned: true, ID: "x"}
+		_ = m.confirmPurge()
+		if m.lastPurge != nil {
+			t.Error("a new purge should clear the prior restore slot")
+		}
+	})
+
+	t.Run("a poll showing a third-party re-take clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil) // takeoverLive=true
+		m = mustUpdate(t, m, publishPollMsg{published: map[int]publishInfo{}, gen: 1})
+		if m.lastPurge != nil {
+			t.Error("a poll showing our take-over gone should clear the slot")
+		}
+	})
+
+	t.Run("a poll CONFIRMING our take-over does NOT clear", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, publishPollMsg{published: map[int]publishInfo{8080: {hostname: ttfhHost}}, gen: 1})
+		if m.lastPurge == nil {
+			t.Error("a poll confirming our take-over is live must NOT clear the slot")
+		}
+	})
+
+	t.Run("a failed take-over's retry slot survives a 'no route' poll", func(t *testing.T) {
+		m := armedRestoreModelWith(t, nil, caddyedge.ErrHostnameConflict) // takeoverLive=false
+		m = mustUpdate(t, m, publishPollMsg{published: map[int]publishInfo{}, gen: 1})
+		if m.lastPurge == nil {
+			t.Error("a failed take-over (armed for retry) must survive the expected 'no route of ours' poll")
+		}
+	})
+
+	t.Run("navigation clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		if m.lastPurge != nil {
+			t.Error("navigation intent should clear the restore affordance")
+		}
+	})
+}
+
+// TestTtfhIdleTimeout: the ~60s idle timer clears the slot, a stale-gen expiry is
+// ignored, and the timer is suspended while a restore is in flight.
+func TestTtfhIdleTimeout(t *testing.T) {
+	t.Run("matching gen clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, lastPurgeExpireMsg{gen: m.lastPurgeGen})
+		if m.lastPurge != nil {
+			t.Error("the idle timeout should clear the slot")
+		}
+	})
+	t.Run("stale gen is ignored", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, lastPurgeExpireMsg{gen: m.lastPurgeGen - 1})
+		if m.lastPurge == nil {
+			t.Error("a superseded (stale-gen) expiry must be ignored")
+		}
+	})
+	t.Run("suspended while restoring", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m.restoring = true
+		m = mustUpdate(t, m, lastPurgeExpireMsg{gen: m.lastPurgeGen})
+		if m.lastPurge == nil {
+			t.Error("the idle timer is suspended while a restore is in flight (design F11)")
+		}
+	})
+}
+
+// TestTtfhRestorePromptRenders: the armed slot shows the deleted route's descriptor
+// and the R key in the shared status-slot action line, reads "restoring …" in
+// flight, and yields to a warn/error flash.
+func TestTtfhRestorePromptRenders(t *testing.T) {
+	m := armedRestoreModel(t, nil)
+	m.width = 80
+	got := stripANSI(m.renderStatusLine())
+	for _, want := range []string{ttfhHost, "other-box:9090", "press", "R", "restore"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("restore prompt = %q, want it to contain %q", got, want)
+		}
+	}
+	m.restoring = true
+	if got := stripANSI(m.renderStatusLine()); !strings.Contains(got, "restoring "+ttfhHost) {
+		t.Errorf("in-flight prompt = %q, want 'restoring …'", got)
+	}
+	m.restoring = false
+	m.flash, m.flashLevel = "boom", flashError
+	if got := stripANSI(m.renderStatusLine()); !strings.Contains(got, "boom") {
+		t.Errorf("a warn/error flash must outrank the restore prompt; got %q", got)
+	}
+}
+
+// TestTtfhUndoHelpPointsToRestore: the registry-undo `u` help documents that the
+// force-purge restore is a SEPARATE, distinctly-keyed affordance (design OQ3).
+func TestTtfhUndoHelpPointsToRestore(t *testing.T) {
+	desc := keyLegendDescs(false)["u"]
+	if !strings.Contains(desc, "R") || !strings.Contains(strings.ToLower(desc), "restore") {
+		t.Errorf("`u` help should point to the separate R restore affordance; got %q", desc)
+	}
+	if !strings.Contains(desc, "does NOT touch what's exposed") {
+		t.Errorf("`u` help should keep its exposure promise; got %q", desc)
+	}
+}

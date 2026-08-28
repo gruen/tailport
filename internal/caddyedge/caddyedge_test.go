@@ -1811,3 +1811,217 @@ func TestPurgeConflictForeignIdWidenedMatcherRefused(t *testing.T) {
 		t.Errorf("the route must survive so the UI can re-disclose the blast radius; got %d", len(f.routes))
 	}
 }
+
+// --- RestoreRoute / VerifyRestore (kata ttfh, the OWNED-only undo) -----------
+
+// capturedOwned is a compact, owned captured route carrying an UNMODELED
+// "metadata" field, so restore/verify are exercised against a route that a
+// decode+re-marshal would mutilate. It points app.example.com at other-box:9090.
+const capturedOwned = `{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"hand-edited"}}`
+
+// TestRestoreRouteAppendsWhenFree: with the name genuinely free, RestoreRoute
+// POST-appends the EXACT captured bytes (byte-faithful, unmodeled field intact).
+func TestRestoreRouteAppendsWhenFree(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned)
+	c, f := newFakeRaw(t) // empty array: nothing claims the host
+	if err := c.RestoreRoute(context.Background(), host, captured); err != nil {
+		t.Fatalf("RestoreRoute: %v", err)
+	}
+	if f.post != 1 || f.mutations != 1 || len(f.routes) != 1 {
+		t.Fatalf("expected exactly one appended route; post=%d mutations=%d routes=%d", f.post, f.mutations, len(f.routes))
+	}
+	if string(f.routes[0]) != string(captured) {
+		t.Errorf("restore is not byte-faithful:\n got %s\nwant %s", f.routes[0], captured)
+	}
+	if !strings.Contains(string(f.routes[0]), `"metadata":{"note":"hand-edited"}`) {
+		t.Errorf("restore dropped the unmodeled field: %s", f.routes[0])
+	}
+}
+
+// TestRestoreRouteRefusesOverlappingClaim: an overlapping (foreign) route already
+// holds the host → refuse with ErrRestoreNameClaimed, never a blind append that
+// would create dual exposure.
+func TestRestoreRouteRefusesOverlappingClaim(t *testing.T) {
+	const host = "app.example.com"
+	claim := json.RawMessage(`{"@id":"foreign-app","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.9:80"}]}],"terminal":true}`)
+	c, f := newFakeRaw(t, claim)
+	err := c.RestoreRoute(context.Background(), host, json.RawMessage(capturedOwned))
+	if !errors.Is(err, ErrRestoreNameClaimed) {
+		t.Fatalf("err = %v, want ErrRestoreNameClaimed", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("a re-claimed name must not be appended (dual exposure); got %d mutations", f.mutations)
+	}
+}
+
+// TestRestoreRouteRefusesWildcardOverlap: a foreign *.suffix wildcard that would
+// intercept the host is an overlap → refuse (the scan reuses routeOverlaps).
+func TestRestoreRouteRefusesWildcardOverlap(t *testing.T) {
+	const host = "app.example.com"
+	wild := json.RawMessage(`{"@id":"foreign-wild","match":[{"host":["*.example.com"]}],"handle":[{"handler":"static_response"}],"terminal":true}`)
+	c, f := newFakeRaw(t, wild)
+	err := c.RestoreRoute(context.Background(), host, json.RawMessage(capturedOwned))
+	if !errors.Is(err, ErrRestoreNameClaimed) {
+		t.Fatalf("err = %v, want ErrRestoreNameClaimed (wildcard overlap)", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("a wildcard-claimed name must not be appended; got %d mutations", f.mutations)
+	}
+}
+
+// TestRestoreRouteRefusesDuplicateID: a route carrying the captured @id but at a
+// DIFFERENT (non-overlapping) host — the overlap scan misses it, the @id scan
+// catches it → refuse (a duplicate @id would be rejected by Caddy anyway).
+func TestRestoreRouteRefusesDuplicateID(t *testing.T) {
+	const host = "app.example.com"
+	dup := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["elsewhere.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"x:1"}]}],"terminal":true}`)
+	c, f := newFakeRaw(t, dup)
+	err := c.RestoreRoute(context.Background(), host, json.RawMessage(capturedOwned))
+	if !errors.Is(err, ErrRestoreNameClaimed) {
+		t.Fatalf("err = %v, want ErrRestoreNameClaimed (duplicate @id)", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("a duplicate @id must not be appended; got %d mutations", f.mutations)
+	}
+}
+
+// TestRestoreRoute412Retries: the array moved under the append (a lost If-Match
+// race) → 412 → re-read, re-scan, retry, then succeed exactly once.
+func TestRestoreRoute412Retries(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFakeRaw(t)
+	f.force412 = 1
+	if err := c.RestoreRoute(context.Background(), host, json.RawMessage(capturedOwned)); err != nil {
+		t.Fatalf("RestoreRoute should retry and succeed: %v", err)
+	}
+	if f.force412 != 0 {
+		t.Errorf("the injected 412 was not consumed (force412=%d)", f.force412)
+	}
+	if f.post != 1 || f.mutations != 1 || len(f.routes) != 1 {
+		t.Errorf("expected exactly one accepted append after retry; post=%d mutations=%d routes=%d", f.post, f.mutations, len(f.routes))
+	}
+}
+
+// TestRestoreRouteEmptyEtagRefuses: a pre-2.5.2 edge emits no ETag, so the append
+// would be unconditional (racing a concurrent claim) → ErrEdgeNoIfMatch, no
+// mutation.
+func TestRestoreRouteEmptyEtagRefuses(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFakeRaw(t)
+	f.noEtag = true
+	err := c.RestoreRoute(context.Background(), host, json.RawMessage(capturedOwned))
+	if !errors.Is(err, ErrEdgeNoIfMatch) {
+		t.Fatalf("err = %v, want ErrEdgeNoIfMatch", err)
+	}
+	if f.mutations != 0 {
+		t.Errorf("no ETag must refuse to append, not clobber blind; got %d mutations", f.mutations)
+	}
+}
+
+// TestVerifyRestoreRestored: exactly one route overlaps and it semantically
+// equals the captured bytes (proved with a KEY-REORDERED live element, so it is a
+// normalized-JSON compare, not a byte compare) → Restored.
+func TestVerifyRestoreRestored(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned)
+	// Same values, keys reordered and whitespace added: byte-different, value-equal.
+	reordered := json.RawMessage(`{ "terminal": true, "@id":"tailport-app.example.com", "metadata":{"note":"hand-edited"}, "match":[{"host":["app.example.com"]}], "handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}] }`)
+	c, _ := newFakeRaw(t, reordered)
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil {
+		t.Fatalf("VerifyRestore: %v", err)
+	}
+	if state != Restored {
+		t.Errorf("state = %v, want Restored (normalized compare of reordered-but-equal route)", state)
+	}
+}
+
+// TestVerifyRestoreUnclaimed: nothing overlaps the host → Unclaimed.
+func TestVerifyRestoreUnclaimed(t *testing.T) {
+	c, _ := newFakeRaw(t)
+	state, err := c.VerifyRestore(context.Background(), "app.example.com", json.RawMessage(capturedOwned))
+	if err != nil || state != RestoreUnclaimed {
+		t.Fatalf("state=%v err=%v, want Unclaimed", state, err)
+	}
+}
+
+// TestVerifyRestoreClaimedByOther: a DIFFERENT route (foreign @id) holds the host
+// → ClaimedByOther, never "restored".
+func TestVerifyRestoreClaimedByOther(t *testing.T) {
+	const host = "app.example.com"
+	other := json.RawMessage(`{"@id":"foreign-app","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.9:80"}]}],"terminal":true}`)
+	c, _ := newFakeRaw(t, other)
+	state, err := c.VerifyRestore(context.Background(), host, json.RawMessage(capturedOwned))
+	if err != nil || state != RestoreClaimedByOther {
+		t.Fatalf("state=%v err=%v, want ClaimedByOther", state, err)
+	}
+}
+
+// TestVerifyRestoreConcurrentOverlapAppend (roborev-k7br-#2): a concurrent
+// overlapping route appended between B and C means >1 route overlaps — even
+// though one of them equals captured, the name is not cleanly ours → ClaimedByOther,
+// NOT "restored".
+func TestVerifyRestoreConcurrentOverlapAppend(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned)
+	concurrent := json.RawMessage(`{"@id":"foreign-late","match":[{"host":["app.example.com"]}],"handle":[{"handler":"static_response"}],"terminal":true}`)
+	c, _ := newFakeRaw(t, captured, concurrent) // our restored route AND a concurrent overlap
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil {
+		t.Fatalf("VerifyRestore: %v", err)
+	}
+	if state != RestoreClaimedByOther {
+		t.Errorf("state = %v, want ClaimedByOther (a second overlapping route → not 'restored')", state)
+	}
+}
+
+// TestVerifyRestoreContentMismatchBackend (roborev-e4ne-#1): a same-@id PATCH
+// between B and C keeps the id+host but swaps the backend → ContentMismatch, not
+// "restored".
+func TestVerifyRestoreContentMismatchBackend(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned) // other-box:9090
+	swapped := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"sneaky-box:1111"}]}],"terminal":true,"metadata":{"note":"hand-edited"}}`)
+	c, _ := newFakeRaw(t, swapped)
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil {
+		t.Fatalf("VerifyRestore: %v", err)
+	}
+	if state != RestoreContentMismatch {
+		t.Errorf("state = %v, want ContentMismatch (same @id, swapped backend)", state)
+	}
+}
+
+// TestVerifyRestoreContentMismatchUnmodeledField: the content compare includes
+// fields tailport doesn't model — a same-@id route whose only change is an
+// UNMODELED field is still ContentMismatch, proving the compare is semantic-full
+// (not hostMatcherIs / backend-only).
+func TestVerifyRestoreContentMismatchUnmodeledField(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned) // metadata note "hand-edited"
+	mutatedMeta := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"TAMPERED"}}`)
+	c, _ := newFakeRaw(t, mutatedMeta)
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil {
+		t.Fatalf("VerifyRestore: %v", err)
+	}
+	if state != RestoreContentMismatch {
+		t.Errorf("state = %v, want ContentMismatch (unmodeled field changed under same @id)", state)
+	}
+}
+
+// TestRestoreThenVerifyComposes: RestoreRoute into a free array then VerifyRestore
+// classifies Restored — the B→C composition proves out end-to-end against the fake.
+func TestRestoreThenVerifyComposes(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned)
+	c, _ := newFakeRaw(t)
+	if err := c.RestoreRoute(context.Background(), host, captured); err != nil {
+		t.Fatalf("RestoreRoute: %v", err)
+	}
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil || state != Restored {
+		t.Fatalf("state=%v err=%v, want Restored", state, err)
+	}
+}

@@ -99,6 +99,14 @@ var (
 	// that a concurrent array shift could point at the wrong route). PurgeConflict
 	// refuses to force-delete rather than clobber blind. See docs/caddy-edge.md.
 	ErrEdgeNoIfMatch = errors.New("edge did not return an ETag; refusing to force-delete — requires Caddy >= 2.5.2")
+	// ErrRestoreNameClaimed means RestoreRoute's scan-before-append found the
+	// hostname already re-claimed — an overlapping route, or a route carrying the
+	// captured route's @id — so appending the captured bytes would create DUAL
+	// exposure (Caddy permits overlapping host matchers) or a duplicate @id. The
+	// undo (kata ttfh) refuses rather than dual-expose; our own take-over was
+	// already removed by step A, so the honest outcome is "another route now
+	// claims the host — resolve the drift in Caddy".
+	ErrRestoreNameClaimed = errors.New("hostname re-claimed by another route; refusing to restore")
 )
 
 // BasicAuth is a single http_basic credential for the edge. Hash is a bcrypt
@@ -1101,6 +1109,184 @@ func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect Purg
 		return captured, nil
 	}
 	return Captured{}, ErrConcurrentUpdate
+}
+
+// RestoreRoute re-creates a route from its captured bytes, as undo step B (kata
+// ttfh; design §3.6-B). It is scan-then-append under ONE routes-array If-Match:
+// re-read the array (fresh etag), scan it for a route whose host matcher OVERLAPS
+// hostname OR that carries the captured route's @id, and if the name is already
+// claimed REFUSE with ErrRestoreNameClaimed — never a blind append, because Caddy
+// permits overlapping host matchers, so appending onto a live claim would create
+// silent DUAL exposure the after-the-fact verify could only report, not prevent.
+// Only when the name is genuinely free does it POST-append the EXACT captured
+// bytes (never a re-serialization — byte-faithful even for fields tailport does
+// not model) under that same array etag; a concurrent append moving the array
+// hash → 412 → re-read, re-scan, retry (bounded). Refusing before appending under
+// the array If-Match makes the refuse-vs-append decision atomic against the
+// overlap race rather than append-then-discover.
+//
+// It is A-before-B by contract: an OWNED captured route shares our take-over's
+// @id, so the caller MUST have removed the take-over (step A) first, else this
+// scan finds the duplicate @id and refuses. If the guarding array ETag is empty
+// (a pre-2.5.2 edge that ignores If-Match) it refuses with ErrEdgeNoIfMatch
+// rather than append blind, mirroring PurgeConflict.
+func (c *Client) RestoreRoute(ctx context.Context, hostname string, captured json.RawMessage) error {
+	hostname = canonHost(hostname)
+	capID := rawRouteID(captured)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		raws, arrEtag, err := c.fetchRoutesRaw(ctx)
+		if err != nil {
+			return err
+		}
+		// Scan for a re-claim: any live route overlapping the hostname, or one
+		// carrying the captured route's @id (a duplicate-@id append would be
+		// rejected by Caddy anyway, but refusing here keeps the message honest).
+		for _, elem := range raws {
+			var r Route
+			if json.Unmarshal(elem, &r) != nil {
+				continue // an element we can't decode can't be matched; skip it
+			}
+			if routeOverlaps(r, hostname) {
+				return ErrRestoreNameClaimed
+			}
+			if capID != "" && rawRouteID(elem) == capID {
+				return ErrRestoreNameClaimed
+			}
+		}
+		// The name is genuinely free. Refuse to append with no guarding ETag (a
+		// pre-2.5.2 edge ignores If-Match, so the append could race a concurrent
+		// claim), mirroring PurgeConflict's ErrEdgeNoIfMatch guard.
+		if arrEtag == "" {
+			return ErrEdgeNoIfMatch
+		}
+		// POST-append the EXACT captured bytes (byte-faithful; never re-serialized)
+		// under the array etag. A concurrent array change → 412 → re-read/re-scan.
+		body, status, _, err := c.do(ctx, http.MethodPost, c.routesURL(), captured, arrEtag)
+		if err != nil {
+			return err
+		}
+		if status == http.StatusPreconditionFailed {
+			continue // array moved under us; re-read, re-scan, retry
+		}
+		if status < 200 || status >= 300 {
+			return c.statusError(status, body)
+		}
+		return nil
+	}
+	return ErrConcurrentUpdate
+}
+
+// RestoreState classifies the OBSERVED post-restore edge state (kata ttfh; design
+// §3.6-C). The undo message is computed from this — a real content compare over a
+// full-array re-read — never from a guess about which step failed: a confidently
+// wrong "restored" is worse than an honest "couldn't".
+type RestoreState int
+
+const (
+	// Restored means exactly one route overlaps the hostname AND it semantically
+	// equals the captured bytes (a normalized-JSON compare INCLUDING fields
+	// tailport doesn't model) AND no OTHER route overlaps it. Only this ⇒ the undo
+	// may honestly say "restored" (content; never positional/routing fidelity — a
+	// restored route re-appends at the array end, an accepted loss).
+	Restored RestoreState = iota
+	// RestoreUnclaimed means nothing overlaps the hostname: the restore did not
+	// take (or the name was freed again after B).
+	RestoreUnclaimed
+	// RestoreClaimedByOther means a DIFFERENT or additional route now overlaps the
+	// hostname (a third-party re-take, or a second overlapping route appended
+	// between B and C creating dual exposure) — resolve the drift in Caddy.
+	RestoreClaimedByOther
+	// RestoreContentMismatch means a route carrying the captured route's @id is
+	// present for the hostname but its content DIFFERS from the captured bytes — a
+	// same-@id PATCH between B and C swapped the backend/auth/an unmodeled field.
+	// "present" is not "restored".
+	RestoreContentMismatch
+)
+
+// String renders a RestoreState for test output and diagnostics.
+func (s RestoreState) String() string {
+	switch s {
+	case Restored:
+		return "Restored"
+	case RestoreUnclaimed:
+		return "Unclaimed"
+	case RestoreClaimedByOther:
+		return "ClaimedByOther"
+	case RestoreContentMismatch:
+		return "ContentMismatch"
+	default:
+		return "RestoreState(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
+// VerifyRestore is undo step C (kata ttfh; design §3.6-C): a full-array re-read
+// that classifies the observed post-restore state, so the caller's message is
+// computed from THIS, not from a guess about which step failed. It deliberately
+// does NOT reuse InspectConflict — that short-circuits on finding our @id and
+// would miss an ADDITIONAL overlapping route appended between B and C. It scans
+// the WHOLE array for routes overlapping hostname and classifies:
+//
+//   - exactly one overlap that SEMANTICALLY EQUALS captured ⇒ Restored;
+//   - none ⇒ Unclaimed;
+//   - one overlap carrying captured's @id but content differs ⇒ ContentMismatch
+//     (a same-@id PATCH swapped the backend/auth/an unmodeled field);
+//   - anything else (a different route holds it, or >1 route overlaps) ⇒
+//     ClaimedByOther.
+//
+// The content compare is a normalized-JSON equality (semanticallyEqual) that
+// includes fields tailport doesn't model — not hostMatcherIs — so "present" is
+// never mistaken for "restored".
+func (c *Client) VerifyRestore(ctx context.Context, hostname string, captured json.RawMessage) (RestoreState, error) {
+	hostname = canonHost(hostname)
+	raws, _, err := c.fetchRoutesRaw(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var overlapping []json.RawMessage
+	for _, elem := range raws {
+		var r Route
+		if json.Unmarshal(elem, &r) != nil {
+			continue // an element we can't decode can't overlap; skip it
+		}
+		if routeOverlaps(r, hostname) {
+			overlapping = append(overlapping, elem)
+		}
+	}
+	switch len(overlapping) {
+	case 0:
+		return RestoreUnclaimed, nil
+	case 1:
+		if semanticallyEqual(overlapping[0], captured) {
+			return Restored, nil
+		}
+		// Present but not equal: our @id but mutated content ⇒ ContentMismatch;
+		// otherwise a different route holds the name ⇒ ClaimedByOther.
+		if capID := rawRouteID(captured); capID != "" && rawRouteID(overlapping[0]) == capID {
+			return RestoreContentMismatch, nil
+		}
+		return RestoreClaimedByOther, nil
+	default:
+		// More than one route overlaps: a concurrent overlapping append between B
+		// and C created dual exposure — even if one of them equals captured, the
+		// name is not cleanly ours, so this is never "restored".
+		return RestoreClaimedByOther, nil
+	}
+}
+
+// semanticallyEqual reports whether two route elements are equal as JSON VALUES —
+// independent of key ordering and whitespace, and INCLUDING every field (so a
+// field tailport doesn't model still participates). It decodes both to generic
+// values and re-marshals canonically (Go sorts object keys), then compares bytes;
+// this is the honest content compare undo step C needs (design §3.6-C), not the
+// structural hostMatcherIs. A decode/encode failure is treated as "not equal".
+func semanticallyEqual(a, b json.RawMessage) bool {
+	var av, bv interface{}
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+	ab, err1 := json.Marshal(av)
+	bb, err2 := json.Marshal(bv)
+	return err1 == nil && err2 == nil && bytes.Equal(ab, bb)
 }
 
 // locateByExpect finds the index of the route the user approved to purge,
