@@ -26,21 +26,21 @@ func TestValidHostname(t *testing.T) {
 		ok bool
 	}{
 		{"myapp.example.com", true},
-		{"a.b.example.com", true},   // nested subdomains allowed
+		{"a.b.example.com", true}, // nested subdomains allowed
 		{"deep.a.b.example.com", true},
-		{"host", true},              // single label is a valid hostname
-		{"x-y.example.com", true},   // internal hyphen ok
-		{"", false},                 // empty
-		{"has space.com", false},    // whitespace
-		{"http://x.com", false},     // scheme
-		{"x.com/path", false},       // path
+		{"host", true},                // single label is a valid hostname
+		{"x-y.example.com", true},     // internal hyphen ok
+		{"", false},                   // empty
+		{"has space.com", false},      // whitespace
+		{"http://x.com", false},       // scheme
+		{"x.com/path", false},         // path
 		{"x.example.com:8080", false}, // port
-		{".example.com", false},     // leading dot
-		{"example.com.", false},     // trailing dot
-		{"a..b.com", false},         // doubled dot -> empty label
-		{"-bad.com", false},         // label starts with hyphen
-		{"bad-.com", false},         // label ends with hyphen
-		{"under_score.com", false},  // underscore not LDH
+		{".example.com", false},       // leading dot
+		{"example.com.", false},       // trailing dot
+		{"a..b.com", false},           // doubled dot -> empty label
+		{"-bad.com", false},           // label starts with hyphen
+		{"bad-.com", false},           // label ends with hyphen
+		{"under_score.com", false},    // underscore not LDH
 	}
 	for _, c := range cases {
 		if got := ValidHostname(c.in); got != c.ok {
@@ -724,5 +724,230 @@ func TestUnreachableOnMidBodyRead(t *testing.T) {
 	_, err := c.List(context.Background())
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable (body read failed after headers)", err)
+	}
+}
+
+// --- InspectConflict (kata qfbf) --------------------------------------------
+
+// TestInspectConflictOwnedDiffBackend: our deterministic @id already holds the
+// hostname but points at a DIFFERENT backend. Read 1 (fetchByID) finds our @id
+// with a matcher that IS still ours, so the only reason Publish refused is the
+// backend — Kind=OwnedDiffBackend, naming the current backend.
+func TestInspectConflictOwnedDiffBackend(t *testing.T) {
+	// Reuse the TestPublishDifferentBackend fixture: our @id -> other-box:3000.
+	existing := BuildRoute("myapp.example.com", "other-box", 3000, nil)
+	c, f := newFake(t, existing)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != OwnedDiffBackend {
+		t.Errorf("Kind = %v, want OwnedDiffBackend", info.Kind)
+	}
+	if !info.Owned || info.ID != "tailport-myapp.example.com" {
+		t.Errorf("owned/ID wrong: owned=%v id=%q", info.Owned, info.ID)
+	}
+	if !info.BackendParseable || info.Label != "other-box" || info.Port != 3000 {
+		t.Errorf("backend wrong: parseable=%v %s:%d, want other-box:3000", info.BackendParseable, info.Label, info.Port)
+	}
+	if info.Handler != "reverse_proxy" {
+		t.Errorf("Handler = %q, want reverse_proxy", info.Handler)
+	}
+	if f.mutations != 0 {
+		t.Errorf("InspectConflict is read-only, got %d mutations", f.mutations)
+	}
+}
+
+// TestInspectConflictIdHijacked is the two-read core (design r2-M1): our @id was
+// re-pointed by a foreign edit to a DIFFERENT, non-overlapping host. A plain
+// overlap scan for the requested name would miss it (so the old "nothing
+// overlaps -> retry" rule livelocks); read 1 catches it via hostMatcherIs and
+// classifies IdHijacked, carrying where it now points.
+func TestInspectConflictIdHijacked(t *testing.T) {
+	stale := BuildRoute("myapp.example.com", "dev-box", 3000, nil)
+	stale.Match = []Match{{Host: []string{"evil.example.com"}}} // @id kept, matcher repointed
+	c, f := newFake(t, stale)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != IdHijacked {
+		t.Fatalf("Kind = %v, want IdHijacked", info.Kind)
+	}
+	if !info.Owned || info.ID != "tailport-myapp.example.com" {
+		t.Errorf("owned/ID wrong: owned=%v id=%q", info.Owned, info.ID)
+	}
+	if info.HijackedTo != "evil.example.com" {
+		t.Errorf("HijackedTo = %q, want evil.example.com", info.HijackedTo)
+	}
+	if f.mutations != 0 {
+		t.Errorf("InspectConflict is read-only, got %d mutations", f.mutations)
+	}
+}
+
+// TestInspectConflictForeignOverlap: no @id of ours, a foreign reverse_proxy
+// route already claims the host. Read 1 misses (no @id), read 2 finds it ->
+// ForeignOverlap naming the foreign backend, Owned=false.
+func TestInspectConflictForeignOverlap(t *testing.T) {
+	foreign := Route{
+		ID:    "someone-elses-route",
+		Match: []Match{{Host: []string{"myapp.example.com"}}},
+		Handle: []Handler{{
+			Handler:   "reverse_proxy",
+			Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}},
+		}},
+		Terminal: true,
+	}
+	c, _ := newFake(t, foreign)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != ForeignOverlap {
+		t.Fatalf("Kind = %v, want ForeignOverlap", info.Kind)
+	}
+	if info.Owned || info.ID != "someone-elses-route" {
+		t.Errorf("owned/ID wrong: owned=%v id=%q", info.Owned, info.ID)
+	}
+	if !info.BackendParseable || info.Label != "192.0.2.9" || info.Port != 8080 {
+		t.Errorf("backend wrong: parseable=%v %s:%d", info.BackendParseable, info.Label, info.Port)
+	}
+}
+
+// TestInspectConflictIdlessForeignOverlap: an id-less foreign route (a hand-
+// authored route with no @id) overlapping the host is still ForeignOverlap, with
+// ID=="".
+func TestInspectConflictIdlessForeignOverlap(t *testing.T) {
+	foreign := Route{
+		Match: []Match{{Host: []string{"myapp.example.com"}}},
+		Handle: []Handler{{
+			Handler:   "reverse_proxy",
+			Upstreams: []Upstream{{Dial: "10.0.0.1:80"}},
+		}},
+	}
+	c, _ := newFake(t, foreign)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != ForeignOverlap || info.Owned || info.ID != "" {
+		t.Errorf("id-less foreign: kind=%v owned=%v id=%q, want ForeignOverlap/false/\"\"", info.Kind, info.Owned, info.ID)
+	}
+}
+
+// TestInspectConflictFindsNonProxyForeign is the raw-scan requirement: a foreign
+// route with NO reverse_proxy dial (a static_response, seeded by host matcher +
+// handler name) is DROPPED by List/parseRoute, yet InspectConflict — which
+// matches on the host matcher alone — must still FIND and NAME it. This is why
+// the scan is not built on List. (The fake needs no rebuild: classification only
+// needs host matcher + @id + handler name, all of which the existing Route/
+// Handler decode preserves; the byte-faithful raw-storage rebuild is 6n15's.)
+func TestInspectConflictFindsNonProxyForeign(t *testing.T) {
+	static := Route{
+		ID:       "foreign-static",
+		Match:    []Match{{Host: []string{"myapp.example.com"}}},
+		Handle:   []Handler{{Handler: "static_response"}}, // no reverse_proxy dial
+		Terminal: true,
+	}
+	c, _ := newFake(t, static)
+
+	// Precondition: List drops it (no parseable backend), proving the scan can't
+	// be built on List.
+	infos, err := c.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("List should skip the non-proxy route, got %+v", infos)
+	}
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != ForeignOverlap {
+		t.Fatalf("Kind = %v, want ForeignOverlap (non-proxy route must be found)", info.Kind)
+	}
+	if info.BackendParseable {
+		t.Errorf("a static_response has no parseable backend, got BackendParseable=true")
+	}
+	if info.Handler != "static_response" {
+		t.Errorf("Handler = %q, want static_response (names a route the backend can't)", info.Handler)
+	}
+	if info.ID != "foreign-static" {
+		t.Errorf("ID = %q, want foreign-static", info.ID)
+	}
+}
+
+// TestInspectConflictCaseAndWildcard: the scan overlaps case-insensitively and
+// honors the single-label "*.suffix" wildcard, matching Publish's own conflict
+// detection.
+func TestInspectConflictCaseAndWildcard(t *testing.T) {
+	t.Run("case variant", func(t *testing.T) {
+		foreign := Route{
+			ID:     "case-route",
+			Match:  []Match{{Host: []string{"App.Example.COM"}}},
+			Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}}}},
+		}
+		c, _ := newFake(t, foreign)
+		info, err := c.InspectConflict(context.Background(), "app.example.com")
+		if err != nil {
+			t.Fatalf("InspectConflict: %v", err)
+		}
+		if info.Kind != ForeignOverlap {
+			t.Errorf("case-variant Kind = %v, want ForeignOverlap", info.Kind)
+		}
+	})
+
+	t.Run("wildcard suffix", func(t *testing.T) {
+		foreign := Route{
+			ID:     "wildcard-route",
+			Match:  []Match{{Host: []string{"*.example.com"}}},
+			Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}}}},
+		}
+		c, _ := newFake(t, foreign)
+		info, err := c.InspectConflict(context.Background(), "app.example.com")
+		if err != nil {
+			t.Fatalf("InspectConflict: %v", err)
+		}
+		if info.Kind != ForeignOverlap {
+			t.Errorf("wildcard Kind = %v, want ForeignOverlap", info.Kind)
+		}
+	})
+}
+
+// TestInspectConflictNone: nothing overlaps and our @id is clean (the conflict
+// cleared between Publish's refusal and this read). Kind=None tells the UI it may
+// retry the plain publish once. A present-but-non-overlapping foreign route must
+// not be mistaken for a conflict.
+func TestInspectConflictNone(t *testing.T) {
+	other := BuildRoute("unrelated.example.com", "some-box", 4000, nil)
+	c, _ := newFake(t, other)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != None {
+		t.Errorf("Kind = %v, want None (nothing overlaps, @id clean)", info.Kind)
+	}
+}
+
+// TestInspectConflictUnreachable: a transport failure on either read surfaces as
+// ErrUnreachable, not a bogus classification.
+func TestInspectConflictUnreachable(t *testing.T) {
+	c, _ := newFake(t)
+	srv := httptest.NewServer(&fakeAdmin{server: "tailport"})
+	closedURL := srv.URL
+	srv.Close()
+	c.AdminURL = closedURL
+
+	_, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
 	}
 }

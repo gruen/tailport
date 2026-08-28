@@ -681,6 +681,31 @@ type publishDoneMsg struct {
 	err  error
 }
 
+// inspectConflictMsg carries the read-only classification of a hostname conflict
+// (kata qfbf): when a publish returns caddyedge.ErrHostnameConflict, the handler
+// issues inspectConflictCmd, which calls caddyedge.InspectConflict and returns
+// this so the model can render a SPECIFIC refusal naming the current holder
+// (owned-other-backend / another machine / hijacked-@id / foreign route), or —
+// on Kind==None — retry the plain publish once. port/hostname identify the
+// attempted publish; info is the classification; err is any read failure.
+type inspectConflictMsg struct {
+	port     int
+	hostname string
+	info     caddyedge.ConflictInfo
+	err      error
+}
+
+// pendingPublish is the carry described on model.pendingPublish: the minimal
+// parameters needed to re-issue an in-flight publish after the flow state is
+// cleared, holding no plaintext secret.
+type pendingPublish struct {
+	hostname string
+	label    string
+	port     int
+	withAuth bool // auth was requested; rebuild from cfg.Caddy.AuthUser/AuthHash
+	retried  bool // a Kind==None retry has already fired (bounds it to once)
+}
+
 // publishPollMsg carries one edge-poll result (kata v1z5 step 5). On err the
 // poll degrades quietly: last-known m.published is kept and publishReachable
 // goes false. On success published replaces m.published wholesale. gen is the
@@ -880,6 +905,17 @@ type model struct {
 	// httptest.Server so the whole publish/unpublish/poll flow runs against
 	// in-process fakes, never a real caddy or a bound port.
 	caddyClientOverride *caddyedge.Client
+	// pendingPublish carries the parameters of the in-flight publish so the
+	// conflict path can act after clearPublishFlow has zeroed the flow (kata
+	// qfbf; design §3.0). It is set at confirm-time and consulted only on a
+	// publishDoneMsg ErrHostnameConflict — to name the attempted hostname when
+	// classifying, and to re-issue the publish ONCE on a Kind==None (the conflict
+	// cleared). The plaintext password never lives here (withAuth records only
+	// whether auth was requested; auth is rebuilt from cfg.Caddy.AuthUser/AuthHash,
+	// already bcrypt-hashed). retried bounds the Kind==None retry to a single
+	// attempt so a cleared-then-returned conflict can never spin. This carry is
+	// also the seam kata 6n15's force-purge takeover resumes the publish through.
+	pendingPublish pendingPublish
 
 	mode       entryMode
 	portInput  textinput.Model
@@ -1532,6 +1568,64 @@ func unpublishCmd(client *caddyedge.Client, hostname, label string, port int) te
 	return func() tea.Msg {
 		return publishDoneMsg{port: port, err: client.Unpublish(context.Background(), hostname, label, port)}
 	}
+}
+
+// inspectConflictCmd classifies a hostname conflict read-only (kata qfbf): it
+// calls caddyedge.InspectConflict and returns an inspectConflictMsg so the model
+// can render a specific refusal (or, on Kind==None, retry once). Nothing is
+// mutated — this is a pure classification read.
+func inspectConflictCmd(client *caddyedge.Client, port int, hostname string) tea.Cmd {
+	return func() tea.Msg {
+		info, err := client.InspectConflict(context.Background(), hostname)
+		return inspectConflictMsg{port: port, hostname: hostname, info: info, err: err}
+	}
+}
+
+// conflictRefusalText formats the one-line refusal for a classified hostname
+// conflict (kata qfbf; design §3.0/§3.4), naming the current holder so the user
+// knows exactly what to do. ourLabel is this machine's short backend label,
+// the discriminator (design r2-m2) between our own publish and another
+// machine's. Kind==None is handled by the caller (a bounded retry), not here.
+func conflictRefusalText(info caddyedge.ConflictInfo, hostname, ourLabel string) string {
+	switch info.Kind {
+	case caddyedge.OwnedDiffBackend:
+		if info.BackendParseable && info.Label == ourLabel {
+			// Same machine, different local port: essentially already-published,
+			// but from another of this machine's ports — name it.
+			return fmt.Sprintf(":%d is already published to %s via your %s:%d — unpublish it first",
+				info.Port, hostname, info.Label, info.Port)
+		}
+		// Another machine's/user's owned route. Do NOT auto-take-over (that's kata
+		// 6n15); name that it belongs elsewhere.
+		return fmt.Sprintf("%s is published by another machine (%s) — take it over is coming, for now remove it there",
+			hostname, backendDesc(info))
+	case caddyedge.IdHijacked:
+		to := info.HijackedTo
+		if to == "" {
+			to = "a different route"
+		}
+		return fmt.Sprintf("your tailport route for %s was re-pointed at %s — resolve it in Caddy", hostname, to)
+	case caddyedge.ForeignOverlap:
+		return fmt.Sprintf("%s is held by a route tailport didn't create (%s) — resolve it in Caddy",
+			hostname, backendDesc(info))
+	default:
+		// Defensive: an unexpected Kind (incl. None, which the caller handles)
+		// still yields a plain, non-spinning refusal rather than a blank toast.
+		return fmt.Sprintf("%s is already claimed on the edge — resolve it in Caddy", hostname)
+	}
+}
+
+// backendDesc names a conflict holder's backend for a refusal: its reverse_proxy
+// dial (label:port) when parseable, else its first handler name (static_response,
+// file_server, …) for a non-proxy route, else a bare fallback.
+func backendDesc(info caddyedge.ConflictInfo) string {
+	if info.BackendParseable {
+		return fmt.Sprintf("%s:%d", info.Label, info.Port)
+	}
+	if info.Handler != "" {
+		return info.Handler
+	}
+	return "an unrecognized route"
 }
 
 // publishErrText maps a caddyedge failure onto a friendly one-line toast,
@@ -2517,6 +2611,11 @@ func (m *model) confirmPublish() tea.Cmd {
 	label := shortLabel(m.fqdn)
 	client := m.caddyClient()
 
+	// Carry the (secret-free) publish parameters so the conflict path can name
+	// the attempted hostname and, on a cleared conflict (Kind==None), re-issue
+	// the publish once (kata qfbf). retried starts false: this is a fresh attempt.
+	m.pendingPublish = pendingPublish{hostname: hostname, label: label, port: port, withAuth: auth != nil}
+
 	// Drop the flow state (esp. the plaintext password) BEFORE the op runs.
 	m.clearPublishFlow()
 	m.pending = port
@@ -2664,6 +2763,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.operatorNotSet = true
 				return m, tea.Batch(refresh, m.pollPublishedCmd())
 			}
+			if errors.Is(msg.err, caddyedge.ErrHostnameConflict) {
+				// The publish collided with a hostname the shared edge already
+				// holds (kata qfbf). Don't dump Caddy's raw message: classify it
+				// read-only (naming the holder) and refuse specifically, via a
+				// second read (inspectConflictCmd -> inspectConflictMsg). Keep
+				// m.pending set to the port so the in-flight discipline holds
+				// across the classification read -- no concurrent op sneaks in and
+				// the status line still reads busy -- until inspectConflictMsg
+				// clears it. Fall back to the bare toast only if the attempted
+				// hostname was somehow lost (confirmPublish always sets it).
+				if m.pendingPublish.hostname != "" {
+					m.pending = msg.port
+					return m, inspectConflictCmd(m.caddyClient(), msg.port, m.pendingPublish.hostname)
+				}
+				return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+			}
 			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
 		}
 		// A publish that auto-enabled serve proves the operator is set.
@@ -2673,6 +2788,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// sticky setup reminder (kata w131).
 		m.domainSetupPending = false
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
+
+	case inspectConflictMsg:
+		// The read-only classification of a hostname conflict is back (kata qfbf).
+		// Clear the in-flight marker the publishDoneMsg conflict path kept set.
+		// NOTHING is mutated on any branch here -- this pillar only refuses.
+		m.pending = 0
+		if msg.err != nil {
+			// The classification read itself failed (edge unreachable, etc.). We
+			// can't name the holder, so surface the transport error; nothing was
+			// mutated.
+			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+		}
+		if msg.info.Kind == caddyedge.None {
+			// The conflict cleared between Publish's refusal and this read. Retry
+			// the plain publish ONCE (bounded -- never spin): a second None after a
+			// retry gives up with a plain refusal instead of looping.
+			if !m.pendingPublish.retried && m.pendingPublish.hostname == msg.hostname {
+				m.pendingPublish.retried = true
+				var auth *caddyedge.BasicAuth
+				if m.pendingPublish.withAuth {
+					auth = &caddyedge.BasicAuth{User: m.cfg.Caddy.AuthUser, Hash: m.cfg.Caddy.AuthHash}
+				}
+				m.pending = msg.port
+				// Serve is already on from the first attempt (publishCmd enables it
+				// before Publish), so don't re-run it here: enableServe=false.
+				return m, publishCmd(m.caddyClient(), msg.hostname, m.pendingPublish.label, msg.port, auth, false)
+			}
+			return m, tea.Batch(
+				m.setErr(fmt.Sprintf("%s: the conflict cleared then returned — try again", msg.hostname)),
+				refresh, m.pollPublishedCmd())
+		}
+
+		// ── SEAM (kata 6n15): force-purge + take-over ─────────────────────────
+		// The conflict is fully classified in msg.info (Kind / Owned / ID /
+		// backend label:port / handler). Pillar 1 (qfbf) REFUSES with attribution
+		// here. 6n15 inserts, BEFORE the refusal below, a "press <key> to
+		// force-purge and take over" affordance driven off this classification:
+		//   - OwnedDiffBackend -> a normal y/n confirm (design entryConfirmPurgeOwned);
+		//   - ForeignOverlap   -> the scary two-gate confirm (entryConfirmPurgeForeign[Type]);
+		//   - IdHijacked       -> STAYS a refusal (never a blind delete of drift).
+		// The resume-after-purge carry is m.pendingPublish (secret-free). Do NOT
+		// implement the purge affordance in this pillar.
+		// ──────────────────────────────────────────────────────────────────────
+		refusal := conflictRefusalText(msg.info, msg.hostname, shortLabel(m.fqdn))
+		return m, tea.Batch(m.setErr(refusal), refresh, m.pollPublishedCmd())
 
 	case publishPollMsg:
 		// Drop a stale result (roborev 0k12 #1): polls are remote round-trips

@@ -215,6 +215,79 @@ type RouteInfo struct {
 	Owned    bool   // the @id carries the tailport- prefix
 }
 
+// ConflictKind classifies WHY a Publish returned ErrHostnameConflict, so the UI
+// can name the current holder and refuse with a specific, actionable message
+// (kata qfbf; design docs/caddy-edge-conflict-design.md §3.1). It is the output
+// of InspectConflict, a pure read-only classifier.
+type ConflictKind int
+
+const (
+	// None means nothing overlaps the requested hostname AND our @id is clean:
+	// the conflict cleared between Publish's refusal and this read. The caller
+	// may retry the plain publish ONCE (bounded — never a spin).
+	None ConflictKind = iota
+	// OwnedDiffBackend means a tailport-owned @id already holds the hostname but
+	// points at a DIFFERENT backend/port than the one requested. The backend may
+	// be this machine's (a publish from another local port) or another machine's
+	// (detectable by comparing the backend label to this machine's short label).
+	OwnedDiffBackend
+	// IdHijacked means our deterministic @id still exists but its host matcher was
+	// re-pointed by a foreign edit to a different, possibly NON-overlapping host.
+	// A plain host-overlap scan for the requested name would miss this (the route
+	// no longer matches our hostname) and the old "retry on no-overlap" rule would
+	// livelock — Publish re-refuses on hostMatcherIs forever. So it is always a
+	// refusal, never a retry, never a blind DELETE (that would delete drift).
+	IdHijacked
+	// ForeignOverlap means a route tailport did NOT create already claims a
+	// hostname overlapping the request — including a non-reverse_proxy route
+	// (static_response / file_server / …) that List would skip, since the scan
+	// matches on the host matcher alone.
+	ForeignOverlap
+)
+
+// String renders a ConflictKind for test output and diagnostics.
+func (k ConflictKind) String() string {
+	switch k {
+	case None:
+		return "None"
+	case OwnedDiffBackend:
+		return "OwnedDiffBackend"
+	case IdHijacked:
+		return "IdHijacked"
+	case ForeignOverlap:
+		return "ForeignOverlap"
+	default:
+		return "ConflictKind(" + strconv.Itoa(int(k)) + ")"
+	}
+}
+
+// ConflictInfo is InspectConflict's read-only classification of the route that
+// currently holds a hostname a Publish refused. It names the holder so the UI
+// can refuse specifically; it deliberately carries NO capture bytes, array
+// index, or etag. Capture and the fresh-read purge are kata 6n15's job — doing
+// its own byte-faithful capture — so keeping this a pure classifier avoids any
+// dependency on raw-storage fidelity and keeps it lean.
+type ConflictInfo struct {
+	Kind ConflictKind // None | OwnedDiffBackend | IdHijacked | ForeignOverlap
+	// Owned reports whether the holder's @id carries the tailport- prefix.
+	Owned bool
+	// ID is the holder's @id ("" for an id-less foreign route).
+	ID string
+	// Label/Port/BackendParseable describe the holder's reverse_proxy dial, when
+	// it has one. BackendParseable is false for a route with no parseable
+	// reverse_proxy backend (a non-proxy foreign route), where Handler names it.
+	Label            string
+	Port             int
+	BackendParseable bool
+	// HijackedTo, set only for IdHijacked, describes where our @id now points
+	// (the host matcher(s) it was re-pointed at), so the UI can name it.
+	HijackedTo string
+	// Handler is the holder's first handler name (e.g. "reverse_proxy",
+	// "static_response"), used to name a non-proxy foreign route the backend
+	// dial can't.
+	Handler string
+}
+
 // canonHost canonicalizes a public hostname for identity and comparison. DNS
 // hostnames are case-insensitive, so lowercasing (after trimming surrounding
 // whitespace) is the single boundary transform that keeps casing from ever
@@ -585,6 +658,118 @@ func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int
 	return ErrConcurrentUpdate
 }
 
+// InspectConflict classifies why a publish of hostname collided, WITHOUT
+// mutating anything (kata qfbf; design §3.1). The UI calls it after Publish
+// returns ErrHostnameConflict, to name the holder and (in a later pillar) branch
+// to force-purge. It does TWO reads:
+//
+//  1. fetchByID(IDFor(hostname)) — if our @id exists but its matcher is NOT
+//     exactly our hostname, a foreign edit re-pointed it (possibly to a
+//     non-overlapping host). A plain overlap scan for the requested name would
+//     MISS this and the old "retry on no overlap" rule would livelock, so this
+//     is classified IdHijacked (carrying where it now points) and refused, never
+//     retried, never blindly deleted. If the @id exists and its matcher IS ours,
+//     the only reason Publish refused is a different backend/port →
+//     OwnedDiffBackend.
+//  2. a raw host-overlap scan of the shared routes array (reusing hostsOverlap)
+//     for the foreign-overlap case. This walks the raw routes and matches on the
+//     host matcher ALONE, so it SEES routes List would drop — a foreign
+//     static_response/file_server with no reverse_proxy dial → ForeignOverlap.
+//
+// If our @id is clean and nothing overlaps, Kind==None: the conflict cleared and
+// the caller may retry the plain publish once.
+func (c *Client) InspectConflict(ctx context.Context, hostname string) (ConflictInfo, error) {
+	hostname = canonHost(hostname)
+	id := IDFor(hostname)
+
+	// Read 1: our own @id.
+	route, _, found, err := c.fetchByID(ctx, id)
+	if err != nil {
+		return ConflictInfo{}, err
+	}
+	if found {
+		if !hostMatcherIs(route, hostname) {
+			// Hijacked: our @id kept but its matcher re-pointed elsewhere.
+			info := ConflictInfo{Kind: IdHijacked, Owned: true, ID: route.ID}
+			info.HijackedTo = matcherHosts(route)
+			info.Handler = firstHandler(route)
+			if label, port, ok := backendOf(route); ok {
+				info.Label, info.Port, info.BackendParseable = label, port, true
+			}
+			return info, nil
+		}
+		// Our @id, matcher still exactly our hostname. Publish only refuses such a
+		// route for a different backend/port, so this is OwnedDiffBackend. (A
+		// backend that actually matched would have PATCHed cleanly; an unparseable
+		// backend surfaces as BackendParseable==false but is still owned.)
+		info := ConflictInfo{Kind: OwnedDiffBackend, Owned: true, ID: route.ID, Handler: firstHandler(route)}
+		if label, port, ok := backendOf(route); ok {
+			info.Label, info.Port, info.BackendParseable = label, port, true
+		}
+		return info, nil
+	}
+
+	// Read 2: raw host-overlap scan. Match on the host matcher alone so a foreign
+	// non-reverse_proxy route (which List/parseRoute would drop) is still found.
+	routes, _, err := c.fetchRoutes(ctx)
+	if err != nil {
+		return ConflictInfo{}, err
+	}
+	for _, r := range routes {
+		if !routeOverlaps(r, hostname) {
+			continue
+		}
+		info := ConflictInfo{
+			Kind:    ForeignOverlap,
+			Owned:   strings.HasPrefix(r.ID, idPrefix),
+			ID:      r.ID,
+			Handler: firstHandler(r),
+		}
+		if label, port, ok := backendOf(r); ok {
+			info.Label, info.Port, info.BackendParseable = label, port, true
+		}
+		return info, nil
+	}
+
+	// Nothing overlaps and our @id is clean: the conflict cleared.
+	return ConflictInfo{Kind: None}, nil
+}
+
+// firstHandler returns the name of a route's first handler ("" if it has none),
+// used to name a foreign route whose backend dial can't (a static_response,
+// file_server, …).
+func firstHandler(r Route) string {
+	if len(r.Handle) == 0 {
+		return ""
+	}
+	return r.Handle[0].Handler
+}
+
+// matcherHosts joins every host value across a route's match blocks, comma-
+// separated, for describing where a hijacked @id now points ("" if it carries no
+// host matcher at all — e.g. a matcher of only path/method).
+func matcherHosts(r Route) string {
+	var hosts []string
+	for _, m := range r.Match {
+		hosts = append(hosts, m.Host...)
+	}
+	return strings.Join(hosts, ", ")
+}
+
+// routeOverlaps reports whether any host matcher on r overlaps the already-
+// canonicalized hostname, using the same predicate (hostsOverlap) findHostConflict
+// applies — see hostsOverlap for the modeled matcher forms.
+func routeOverlaps(r Route, hostname string) bool {
+	for _, m := range r.Match {
+		for _, h := range m.Host {
+			if hostsOverlap(canonHost(h), hostname) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // parseRoute flattens a wire Route into a RouteInfo. ok is false when the route
 // lacks a host matcher or a parseable reverse_proxy backend.
 func parseRoute(r Route) (RouteInfo, bool) {
@@ -685,15 +870,11 @@ func hostMatcherIs(route Route, hostname string) bool {
 // deliberately left for Caddy itself to resolve.
 func findHostConflict(routes []Route, hostname string) string {
 	for _, r := range routes {
-		for _, m := range r.Match {
-			for _, h := range m.Host {
-				if hostsOverlap(canonHost(h), hostname) {
-					if r.ID != "" {
-						return "route " + r.ID
-					}
-					return "a foreign route"
-				}
+		if routeOverlaps(r, hostname) {
+			if r.ID != "" {
+				return "route " + r.ID
 			}
+			return "a foreign route"
 		}
 	}
 	return ""

@@ -6147,6 +6147,156 @@ func TestPublishDoneMsgReFetches(t *testing.T) {
 	}
 }
 
+// TestPublishConflictRefusalPerKind drives a hostname conflict end to end
+// (publishDoneMsg{ErrHostnameConflict} -> inspectConflictCmd -> inspectConflictMsg)
+// and asserts each Kind renders its specific refusal while mutating NOTHING
+// (kata qfbf). The classification read is real (against the fake edge); the
+// refusal is a toast, not a purge.
+func TestPublishConflictRefusalPerKind(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+
+	// drive seeds the fake, runs the conflict classification round trip for an
+	// attempted publish of :8080 -> host, and returns the resulting model. It
+	// asserts pending discipline and that no mutation ever occurred.
+	drive := func(t *testing.T, seed func(fc *fakeCaddy)) model {
+		t.Helper()
+		fc := newFakeCaddy()
+		seed(fc)
+		srv := httptest.NewServer(fc)
+		t.Cleanup(srv.Close)
+
+		m := newPublishModel(t, srv)
+		// Mirror confirmPublish's secret-free carry + the in-flight marker.
+		m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080}
+		m.pending = 8080
+
+		res, cmd := m.Update(publishDoneMsg{port: 8080, err: caddyedge.ErrHostnameConflict})
+		m = res.(model)
+		if cmd == nil {
+			t.Fatal("a conflicted publishDoneMsg should issue a classification cmd")
+		}
+		if m.pending != 8080 {
+			t.Errorf("pending must stay set across the classification read; got %d", m.pending)
+		}
+		msg, ok := cmd().(inspectConflictMsg)
+		if !ok {
+			t.Fatalf("conflict cmd returned %#v, want an inspectConflictMsg", cmd())
+		}
+		res, _ = m.Update(msg)
+		m = res.(model)
+		if m.pending != 0 {
+			t.Errorf("inspectConflictMsg should clear pending; got %d", m.pending)
+		}
+		if m.flashLevel != flashError {
+			t.Errorf("a refusal should be an error toast; level=%v flash=%q", m.flashLevel, m.flash)
+		}
+		if len(fc.mutations) != 0 || len(fc.deletes) != 0 {
+			t.Errorf("refuse-on-conflict must not mutate: mutations=%d deletes=%d", len(fc.mutations), len(fc.deletes))
+		}
+		return m
+	}
+
+	t.Run("owned same machine (different local port)", func(t *testing.T) {
+		m := drive(t, func(fc *fakeCaddy) {
+			fc.routes[id] = caddyedge.BuildRoute(host, "dev-box", 3000, nil) // our label, other port
+		})
+		if !strings.Contains(m.flash, "unpublish it first") || !strings.Contains(m.flash, "dev-box:3000") {
+			t.Errorf("same-machine refusal = %q, want it to name your dev-box:3000 and say unpublish first", m.flash)
+		}
+	})
+
+	t.Run("owned another machine", func(t *testing.T) {
+		m := drive(t, func(fc *fakeCaddy) {
+			fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil) // NOT our label
+		})
+		if !strings.Contains(m.flash, "another machine") || !strings.Contains(m.flash, "other-box:9090") {
+			t.Errorf("cross-machine refusal = %q, want it to name it another machine's other-box:9090", m.flash)
+		}
+		if strings.Contains(m.flash, "unpublish it first") {
+			t.Errorf("cross-machine refusal must NOT tell the user to unpublish locally: %q", m.flash)
+		}
+	})
+
+	t.Run("id hijacked", func(t *testing.T) {
+		m := drive(t, func(fc *fakeCaddy) {
+			rt := caddyedge.BuildRoute(host, "dev-box", 8080, nil)
+			rt.Match = []caddyedge.Match{{Host: []string{"evil.example.com"}}} // @id kept, matcher repointed
+			fc.routes[id] = rt
+		})
+		if !strings.Contains(m.flash, "re-pointed at evil.example.com") || !strings.Contains(m.flash, "resolve it in Caddy") {
+			t.Errorf("hijacked refusal = %q, want it to name the re-point and send the user to Caddy", m.flash)
+		}
+	})
+
+	t.Run("foreign overlap (non-proxy route)", func(t *testing.T) {
+		// A foreign static_response with no @id of ours and no reverse_proxy dial:
+		// List would drop it, but the refusal must still name it by its handler.
+		m := drive(t, func(fc *fakeCaddy) {
+			fc.routes["foreign-static"] = caddyedge.Route{
+				ID:     "foreign-static",
+				Match:  []caddyedge.Match{{Host: []string{host}}},
+				Handle: []caddyedge.Handler{{Handler: "static_response"}},
+			}
+		})
+		if !strings.Contains(m.flash, "tailport didn't create") || !strings.Contains(m.flash, "static_response") {
+			t.Errorf("foreign refusal = %q, want it to name the foreign static_response route", m.flash)
+		}
+	})
+}
+
+// TestPublishConflictNoneRetriesOnce: when the classification finds nothing (the
+// conflict cleared between Publish's refusal and the read), the model retries the
+// plain publish exactly ONCE. A second None gives up with a refusal instead of
+// spinning (kata qfbf, bounded retry).
+func TestPublishConflictNoneRetriesOnce(t *testing.T) {
+	const host = "app.example.com"
+	m := newPublishModel(t, nil) // no edge round-trip: we feed the msgs directly
+	m.pendingPublish = pendingPublish{hostname: host, label: "dev-box", port: 8080}
+
+	none := inspectConflictMsg{port: 8080, hostname: host, info: caddyedge.ConflictInfo{Kind: caddyedge.None}}
+
+	// First None -> a retry publish cmd; retried flips true; pending re-armed; no toast.
+	res, cmd := m.Update(none)
+	m = res.(model)
+	if !m.pendingPublish.retried {
+		t.Error("the first None should mark the retry as fired")
+	}
+	if m.pending != 8080 {
+		t.Errorf("the retry should re-arm pending; got %d", m.pending)
+	}
+	if cmd == nil {
+		t.Fatal("the first None should return a retry publish cmd")
+	}
+	if m.flash != "" {
+		t.Errorf("a retried None should not toast; got %q", m.flash)
+	}
+
+	// Second None -> give up (no spin), a plain refusal, no further retry cmd.
+	res, _ = m.Update(none)
+	m = res.(model)
+	if m.flashLevel != flashError || !strings.Contains(m.flash, "cleared then returned") {
+		t.Errorf("the second None should give up with a refusal; flash=%q level=%v", m.flash, m.flashLevel)
+	}
+}
+
+// TestPublishConflictInspectUnreachableFallsBack: if the classification read
+// itself fails (edge unreachable), the model surfaces the transport error rather
+// than a bogus attribution, and mutates nothing.
+func TestPublishConflictInspectUnreachableFallsBack(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080}
+
+	res, _ := m.Update(inspectConflictMsg{port: 8080, hostname: "app.example.com", err: caddyedge.ErrUnreachable})
+	m = res.(model)
+	if m.pending != 0 {
+		t.Errorf("a failed classification should clear pending; got %d", m.pending)
+	}
+	if m.flashLevel != flashError || !strings.Contains(m.flash, "unreachable") {
+		t.Errorf("classification failure flash=%q level=%v, want the mapped transport error", m.flash, m.flashLevel)
+	}
+}
+
 // TestPublishErrText maps caddyedge sentinels to friendly text.
 func TestPublishErrText(t *testing.T) {
 	cases := []struct {
