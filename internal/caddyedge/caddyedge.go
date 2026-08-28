@@ -765,7 +765,14 @@ func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string
 		// actually matched at Publish-time would have PATCHed cleanly there; an
 		// unparseable backend surfaces as BackendParseable==false but is still owned.)
 		if label, port, ok := backendOf(route); ok && label == wantLabel && port == wantPort {
-			return ConflictInfo{Kind: None}, nil
+			// Our route already points where we want, so there's nothing to refuse
+			// about IT — but before declaring the conflict resolved, scan the shared
+			// array for ANOTHER route overlapping the hostname (roborev 2g50): a
+			// coexisting foreign exact/wildcard route would still intercept traffic
+			// or bypass the requested auth, and a bare Kind=None here would let the
+			// caller PATCH-and-"succeed" blind to it. Exclude our own @id so we don't
+			// rediscover the route we just cleared.
+			return c.scanOverlap(ctx, hostname, route.ID)
 		}
 		info := ConflictInfo{Kind: OwnedDiffBackend, Owned: true, ID: route.ID, Handler: firstHandler(route)}
 		if label, port, ok := backendOf(route); ok {
@@ -774,13 +781,26 @@ func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string
 		return info, nil
 	}
 
-	// Read 2: raw host-overlap scan. Match on the host matcher alone so a foreign
-	// non-reverse_proxy route (which List/parseRoute would drop) is still found.
+	// Read 2: nothing owns our @id — scan the shared array for a foreign overlap.
+	return c.scanOverlap(ctx, hostname, "")
+}
+
+// scanOverlap walks the shared routes array for a route whose host matcher
+// overlaps hostname, skipping the route whose @id == excludeID (so a caller that
+// has already accounted for its own owned route doesn't rediscover it). It
+// matches on the host matcher ALONE, so a foreign non-reverse_proxy route that
+// List/parseRoute would drop is still found. The first overlap is returned as
+// ForeignOverlap (carrying its full host list for the blast-radius disclosure,
+// roborev hped #3); no overlap → Kind=None.
+func (c *Client) scanOverlap(ctx context.Context, hostname, excludeID string) (ConflictInfo, error) {
 	routes, _, err := c.fetchRoutes(ctx)
 	if err != nil {
 		return ConflictInfo{}, err
 	}
 	for _, r := range routes {
+		if excludeID != "" && r.ID == excludeID {
+			continue
+		}
 		if !routeOverlaps(r, hostname) {
 			continue
 		}
@@ -789,17 +809,13 @@ func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string
 			Owned:   strings.HasPrefix(r.ID, idPrefix),
 			ID:      r.ID,
 			Handler: firstHandler(r),
-			// Carry the full host-matcher list so the UI can name the blast radius
-			// of a wildcard/multi-host foreign route (roborev hped #3).
-			Hosts: matcherHostList(r),
+			Hosts:   matcherHostList(r),
 		}
 		if label, port, ok := backendOf(r); ok {
 			info.Label, info.Port, info.BackendParseable = label, port, true
 		}
 		return info, nil
 	}
-
-	// Nothing overlaps and our @id is clean: the conflict cleared.
 	return ConflictInfo{Kind: None}, nil
 }
 

@@ -935,6 +935,41 @@ func TestInspectConflictBackendAlreadyMatchesWanted(t *testing.T) {
 	})
 }
 
+// TestInspectConflictBackendMatchesButForeignCoexists covers roborev 2g50: when
+// our owned route already points at the wanted backend, InspectConflict must
+// still scan the shared array for ANOTHER overlapping route before declaring the
+// conflict resolved -- a coexisting foreign wildcard/exact route would otherwise
+// be missed and the caller would PATCH-and-"succeed" while that route can still
+// intercept traffic. It must return ForeignOverlap (naming the foreign route),
+// not None.
+func TestInspectConflictBackendMatchesButForeignCoexists(t *testing.T) {
+	// Our owned route already points where we want to publish...
+	owned := BuildRoute("myapp.example.com", "dev-box", 8080, nil)
+	// ...but a FOREIGN wildcard route (seeded BEFORE it in the array) also
+	// overlaps the hostname.
+	foreign := Route{
+		ID:       "caddy_manual_1",
+		Match:    []Match{{Host: []string{"*.example.com"}}},
+		Handle:   []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.9:8080"}}}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign, owned)
+
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
+	if err != nil {
+		t.Fatalf("InspectConflict: %v", err)
+	}
+	if info.Kind != ForeignOverlap {
+		t.Errorf("Kind = %v, want ForeignOverlap (a foreign wildcard coexists with our matching owned route)", info.Kind)
+	}
+	if info.ID != "caddy_manual_1" {
+		t.Errorf("ID = %q, want the foreign route's id (caddy_manual_1)", info.ID)
+	}
+	if f.mutations != 0 {
+		t.Errorf("InspectConflict is read-only, got %d mutations", f.mutations)
+	}
+}
+
 // TestInspectConflictIdHijacked is the two-read core (design r2-M1): our @id was
 // re-pointed by a foreign edit to a DIFFERENT, non-overlapping host. A plain
 // overlap scan for the requested name would miss it (so the old "nothing
