@@ -1700,3 +1700,114 @@ func TestInspectConflictForeignHostsBlastRadius(t *testing.T) {
 		}
 	}
 }
+
+// --- roborev ve95 hardening: FIX 1 (RawHash through the real flow) / FIX 2 (host
+//     set pin) ---------------------------------------------------------------
+
+// TestPurgeConflictIdlessForeignRawHashThroughClassify (roborev ve95 FIX 1)
+// exercises the WHOLE production path — InspectConflict → ExpectFromConflict →
+// PurgeConflict — for an id-less foreign route, with a STRUCTURALLY-SIMILAR
+// sibling (same host, same backend, id-less) inserted AHEAD of the approved route
+// after classification. The sibling would be the FIRST overlap PurgeConflict finds
+// if the expect fell back to first-overlap; the RawHash computed by InspectConflict
+// and carried through ExpectFromConflict must instead re-locate the PRECISE
+// approved route, so the SIBLING survives and the APPROVED route is the one
+// deleted. It uses no hand-built PurgeExpect — the RawHash is populated only by the
+// real classify→expect plumbing FIX 1 adds.
+func TestPurgeConflictIdlessForeignRawHashThroughClassify(t *testing.T) {
+	const host = "a.example.com"
+	// The approved route: id-less foreign, host a.example.com, backend 10.0.0.1:80.
+	approved := json.RawMessage(`{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.1:80"}]}]}`)
+	// A sibling STRUCTURALLY IDENTICAL under the structural re-verify (same host,
+	// same backend, id-less) but with DIFFERENT bytes (an unmodeled field), so its
+	// RawHash differs. First-overlap would grab this; RawHash must not.
+	sibling := json.RawMessage(`{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.1:80"}]}],"metadata":{"note":"sibling"}}`)
+
+	c, f := newFakeRaw(t, approved)
+
+	// Classify, then build the re-verify identity exactly as the UI does.
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != ForeignOverlap || info.ID != "" {
+		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want id-less ForeignOverlap", info.Kind, info.ID, err)
+	}
+	if info.RawHash == "" {
+		t.Fatalf("InspectConflict must fingerprint the located id-less route into RawHash (FIX 1)")
+	}
+	expect := ExpectFromConflict(info)
+	if expect.RawHash != info.RawHash {
+		t.Fatalf("ExpectFromConflict must carry RawHash for an id-less foreign route (FIX 1); got %q", expect.RawHash)
+	}
+
+	// AFTER the user confirmed: a structurally-similar sibling is inserted AHEAD of
+	// the approved route (index 0), pushing the approved route to index 1.
+	f.mu.Lock()
+	f.routes = append([]json.RawMessage{sibling}, f.routes...)
+	f.mu.Unlock()
+
+	captured, err := c.PurgeConflict(context.Background(), host, expect)
+	if err != nil {
+		t.Fatalf("PurgeConflict should re-locate and delete the approved route: %v", err)
+	}
+	// The APPROVED bytes were captured/deleted — never the sibling's.
+	if string(captured.Raw) != string(approved) {
+		t.Errorf("captured the wrong route:\n got %s\nwant %s (approved)", captured.Raw, approved)
+	}
+	if len(f.delPaths) != 1 || f.delPaths[0] != f.routesPath()+"/1" {
+		t.Errorf("must delete the approved route at index 1, not the sibling at 0; delPaths=%v", f.delPaths)
+	}
+	// The sibling must survive untouched.
+	if len(f.routes) != 1 || string(f.routes[0]) != string(sibling) {
+		t.Errorf("the structurally-similar sibling must survive; routes=%v", f.routes)
+	}
+}
+
+// TestPurgeConflictForeignIdWidenedMatcherRefused (roborev ve95 FIX 2): a FOREIGN
+// route identified by @id whose host matcher is WIDENED (an extra unrelated
+// hostname added) between the user's confirm and the delete — while keeping its
+// @id and backend — must NOT be deleted with the enlarged blast radius. The
+// confirmed host set pinned on PurgeExpect no longer equals the live matcher, so
+// the re-verify fails → ErrConflictChanged, nothing deleted, and the UI re-
+// classifies to re-disclose the new blast radius.
+func TestPurgeConflictForeignIdWidenedMatcherRefused(t *testing.T) {
+	const host = "app.example.com"
+	foreign := Route{
+		ID:       "third-party-app",
+		Match:    []Match{{Host: []string{host}}},
+		Handle:   []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.5:80"}}}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign)
+
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != ForeignOverlap || info.ID != "third-party-app" {
+		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want foreign-with-@id ForeignOverlap", info.Kind, info.ID, err)
+	}
+	expect := ExpectFromConflict(info) // pins Hosts = [app.example.com]
+	if len(expect.Hosts) != 1 || expect.Hosts[0] != host {
+		t.Fatalf("ExpectFromConflict must pin the confirmed host set (FIX 2); got %v", expect.Hosts)
+	}
+
+	// Between confirm and purge, a foreign edit WIDENS the matcher (adds an
+	// unrelated hostname) while keeping the @id and backend.
+	widened := Route{
+		ID:       "third-party-app",
+		Match:    []Match{{Host: []string{host, "unrelated.example.com"}}},
+		Handle:   []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.5:80"}}}},
+		Terminal: true,
+	}
+	raw, _ := json.Marshal(widened)
+	f.mu.Lock()
+	f.routes[0] = raw
+	f.mu.Unlock()
+
+	_, err = c.PurgeConflict(context.Background(), host, expect)
+	if !errors.Is(err, ErrConflictChanged) {
+		t.Fatalf("err = %v, want ErrConflictChanged (matcher widened under the confirm)", err)
+	}
+	if f.del != 0 || f.mutations != 0 {
+		t.Errorf("a widened-matcher foreign route must not be purged; del=%d mutations=%d", f.del, f.mutations)
+	}
+	if len(f.routes) != 1 {
+		t.Errorf("the route must survive so the UI can re-disclose the blast radius; got %d", len(f.routes))
+	}
+}

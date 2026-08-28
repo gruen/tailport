@@ -6980,10 +6980,12 @@ func TestPurgeForeignConfirmDisclosesBlastRadius(t *testing.T) {
 	})
 }
 
-// TestTakeoverResumeFailurePartialToast (roborev hped #5): when the RESUMED
-// take-over publish fails, the toast must disclose the partial outcome — the old
-// route was purged, so the host is now unpublished — not just the raw publish
-// error that hides the destructive half.
+// TestTakeoverResumeFailurePartialToast (roborev hped #5 / ve95 FIX 3): when the
+// RESUMED take-over publish fails, the toast must disclose the partial outcome —
+// the old route WAS purged — without over-claiming the host is now "unpublished".
+// That claim isn't proven (a conflict means another route may hold the name; a
+// transport error may have committed server-side), so the toast reports only the
+// known purge plus that the take-over's outcome is UNKNOWN, pending the poll.
 func TestTakeoverResumeFailurePartialToast(t *testing.T) {
 	const host = "app.example.com"
 	id := caddyedge.IDFor(host)
@@ -7017,8 +7019,13 @@ func TestTakeoverResumeFailurePartialToast(t *testing.T) {
 	}
 	if !strings.Contains(m.flash, "purged the old route for "+host) ||
 		!strings.Contains(m.flash, "take-over publish failed") ||
-		!strings.Contains(m.flash, host+" is now unpublished") {
-		t.Errorf("partial-failure toast = %q, want it to disclose the purge + that %s is now unpublished", m.flash, host)
+		!strings.Contains(m.flash, host+"'s current state is unknown") {
+		t.Errorf("partial-failure toast = %q, want it to disclose the purge + that %s's state is UNKNOWN", m.flash, host)
+	}
+	// It must NOT over-claim the host is now unpublished (roborev ve95 FIX 3): that
+	// isn't proven after a failed take-over publish.
+	if strings.Contains(m.flash, "is now unpublished") {
+		t.Errorf("partial-failure toast must not over-claim 'unpublished'; got %q", m.flash)
 	}
 	if m.takeoverHost != "" {
 		t.Errorf("takeoverHost must be cleared so a later ordinary error isn't mislabeled; got %q", m.takeoverHost)
@@ -7090,4 +7097,36 @@ func TestPurgeCancelFlashesServeLeftOn(t *testing.T) {
 		m = mustUpdate(t, m, enterKey) // wrong word cancels
 		assertServeFlash(t, m)
 	})
+}
+
+// TestPurgeCancelReconcilesServeState (roborev ve95 FIX 4): publishCmd auto-
+// enables serve BEFORE the conflicting publish, but m.active can be STALE at the
+// purge confirm (the 15s poll hasn't run since the auto-enable). The cancel toast
+// promises "space to stop", and the space toggle decides on/off from
+// m.active[port] — so a stale false would make space try to turn serve ON again
+// instead of stopping it. Drive the real publish→conflict→cancel sequence with a
+// stale (false) serve state and assert the cancel reconciles it to ON, so the
+// selected row reflects serve=on and space genuinely stops it.
+func TestPurgeCancelReconcilesServeState(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+	m, _ := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+		fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil)
+	})
+	if m.mode != entryConfirmPurgeOwned {
+		t.Fatalf("want entryConfirmPurgeOwned; got %v", m.mode)
+	}
+	// Simulate the stale window: publishCmd turned serve ON for :8080, but the poll
+	// hasn't reflected it yet, so the model still believes serve is off.
+	m.active[8080] = false
+
+	m = mustUpdate(t, m, rkey("n")) // any non-y key cancels
+	if m.mode != entryNone {
+		t.Fatalf("cancel should return to entryNone; mode=%v", m.mode)
+	}
+	// Reconciled to ON: the space toggle now computes turnOn = !active = false, i.e.
+	// it will STOP serve rather than try to enable it again.
+	if !m.active[8080] {
+		t.Errorf("cancel must reconcile serve state to ON so 'space to stop' is honest; m.active[8080]=%v", m.active[8080])
+	}
 }

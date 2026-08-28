@@ -41,6 +41,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -312,6 +313,18 @@ type ConflictInfo struct {
 	// name every pattern so the user isn't deleting unrelated public hostnames
 	// blind. Empty for a route with no host matcher.
 	Hosts []string
+	// RawHash is an opaque fingerprint of the LOCATED overlapping route's exact
+	// element bytes, set for a ForeignOverlap so PurgeConflict can re-locate that
+	// PRECISE element later rather than the first overlap (roborev ve95 FIX 1).
+	// It closes a hole for an id-less foreign route: with no @id to pin it, a
+	// structurally-similar sibling inserted ahead of the approved route between
+	// classify and purge would otherwise be the first overlap PurgeConflict finds
+	// and deletes. ExpectFromConflict carries it into PurgeExpect.RawHash for the
+	// id-less case (ID==""), where it becomes the located route's identity. Empty
+	// when nothing overlaps (Kind==None). The hash is read over the same raw
+	// element bytes fetchRoutesRaw yields, so it is byte-stable across the two
+	// reads as long as the route itself has not changed.
+	RawHash string
 }
 
 // canonHost canonicalizes a public hostname for identity and comparison. DNS
@@ -792,12 +805,22 @@ func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string
 // List/parseRoute would drop is still found. The first overlap is returned as
 // ForeignOverlap (carrying its full host list for the blast-radius disclosure,
 // roborev hped #3); no overlap → Kind=None.
+//
+// It reads the array RAW (fetchRoutesRaw) so it can fingerprint the LOCATED
+// overlapping element's exact bytes into ConflictInfo.RawHash (roborev ve95 FIX
+// 1): the same normalization PurgeConflict's own fetchRoutesRaw applies, so the
+// hash re-locates the identical element at purge time even for an id-less foreign
+// route that carries no @id to pin it by.
 func (c *Client) scanOverlap(ctx context.Context, hostname, excludeID string) (ConflictInfo, error) {
-	routes, _, err := c.fetchRoutes(ctx)
+	raws, _, err := c.fetchRoutesRaw(ctx)
 	if err != nil {
 		return ConflictInfo{}, err
 	}
-	for _, r := range routes {
+	for _, elem := range raws {
+		var r Route
+		if json.Unmarshal(elem, &r) != nil {
+			continue // an element we can't decode can't be matched; skip it
+		}
 		if excludeID != "" && r.ID == excludeID {
 			continue
 		}
@@ -810,6 +833,7 @@ func (c *Client) scanOverlap(ctx context.Context, hostname, excludeID string) (C
 			ID:      r.ID,
 			Handler: firstHandler(r),
 			Hosts:   matcherHostList(r),
+			RawHash: rawIdentityHash(elem),
 		}
 		if label, port, ok := backendOf(r); ok {
 			info.Label, info.Port, info.BackendParseable = label, port, true
@@ -862,21 +886,43 @@ type PurgeExpect struct {
 	// exact hash of the element's raw bytes (design §3.2, for an id-less foreign
 	// route). Owned-ness is still checked alongside it.
 	RawHash string
+	// Hosts is the FULL host-matcher set the user was shown at confirm time (the
+	// disclosed blast radius). When non-empty, the structural re-verify additionally
+	// requires the LIVE route's matcher set to still equal it, order-insensitive
+	// (roborev ve95 FIX 2): a foreign route identified by @id could have its matcher
+	// WIDENED (more hostnames added) between confirm and delete while keeping the
+	// id+backend, and be deleted with a blast radius the user never saw. A grow or
+	// change → no match → ErrConflictChanged → the UI re-classifies and re-discloses.
+	// (An OWNED route is already pinned to exactly its hostname by hostMatcherIs, so
+	// this specifically closes the foreign-with-@id widen; Hosts is unset for owned
+	// classifications and the RawHash exact-bytes path already pins the id-less case.)
+	Hosts []string
 }
 
 // ExpectFromConflict builds the re-verify identity from a read-only conflict
 // classification (the identity the UI showed the user at confirm time). It uses
-// the structural fields ConflictInfo carries; it does not set RawHash (§3.1 keeps
-// raw bytes out of the classifier).
+// the structural fields ConflictInfo carries, plus the confirmed host set (Hosts)
+// so a foreign matcher widen is refused (roborev ve95 FIX 2). For an id-less
+// foreign route (ID=="") it also pins RawHash to the located element's exact
+// bytes (roborev ve95 FIX 1): with no @id, RawHash is the only stable identity
+// that re-locates the PRECISE approved route rather than the first overlap. A
+// route WITH an @id keeps the structural (@id + backend) identity, so a benign
+// byte change to it doesn't spuriously re-open the ladder; its widen is caught by
+// the Hosts pin instead.
 func ExpectFromConflict(info ConflictInfo) PurgeExpect {
-	return PurgeExpect{
+	e := PurgeExpect{
 		Owned:            info.Owned,
 		ID:               info.ID,
 		BackendParseable: info.BackendParseable,
 		Label:            info.Label,
 		Port:             info.Port,
 		Handler:          info.Handler,
+		Hosts:            info.Hosts,
 	}
+	if info.ID == "" {
+		e.RawHash = info.RawHash
+	}
+	return e
 }
 
 // matches reports whether the live route (decoded r, raw bytes raw) still has the
@@ -888,7 +934,17 @@ func (e PurgeExpect) matches(r Route, raw json.RawMessage) bool {
 		return false // owned↔foreign escalation: never delete under a stale confirm
 	}
 	if e.RawHash != "" {
+		// Exact-bytes identity (id-less foreign): the raw pin already fixes the
+		// matcher, so no separate host-set check is needed.
 		return raw != nil && rawIdentityHash(raw) == e.RawHash
+	}
+	// Pin the confirmed host-matcher set (roborev ve95 FIX 2): refuse to delete a
+	// route whose live matcher grew/changed since the user confirmed the blast
+	// radius, so a foreign @id route silently widened between confirm and delete is
+	// re-classified (ErrConflictChanged) rather than deleted with hosts the user
+	// never saw. Skipped when Hosts is unset (owned routes, pinned by hostMatcherIs).
+	if len(e.Hosts) > 0 && !sameHostSet(matcherHostList(r), e.Hosts) {
+		return false
 	}
 	if r.ID != e.ID {
 		return false
@@ -1166,6 +1222,35 @@ func matcherHostList(r Route) []string {
 // host matcher at all — e.g. a matcher of only path/method).
 func matcherHosts(r Route) string {
 	return strings.Join(matcherHostList(r), ", ")
+}
+
+// sameHostSet reports whether two host-matcher lists describe the same set of
+// hostnames, order-insensitively and case-insensitively (via canonHost). It is
+// the PurgeExpect.Hosts pin's comparator (roborev ve95 FIX 2): a live matcher that
+// gained, lost, or changed a host relative to the confirmed set is NOT the same
+// set, so the purge is refused. Lengths differing is an immediate mismatch (a
+// widen adds entries), then a sorted element-wise compare catches a same-count
+// swap.
+func sameHostSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ca := make([]string, len(a))
+	for i, h := range a {
+		ca[i] = canonHost(h)
+	}
+	cb := make([]string, len(b))
+	for i, h := range b {
+		cb[i] = canonHost(h)
+	}
+	sort.Strings(ca)
+	sort.Strings(cb)
+	for i := range ca {
+		if ca[i] != cb[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // routeOverlaps reports whether any host matcher on r overlaps the already-

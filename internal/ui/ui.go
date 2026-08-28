@@ -2787,10 +2787,26 @@ func (m *model) clearPurgeFlow() {
 // time a purge confirm shows serve is already active for the port; backing out
 // here would otherwise leave it on silently — a footgun. The port is captured
 // BEFORE clearPurgeFlow zeroes it.
+//
+// It also reconciles the serve state so "space to stop" is honest (roborev ve95
+// FIX 4). The space toggle decides on/off from m.active[port], but that map can be
+// STALE here — the 15s poll hasn't necessarily run since publishCmd auto-enabled
+// serve — so a lingering false would make the very next space try to turn serve ON
+// AGAIN instead of stopping it. Serve being ON is a known fact by this point (a
+// serve-enable failure short-circuits publishCmd before any conflict), so hand-set
+// m.active[port]=true now for an immediate, honest toggle, AND issue a refresh so
+// the row reconciles to tailscale's live state — the same reconcile the toggle
+// path relies on.
 func (m *model) cancelPurgeFlow() tea.Cmd {
 	port := m.purgePort
 	m.clearPurgeFlow()
-	return m.setFlash(fmt.Sprintf("serve left on for :%d — space to stop", port), flashWarn)
+	if port != 0 {
+		m.active[port] = true
+	}
+	return tea.Batch(
+		m.setFlash(fmt.Sprintf("serve left on for :%d — space to stop", port), flashWarn),
+		refresh,
+	)
 }
 
 // purgeBlastRadiusLines renders the extra exposure a foreign purge would remove
@@ -3058,14 +3074,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if tookOver != "" {
 				// This is the RESUMED take-over publish (kata 6n15) and it FAILED. The
-				// destructive half already happened — the old route is gone and <host>
-				// is now unpublished — so a bare publish-error toast would hide that
-				// (roborev hped #5). Disclose the partial outcome plainly. Terminal:
+				// destructive half already happened — the old route was purged — so a
+				// bare publish-error toast would hide that (roborev hped #5). But do NOT
+				// over-claim the host is now "unpublished" (roborev ve95 FIX 3): that
+				// isn't proven — an ErrHostnameConflict means another route may already
+				// hold the name, and a transport error may have committed the publish
+				// server-side before the response was lost. Report only the KNOWN fact
+				// (the purge happened) and that the take-over's outcome is UNCERTAIN;
+				// the poll below reflects whatever the edge actually holds. Terminal:
 				// clear the carry and do NOT re-classify/loop; restoring the capture is
 				// ttfh's job (its seam on the success path is untouched).
 				m.pendingPublish = pendingPublish{}
 				return m, tea.Batch(
-					m.setErr(fmt.Sprintf("purged the old route for %s but the take-over publish failed: %s — %s is now unpublished",
+					m.setErr(fmt.Sprintf("purged the old route for %s, but the take-over publish failed: %s — %s's current state is unknown; the next edge poll will show it",
 						tookOver, publishErrText(msg.err), tookOver)),
 					refresh, m.pollPublishedCmd())
 			}
