@@ -1818,7 +1818,10 @@ func purgeDescOf(e caddyedge.PurgeExpect) string {
 
 // restoreCmd runs the purge-undo (kata ttfh; design §3.6) as ONE command, in the
 // load-bearing order A-before-B-before-C, classifying its result from the FINAL
-// observed edge state rather than a guess about which step failed:
+// observed edge state rather than a guess about which step failed. It runs a
+// VerifyRestore FIRST (kata 7jy2 FIX 1) so a lost-response step-B commit that a
+// retry re-attempts is recognized as already-restored instead of being misread
+// as a drifted take-over:
 //
 //   - (A) Unpublish our take-over. A clean delete or ErrNotFound ⇒ our route is
 //     gone, proceed to B. ErrHostnameConflict ⇒ our take-over is STILL LIVE
@@ -1833,6 +1836,22 @@ func purgeDescOf(e caddyedge.PurgeExpect) string {
 func restoreCmd(client *caddyedge.Client, hostname, label string, port int, captured json.RawMessage) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
+		// Idempotency guard (kata 7jy2 FIX 1): step B's POST can COMMIT server-side
+		// and then have its response lost to a transport error, which today looks
+		// retryable. On the user's retry, step A (Unpublish) would see the now-
+		// restored route (our captured OLD backend under the same @id), refuse the
+		// delete with ErrHostnameConflict, and misreport "your take-over changed
+		// under you" — never noticing the restore already succeeded. So verify
+		// FIRST: if the captured route is already present and SEMANTICALLY EQUAL,
+		// the earlier B committed, so report success without re-running A/B. This is
+		// uniform and idempotent: on the FIRST attempt our take-over (a different
+		// backend under the same @id) is present, so VerifyRestore returns a
+		// non-Restored state and the flow proceeds A→B→C normally; only after a
+		// lost-response commit is it Restored. Any non-Restored outcome (including a
+		// read error) falls through to A, which surfaces the right result.
+		if state, err := client.VerifyRestore(ctx, hostname, captured); err == nil && state == caddyedge.Restored {
+			return restoreDoneMsg{hostname: hostname, result: restoreRestored}
+		}
 		// (A) remove our take-over.
 		switch err := client.Unpublish(ctx, hostname, label, port); {
 		case err == nil, errors.Is(err, caddyedge.ErrNotFound):
@@ -2959,6 +2978,19 @@ func (m *model) clearLastPurge() {
 	m.resizeList()   // give the status slot back the row the prompt held
 }
 
+// clearRestoreOnNav drops the restore affordance on selection-changing navigation
+// intent (kata ttfh; design §3.6). The end-of-Update navigation clear covers keys
+// that fall through to m.list.Update, but the grid-column case "left"/"right"
+// returns EARLY — before that clear — so it (and any other early-returning
+// navigation case) must route through this helper, else the affordance would stay
+// armed after the selection moved (kata 7jy2 FIX 4). Suppressed while a restore is
+// in flight: the slot must survive to catch its restoreDoneMsg / retry.
+func (m *model) clearRestoreOnNav() {
+	if m.lastPurge != nil && !m.restoring {
+		m.clearLastPurge()
+	}
+}
+
 // beginRestore launches the purge-undo A→B→C command (kata ttfh; design §3.6). It
 // sets the in-flight guards (restoring + m.pending on our port) so a second R is a
 // no-op and no other remote op races it, marks the take-over no-longer-live (step
@@ -3927,6 +3959,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// size -- a known, accepted imprecision (not a correctness bug:
 			// it's still a monotonic, in-bounds jump) rather than fight
 			// bubbles/list's paginator to make it exact.
+			//
+			// This case returns EARLY (below), before the end-of-Update
+			// navigation clear, so clear the restore affordance here too
+			// (kata 7jy2 FIX 4) — horizontal nav is selection-changing
+			// navigation intent like the vertical keys that fall through.
+			m.clearRestoreOnNav()
 			items := m.list.VisibleItems()
 			if len(items) == 0 {
 				return m, nil
@@ -4176,11 +4214,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Navigation intent clears the restore affordance (kata ttfh; design §3.6).
 	// Only keys NOT handled by any case above reach here -- list navigation (arrows,
 	// j/k, home/end, pgup/pgdn) and the like -- so a user who has moved on drops the
-	// transient "press R to restore" prompt. Suppressed while a restore is in flight
-	// (the slot must survive to catch its restoreDoneMsg / retry).
-	if m.lastPurge != nil && !m.restoring {
-		m.clearLastPurge()
-	}
+	// transient "press R to restore" prompt. The early-returning grid-column
+	// left/right case clears via the same helper before its return (kata 7jy2 FIX 4).
+	m.clearRestoreOnNav()
 
 	// Anything not handled above goes to the list. In FilterApplied state this
 	// is where esc clears the filter (ClearFilter), so if the filter just

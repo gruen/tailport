@@ -2050,6 +2050,45 @@ func TestVerifyRestoreContentMismatchUnmodeledField(t *testing.T) {
 	}
 }
 
+// TestVerifyRestoreIDMovedOffHostname (kata 7jy2 FIX 2): the captured route's @id
+// was concurrently re-pointed to a DIFFERENT host between B and C, so NOTHING
+// overlaps the original hostname — but our restored route still exists (mutated)
+// elsewhere. A pure overlap scan would report Unclaimed, hiding it; the full-array
+// @id scan must catch it → ContentMismatch, not Unclaimed.
+func TestVerifyRestoreIDMovedOffHostname(t *testing.T) {
+	const host = "app.example.com"
+	captured := json.RawMessage(capturedOwned) // @id tailport-app.example.com, host app.example.com
+	// Same @id, but its host matcher re-pointed to a non-overlapping host: no route
+	// overlaps app.example.com, yet the captured @id is present with mutated content.
+	moved := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["elsewhere.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"hand-edited"}}`)
+	c, _ := newFakeRaw(t, moved)
+	state, err := c.VerifyRestore(context.Background(), host, captured)
+	if err != nil {
+		t.Fatalf("VerifyRestore: %v", err)
+	}
+	if state != RestoreContentMismatch {
+		t.Errorf("state = %v, want ContentMismatch (captured @id re-pointed off the hostname, not Unclaimed)", state)
+	}
+}
+
+// TestSemanticallyEqualPreservesLargeIntegers (kata 7jy2 FIX 3): two routes that
+// differ ONLY in an integer field above 2^53 must NOT compare equal. A plain
+// interface{} decode routes JSON numbers through float64, which collapses 2^53 and
+// 2^53+1 to one value → a false "restored". Decoding with UseNumber() (json.Number
+// preserves the exact digits) keeps them distinct.
+func TestSemanticallyEqualPreservesLargeIntegers(t *testing.T) {
+	// 9007199254740992 == 2^53; 9007199254740993 == 2^53+1 (indistinguishable as float64).
+	a := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy"}],"big":9007199254740992}`)
+	b := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy"}],"big":9007199254740993}`)
+	if semanticallyEqual(a, b) {
+		t.Error("distinct integers above 2^53 must NOT be semanticallyEqual (json.Number precision)")
+	}
+	// Sanity: genuinely identical bytes still compare equal.
+	if !semanticallyEqual(a, json.RawMessage(string(a))) {
+		t.Error("identical routes must compare equal")
+	}
+}
+
 // TestRestoreThenVerifyComposes: RestoreRoute into a free array then VerifyRestore
 // classifies Restored — the B→C composition proves out end-to-end against the fake.
 func TestRestoreThenVerifyComposes(t *testing.T) {

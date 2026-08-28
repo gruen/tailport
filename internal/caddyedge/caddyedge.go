@@ -1221,7 +1221,11 @@ func (s RestoreState) String() string {
 // the WHOLE array for routes overlapping hostname and classifies:
 //
 //   - exactly one overlap that SEMANTICALLY EQUALS captured ⇒ Restored;
-//   - none ⇒ Unclaimed;
+//   - none overlapping, BUT the captured @id exists elsewhere in the array with
+//     differing content (it was re-pointed off the hostname between B and C —
+//     kata 7jy2 FIX 2) ⇒ ContentMismatch (our route mutated and moved, not a free
+//     name);
+//   - none, and the captured @id is nowhere ⇒ Unclaimed;
 //   - one overlap carrying captured's @id but content differs ⇒ ContentMismatch
 //     (a same-@id PATCH swapped the backend/auth/an unmodeled field);
 //   - anything else (a different route holds it, or >1 route overlaps) ⇒
@@ -1248,6 +1252,20 @@ func (c *Client) VerifyRestore(ctx context.Context, hostname string, captured js
 	}
 	switch len(overlapping) {
 	case 0:
+		// Nothing overlaps the ORIGINAL hostname — but the captured route's @id may
+		// have been concurrently re-pointed to ANOTHER hostname between B and C
+		// (kata 7jy2 FIX 2). A pure overlap scan misses that and would report
+		// Unclaimed, hiding that our restored route still exists (mutated) elsewhere.
+		// Independently scan the FULL array for the captured @id: if it exists
+		// anywhere with content that is NOT semantically equal to the capture, that
+		// is our route mutated and moved, not a free name → ContentMismatch.
+		if capID := rawRouteID(captured); capID != "" {
+			for _, elem := range raws {
+				if rawRouteID(elem) == capID && !semanticallyEqual(elem, captured) {
+					return RestoreContentMismatch, nil
+				}
+			}
+		}
 		return RestoreUnclaimed, nil
 	case 1:
 		if semanticallyEqual(overlapping[0], captured) {
@@ -1273,14 +1291,34 @@ func (c *Client) VerifyRestore(ctx context.Context, hostname string, captured js
 // values and re-marshals canonically (Go sorts object keys), then compares bytes;
 // this is the honest content compare undo step C needs (design §3.6-C), not the
 // structural hostMatcherIs. A decode/encode failure is treated as "not equal".
+//
+// The decode uses json.Decoder + UseNumber() (kata 7jy2 FIX 3), so JSON numbers
+// become json.Number (their exact source digits preserved) rather than float64:
+// a plain interface{} decode collapses two DISTINCT integers above 2^53 to one
+// float64 value, which would canonicalize identically and yield a false
+// "restored" for a route mutated only in a large integer field.
 func semanticallyEqual(a, b json.RawMessage) bool {
-	var av, bv interface{}
-	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+	av, ok1 := decodeCanonical(a)
+	bv, ok2 := decodeCanonical(b)
+	if !ok1 || !ok2 {
 		return false
 	}
 	ab, err1 := json.Marshal(av)
 	bb, err2 := json.Marshal(bv)
 	return err1 == nil && err2 == nil && bytes.Equal(ab, bb)
+}
+
+// decodeCanonical decodes one JSON value with UseNumber() so integer precision
+// survives the round trip (a json.Number keeps its exact digits, unlike a
+// float64). ok is false on a decode failure. Used by semanticallyEqual for the
+// honest content compare undo step C needs.
+func decodeCanonical(raw json.RawMessage) (v interface{}, ok bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, false
+	}
+	return v, true
 }
 
 // locateByExpect finds the index of the route the user approved to purge,

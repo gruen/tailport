@@ -5217,6 +5217,10 @@ type fakeCaddy struct {
 	routes    map[string]caddyedge.Route
 	mutations []caddyedge.Route // POST/PATCH bodies, in order
 	deletes   []string          // @ids DELETEd, in order
+	// failNextPost, when true, makes the NEXT POST commit the route server-side and
+	// then drop the connection so the client sees a transport error -- a lost-
+	// response step-B commit (kata 7jy2 FIX 1). Consumed (reset) after it fires.
+	failNextPost bool
 }
 
 func newFakeCaddy() *fakeCaddy {
@@ -5263,6 +5267,18 @@ func (fc *fakeCaddy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewDecoder(r.Body).Decode(&rt)
 			fc.routes[rt.ID] = rt
 			fc.mutations = append(fc.mutations, rt)
+			if fc.failNextPost {
+				// The write LANDED above; now drop the connection before writing any
+				// response so the client sees a transport error (ErrUnreachable) even
+				// though the commit succeeded server-side -- a lost step-B response.
+				fc.failNextPost = false
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						_ = conn.Close()
+						return
+					}
+				}
+			}
 			w.WriteHeader(http.StatusOK)
 		}
 	default:
@@ -7399,6 +7415,60 @@ func TestTtfhSplitAOutcomes(t *testing.T) {
 	})
 }
 
+// TestTtfhLostResponseCommitRetryReportsRestored (kata 7jy2 FIX 1): a step-B POST
+// that COMMITS server-side but whose response is LOST to a transport error leaves
+// the restore armed for retry. Because restoreCmd verifies FIRST, the retry sees
+// the captured route already present and reports "restored" — NOT the pre-fix
+// "your take-over changed under you" that step A would emit (it would see the
+// restored OLD backend under our @id and refuse the Unpublish). This is the
+// load-bearing test: without the VerifyRestore-first guard the retry classifies
+// restoreTakeoverChanged.
+func TestTtfhLostResponseCommitRetryReportsRestored(t *testing.T) {
+	fc := newFakeCaddy()
+	fc.routes[caddyedge.IDFor(ttfhHost)] = caddyedge.BuildRoute(ttfhHost, "dev-box", 8080, nil) // our live take-over
+	fc.failNextPost = true                                                                      // step B commits, then the response is lost
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := armedRestoreModel(t, srv)
+
+	// First R: A deletes our take-over, B POSTs the captured route (COMMITTED) but
+	// the response is lost → ErrUnreachable → retryable, slot stays armed.
+	res, cmd := m.Update(rkey("R"))
+	m = res.(model)
+	done := cmd().(restoreDoneMsg)
+	if done.result != restoreUnreachable {
+		t.Fatalf("a lost-response commit should be retryable (unreachable); got %v", done.result)
+	}
+	m = mustUpdate(t, m, done)
+	if m.lastPurge == nil {
+		t.Fatal("a lost-response commit must KEEP the slot armed for retry")
+	}
+	// The commit actually landed: the captured OLD backend is now under our @id.
+	if rt, ok := fc.routes[caddyedge.IDFor(ttfhHost)]; !ok || routeDial(rt) != "other-box:9090" {
+		t.Fatalf("step B should have committed the captured route despite the lost response; got %+v", rt)
+	}
+
+	// Retry R: VerifyRestore-first sees the captured route already present →
+	// Restored, WITHOUT re-running A (which would refuse and misreport).
+	res, cmd = m.Update(rkey("R"))
+	m = res.(model)
+	if !m.restoring || cmd == nil {
+		t.Fatal("retry R should relaunch the restore")
+	}
+	done = cmd().(restoreDoneMsg)
+	if done.result != restoreRestored {
+		t.Errorf("retry after a lost-response commit should report Restored (not takeoverChanged); got %v", done.result)
+	}
+	m = mustUpdate(t, m, done)
+	if m.lastPurge != nil {
+		t.Error("a restored retry should clear the slot")
+	}
+	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "restored "+ttfhHost) {
+		t.Errorf("flash=%q level=%v, want a plain 'restored %s'", m.flash, m.flashLevel, ttfhHost)
+	}
+}
+
 // TestTtfhMessagePerState pins each restore outcome's exact message + level and
 // whether it clears or KEEPS (retryable) the slot — computed from the FINAL state,
 // never a guess.
@@ -7575,6 +7645,29 @@ func TestTtfhClearTriggers(t *testing.T) {
 		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyDown})
 		if m.lastPurge != nil {
 			t.Error("navigation intent should clear the restore affordance")
+		}
+	})
+
+	// The grid-column left/right case returns EARLY, before the end-of-Update
+	// navigation clear, so it must clear the affordance itself (kata 7jy2 FIX 4).
+	t.Run("horizontal (left/right) navigation clears", func(t *testing.T) {
+		for _, kt := range []tea.KeyType{tea.KeyLeft, tea.KeyRight} {
+			m := armedRestoreModel(t, nil)
+			m = mustUpdate(t, m, tea.KeyMsg{Type: kt})
+			if m.lastPurge != nil {
+				t.Errorf("%v navigation should clear the restore affordance", kt)
+			}
+		}
+	})
+
+	// But horizontal nav must NOT clear while a restore is in flight — the slot has
+	// to survive to catch its restoreDoneMsg / retry.
+	t.Run("horizontal navigation does NOT clear while restoring", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m.restoring = true
+		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRight})
+		if m.lastPurge == nil {
+			t.Error("horizontal nav must not clear the slot while a restore is in flight (design F11)")
 		}
 	})
 }
