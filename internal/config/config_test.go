@@ -560,6 +560,393 @@ func TestSaveErrorsOnSymlinkLoop(t *testing.T) {
 	}
 }
 
+// caddyDomainWritebackFixture is a realistic, hand-tuned config file used by
+// the SaveCaddyDomain tests: it carries a ports block, a foreign top-level key
+// (future_field) this build's Config struct does NOT model -- with both a head
+// comment and an inline comment -- a full caddy block including an auth_hash,
+// and a markers preference. SaveCaddyDomain must change ONLY caddy.domain and
+// leave everything else (foreign key, comments, other fields) intact; a
+// struct-re-encode "simplification" would drop future_field and its comments,
+// failing the merge test loudly.
+const caddyDomainWritebackFixture = `# tailport config (hand-tuned by a human)
+ports:
+    22:
+        locked: true
+    3000:
+        label: dev server
+        favorite: true
+        last_process: vite
+# future_field is a top-level key this build's Config struct does not model
+# (a newer tailport wrote it, or a human added it in $EDITOR). It MUST survive
+# a caddy.domain write-back -- a struct re-encode would silently drop it.
+future_field: 42 # keep this inline comment too
+caddy:
+    hostname: caddy
+    domain: old.example.com
+    server_name: tailport
+    admin_port: 2019
+    auth_user: mg
+    auth_hash: $2a$10$abcdefghijklmnopqrstuvABCDEFghijklmnopqrstuvwxyz012
+markers: emoji
+`
+
+// TestSaveCaddyDomainMergePreservesForeignContent is THE test proving
+// SaveCaddyDomain re-reads the file into a yaml.Node tree and merges, rather
+// than re-encoding the in-memory Config (which would drop unknown keys and
+// stale-overwrite concurrent edits -- the config-clobber history ycv1/OQ3
+// avoids). Starting from a file with ports, a foreign top-level key + comments,
+// a full caddy block, and a markers pref, a SaveCaddyDomain changes only
+// caddy.domain: the foreign key, its comments, the other caddy fields, the
+// ports, and the markers pref all survive. If someone later "simplifies" this
+// back to a struct re-encode, future_field (and its comments) vanish and this
+// fails.
+func TestSaveCaddyDomainMergePreservesForeignContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o644); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(fixture) error: %v", err)
+	}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading merged config: %v", err)
+	}
+	text := string(raw)
+
+	// The domain changed to the new value; the old value is gone.
+	if !strings.Contains(text, "domain: apps.example.com") {
+		t.Errorf("expected merged config to contain the new domain, got:\n%s", text)
+	}
+	if strings.Contains(text, "old.example.com") {
+		t.Errorf("expected the old domain to be gone from the merged config, got:\n%s", text)
+	}
+
+	// The foreign top-level key SURVIVES -- the load-bearing proof of a
+	// Node-tree merge (a struct re-encode would drop it entirely).
+	if !strings.Contains(text, "future_field: 42") {
+		t.Errorf("expected the unknown top-level key future_field to survive the merge, got:\n%s", text)
+	}
+	// Its comments (a non-tailport-managed head comment + an inline comment)
+	// survive too -- only a Node re-read preserves these.
+	for _, want := range []string{
+		"future_field is a top-level key this build's Config struct does not model",
+		"keep this inline comment too",
+		"tailport config (hand-tuned by a human)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected foreign comment %q to survive the merge, got:\n%s", want, text)
+		}
+	}
+	// The self-documenting caddy comments are present (applyCaddyComments is
+	// re-applied on the merged tree, matching Save's invariant).
+	for _, want := range []string{
+		"Public base domain used to build publish hostnames",
+		"Name of the shared Caddy JSON HTTP server under apps.http.servers",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected caddy comment %q present after merge, got:\n%s", want, text)
+		}
+	}
+
+	// Everything else round-trips unchanged through Load.
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after merge error: %v", err)
+	}
+	if got.Caddy.Domain != "apps.example.com" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "apps.example.com")
+	}
+	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("Load().Caddy = %+v, want hostname/server_name/admin_port untouched", got.Caddy)
+	}
+	if got.Caddy.AuthUser != "mg" || got.Caddy.AuthHash != "$2a$10$abcdefghijklmnopqrstuvABCDEFghijklmnopqrstuvwxyz012" {
+		t.Errorf("Load().Caddy auth = user %q hash %q, want the fixture's auth untouched", got.Caddy.AuthUser, got.Caddy.AuthHash)
+	}
+	if got.Markers != "emoji" {
+		t.Errorf("Load().Markers = %q, want %q (unrelated field must survive)", got.Markers, "emoji")
+	}
+	if meta, ok := got.Ports[3000]; !ok || meta.Label != "dev server" || !meta.Favorite || meta.LastProcess != "vite" {
+		t.Errorf("Load().Ports[3000] = %+v (ok=%v), want the fixture's port entry untouched", meta, ok)
+	}
+	if meta, ok := got.Ports[22]; !ok || !meta.Locked {
+		t.Errorf("Load().Ports[22] = %+v (ok=%v), want locked SSH port untouched", meta, ok)
+	}
+}
+
+// TestSaveCaddyDomainWritesBackup covers the .bak requirement: before
+// overwriting, SaveCaddyDomain copies the file's CURRENT on-disk bytes to
+// <path>.bak, which must exist, be mode 0600 (the config can hold a bcrypt
+// auth_hash -- a world-readable backup would defeat the main file's 0600
+// protection), and contain the pre-write bytes exactly.
+func TestSaveCaddyDomainWritesBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	bakPath := path + ".bak"
+	info, err := os.Stat(bakPath)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", bakPath, err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf(".bak mode = %o, want 600 (may hold an auth_hash)", got)
+	}
+	bak, err := os.ReadFile(bakPath)
+	if err != nil {
+		t.Fatalf("reading .bak: %v", err)
+	}
+	if string(bak) != caddyDomainWritebackFixture {
+		t.Errorf(".bak contents = %q, want the exact pre-write bytes", string(bak))
+	}
+	// No Save-style scratch temp file may survive the write.
+	assertNoLeftoverTempFiles(t, dir)
+}
+
+// TestSaveCaddyDomainLoadRoundTrip covers the basic contract: after
+// SaveCaddyDomain, a fresh Load yields the new domain.
+func TestSaveCaddyDomainLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("newdomain.example.org"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Domain != "newdomain.example.org" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "newdomain.example.org")
+	}
+}
+
+// TestSaveCaddyDomainCreatesFileWhenAbsent covers the no-file-yet branch: with
+// nothing on disk to back up, SaveCaddyDomain seeds a fresh Default() with the
+// domain set (defaults + caddy comments), writes it 0600, creates any missing
+// parent directory, and drops NO .bak.
+func TestSaveCaddyDomainCreatesFileWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	// A parent dir that does not exist yet, to exercise the mkdir path.
+	path := filepath.Join(dir, "sub", "config.yaml")
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("fresh.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected fresh config to be created: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("fresh config mode = %o, want 600", got)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("expected NO .bak when seeding a fresh file; stat err = %v", err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Domain != "fresh.example.com" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "fresh.example.com")
+	}
+	// Fresh seed carries the Default() caddy defaults and the locked SSH port.
+	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("Load().Caddy = %+v, want defaults on a fresh seed", got.Caddy)
+	}
+	if meta, ok := got.Ports[22]; !ok || !meta.Locked {
+		t.Errorf("Load().Ports[22] = %+v (ok=%v), want Default()'s locked SSH port", meta, ok)
+	}
+	// The fresh file is self-documenting (caddy comments present).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading fresh config: %v", err)
+	}
+	if !strings.Contains(string(raw), "Public base domain used to build publish hostnames") {
+		t.Errorf("expected fresh seed to carry caddy comments, got:\n%s", raw)
+	}
+}
+
+// TestSaveCaddyDomainInsertsMissingCaddyBlock covers a hand-minimal file that
+// has no caddy block at all: SaveCaddyDomain must INSERT caddy.domain (and
+// attach its explanatory comment) so the value lands, while preserving the
+// file's other content.
+func TestSaveCaddyDomainInsertsMissingCaddyBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	minimal := "ports:\n    8080:\n        favorite: true\nfuture_field: 7\n"
+	if err := os.WriteFile(path, []byte(minimal), 0o600); err != nil {
+		t.Fatalf("seeding minimal fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "domain: apps.example.com") {
+		t.Errorf("expected inserted caddy.domain, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Public base domain used to build publish hostnames") {
+		t.Errorf("expected the inserted domain key to carry its comment, got:\n%s", text)
+	}
+	if !strings.Contains(text, "future_field: 7") {
+		t.Errorf("expected the minimal file's other content to survive, got:\n%s", text)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Domain != "apps.example.com" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "apps.example.com")
+	}
+	if meta, ok := got.Ports[8080]; !ok || !meta.Favorite {
+		t.Errorf("Load().Ports[8080] = %+v (ok=%v), want the minimal file's port preserved", meta, ok)
+	}
+}
+
+// TestSaveCaddyDomainWritesThroughSymlink mirrors TestSaveWritesThroughSymlink
+// for the write-back path: when the resolved config path is a symlink (a
+// dotfiles-repo setup), SaveCaddyDomain writes THROUGH to the real target
+// (leaving the symlink itself intact), and its .bak lands next to the real
+// target -- not next to the link.
+func TestSaveCaddyDomainWritesThroughSymlink(t *testing.T) {
+	dirA := t.TempDir()
+	realPath := filepath.Join(dirA, "real.yaml")
+
+	// Seed the real target with a valid tailport config (defaults + comments)
+	// carrying an old domain.
+	seed := Default()
+	seed.path = realPath
+	seed.Caddy.Domain = "old.example.com"
+	if err := seed.Save(); err != nil {
+		t.Fatalf("seeding real target: %v", err)
+	}
+	preBytes, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("reading seeded real target: %v", err)
+	}
+
+	dirB := t.TempDir()
+	linkPath := filepath.Join(dirB, "config.yaml")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	cfg := Config{path: linkPath}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	// The link must still be a symlink pointing at the same real target.
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("Lstat(linkPath): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected %s to still be a symlink after SaveCaddyDomain, got mode %v", linkPath, info.Mode())
+	}
+	if got, err := os.Readlink(linkPath); err != nil {
+		t.Fatalf("Readlink(linkPath): %v", err)
+	} else if got != realPath {
+		t.Errorf("Readlink(linkPath) = %q, want %q", got, realPath)
+	}
+
+	// The real target holds the new domain, at 0600.
+	realInfo, err := os.Stat(realPath)
+	if err != nil {
+		t.Fatalf("Stat(realPath): %v", err)
+	}
+	if got := realInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("real target mode = %o, want 600", got)
+	}
+	realRaw, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("ReadFile(realPath): %v", err)
+	}
+	if !strings.Contains(string(realRaw), "domain: apps.example.com") {
+		t.Errorf("expected real target to carry the new domain, got:\n%s", realRaw)
+	}
+
+	// The .bak lands next to the REAL target (with the pre-write bytes, 0600),
+	// NOT next to the link.
+	realBak := realPath + ".bak"
+	bakInfo, err := os.Stat(realBak)
+	if err != nil {
+		t.Fatalf("expected .bak next to real target: %v", err)
+	}
+	if got := bakInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("real-target .bak mode = %o, want 600", got)
+	}
+	if bak, err := os.ReadFile(realBak); err != nil {
+		t.Fatalf("reading real-target .bak: %v", err)
+	} else if string(bak) != string(preBytes) {
+		t.Errorf(".bak contents differ from the pre-write real-target bytes")
+	}
+	if _, err := os.Stat(linkPath + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("expected NO .bak next to the symlink; stat err = %v", err)
+	}
+}
+
+// TestSaveCaddyDomainMainFileStays0600 covers the mode requirement on the main
+// file for the merge path: a pre-existing world-readable (0644) config must be
+// tightened to 0600 by the atomic overwrite, and its .bak written 0600 too.
+func TestSaveCaddyDomainMainFileStays0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o644); err != nil {
+		t.Fatalf("seeding 0644 fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("apps.example.com"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat main file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("main config mode = %o, want 600 (pre-existing 0644 must be tightened)", got)
+	}
+	bakInfo, err := os.Stat(path + ".bak")
+	if err != nil {
+		t.Fatalf("stat .bak: %v", err)
+	}
+	if got := bakInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf(".bak mode = %o, want 600", got)
+	}
+	assertNoLeftoverTempFiles(t, dir)
+}
+
 // TestSaveAppliesCaddyDefaultsForLiteral covers roborev 4ejm finding #3: a
 // Config literal built directly (never through Default()/Load(), which apply
 // the defaults) must still write visible caddy defaults, not empty/zero values.

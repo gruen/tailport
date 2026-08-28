@@ -237,10 +237,6 @@ func (c Config) Save() error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(target)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	var root yaml.Node
 	if err := root.Encode(c); err != nil {
 		return err
@@ -248,6 +244,26 @@ func (c Config) Save() error {
 	applyCaddyComments(&root)
 	data, err := yaml.Marshal(&root)
 	if err != nil {
+		return err
+	}
+	return writeConfigAtomic(target, data)
+}
+
+// writeConfigAtomic writes data to target using the symlink-safe atomic swap
+// Save's doc comment describes: a 0600 temp file in target's OWN directory,
+// written, explicitly Chmod'd 0600, closed, then os.Rename'd over target -- an
+// atomic same-filesystem replace that is secure from the first byte (never
+// written-then-chmod'd in place, so an auth_hash is never transiently
+// world-readable) and free of torn-write risk. target must ALREADY be the
+// resolved save target (see resolveSaveTarget); the parent directory is created
+// if needed. On any error the temp file is removed and target is left
+// byte-for-byte untouched.
+//
+// Factored out of Save so Save and SaveCaddyDomain share one audited write
+// path (mzvh/3f5t/kg6f all live here) rather than diverging copies.
+func writeConfigAtomic(target string, data []byte) error {
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 
@@ -278,6 +294,160 @@ func (c Config) Save() error {
 		return err
 	}
 	return nil
+}
+
+// SaveCaddyDomain persists ONLY the caddy.domain field to the on-disk config,
+// leaving every other byte of the file -- its comments, its formatting, and any
+// top-level keys this build's Config struct does not model -- untouched. It is
+// the write-back primitive the TUI's mid-flow domain-capture prompt (kata w131)
+// calls after the user types a domain during a `P` publish.
+//
+// Unlike Save, it deliberately does NOT re-encode the in-memory Config. A
+// struct re-encode would DROP any unknown top-level key on disk (a field a
+// newer/foreign tailport wrote, or a hand `$EDITOR` addition) and would
+// stale-overwrite a concurrent edit -- e.g. a second tailport instance changing
+// a port label/marker between this Config's Load and this call. That
+// last-writer-wins clobber is exactly the config-clobber history the ycv1
+// design (OQ3) set out to avoid. Instead this method RE-READS the file's
+// current bytes, parses them into a yaml.Node tree, mutates only the
+// caddy.domain scalar in that tree (inserting the caddy block and/or the domain
+// key if a hand-minimal file lacks them, then re-applying the caddy
+// head-comments via applyCaddyComments so a freshly inserted domain still
+// documents itself -- matching Save's self-documenting caddy-block invariant),
+// and re-marshals. Everything else already on disk therefore survives verbatim.
+//
+// Before overwriting, it copies the file's CURRENT on-disk bytes to
+// <resolved-target>.bak at mode 0600 (via the same atomic 0600 write path as
+// the main file): the config can hold a bcrypt auth_hash, and a world-readable
+// backup would defeat the 0600 protection the main write maintains. If no config
+// file exists yet there is nothing to back up -- it seeds a fresh Default() with
+// the domain set and writes that, with no .bak. The overwrite reuses the
+// symlink-safe atomic temp-file+rename (writeConfigAtomic), so on any failure
+// the existing config is left byte-for-byte intact (the temp is removed).
+//
+// The target and its .bak resolve exactly as Save's write does: the Config's
+// resolved path (c.path) if set, else Path(""), run through resolveSaveTarget so
+// a symlinked config is written THROUGH to its real target and the .bak lands
+// next to that real target.
+//
+// It persists to DISK ONLY. The caller must update its own in-memory
+// cfg.Caddy.Domain after a successful return -- this method intentionally does
+// not read the file's (possibly newer) values for the OTHER caddy/port fields
+// back into the struct, so it cannot and must not mutate the caller's struct
+// view of fields it did not touch. No domain validation happens here: this is a
+// pure persistence primitive, and the caller (w131) validates the domain string
+// before calling.
+func (c Config) SaveCaddyDomain(domain string) error {
+	path := c.path
+	if path == "" {
+		var err error
+		path, err = Path("")
+		if err != nil {
+			return err
+		}
+	}
+	target, err := resolveSaveTarget(path)
+	if err != nil {
+		return err
+	}
+
+	current, readErr := os.ReadFile(target)
+	if os.IsNotExist(readErr) {
+		// Nothing on disk to merge or back up: seed a fresh default with the
+		// domain set, matching what a first Save would write (defaults +
+		// caddy comments), and skip the .bak.
+		cfg := Default()
+		cfg.Caddy.Domain = domain
+		var root yaml.Node
+		if err := root.Encode(cfg); err != nil {
+			return err
+		}
+		applyCaddyComments(&root)
+		data, err := yaml.Marshal(&root)
+		if err != nil {
+			return err
+		}
+		return writeConfigAtomic(target, data)
+	}
+	if readErr != nil {
+		return readErr
+	}
+
+	// Merge path: parse the current file into a Node tree and set only
+	// caddy.domain, so comments and unknown/foreign keys are preserved.
+	var root yaml.Node
+	if err := yaml.Unmarshal(current, &root); err != nil {
+		return err
+	}
+	setCaddyDomainNode(&root, domain)
+	data, err := yaml.Marshal(&root)
+	if err != nil {
+		return err
+	}
+
+	// Back up the CURRENT on-disk bytes (0600) BEFORE overwriting, so a
+	// failure or a bad merge is recoverable and the backup never leaks a hash.
+	if err := writeConfigAtomic(target+".bak", current); err != nil {
+		return err
+	}
+	return writeConfigAtomic(target, data)
+}
+
+// setCaddyDomainNode mutates a parsed config Node tree in place so that
+// caddy.domain equals domain, touching nothing else. doc is what
+// yaml.Unmarshal produced (a DocumentNode, or a bare node for an empty file).
+// If the caddy mapping and/or the domain key are absent (a hand-minimal file),
+// they are inserted so the value lands. It then re-applies the caddy
+// head-comments (applyCaddyComments) so a freshly inserted domain key still
+// carries its explanatory comment, exactly as Save keeps the caddy block
+// self-documenting on every write.
+func setCaddyDomainNode(doc *yaml.Node, domain string) {
+	root := documentRootMapping(doc)
+	caddy := mappingValueNode(root, "caddy")
+	if caddy == nil {
+		caddy = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "caddy"},
+			caddy,
+		)
+	}
+	if v := mappingValueNode(caddy, "domain"); v != nil {
+		// Update in place; reset Style so a real domain renders plain
+		// (domain: apps.example.com) the way an encoded struct would, rather
+		// than inheriting a quoted style from a prior `domain: ""`.
+		v.Kind = yaml.ScalarNode
+		v.Tag = "!!str"
+		v.Value = domain
+		v.Style = 0
+	} else {
+		caddy.Content = append(caddy.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "domain"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: domain},
+		)
+	}
+	applyCaddyComments(root)
+}
+
+// documentRootMapping returns the mapping node setCaddyDomainNode should mutate:
+// the content of a DocumentNode (the normal yaml.Unmarshal shape), a bare
+// MappingNode as-is, or -- for an empty/whitespace-only file that parsed to a
+// null/zero node -- a freshly initialized empty mapping installed as the tree's
+// content so the caddy block has somewhere to land.
+func documentRootMapping(doc *yaml.Node) *yaml.Node {
+	if doc.Kind == yaml.DocumentNode {
+		if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+			m := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			doc.Content = []*yaml.Node{m}
+			return m
+		}
+		return doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		doc.Kind = yaml.MappingNode
+		doc.Tag = "!!map"
+		doc.Content = nil
+	}
+	return doc
 }
 
 // maxSymlinkHops bounds the manual chain-walk in resolveSaveTarget's
