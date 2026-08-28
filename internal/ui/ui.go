@@ -750,9 +750,12 @@ const (
 	// The publish (`P`) flow (kata v1z5) is a small state machine of its own,
 	// all handled in updatePublishEntry. It gathers a public hostname, an
 	// optional shared basic-auth credential (first authed publish only), then a
-	// funnel-grade confirm before touching the Caddy edge:
-	//   entryPublishHost -> entryPublishAuth -> [entryPublishCredUser ->
-	//   entryPublishCredPass ->] entryConfirmPublish
+	// funnel-grade confirm before touching the Caddy edge. The domain step is
+	// reached ONLY when caddy.domain is blank (kata w131 -- captured inline
+	// instead of refusing), and once saved, feeds the same host step:
+	//   [entryPublishDomain ->] entryPublishHost -> entryPublishAuth ->
+	//   [entryPublishCredUser -> entryPublishCredPass ->] entryConfirmPublish
+	entryPublishDomain   // text: the public base domain, captured when caddy.domain is blank (w131)
 	entryPublishHost     // text: the public hostname, prefilled <label-or-process>.<domain>
 	entryPublishAuth     // 3-way y/n/esc: require basic auth? ("no auth" != "abort")
 	entryPublishCredUser // text: shared basic-auth username (first authed publish)
@@ -939,6 +942,21 @@ type model struct {
 	// startup, or on "r") confirming the operator is now set. See
 	// operatorHintText, and the detectOperatorMsg/toggleDoneMsg handlers.
 	operatorNotSet bool
+	// domainSetupPending is a SECOND sticky banner, PARALLEL to and independent
+	// of operatorNotSet (kata w131, ycv1 r3-NEW-1): it is raised when the `P`
+	// flow captures a blank caddy.domain inline (entryPublishDomain) and reminds
+	// the user that saving the config FIELD is not the same as doing the edge
+	// SETUP -- they still owe the *.<domain> wildcard DNS pointed at the edge and
+	// a deployed edge. It is deliberately NOT a reuse of operatorNotSet: that one
+	// is a single slot with its own unrelated clear-triggers, and the two
+	// conditions (operator unset; domain-saved-needs-DNS) are orthogonal and can
+	// be true SIMULTANEOUSLY, which one slot can't render. Like operatorNotSet it
+	// is sticky -- it survives keypresses and does NOT auto-dismiss (a toast
+	// would vanish while the user types the hostname in the very next dialog) --
+	// and it clears when a real DNS/edge is demonstrably working: a successful
+	// published-state poll or a successful publish. See domainSetupHintText and
+	// the publishPollMsg/publishDoneMsg handlers.
+	domainSetupPending bool
 	// operatorUser is the OS username used to build the sticky hint's exact,
 	// copy-pasteable fix command ($USER EXPANDED, via tsserve.CurrentUsername
 	// resolved once in New) -- falls back to a "<you>" placeholder at render
@@ -2201,30 +2219,60 @@ func (m *model) requestPublish(port int) tea.Cmd {
 		m.pending = port
 		return unpublishCmd(m.caddyClient(), info.hostname, shortLabel(m.fqdn), port)
 	}
-	// 6. config: publishing needs a public base domain AND a reachable edge
-	// admin hostname. Name the missing field, its config file, and the docs.
-	if m.cfg.Caddy.Domain == "" || m.cfg.Caddy.Hostname == "" {
-		field := "caddy.domain"
-		if m.cfg.Caddy.Domain != "" {
-			field = "caddy.hostname"
-		}
+	// 6. locked port: publish must not bypass the `x` lock any more than serve
+	// or funnel do. Resolved BEFORE any domain handling (kata w131, ycv1 r1-#10)
+	// so a locked-port (or otherwise un-publishable) user is refused OUTRIGHT --
+	// never prompted for a domain and then refused.
+	if m.cfg.Ports[port].Locked {
+		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
+	}
+	// 7. hostname validity: we dial the edge admin API by caddy.hostname, and
+	// the edge derives its admin origin from the SHORT MagicDNS label only
+	// (ycv1 §4d). A blank hostname (it defaults to "caddy", so this is unusual,
+	// but the default is applied at config load, not here) leaves nothing to
+	// dial; an FQDN-shaped one (contains a dot) would silently 403 at the edge.
+	// Both are REFUSED here -- this is a refusal, not a capture: the hostname is
+	// not gathered in this flow. Refused before the domain is resolved.
+	if m.cfg.Caddy.Hostname == "" {
 		where := m.configPath
 		if where == "" {
 			where = "your tailport config"
 		}
-		return m.setErr(fmt.Sprintf("publish is unconfigured: set %s in %s (see docs/caddy-edge.md)", field, where))
+		return m.setErr(fmt.Sprintf("publish is unconfigured: set caddy.hostname in %s (see docs/caddy-edge.md)", where))
 	}
-	// 7. locked port: publish must not bypass the `x` lock any more than serve
-	// or funnel do.
-	if m.cfg.Ports[port].Locked {
-		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
+	if strings.Contains(m.cfg.Caddy.Hostname, ".") {
+		return m.setErr(fmt.Sprintf("caddy.hostname %q looks like an FQDN — use the short MagicDNS label (the edge admits only its short name; an FQDN silently 403s). See docs/caddy-edge.md", m.cfg.Caddy.Hostname))
 	}
 
-	// All guards passed: open the host dialog, prefilled <label-or-process>.<domain>.
-	// Prefill precedence: the port's user label, else its live process name,
-	// else this machine's short label -- then "."+domain. It's editable and
-	// nested subdomains are allowed; ValidHostname checks it on submit.
+	// All refuse-guards passed. Record the port ONCE, up front, so both the
+	// domain-capture step and the shared host-dialog continuation can read it.
 	m.publishPort = port
+
+	// 8. domain: publishing needs a public base domain. A set caddy.domain opens
+	// the host dialog directly; a BLANK one is captured inline (kata w131, ycv1
+	// §4b) instead of refusing -- resolved LAST so an un-publishable port was
+	// already refused above, rather than prompted for a domain then refused.
+	if m.cfg.Caddy.Domain == "" {
+		m.publishInput.Reset()
+		m.publishInput.EchoMode = textinput.EchoNormal
+		m.publishInput.Placeholder = "example.com"
+		m.publishInput.Focus()
+		m.mode = entryPublishDomain
+		return nil
+	}
+	return m.enterPublishHostDialog()
+}
+
+// enterPublishHostDialog opens the entryPublishHost step for m.publishPort with
+// the public hostname prefilled <label-or-process>.<domain>. Prefill precedence:
+// the port's user label, else its live process name, else this machine's short
+// label -- then "."+caddy.domain. It's editable and nested subdomains are
+// allowed; ValidHostname checks it on submit. This is the SHARED continuation
+// (kata w131, ycv1 r2-#5) called from BOTH requestPublish (caddy.domain already
+// set) and the entryPublishDomain enter-handler (caddy.domain just saved) -- both
+// set m.publishPort first, which this reads.
+func (m *model) enterPublishHostDialog() tea.Cmd {
+	port := m.publishPort
 	prefix := m.cfg.Ports[port].Label
 	if prefix == "" {
 		prefix = m.selectedProcess(port)
@@ -2238,6 +2286,18 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	m.publishInput.Focus()
 	m.mode = entryPublishHost
 	return nil
+}
+
+// validPublishDomain reports whether s is usable as the public BASE domain that
+// publish hostnames are built under (label + "." + domain). It reuses
+// caddyedge.ValidHostname (already rejecting blank, whitespace, schemes, ports,
+// paths, bad labels, and "*.x") and ADDS a "must contain at least one dot" rule:
+// a bare label like "localhost" or "foo" can't be a real public base domain and
+// would build a bogus "label.foo" publish host, so it's rejected here even
+// though it's a syntactically valid single-label hostname. "example.com" and
+// "apps.example.com" pass. (kata w131.)
+func validPublishDomain(s string) bool {
+	return caddyedge.ValidHostname(s) && strings.Contains(s, ".")
 }
 
 // clearPublishFlow resets every publish-flow field to its zero value and
@@ -2264,6 +2324,39 @@ func (m *model) clearPublishFlow() {
 // at every step.
 func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 	switch m.mode {
+	case entryPublishDomain:
+		// Domain-capture assist (kata w131, ycv1 §4b): reached only when
+		// caddy.domain was blank, so the base domain is gathered inline instead
+		// of refusing the publish. esc aborts; enter validates the base domain,
+		// persists ONLY caddy.domain (targeted merge + .bak, OQ3) and then feeds
+		// the shared host-dialog continuation. Persisting BEFORE continuing is
+		// deliberate: we never open the host step against a domain that isn't on
+		// disk -- a save failure ABORTS rather than publishing an unpersisted
+		// domain.
+		switch msg.String() {
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		case "enter":
+			domain := strings.TrimSpace(m.publishInput.Value())
+			if !validPublishDomain(domain) {
+				return m.setErr(fmt.Sprintf("invalid base domain %q — enter a dotted public domain like example.com or apps.example.com", domain))
+			}
+			if err := m.cfg.SaveCaddyDomain(domain); err != nil {
+				m.clearPublishFlow()
+				return m.setErr("could not save caddy.domain: " + err.Error())
+			}
+			// SaveCaddyDomain persists to DISK ONLY -- mirror it in memory.
+			m.cfg.Caddy.Domain = domain
+			// Raise the parallel sticky setup-banner (ycv1 r3-NEW-1): the field
+			// is saved, but the user still owes *.<domain> DNS + a deployed edge.
+			m.domainSetupPending = true
+			return m.enterPublishHostDialog()
+		}
+		var cmd tea.Cmd
+		m.publishInput, cmd = m.publishInput.Update(msg)
+		return cmd
+
 	case entryPublishHost:
 		switch msg.String() {
 		case "esc":
@@ -2575,6 +2668,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A publish that auto-enabled serve proves the operator is set.
 		m.operatorNotSet = false
+		// A successful publish means the edge accepted the route -- the domain
+		// setup (DNS + a deployed edge) is demonstrably working, so retire the
+		// sticky setup reminder (kata w131).
+		m.domainSetupPending = false
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
 	case publishPollMsg:
@@ -2598,6 +2695,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.published = msg.published
 		m.publishReachable = true
+		// A successful poll reached the edge admin API -- a real edge is now
+		// working, so the domain-setup reminder has done its job (kata w131).
+		m.domainSetupPending = false
 		return m, m.rebuildItems()
 
 	case publishTickMsg:
@@ -2776,8 +2876,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// textinput fallthrough below -- so its keystrokes reach publishInput
 			// and never leak into labelInput.
 			switch m.mode {
-			case entryPublishHost, entryPublishAuth, entryPublishCredUser,
-				entryPublishCredPass, entryConfirmPublish:
+			case entryPublishDomain, entryPublishHost, entryPublishAuth,
+				entryPublishCredUser, entryPublishCredPass, entryConfirmPublish:
 				return m, m.updatePublishEntry(msg)
 			}
 			switch msg.String() {
@@ -5402,6 +5502,22 @@ func (m model) operatorHintText() string {
 	return fmt.Sprintf("⚠ tailscale operator not set — run once: sudo tailscale set --operator=%s  (then press r)  — or run tailport with sudo", you)
 }
 
+// domainSetupHintText returns the STICKY setup-reminder banner raised after the
+// `P` flow captures a blank caddy.domain inline (kata w131, ycv1 r3-NEW-1), or
+// "" when it isn't active (see m.domainSetupPending). It follows
+// operatorHintText's PATTERN -- sticky, single line, warnStyle at the render
+// site -- but is a SEPARATE, parallel slot: filling the config field is not the
+// same as doing the edge setup, so this reminds the user of the standing actions
+// the assist can't do for them (the *.<domain> wildcard DNS + a deployed edge).
+// Both banners can be active at once, which is why this is a distinct field/func
+// rather than a reuse of operatorNotSet.
+func (m model) domainSetupHintText() string {
+	if !m.domainSetupPending {
+		return ""
+	}
+	return fmt.Sprintf("⚠ domain saved — you still need *.%s DNS pointed at your edge, and the edge deployed (see docs/caddy-edge.md)", m.cfg.Caddy.Domain)
+}
+
 // listBodyHeight computes the vertical space available for the port grid/
 // list body: the current terminal height minus every reservation the bottom
 // bar (and now the grid's own page indicator) makes below it. Factored out
@@ -5444,15 +5560,19 @@ func (m model) listBodyHeight() int {
 	// cleanEnabled=true dominates -- see legendReservationLines and
 	// TestLegendReservationDominatesLive.
 	legendLines := m.legendReservationLines()
-	// Reserve the WORST-CASE operator-hint banner height too (kata tapv),
-	// unconditionally -- like cleanEnabled=true above, NOT gated on the
-	// CURRENT m.operatorNotSet. The banner can appear asynchronously (a
-	// failed toggle's toggleDoneMsg, or the startup detectOperatorMsg)
-	// with no fresh WindowSizeMsg in between, so sizing done here has to
-	// already assume the worst case or a later appearance would clip the
-	// list by one row. operatorHintText() is always exactly one line (no
-	// embedded newlines), so the reservation is a constant 1.
-	const bannerLines = 1
+	// Reserve the WORST-CASE sticky-banner height too, unconditionally -- like
+	// cleanEnabled=true above, NOT gated on the CURRENT banner state. There are
+	// now TWO independent single-line sticky banners that can each appear
+	// asynchronously with no fresh WindowSizeMsg in between: the operator-hint
+	// banner (kata tapv -- a failed toggle's toggleDoneMsg, or the startup
+	// detectOperatorMsg) and the domain-setup reminder (kata w131 -- raised when
+	// the P flow captures a blank caddy.domain). They are ORTHOGONAL and can be
+	// on at the SAME time, and View stacks both above the status line, so sizing
+	// here must assume the worst case of both live or a later appearance would
+	// clip the list. operatorHintText()/domainSetupHintText() are each always
+	// exactly one line (no embedded newlines), so the worst-case reservation is
+	// a constant 2.
+	const bannerLines = 2
 	// Reserve the persistent top header (one row) plus the bottom bar: one
 	// blank separator, the status line (now measured live -- see below,
 	// rather than a flat 1, since a wrapped flash toast can span multiple
@@ -5578,6 +5698,9 @@ func (m model) renderBottom() string {
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
+	case entryPublishDomain:
+		return helpStyle.Render(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort)) +
+			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")
 	case entryPublishHost:
 		return helpStyle.Render(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort)) +
 			m.publishInput.View() + helpStyle.Render("  (enter: next, esc: cancel)")
@@ -5608,12 +5731,18 @@ func (m model) renderBottom() string {
 		return strings.Join(lines, "\n")
 	}
 	bar := m.renderStatusLine()
-	// The sticky operator hint (kata tapv), when active, sits ABOVE the
-	// status line -- unlike the transient toast it never auto-dismisses, so
-	// it stays put through refreshes and keypresses that would otherwise
-	// clear m.flash. Styled via warnStyle (a NAMED style, not a hardcoded
-	// color) so it stays legible under any future light/dark AdaptiveColor
-	// conversion of that style.
+	// The sticky banners, when active, sit ABOVE the status line -- unlike the
+	// transient toast they never auto-dismiss, so they stay put through
+	// refreshes and keypresses that would otherwise clear m.flash. There are TWO
+	// independent ones (kata w131): the operator hint (kata tapv) and the
+	// domain-setup reminder; both are orthogonal and can show at once, so both
+	// are rendered here, stacked. Each is styled via warnStyle (a NAMED style,
+	// not a hardcoded color) so it stays legible under any future light/dark
+	// AdaptiveColor conversion of that style, and listBodyHeight's bannerLines
+	// reserves the worst case of both being live.
+	if hint := m.domainSetupHintText(); hint != "" {
+		bar = warnStyle.Render(hint) + "\n" + bar
+	}
 	if hint := m.operatorHintText(); hint != "" {
 		bar = warnStyle.Render(hint) + "\n" + bar
 	}

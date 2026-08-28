@@ -5377,26 +5377,55 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
-	// missing caddy.domain.
-	t.Run("no domain configured", func(t *testing.T) {
+	// blank caddy.domain: no longer refused -- it opens the inline
+	// domain-capture prompt (kata w131), and ONLY after all refuse-guards pass.
+	t.Run("blank domain opens capture prompt", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Domain = ""
-		m.requestPublish(8080)
-		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "caddy.domain") {
-			t.Errorf("no domain: mode=%v flash=%q (want refuse naming caddy.domain)", m.mode, m.flash)
+		if cmd := m.requestPublish(8080); cmd != nil {
+			t.Error("opening the domain-capture prompt should return a nil cmd")
 		}
-		if !strings.Contains(m.flash, "caddy-edge.md") {
-			t.Errorf("no-domain refusal should point at the docs; flash=%q", m.flash)
+		if m.mode != entryPublishDomain {
+			t.Errorf("blank domain: mode=%v flash=%q (want entryPublishDomain capture prompt)", m.mode, m.flash)
+		}
+		if m.publishPort != 8080 {
+			t.Errorf("blank domain: publishPort=%d, want 8080", m.publishPort)
 		}
 	})
 
-	// unresolvable caddy.hostname.
+	// unresolvable caddy.hostname: a blank hostname is refused (guard 7).
 	t.Run("no hostname configured", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Hostname = ""
 		m.requestPublish(8080)
 		if m.mode != entryNone || !strings.Contains(m.flash, "caddy.hostname") {
 			t.Errorf("no hostname: mode=%v flash=%q (want refuse naming caddy.hostname)", m.mode, m.flash)
+		}
+	})
+
+	// FQDN-shaped caddy.hostname: refused with the short-MagicDNS-label
+	// guidance (§4d) -- the edge admits only the short name, so an FQDN 403s.
+	t.Run("fqdn hostname refused", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Hostname = "caddy.tailnet.ts.net"
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError {
+			t.Errorf("fqdn hostname: mode=%v level=%v (want refuse)", m.mode, m.flashLevel)
+		}
+		if !strings.Contains(m.flash, "short MagicDNS label") {
+			t.Errorf("fqdn hostname refusal should name the short label; flash=%q", m.flash)
+		}
+	})
+
+	// The guard REORDER's whole point (ycv1 r1-#10): a locked port with a BLANK
+	// domain must be REFUSED for the lock, never prompted for a domain first.
+	t.Run("locked port with blank domain refused (not prompted)", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Domain = ""
+		m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Locked: true}
+		m.requestPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "locked") {
+			t.Errorf("locked+blank-domain: mode=%v flash=%q (want lock refusal, NOT a domain prompt)", m.mode, m.flash)
 		}
 	})
 
@@ -5476,6 +5505,230 @@ func TestPublishInvalidHostnameRefused(t *testing.T) {
 	}
 	if m.flashLevel != flashError {
 		t.Errorf("invalid hostname should raise an error toast; level=%v flash=%q", m.flashLevel, m.flash)
+	}
+}
+
+// TestValidPublishDomain pins the base-domain validator (kata w131): it reuses
+// caddyedge.ValidHostname (rejecting blank/"*.x") and ADDS a "must have a dot"
+// rule so a bare label can't become a bogus "label.foo" publish host, while
+// dotted public domains pass.
+func TestValidPublishDomain(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want bool
+	}{
+		{"example.com", true},
+		{"apps.example.com", true},
+		{"a.b.example.com", true},
+		{"foo", false},       // bare label -- no dot
+		{"localhost", false}, // bare label -- no dot
+		{"", false},          // blank
+		{"*.x", false},       // wildcard label is not LDH
+		{"http://x.com", false},
+		{"x.com:8080", false},
+		{"has space.com", false},
+	} {
+		if got := validPublishDomain(c.in); got != c.want {
+			t.Errorf("validPublishDomain(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPublishDomainCaptureHappyPath is the guard-reorder assist's happy path
+// (kata w131): a blank caddy.domain opens the inline capture prompt, a valid
+// domain is persisted (disk + memory), the flow advances into the SHARED host
+// dialog with the prefill rebuilt against the just-saved domain, and the
+// parallel sticky setup-banner goes active.
+func TestPublishDomainCaptureHappyPath(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.Domain = "" // force the capture path
+
+	m = mustUpdate(t, m, rkey("P"))
+	if m.mode != entryPublishDomain {
+		t.Fatalf("blank domain: mode=%v, want entryPublishDomain", m.mode)
+	}
+	if m.publishPort != 8080 {
+		t.Fatalf("publishPort=%d, want 8080", m.publishPort)
+	}
+
+	m = mustUpdate(t, m, rkey("apps.example.com"))
+	m = mustUpdate(t, m, enterKey)
+
+	// Persisted in memory...
+	if m.cfg.Caddy.Domain != "apps.example.com" {
+		t.Errorf("in-memory caddy.domain = %q, want apps.example.com", m.cfg.Caddy.Domain)
+	}
+	// ...and to disk (SaveCaddyDomain wrote to the isolated XDG config).
+	loaded, err := config.Load("")
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if loaded.Caddy.Domain != "apps.example.com" {
+		t.Errorf("persisted caddy.domain = %q, want apps.example.com", loaded.Caddy.Domain)
+	}
+	// Advanced into the shared host dialog, prefill rebuilt on the new domain.
+	if m.mode != entryPublishHost {
+		t.Fatalf("after domain save, mode=%v, want entryPublishHost", m.mode)
+	}
+	if got := m.publishInput.Value(); !strings.HasSuffix(got, ".apps.example.com") {
+		t.Errorf("host prefill = %q, want suffix .apps.example.com", got)
+	}
+	// The parallel sticky setup-banner is now active and names the domain.
+	if !m.domainSetupPending {
+		t.Error("domainSetupPending should be true after a domain capture")
+	}
+	if hint := m.domainSetupHintText(); !strings.Contains(hint, "*.apps.example.com") {
+		t.Errorf("domain-setup banner should name *.apps.example.com; got %q", hint)
+	}
+}
+
+// TestPublishDomainInvalidStaysOnPrompt: an invalid base domain at the capture
+// step stays on the prompt with an error and persists nothing (kata w131).
+func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
+	for _, bad := range []string{"foo", "*.x", ""} {
+		t.Run(bad, func(t *testing.T) {
+			m := newPublishModel(t, nil)
+			m.cfg.Caddy.Domain = ""
+			m = mustUpdate(t, m, rkey("P"))
+			if bad != "" {
+				m.publishInput.SetValue(bad)
+			}
+			m = mustUpdate(t, m, enterKey)
+			if m.mode != entryPublishDomain {
+				t.Errorf("invalid domain %q should stay on the capture step; mode=%v", bad, m.mode)
+			}
+			if m.flashLevel != flashError {
+				t.Errorf("invalid domain %q should raise an error toast; level=%v flash=%q", bad, m.flashLevel, m.flash)
+			}
+			if m.cfg.Caddy.Domain != "" {
+				t.Errorf("invalid domain %q must not persist a domain; got %q", bad, m.cfg.Caddy.Domain)
+			}
+			if m.domainSetupPending {
+				t.Errorf("invalid domain %q must not raise the setup banner", bad)
+			}
+		})
+	}
+}
+
+// TestPublishDomainEscAborts: esc at the domain-capture step aborts cleanly back
+// to entryNone, persisting nothing and raising no banner (kata w131).
+func TestPublishDomainEscAborts(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.Domain = ""
+	m = mustUpdate(t, m, rkey("P"))
+	if m.mode != entryPublishDomain {
+		t.Fatalf("setup: mode=%v, want entryPublishDomain", m.mode)
+	}
+	m = mustUpdate(t, m, escKey)
+	if m.mode != entryNone {
+		t.Errorf("esc at domain step -> mode %v, want entryNone", m.mode)
+	}
+	if m.publishPort != 0 {
+		t.Errorf("esc at domain step left publishPort=%d", m.publishPort)
+	}
+	if m.domainSetupPending {
+		t.Error("esc at domain step must not raise the setup banner")
+	}
+}
+
+// TestDomainSetupBannerClearsOnPublish: the sticky setup-banner is retired by a
+// successful publish and by a successful published-state poll (kata w131) -- a
+// real edge is then demonstrably working.
+func TestDomainSetupBannerClearsOnPublish(t *testing.T) {
+	t.Run("cleared on publishDoneMsg success", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.domainSetupPending = true
+		res, _ := m.Update(publishDoneMsg{port: 8080, err: nil})
+		if res.(model).domainSetupPending {
+			t.Error("a successful publish should clear domainSetupPending")
+		}
+	})
+	t.Run("cleared on publishPollMsg success", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.domainSetupPending = true
+		res, _ := m.Update(publishPollMsg{gen: 1, published: map[int]publishInfo{}})
+		if res.(model).domainSetupPending {
+			t.Error("a successful poll should clear domainSetupPending")
+		}
+	})
+}
+
+// TestTwoConcurrentBanners proves the two sticky banners are genuinely PARALLEL
+// (kata w131, ycv1 r3-NEW-1): with BOTH operatorNotSet and domainSetupPending
+// true, View renders both lines, and listBodyHeight reserves enough that neither
+// the banners nor the bottom bar clip.
+func TestTwoConcurrentBanners(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.cfg.Caddy.Domain = "apps.example.com"
+	m.operatorUser = "alice"
+	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"}}
+	m.showAllPorts = true
+	m.rebuildItems()
+	r, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = r.(model)
+	m.operatorNotSet = true
+	m.domainSetupPending = true
+
+	view := m.View()
+	if got := lipgloss.Height(view); got > m.height {
+		t.Errorf("View height %d > terminal height %d (both banners clip/overlap):\n%s", got, m.height, stripANSI(view))
+	}
+	plain := stripANSI(view)
+	if !strings.Contains(plain, "operator not set") {
+		t.Errorf("operator banner missing from View:\n%s", plain)
+	}
+	if !strings.Contains(plain, "domain saved") {
+		t.Errorf("domain-setup banner missing from View:\n%s", plain)
+	}
+	if !strings.Contains(plain, "q quit") {
+		t.Errorf("bottom bar clipped with both banners live:\n%s", plain)
+	}
+}
+
+// TestBannerReservationDominatesBothLive mirrors TestOperatorHintSizingNoClip
+// but exercises BOTH sticky banners appearing after the last resize (kata w131):
+// the worst-case bannerLines reservation (now 2) must cover both live at once so
+// a late appearance never clips the list.
+func TestBannerReservationDominatesBothLive(t *testing.T) {
+	build := func(w, h int, opAtRender, domAtRender bool) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.cfg.Caddy.Domain = "apps.example.com"
+		m.operatorUser = "alice"
+		m.allPorts = []portscan.Port{
+			{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"},
+			{Number: 9000, Process: "api"}, {Number: 5173, Process: "vite"},
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		// Both banners OFF at resize time, then flipped on AFTER -- the reservation
+		// must already cover the worst case.
+		r, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		m = r.(model)
+		m.operatorNotSet = opAtRender
+		m.domainSetupPending = domAtRender
+		return m
+	}
+	for _, tc := range []struct {
+		name        string
+		w, h        int
+		opOn, domOn bool
+	}{
+		{"wide/both", 100, 24, true, true},
+		{"narrow/both", 58, 24, true, true},
+		{"wide/op-only", 100, 24, true, false},
+		{"wide/dom-only", 100, 24, false, true},
+		{"narrow/dom-only", 58, 24, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := build(tc.w, tc.h, tc.opOn, tc.domOn)
+			view := m.View()
+			if got := lipgloss.Height(view); got > m.height {
+				t.Errorf("View height %d > terminal height %d (clip/overlap):\n%s", got, m.height, stripANSI(view))
+			}
+			if plain := stripANSI(view); !strings.Contains(plain, "q quit") {
+				t.Errorf("bottom bar clipped:\n%s", plain)
+			}
+		})
 	}
 }
 
