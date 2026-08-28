@@ -675,10 +675,19 @@ type publishInfo struct {
 // handler MIRRORS toggleDoneMsg: it clears m.pending and, rather than hand-set
 // the published map from the op's outcome, always re-fetches (refresh +
 // pollPublishedCmd) so the UI reflects Caddy's actual state, not an optimistic
-// guess.
+// guess. unpublish distinguishes which op produced this outcome (kata vsx4 #1):
+// unpublishCmd sets it true, publishCmd leaves it false (its zero value). This
+// matters because Unpublish can also return caddyedge.ErrHostnameConflict
+// (caddyedge.go) -- without the flag an unpublish outcome would be
+// indistinguishable from a publish one and could walk the ErrHostnameConflict
+// branch below, classifying the STALE m.pendingPublish from a prior publish and
+// potentially RE-PUBLISHING during what the user asked to be a de-escalation.
+// The handler gates that branch on !unpublish so an unpublish conflict always
+// falls through to a plain error toast.
 type publishDoneMsg struct {
-	port int
-	err  error
+	port      int
+	err       error
+	unpublish bool
 }
 
 // inspectConflictMsg carries the read-only classification of a hostname conflict
@@ -1612,17 +1621,19 @@ func publishCmd(client *caddyedge.Client, hostname, label string, port int, auth
 // public route leaves the tailnet serve mapping exactly as it was.
 func unpublishCmd(client *caddyedge.Client, hostname, label string, port int) tea.Cmd {
 	return func() tea.Msg {
-		return publishDoneMsg{port: port, err: client.Unpublish(context.Background(), hostname, label, port)}
+		return publishDoneMsg{port: port, err: client.Unpublish(context.Background(), hostname, label, port), unpublish: true}
 	}
 }
 
 // inspectConflictCmd classifies a hostname conflict read-only (kata qfbf): it
 // calls caddyedge.InspectConflict and returns an inspectConflictMsg so the model
 // can render a specific refusal (or, on Kind==None, retry once). Nothing is
-// mutated — this is a pure classification read.
-func inspectConflictCmd(client *caddyedge.Client, port int, hostname string) tea.Cmd {
+// mutated — this is a pure classification read. wantLabel/wantPort (kata vsx4
+// #2) name the backend we're trying to publish, so InspectConflict can notice
+// the live route already matches it and return None instead of a stale refusal.
+func inspectConflictCmd(client *caddyedge.Client, port int, hostname, wantLabel string, wantPort int) tea.Cmd {
 	return func() tea.Msg {
-		info, err := client.InspectConflict(context.Background(), hostname)
+		info, err := client.InspectConflict(context.Background(), hostname, wantLabel, wantPort)
 		return inspectConflictMsg{port: port, hostname: hostname, info: info, err: err}
 	}
 }
@@ -2911,7 +2922,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.operatorNotSet = true
 				return m, tea.Batch(refresh, m.pollPublishedCmd())
 			}
-			if errors.Is(msg.err, caddyedge.ErrHostnameConflict) {
+			if !msg.unpublish && errors.Is(msg.err, caddyedge.ErrHostnameConflict) {
 				// The publish collided with a hostname the shared edge already
 				// holds (kata qfbf). Don't dump Caddy's raw message: classify it
 				// read-only (naming the holder) and refuse specifically, via a
@@ -2921,12 +2932,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// the status line still reads busy -- until inspectConflictMsg
 				// clears it. Fall back to the bare toast only if the attempted
 				// hostname was somehow lost (confirmPublish always sets it).
+				//
+				// Gated on !msg.unpublish (kata vsx4 #1): Unpublish can ALSO return
+				// ErrHostnameConflict, and m.pendingPublish is never cleared on this
+				// path (only on a terminal outcome below), so without the gate an
+				// unpublish's conflict would classify a STALE prior publish's
+				// hostname and, on Kind==None, RE-PUBLISH -- re-exposing a port the
+				// user asked to de-escalate. An unpublish conflict always falls
+				// through to the plain error toast instead.
 				if m.pendingPublish.hostname != "" {
 					m.pending = msg.port
-					return m, inspectConflictCmd(m.caddyClient(), msg.port, m.pendingPublish.hostname)
+					return m, inspectConflictCmd(m.caddyClient(), msg.port, m.pendingPublish.hostname, shortLabel(m.fqdn), msg.port)
 				}
 				return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
 			}
+			// Terminal, non-conflict outcome (kata vsx4 #1): clear the carry so a
+			// stale pendingPublish from THIS attempt can't be read by some later,
+			// unrelated op.
+			m.pendingPublish = pendingPublish{}
 			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
 		}
 		// A publish that auto-enabled serve proves the operator is set.
@@ -2935,6 +2958,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// setup (DNS + a deployed edge) is demonstrably working, so retire the
 		// sticky setup reminder (kata w131).
 		m.domainSetupPending = false
+		// Terminal success (kata vsx4 #1): clear the carry -- see the note on the
+		// non-conflict error branch above.
+		m.pendingPublish = pendingPublish{}
 		if tookOver != "" {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over.
@@ -3016,14 +3042,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// ladder: a route approved as owned must never be deleted under only
 				// the normal confirm once it became foreign.
 				m.pending = msg.port
-				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname)
+				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname, shortLabel(m.fqdn), msg.port)
 			case errors.Is(msg.err, caddyedge.ErrNoConflict):
 				// The conflict cleared before we deleted anything. Reuse the qfbf None
 				// path: re-classify, which returns None and retries the plain publish
 				// once (bounded). retried starts false on this fresh pendingPublish.
 				m.pendingPublish.retried = false
 				m.pending = msg.port
-				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname)
+				return m, inspectConflictCmd(m.caddyClient(), msg.port, msg.hostname, shortLabel(m.fqdn), msg.port)
 			default:
 				// ErrUnreachable / ErrConcurrentUpdate / any other: a toast, nothing
 				// half-done. The (possibly) deleted route, if any, is reflected by the

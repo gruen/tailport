@@ -854,7 +854,7 @@ func TestInspectConflictOwnedDiffBackend(t *testing.T) {
 	existing := BuildRoute("myapp.example.com", "other-box", 3000, nil)
 	c, f := newFake(t, existing)
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -875,6 +875,48 @@ func TestInspectConflictOwnedDiffBackend(t *testing.T) {
 	}
 }
 
+// TestInspectConflictBackendAlreadyMatchesWanted (kata vsx4 #2): our @id already
+// holds the hostname, its matcher is still exactly ours, and its backend is
+// EXACTLY the one the caller is trying to publish (wantLabel:wantPort). Between
+// the failed Publish and this classification read, the live route changed to
+// point at the requested backend -- there is no conflict left to refuse, so
+// Kind must be None (letting the caller's bounded retry PATCH it, applying its
+// config) rather than a stale OwnedDiffBackend refusal. A route pointing
+// elsewhere must still classify OwnedDiffBackend, unchanged.
+func TestInspectConflictBackendAlreadyMatchesWanted(t *testing.T) {
+	t.Run("backend now matches -> None", func(t *testing.T) {
+		existing := BuildRoute("myapp.example.com", "dev-box", 8080, nil)
+		c, f := newFake(t, existing)
+
+		info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
+		if err != nil {
+			t.Fatalf("InspectConflict: %v", err)
+		}
+		if info.Kind != None {
+			t.Errorf("Kind = %v, want None (live route already matches the requested backend)", info.Kind)
+		}
+		if f.mutations != 0 {
+			t.Errorf("InspectConflict is read-only, got %d mutations", f.mutations)
+		}
+	})
+
+	t.Run("backend points elsewhere -> still OwnedDiffBackend", func(t *testing.T) {
+		existing := BuildRoute("myapp.example.com", "other-box", 3000, nil)
+		c, _ := newFake(t, existing)
+
+		info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
+		if err != nil {
+			t.Fatalf("InspectConflict: %v", err)
+		}
+		if info.Kind != OwnedDiffBackend {
+			t.Errorf("Kind = %v, want OwnedDiffBackend (backend does not match wanted)", info.Kind)
+		}
+		if info.Label != "other-box" || info.Port != 3000 {
+			t.Errorf("backend = %s:%d, want other-box:3000 (the LIVE holder, not the wanted backend)", info.Label, info.Port)
+		}
+	})
+}
+
 // TestInspectConflictIdHijacked is the two-read core (design r2-M1): our @id was
 // re-pointed by a foreign edit to a DIFFERENT, non-overlapping host. A plain
 // overlap scan for the requested name would miss it (so the old "nothing
@@ -885,7 +927,7 @@ func TestInspectConflictIdHijacked(t *testing.T) {
 	stale.Match = []Match{{Host: []string{"evil.example.com"}}} // @id kept, matcher repointed
 	c, f := newFake(t, stale)
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -918,7 +960,7 @@ func TestInspectConflictForeignOverlap(t *testing.T) {
 	}
 	c, _ := newFake(t, foreign)
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -946,7 +988,7 @@ func TestInspectConflictIdlessForeignOverlap(t *testing.T) {
 	}
 	c, _ := newFake(t, foreign)
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -981,7 +1023,7 @@ func TestInspectConflictFindsNonProxyForeign(t *testing.T) {
 		t.Fatalf("List should skip the non-proxy route, got %+v", infos)
 	}
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -1010,7 +1052,7 @@ func TestInspectConflictCaseAndWildcard(t *testing.T) {
 			Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}}}},
 		}
 		c, _ := newFake(t, foreign)
-		info, err := c.InspectConflict(context.Background(), "app.example.com")
+		info, err := c.InspectConflict(context.Background(), "app.example.com", "dev-box", 8080)
 		if err != nil {
 			t.Fatalf("InspectConflict: %v", err)
 		}
@@ -1026,7 +1068,7 @@ func TestInspectConflictCaseAndWildcard(t *testing.T) {
 			Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "192.0.2.9:8080"}}}},
 		}
 		c, _ := newFake(t, foreign)
-		info, err := c.InspectConflict(context.Background(), "app.example.com")
+		info, err := c.InspectConflict(context.Background(), "app.example.com", "dev-box", 8080)
 		if err != nil {
 			t.Fatalf("InspectConflict: %v", err)
 		}
@@ -1044,7 +1086,7 @@ func TestInspectConflictNone(t *testing.T) {
 	other := BuildRoute("unrelated.example.com", "some-box", 4000, nil)
 	c, _ := newFake(t, other)
 
-	info, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	info, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if err != nil {
 		t.Fatalf("InspectConflict: %v", err)
 	}
@@ -1062,7 +1104,7 @@ func TestInspectConflictUnreachable(t *testing.T) {
 	srv.Close()
 	c.AdminURL = closedURL
 
-	_, err := c.InspectConflict(context.Background(), "myapp.example.com")
+	_, err := c.InspectConflict(context.Background(), "myapp.example.com", "dev-box", 8080)
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
 	}
@@ -1077,7 +1119,7 @@ func TestPurgeConflictOwnedDeletesByID(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil)) // OwnedDiffBackend
 
-	info, err := c.InspectConflict(context.Background(), host)
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	if err != nil || info.Kind != OwnedDiffBackend {
 		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
 	}
@@ -1115,7 +1157,7 @@ func TestPurgeConflictIdlessForeignDeletesByIndex(t *testing.T) {
 	}
 	c, f := newFake(t, foreign)
 
-	info, err := c.InspectConflict(context.Background(), host)
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	if err != nil || info.Kind != ForeignOverlap || info.ID != "" {
 		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want id-less ForeignOverlap", info.Kind, info.ID, err)
 	}
@@ -1144,7 +1186,7 @@ func TestPurgeConflictByteFaithfulCapture(t *testing.T) {
 	seed := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"hand-edited"}}`)
 	c, _ := newFakeRaw(t, seed)
 
-	info, err := c.InspectConflict(context.Background(), host)
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	if err != nil || info.Kind != OwnedDiffBackend {
 		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
 	}
@@ -1166,7 +1208,7 @@ func TestPurgeConflictByteFaithfulCapture(t *testing.T) {
 func TestPurgeConflictNoConflictWhenCleared(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	expect := ExpectFromConflict(info)
 
 	f.mu.Lock()
@@ -1188,7 +1230,7 @@ func TestPurgeConflictNoConflictWhenCleared(t *testing.T) {
 func TestPurgeConflictOwnedBackendSwapChanged(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	expect := ExpectFromConflict(info) // pins other-box:9090
 
 	swapped, _ := json.Marshal(BuildRoute(host, "sneaky-box", 1234, nil)) // same @id, new backend
@@ -1211,7 +1253,7 @@ func TestPurgeConflictOwnedBackendSwapChanged(t *testing.T) {
 func TestPurgeConflictOwnedToForeignChanged(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	expect := ExpectFromConflict(info) // Owned=true
 
 	foreignified := BuildRoute(host, "other-box", 9090, nil)
@@ -1236,7 +1278,7 @@ func TestPurgeConflictOwnedToForeignChanged(t *testing.T) {
 func TestPurgeConflict412ThenSucceedByID(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	f.force412 = 1 // first DELETE loses the race, the retry wins
 
 	if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); err != nil {
@@ -1263,7 +1305,7 @@ func TestPurgeConflict412ThenSucceedByIndex(t *testing.T) {
 		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.1:80"}}}},
 	}
 	c, f := newFake(t, foreign)
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	f.force412 = 1
 
 	if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); err != nil {
@@ -1394,7 +1436,7 @@ func TestPurgeConflictRawHashIdlessForeign(t *testing.T) {
 func TestPurgeConflictConcurrentUpdateExhausted(t *testing.T) {
 	const host = "app.example.com"
 	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
-	info, _ := c.InspectConflict(context.Background(), host)
+	info, _ := c.InspectConflict(context.Background(), host, "dev-box", 8080)
 	f.force412 = maxRetries + 2
 
 	_, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))

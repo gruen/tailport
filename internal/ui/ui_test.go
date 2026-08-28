@@ -5654,6 +5654,20 @@ func TestDomainSetupBannerClearsOnPublish(t *testing.T) {
 	})
 }
 
+// TestPublishSuccessClearsPendingPublish (kata vsx4 #1): a successful publish is
+// a TERMINAL outcome, so it clears m.pendingPublish -- otherwise the carry from
+// this attempt could linger and be misread by some later, unrelated op (the
+// vsx4 #1 class of bug).
+func TestPublishSuccessClearsPendingPublish(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080, withAuth: true}
+	res, _ := m.Update(publishDoneMsg{port: 8080, err: nil})
+	got := res.(model)
+	if got.pendingPublish != (pendingPublish{}) {
+		t.Errorf("a successful publish should clear pendingPublish; got %+v", got.pendingPublish)
+	}
+}
+
 // TestTwoConcurrentBanners proves the two sticky banners are genuinely PARALLEL
 // (kata w131, ycv1 r3-NEW-1): with BOTH operatorNotSet and domainSetupPending
 // true, View renders both lines, and listBodyHeight reserves enough that neither
@@ -6116,8 +6130,60 @@ func TestUnpublishCmdRoundTrip(t *testing.T) {
 	if !ok || msg.err != nil {
 		t.Fatalf("unpublish cmd = %#v, want a clean publishDoneMsg", msg)
 	}
+	if !msg.unpublish {
+		t.Error("unpublishCmd's publishDoneMsg must set unpublish=true (kata vsx4 #1)")
+	}
 	if _, still := fc.routes[rt.ID]; still {
 		t.Error("unpublish should have deleted the route")
+	}
+}
+
+// TestUnpublishConflictNeverRepublishes is the vsx4 #1 HIGH regression: an
+// unpublish whose Unpublish call returns caddyedge.ErrHostnameConflict (a real
+// possibility -- caddyedge.go) must NEVER walk the publish conflict/retry path,
+// even with a STALE m.pendingPublish left over from some earlier, unrelated
+// publish attempt (m.pendingPublish is never cleared on the non-terminal
+// conflict/inspect/purge branches, so a prior attempt's carry can genuinely
+// still be sitting there). Before the fix, publishDoneMsg had no way to tell an
+// unpublish outcome from a publish one, so this classified the STALE hostname
+// and, on Kind==None, re-published -- re-exposing a port the user asked to
+// de-escalate. The fix gates the conflict branch on !msg.unpublish, so this
+// must fall straight through to a plain error toast: no inspectConflictCmd, no
+// publishCmd.
+func TestUnpublishConflictNeverRepublishes(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: "stale.example.com", label: "dev-box", port: 9999, withAuth: true}
+	m.pending = 8080
+
+	res, cmd := m.Update(publishDoneMsg{port: 8080, err: caddyedge.ErrHostnameConflict, unpublish: true})
+	got := res.(model)
+
+	if got.pending != 0 {
+		t.Errorf("an unpublish outcome should clear pending; got %d", got.pending)
+	}
+	if got.pendingPublish != (pendingPublish{}) {
+		t.Errorf("pendingPublish should be cleared on this terminal outcome; got %+v", got.pendingPublish)
+	}
+	if got.flashLevel != flashError || got.flash != publishErrText(caddyedge.ErrHostnameConflict) {
+		t.Errorf("an unpublish conflict should raise the PLAIN error toast; flash=%q level=%v", got.flash, got.flashLevel)
+	}
+
+	if cmd == nil {
+		t.Fatal("expected a cmd (toast + refresh + poll)")
+	}
+	// The classify/re-publish path (the bug) returns inspectConflictCmd BARE --
+	// not wrapped in tea.Batch -- so cmd() would be a direct inspectConflictMsg.
+	// The fixed, gated path always falls through to the plain-toast return,
+	// which batches setErr+refresh+pollPublishedCmd. Assert the shape without
+	// invoking the individual sub-cmds (refresh/poll do real local/network
+	// I/O that has no place in this unit test).
+	switch msg := cmd().(type) {
+	case inspectConflictMsg:
+		t.Fatalf("unpublish conflict must NOT classify/inspect; got a direct inspectConflictMsg cmd %#v", msg)
+	case tea.BatchMsg:
+		// expected: the plain-toast branch's batched refresh/toast/poll.
+	default:
+		t.Fatalf("unexpected cmd result type %T (%#v)", msg, msg)
 	}
 }
 

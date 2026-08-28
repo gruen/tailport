@@ -672,7 +672,10 @@ func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int
 // InspectConflict classifies why a publish of hostname collided, WITHOUT
 // mutating anything (kata qfbf; design §3.1). The UI calls it after Publish
 // returns ErrHostnameConflict, to name the holder and (in a later pillar) branch
-// to force-purge. It does TWO reads:
+// to force-purge. wantLabel/wantPort (kata vsx4 #2) name the backend the CALLER
+// is trying to publish -- InspectConflict doesn't otherwise know this, and a
+// route that changed to point at exactly this backend between the failed
+// Publish and this read is no longer a conflict at all. It does TWO reads:
 //
 //  1. fetchByID(IDFor(hostname)) — if our @id exists but its matcher is NOT
 //     exactly our hostname, a foreign edit re-pointed it (possibly to a
@@ -680,8 +683,10 @@ func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int
 //     MISS this and the old "retry on no overlap" rule would livelock, so this
 //     is classified IdHijacked (carrying where it now points) and refused, never
 //     retried, never blindly deleted. If the @id exists and its matcher IS ours,
-//     the only reason Publish refused is a different backend/port →
-//     OwnedDiffBackend.
+//     Publish refused only because of the backend: if the live backend now
+//     equals wantLabel:wantPort, the route already matches what we'd publish —
+//     Kind=None lets the caller's bounded retry PATCH it (applying the caller's
+//     config, e.g. auth) instead of falsely refusing. Otherwise OwnedDiffBackend.
 //  2. a raw host-overlap scan of the shared routes array (reusing hostsOverlap)
 //     for the foreign-overlap case. This walks the raw routes and matches on the
 //     host matcher ALONE, so it SEES routes List would drop — a foreign
@@ -689,7 +694,7 @@ func (c *Client) Unpublish(ctx context.Context, hostname, label string, port int
 //
 // If our @id is clean and nothing overlaps, Kind==None: the conflict cleared and
 // the caller may retry the plain publish once.
-func (c *Client) InspectConflict(ctx context.Context, hostname string) (ConflictInfo, error) {
+func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string, wantPort int) (ConflictInfo, error) {
 	hostname = canonHost(hostname)
 	id := IDFor(hostname)
 
@@ -710,9 +715,16 @@ func (c *Client) InspectConflict(ctx context.Context, hostname string) (Conflict
 			return info, nil
 		}
 		// Our @id, matcher still exactly our hostname. Publish only refuses such a
-		// route for a different backend/port, so this is OwnedDiffBackend. (A
-		// backend that actually matched would have PATCHed cleanly; an unparseable
-		// backend surfaces as BackendParseable==false but is still owned.)
+		// route for a different backend/port, so this is OwnedDiffBackend — UNLESS
+		// the live backend already equals the one the caller wants to publish, in
+		// which case the conflict has resolved itself (e.g. another retry of ours,
+		// or a concurrent identical publish, already won) and there is nothing left
+		// to refuse: Kind=None so the caller retries and PATCHes it. (A backend that
+		// actually matched at Publish-time would have PATCHed cleanly there; an
+		// unparseable backend surfaces as BackendParseable==false but is still owned.)
+		if label, port, ok := backendOf(route); ok && label == wantLabel && port == wantPort {
+			return ConflictInfo{Kind: None}, nil
+		}
 		info := ConflictInfo{Kind: OwnedDiffBackend, Owned: true, ID: route.ID, Handler: firstHandler(route)}
 		if label, port, ok := backendOf(route); ok {
 			info.Label, info.Port, info.BackendParseable = label, port, true
