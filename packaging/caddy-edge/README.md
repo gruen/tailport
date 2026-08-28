@@ -64,13 +64,15 @@ which would 403 against the unmodified default.
 The tracked template widens `admin.origins` with a placeholder token,
 `__TAILPORT_ADMIN_ORIGIN__`, alongside the `localhost`/`127.0.0.1` entries — no
 tailnet name, no hostname, valid JSON exactly as committed. `entrypoint.sh`
-fills that token in from env, in-shell, right before `caddy run`: the token
-becomes `$TS_HOSTNAME:$CADDY_ADMIN_PORT` (tailport's actual admin `Host`), and
-every literal `:2019` in the template — `admin.listen` plus the
-`localhost`/`127.0.0.1` origins — is repointed at the real admin port in the
+fills that token in from env, in-shell, right before `caddy run`: every literal
+`:2019` in the template — `admin.listen` plus the `localhost`/`127.0.0.1`
+origins — is repointed at the real admin port, and the token becomes
+`$TS_HOSTNAME:$CADDY_ADMIN_PORT` (tailport's actual admin `Host`) — both in the
 same pass (a no-op if `CADDY_ADMIN_PORT` is left at its default). See the `sed`
 step and its comment in `entrypoint.sh` for the exact substitution and why the
-order (token first, `:2019` second) matters.
+order (`:2019` port rewrite first, token injection second) matters — the token
+already expands to `<host>:<CADDY_ADMIN_PORT>`, so injecting it last keeps the
+`:2019` rewrite from mangling it when the admin port itself begins with `2019`.
 
 There is nothing to fill in before building the image — the tracked
 `bootstrap-caddy.json.example` is exactly what `docker build`/`fly deploy` bake
@@ -80,13 +82,16 @@ autosave then carries that live config forward across restarts (`--resume`,
 see [`docs/caddy-edge.md`](../../docs/caddy-edge.md)'s "Updating the edge"
 section), it stays correct without re-templating on every boot.
 
-**Known limitation:** if you later change `caddy.hostname`/`TS_HOSTNAME`
-*after* the edge has already booted once, the autosave still holds the old
-origin — the entrypoint only templates a fresh `admin.origins` into a true
-first-boot config, never into the resumed one. Recovery is the existing
-edge-reset procedure (docs/caddy-edge.md's "Updating the edge" section: clear
-the autosave file or recreate the volume), not something this templating
-re-does automatically.
+**Known limitation:** if you later change `caddy.hostname`/`TS_HOSTNAME` **or**
+`caddy.admin_port`/`CADDY_ADMIN_PORT` *after* the edge has already booted once,
+the autosave still holds the old values — the entrypoint only templates a fresh
+`admin.listen`/`admin.origins` into a true first-boot config, never into the
+resumed one. A stale hostname 403s tailport's admin requests; a stale admin
+port leaves `tailscale serve` forwarding to the new port while resumed Caddy
+still listens on the old one, so the admin API goes unreachable. Recovery for
+either is the existing edge-reset procedure (docs/caddy-edge.md's "Updating the
+edge" section: clear the autosave file or recreate the volume), not something
+this templating re-does automatically.
 
 ## Building and deploying
 
