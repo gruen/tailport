@@ -226,16 +226,19 @@ caddy:
 
 Set **`domain`** to the base whose DNS you pointed at the edge in step 3, at the
 wildcard depth you actually publish at (`*.apps.example.com` → `domain:
-apps.example.com`). Until it's set, `P` refuses with an error naming this field
-and the background published-state poll stays off (zero cost until you opt in).
+apps.example.com`). While it's blank the background published-state poll stays
+off (zero cost until you opt in); you don't have to hand-edit it, though —
+pressing `P` on a port with a blank `domain` prompts for it inline and saves it
+for you (a targeted write that preserves the rest of the file), then continues
+the publish.
 
 tailport writes this block with commented defaults the first time it saves the
 config, so normally you only edit the `domain:` line. **If your `config.yaml`
 predates the publish feature the block won't be there yet** — trigger one save
 with any change that writes the file (favouriting or labelling a port), or
-paste the block above in by hand, then set `domain:`. (Publishing a port can't
-seed it: `P` is refused while `domain` is blank, which is exactly the state
-you're in.) Full field reference: the root README's
+paste the block above in by hand, then set `domain:`. Publishing can also seed
+it: pressing `P` with a blank `domain` captures it inline and saves it rather
+than refusing. Full field reference: the root README's
 [Configuration](../README.md#configuration) section.
 
 `hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
