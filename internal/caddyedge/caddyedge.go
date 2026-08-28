@@ -91,6 +91,13 @@ var (
 	// re-classify and re-confirm with the correct (possibly scarier) ladder rather
 	// than delete a route approved under a now-stale, weaker confirm.
 	ErrConflictChanged = errors.New("the conflicting route changed since it was classified")
+	// ErrEdgeNoIfMatch means the edge returned no ETag on the read guarding a
+	// force-delete, so the If-Match optimistic-concurrency guard the delete relies
+	// on is absent (Caddy first shipped ETag/If-Match in 2.5.2; an older edge
+	// IGNORES If-Match, turning every conditional delete into an UNCONDITIONAL one
+	// that a concurrent array shift could point at the wrong route). PurgeConflict
+	// refuses to force-delete rather than clobber blind. See docs/caddy-edge.md.
+	ErrEdgeNoIfMatch = errors.New("edge did not return an ETag; refusing to force-delete — requires Caddy >= 2.5.2")
 )
 
 // BasicAuth is a single http_basic credential for the edge. Hash is a bcrypt
@@ -297,6 +304,14 @@ type ConflictInfo struct {
 	// "static_response"), used to name a non-proxy foreign route the backend
 	// dial can't.
 	Handler string
+	// Hosts is the holder's FULL host-matcher list (every host pattern across
+	// every match block), populated for a ForeignOverlap so the UI can disclose
+	// the true blast radius of a force-purge (kata 6n15 / roborev hped #3): a
+	// foreign route matching a bare "*" catch-all, a "*.suffix" wildcard, or
+	// several hostnames serves more than the one requested, and the confirm must
+	// name every pattern so the user isn't deleting unrelated public hostnames
+	// blind. Empty for a route with no host matcher.
+	Hosts []string
 }
 
 // canonHost canonicalizes a public hostname for identity and comparison. DNS
@@ -484,6 +499,33 @@ func (c *Client) fetchByID(ctx context.Context, id string) (route Route, etag st
 		return Route{}, "", false, fmt.Errorf("parsing caddy route: %w", err)
 	}
 	return route, etag, true, nil
+}
+
+// fetchByIDRaw GETs /id/<id> as RAW JSON bytes plus the id-scope Etag. It is the
+// raw-fidelity twin of fetchByID, used by PurgeConflict's /id delete path so the
+// re-verify and the capture both run over the FRESH id-read bytes (roborev hped
+// #1) — not the stale array bytes read moments earlier. The returned raw is a
+// copy the caller owns (byte-faithful even for fields tailport doesn't model);
+// found is false on 404 (the route vanished between the array read and now).
+func (c *Client) fetchByIDRaw(ctx context.Context, id string) (raw json.RawMessage, etag string, found bool, err error) {
+	body, status, etag, err := c.do(ctx, http.MethodGet, c.idURL(id), nil, "")
+	if err != nil {
+		return nil, "", false, err
+	}
+	if status == http.StatusNotFound {
+		return nil, "", false, nil
+	}
+	if status < 200 || status >= 300 {
+		return nil, "", false, c.statusError(status, body)
+	}
+	// Unmarshal into a RawMessage to trim any transport framing (e.g. an
+	// encoder's trailing newline) while preserving the element's exact value
+	// bytes — the same normalization fetchRoutesRaw's elements get, so a capture
+	// taken here is byte-comparable to one taken from the array read.
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, "", false, fmt.Errorf("parsing caddy route: %w", err)
+	}
+	return raw, etag, true, nil
 }
 
 // fetchRoutes GETs the shared routes array and returns it with the array's Etag
@@ -747,6 +789,9 @@ func (c *Client) InspectConflict(ctx context.Context, hostname, wantLabel string
 			Owned:   strings.HasPrefix(r.ID, idPrefix),
 			ID:      r.ID,
 			Handler: firstHandler(r),
+			// Carry the full host-matcher list so the UI can name the blast radius
+			// of a wildcard/multi-host foreign route (roborev hped #3).
+			Hosts: matcherHostList(r),
 		}
 		if label, port, ok := backendOf(r); ok {
 			info.Label, info.Port, info.BackendParseable = label, port, true
@@ -849,16 +894,33 @@ func (e PurgeExpect) matches(r Route, raw json.RawMessage) bool {
 // behind the UI's escalated confirm ladders.
 //
 // Each attempt (≤ maxRetries) re-reads the shared routes array with a FRESH
-// path-scoped etag, re-locates the host-overlapping route, and re-verifies it
-// still matches expect — the identity classified at confirm time. If nothing
-// overlaps → ErrNoConflict; if the live route drifted from expect (an
-// owned→foreign escalation or an owned backend swap) → ErrConflictChanged. Only
-// then does it capture the exact raw element bytes and delete: by /id/<id> under
-// the id-scope etag when the route carries an @id (stable across index shifts),
-// else by DELETE .../routes/<index> under the routes-array etag (the id-less
-// foreign case; the parent-scope If-Match re-hashes the whole array, so any
-// concurrent add/remove/reorder → 412 → re-read). A 412 or a vanished route
-// re-reads and retries; the retry budget exhausting yields ErrConcurrentUpdate.
+// path-scoped etag and re-locates the route the user actually approved BY ITS
+// IDENTITY, not by first host-overlap (roborev hped #4): by @id when expect.ID
+// is set, else by exact-bytes hash when expect.RawHash is set, else (a foreign
+// route classified with neither) by first overlap. Locating by identity means a
+// foreign route that merely PRECEDES the approved owned route in the array can no
+// longer be re-located and rejected in an endless re-classify loop. If the
+// expected route is gone but something still overlaps → ErrConflictChanged (the
+// holder changed — re-classify); if nothing overlaps at all → ErrNoConflict.
+//
+// It then re-verifies the located route still matches expect and deletes:
+//
+//   - By /id/<id> when the route carries an @id. Here it re-reads the route as
+//     RAW bytes under its own id-scope etag (roborev hped #1): the re-verify and
+//     the CAPTURE both run over those FRESH id-read bytes, and — because an owned
+//     route's matcher is always exactly its hostname — the fresh matcher must
+//     still be ours (hostMatcherIs) for an owned route, or at least still overlap
+//     for a foreign one. An @id re-pointed to a different (or widened) host
+//     between the array read and the id read thus fails here → ErrConflictChanged,
+//     nothing deleted; and the captured bytes are the ones actually deleted.
+//   - By DELETE .../routes/<index> under the routes-array etag for a truly
+//     id-less foreign route; the parent-scope If-Match re-hashes the whole array,
+//     so any concurrent add/remove/reorder → 412 → re-read.
+//
+// If the guarding ETag is absent (a pre-2.5.2 edge that ignores If-Match, turning
+// the delete unconditional) it REFUSES with ErrEdgeNoIfMatch rather than clobber
+// blind (roborev hped #6). A 412 or a vanished route re-reads and retries; the
+// retry budget exhausting yields ErrConcurrentUpdate.
 func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect PurgeExpect) (Captured, error) {
 	hostname = canonHost(hostname)
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -867,51 +929,72 @@ func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect Purg
 			return Captured{}, err
 		}
 
-		idx := -1
-		var raw json.RawMessage
-		var route Route
-		for i, elem := range raws {
-			var r Route
-			if err := json.Unmarshal(elem, &r); err != nil {
-				continue // an element we can't even decode can't be our overlap
-			}
-			if routeOverlaps(r, hostname) {
-				idx, raw, route = i, elem, r
-				break
-			}
-		}
+		// Locate the approved route BY IDENTITY (roborev hped #4), not first
+		// overlap: an @id-identified route by its @id, an id-less foreign route
+		// pinned by RawHash by that hash, else (no stable identity carried) by first
+		// host-overlap.
+		idx := locateByExpect(raws, hostname, expect)
 		if idx < 0 {
+			// The approved route is gone. If something still overlaps, the holder
+			// changed under us → re-classify; else there is nothing left to purge.
+			if rawsOverlap(raws, hostname) {
+				return Captured{}, ErrConflictChanged
+			}
 			return Captured{}, ErrNoConflict
+		}
+		raw := raws[idx]
+		var route Route
+		if err := json.Unmarshal(raw, &route); err != nil {
+			// We located it by @id/hash but can no longer decode it: treat as drifted.
+			return Captured{}, ErrConflictChanged
 		}
 		if !expect.matches(route, raw) {
 			return Captured{}, ErrConflictChanged
 		}
 
-		// Capture the EXACT bytes before deleting (a copy — raw aliases the fetch
-		// buffer). This is byte-faithful even if the route accreted fields tailport
-		// doesn't model.
-		captured := Captured{
-			Raw:      append(json.RawMessage(nil), raw...),
-			Hostname: hostname,
-			HadID:    route.ID != "",
-		}
-
 		var body []byte
 		var status int
+		var captured Captured
 		if route.ID != "" {
-			// Prefer stable @id deletion. Fetch the id-scope etag; a 404 means the
-			// route vanished between the array read and now → re-read and retry.
-			live, idEtag, found, err := c.fetchByID(ctx, route.ID)
+			// Prefer stable @id deletion. Re-read the route as RAW bytes under its
+			// own id-scope etag so the re-verify and the capture use the FRESH bytes
+			// (roborev hped #1). A 404 means it vanished between reads → re-read.
+			freshRaw, idEtag, found, err := c.fetchByIDRaw(ctx, route.ID)
 			if err != nil {
 				return Captured{}, err
 			}
 			if !found {
 				continue
 			}
-			// Re-verify against the id-read too, closing the array-read→id-read
-			// window: if it drifted from expect here, don't delete it.
-			if !expect.matches(live, raw) {
+			var live Route
+			if err := json.Unmarshal(freshRaw, &live); err != nil {
 				return Captured{}, ErrConflictChanged
+			}
+			// The id-read must STILL be the approved route. Identity must match, and
+			// the matcher must not have drifted off the hostname: an OWNED route must
+			// still be EXACTLY our hostname (a re-point or a widen-to-wildcard is
+			// drift we must never delete under the owned confirm — roborev hped #1);
+			// a foreign route (which may legitimately carry a wildcard/multi-host
+			// matcher) must at least still overlap the hostname.
+			matcherOK := routeOverlaps(live, hostname)
+			if expect.Owned {
+				matcherOK = hostMatcherIs(live, hostname)
+			}
+			if !matcherOK || !expect.matches(live, freshRaw) {
+				return Captured{}, ErrConflictChanged
+			}
+			// Refuse a destructive delete with no guarding ETag (roborev hped #6):
+			// on a pre-2.5.2 edge If-Match is ignored, so this would be an
+			// UNCONDITIONAL delete a concurrent shift could point at the wrong route.
+			if idEtag == "" {
+				return Captured{}, ErrEdgeNoIfMatch
+			}
+			// Capture the FRESH id-read bytes — the exact bytes being deleted, and
+			// byte-faithful even for fields tailport doesn't model.
+			captured = Captured{
+				Raw:      append(json.RawMessage(nil), freshRaw...),
+				Hostname: hostname,
+				HadID:    true,
 			}
 			body, status, _, err = c.do(ctx, http.MethodDelete, c.idURL(route.ID), nil, idEtag)
 			if err != nil {
@@ -921,6 +1004,14 @@ func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect Purg
 			// Truly id-less foreign route: delete by array index under the
 			// routes-array etag. The parent-scope If-Match re-hashes the whole
 			// array, so an index-shifting concurrent edit → 412 → re-read.
+			if arrEtag == "" {
+				return Captured{}, ErrEdgeNoIfMatch // roborev hped #6
+			}
+			captured = Captured{
+				Raw:      append(json.RawMessage(nil), raw...),
+				Hostname: hostname,
+				HadID:    false,
+			}
 			body, status, _, err = c.do(ctx, http.MethodDelete, c.routesURL()+"/"+strconv.Itoa(idx), nil, arrEtag)
 			if err != nil {
 				return Captured{}, err
@@ -938,6 +1029,52 @@ func (c *Client) PurgeConflict(ctx context.Context, hostname string, expect Purg
 		return captured, nil
 	}
 	return Captured{}, ErrConcurrentUpdate
+}
+
+// locateByExpect finds the index of the route the user approved to purge,
+// identifying it the way it was CLASSIFIED rather than by first host-overlap
+// (roborev hped #4). An @id-identified route is found by its @id; an id-less
+// foreign route pinned by RawHash is found by that exact-bytes hash; a foreign
+// route classified with neither identity falls back to the first host-overlap
+// (the pre-hped behavior, correct when only one route can overlap). Returns -1
+// when the approved route is not present.
+func locateByExpect(raws []json.RawMessage, hostname string, expect PurgeExpect) int {
+	switch {
+	case expect.ID != "":
+		for i, elem := range raws {
+			if rawRouteID(elem) == expect.ID {
+				return i
+			}
+		}
+	case expect.RawHash != "":
+		for i, elem := range raws {
+			if rawIdentityHash(elem) == expect.RawHash {
+				return i
+			}
+		}
+	default:
+		for i, elem := range raws {
+			var r Route
+			if json.Unmarshal(elem, &r) == nil && routeOverlaps(r, hostname) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// rawsOverlap reports whether any raw route element overlaps the (already
+// canonicalized) hostname — used to distinguish "the approved route is gone but
+// another still claims the host" (→ ErrConflictChanged) from "nothing overlaps"
+// (→ ErrNoConflict).
+func rawsOverlap(raws []json.RawMessage, hostname string) bool {
+	for _, elem := range raws {
+		var r Route
+		if json.Unmarshal(elem, &r) == nil && routeOverlaps(r, hostname) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchRoutesRaw GETs the shared routes array as raw elements (each preserving
@@ -996,15 +1133,23 @@ func firstHandler(r Route) string {
 	return r.Handle[0].Handler
 }
 
-// matcherHosts joins every host value across a route's match blocks, comma-
-// separated, for describing where a hijacked @id now points ("" if it carries no
-// host matcher at all — e.g. a matcher of only path/method).
-func matcherHosts(r Route) string {
+// matcherHostList returns every host value across a route's match blocks, in
+// order (nil if it carries no host matcher at all). It is the list form behind
+// both matcherHosts (a comma-joined description) and ConflictInfo.Hosts (the
+// blast-radius disclosure, roborev hped #3).
+func matcherHostList(r Route) []string {
 	var hosts []string
 	for _, m := range r.Match {
 		hosts = append(hosts, m.Host...)
 	}
-	return strings.Join(hosts, ", ")
+	return hosts
+}
+
+// matcherHosts joins every host value across a route's match blocks, comma-
+// separated, for describing where a hijacked @id now points ("" if it carries no
+// host matcher at all — e.g. a matcher of only path/method).
+func matcherHosts(r Route) string {
+	return strings.Join(matcherHostList(r), ", ")
 }
 
 // routeOverlaps reports whether any host matcher on r overlaps the already-

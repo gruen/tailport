@@ -2707,6 +2707,53 @@ func (m *model) clearPurgeFlow() {
 	m.purgeInput.Reset()
 }
 
+// cancelPurgeFlow aborts a purge ladder (esc / any non-commit key at any gate)
+// and flashes that serve was left on for the port (OQ-Serve; roborev hped #7).
+// publishCmd turned serve ON before the publish that hit this conflict, so by the
+// time a purge confirm shows serve is already active for the port; backing out
+// here would otherwise leave it on silently — a footgun. The port is captured
+// BEFORE clearPurgeFlow zeroes it.
+func (m *model) cancelPurgeFlow() tea.Cmd {
+	port := m.purgePort
+	m.clearPurgeFlow()
+	return m.setFlash(fmt.Sprintf("serve left on for :%d — space to stop", port), flashWarn)
+}
+
+// purgeBlastRadiusLines renders the extra exposure a foreign purge would remove
+// (roborev hped #3): a foreign route may match a bare "*" catch-all, a "*.suffix"
+// wildcard, or several hostnames, but the confirm names only the requested host —
+// so without this the user could delete unrelated public hostnames blind. It
+// names every OTHER host pattern the route carries, and calls out a bare "*"
+// catch-all prominently. Returns nil when the route serves only the requested
+// hostname (nothing extra to disclose). Styled with warnStyle since the blast
+// radius is a safety warning.
+func (m *model) purgeBlastRadiusLines() []string {
+	req := strings.ToLower(strings.TrimSpace(m.purgeHostname))
+	var extras []string
+	catchAll := false
+	seen := map[string]bool{}
+	for _, h := range m.purgeInfo.Hosts {
+		hc := strings.ToLower(strings.TrimSpace(h))
+		if hc == "*" {
+			catchAll = true // named by the prominent catch-all line, not "also serves"
+			continue
+		}
+		if hc == "" || hc == req || seen[hc] {
+			continue
+		}
+		seen[hc] = true
+		extras = append(extras, h)
+	}
+	var lines []string
+	if catchAll {
+		lines = append(lines, warnStyle.Render("   ⚠ CATCH-ALL (*): this route serves EVERY hostname on this edge"))
+	}
+	if len(extras) > 0 {
+		lines = append(lines, warnStyle.Render("   this route also serves: "+strings.Join(extras, ", ")))
+	}
+	return lines
+}
+
 // updatePurgeEntry drives the two force-purge confirm ladders (kata 6n15; design
 // §3.4), owning every key for the purge modes so keystrokes never leak into
 // another input. OwnedDiffBackend is a single normal y/n; ForeignOverlap is the
@@ -2722,8 +2769,7 @@ func (m *model) updatePurgeEntry(msg tea.KeyMsg) tea.Cmd {
 		case "y", "Y":
 			return m.confirmPurge()
 		default:
-			m.clearPurgeFlow()
-			return nil
+			return m.cancelPurgeFlow()
 		}
 	case entryConfirmPurgeForeign:
 		// Scary first gate: y advances to the typed-word commit, every other key
@@ -2735,8 +2781,7 @@ func (m *model) updatePurgeEntry(msg tea.KeyMsg) tea.Cmd {
 			m.mode = entryConfirmPurgeForeignType
 			return nil
 		default:
-			m.clearPurgeFlow()
-			return nil
+			return m.cancelPurgeFlow()
 		}
 	case entryConfirmPurgeForeignType:
 		// Typed-word commit (mirror entryConfirmUnlockSSH): commit only on enter
@@ -2745,13 +2790,11 @@ func (m *model) updatePurgeEntry(msg tea.KeyMsg) tea.Cmd {
 		case "enter":
 			typed := strings.ToLower(strings.TrimSpace(m.purgeInput.Value()))
 			if typed != "purge" {
-				m.clearPurgeFlow() // wrong word (incl. empty): cancel, no mutation
-				return nil
+				return m.cancelPurgeFlow() // wrong word (incl. empty): cancel, no mutation
 			}
 			return m.confirmPurge()
 		case "esc":
-			m.clearPurgeFlow()
-			return nil
+			return m.cancelPurgeFlow()
 		default:
 			var cmd tea.Cmd
 			m.purgeInput, cmd = m.purgeInput.Update(msg)
@@ -2916,6 +2959,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tookOver := m.takeoverHost
 		m.takeoverHost = ""
 		if msg.err != nil {
+			if tookOver != "" {
+				// This is the RESUMED take-over publish (kata 6n15) and it FAILED. The
+				// destructive half already happened — the old route is gone and <host>
+				// is now unpublished — so a bare publish-error toast would hide that
+				// (roborev hped #5). Disclose the partial outcome plainly. Terminal:
+				// clear the carry and do NOT re-classify/loop; restoring the capture is
+				// ttfh's job (its seam on the success path is untouched).
+				m.pendingPublish = pendingPublish{}
+				return m, tea.Batch(
+					m.setErr(fmt.Sprintf("purged the old route for %s but the take-over publish failed: %s — %s is now unpublished",
+						tookOver, publishErrText(msg.err), tookOver)),
+					refresh, m.pollPublishedCmd())
+			}
 			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
 				// The auto-enable-serve step hit tailscale's operator gate --
 				// same sticky guidance banner a serve toggle would raise.
@@ -6225,14 +6281,23 @@ func (m model) renderBottom() string {
 		lines := []string{
 			warnStyle.Render(fmt.Sprintf("⚠ %s is held by a route tailport did NOT create (%s).", m.purgeHostname, backendDesc(m.purgeInfo))),
 			warnStyle.Render("   Force-purging deletes a route you didn't make through tailport — this is drift."),
-			helpStyle.Render("   (y: continue to the typed confirm, any other key: cancel)"),
 		}
+		// Disclose the blast radius: every other host pattern this route carries
+		// (roborev hped #3), so a wildcard/multi-host route isn't purged blind.
+		lines = append(lines, m.purgeBlastRadiusLines()...)
+		lines = append(lines, helpStyle.Render("   (y: continue to the typed confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
 	case entryConfirmPurgeForeignType:
-		// Typed-word commit (mirror entryConfirmUnlockSSH's shape).
-		return warnStyle.Render(fmt.Sprintf("⚠ permanently delete the foreign route holding %s — ", m.purgeHostname)) +
+		// Typed-word commit (mirror entryConfirmUnlockSSH's shape). The blast-radius
+		// disclosure (roborev hped #3) rides above the input line so it stays visible
+		// through the final commit gate.
+		inputLine := warnStyle.Render(fmt.Sprintf("⚠ permanently delete the foreign route holding %s — ", m.purgeHostname)) +
 			helpStyle.Render("type ") + helpKeyStyle.Render("purge") + helpStyle.Render(" to confirm: ") +
 			m.purgeInput.View() + helpStyle.Render("  (esc: cancel)")
+		if radius := m.purgeBlastRadiusLines(); len(radius) > 0 {
+			return strings.Join(radius, "\n") + "\n" + inputLine
+		}
+		return inputLine
 	}
 	bar := m.renderStatusLine()
 	// The sticky banners, when active, sit ABOVE the status line -- unlike the

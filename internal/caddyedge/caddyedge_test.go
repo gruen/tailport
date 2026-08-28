@@ -150,6 +150,15 @@ type fakeAdmin struct {
 	// deleteReturns404, when true, makes DELETE answer 404 without removing the
 	// route, to exercise the "404 on DELETE = success" branch.
 	deleteReturns404 bool
+	// noEtag, when true, suppresses the Etag header on GET responses, modeling a
+	// pre-2.5.2 edge that never emits an ETag — so a client's guarding etag is
+	// empty and a force-delete must REFUSE (roborev hped #6).
+	noEtag bool
+	// hookAfterRoutesGet, when set, fires ONCE right after a GET on the routes-
+	// array path is served, letting a test simulate a concurrent edit that lands
+	// in the array-read→/id-read window (roborev hped #1). It runs while f.mu is
+	// held, so it must mutate f.routes directly and MUST NOT lock f.mu.
+	hookAfterRoutesGet func()
 
 	// Recorded, accepted client mutations (a rejected 412 is NOT counted).
 	mutations int
@@ -275,7 +284,9 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 			http.Error(w, "unknown object id", http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Etag", f.etagFor("/id/"+id))
+		if !f.noEtag {
+			w.Header().Set("Etag", f.etagFor("/id/"+id))
+		}
 		f.writeJSON(w, f.routes[idx])
 	case http.MethodPatch:
 		if !f.precheck(w, r) {
@@ -324,8 +335,15 @@ func (f *fakeAdmin) handleID(w http.ResponseWriter, r *http.Request, id string) 
 func (f *fakeAdmin) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		w.Header().Set("Etag", f.etagFor(f.routesPath()))
+		if !f.noEtag {
+			w.Header().Set("Etag", f.etagFor(f.routesPath()))
+		}
 		f.writeJSON(w, f.routes)
+		if f.hookAfterRoutesGet != nil {
+			h := f.hookAfterRoutesGet
+			f.hookAfterRoutesGet = nil // fire once
+			h()
+		}
 	case http.MethodPost:
 		if !f.precheck(w, r) {
 			return
@@ -1448,5 +1466,202 @@ func TestPurgeConflictConcurrentUpdateExhausted(t *testing.T) {
 	}
 	if len(f.routes) != 1 {
 		t.Errorf("route must survive an exhausted purge; got %d", len(f.routes))
+	}
+}
+
+// --- roborev hped hardening: PurgeConflict FIX1 / FIX4 / FIX6 ----------------
+
+// TestPurgeConflictIDRematcherRefused (roborev hped #1): an owned @id re-pointed
+// to a DIFFERENT host (same backend) in the array-read→id-read window must NOT be
+// deleted. The stale array bytes still carry our identity, so the old code (which
+// re-checked expect against the STALE array bytes and never revalidated the live
+// matcher) would delete a route the user never approved. The fresh id-read's
+// hostMatcherIs catches the drift → ErrConflictChanged, nothing deleted.
+func TestPurgeConflictIDRematcherRefused(t *testing.T) {
+	const host = "app.example.com"
+	c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil)) // OwnedDiffBackend
+
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != OwnedDiffBackend {
+		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
+	}
+	expect := ExpectFromConflict(info)
+
+	// Between PurgeConflict's array read and its /id read, a foreign edit re-points
+	// our @id at a DIFFERENT host while keeping the backend (id+backend still match).
+	f.hookAfterRoutesGet = func() {
+		f.routes[0] = json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["evil.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true}`)
+	}
+
+	if _, err := c.PurgeConflict(context.Background(), host, expect); !errors.Is(err, ErrConflictChanged) {
+		t.Fatalf("err = %v, want ErrConflictChanged (matcher re-pointed under us)", err)
+	}
+	if f.del != 0 || f.mutations != 0 {
+		t.Errorf("a re-pointed @id must not be deleted; del=%d mutations=%d", f.del, f.mutations)
+	}
+	if len(f.routes) != 1 {
+		t.Errorf("route must survive; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictCapturesFreshIDBytes (roborev hped #1): the capture must be the
+// bytes ACTUALLY deleted — the fresh /id read — not the stale array bytes. An
+// identity-preserving edit (an unmodeled field changes A→B) lands in the
+// array-read→id-read window; the purge still commits (matcher + identity stable)
+// and the capture carries the FRESH (B) bytes.
+func TestPurgeConflictCapturesFreshIDBytes(t *testing.T) {
+	const host = "app.example.com"
+	seedA := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"A"}}`)
+	seedB := json.RawMessage(`{"@id":"tailport-app.example.com","match":[{"host":["app.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"other-box:9090"}]}],"terminal":true,"metadata":{"note":"B"}}`)
+	c, f := newFakeRaw(t, seedA)
+
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != OwnedDiffBackend {
+		t.Fatalf("InspectConflict kind=%v err=%v, want OwnedDiffBackend", info.Kind, err)
+	}
+	// After the array read, an identity-preserving edit swaps A's unmodeled field
+	// for B (same @id, host, backend), so the /id read differs from the array read.
+	f.hookAfterRoutesGet = func() { f.routes[0] = seedB }
+
+	captured, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if err != nil {
+		t.Fatalf("PurgeConflict: %v", err)
+	}
+	if string(captured.Raw) != string(seedB) {
+		t.Errorf("capture must equal the FRESH id-read bytes:\n got %s\nwant %s", captured.Raw, seedB)
+	}
+	if strings.Contains(string(captured.Raw), `"note":"A"`) {
+		t.Errorf("capture used the STALE array bytes (note A): %s", captured.Raw)
+	}
+	if f.del != 1 || len(f.routes) != 0 {
+		t.Errorf("the route should be deleted once; del=%d routes=%d", f.del, len(f.routes))
+	}
+}
+
+// TestPurgeConflictLocatesApprovedNotPrecedingForeign (roborev hped #4): a foreign
+// route PRECEDING the owned route, both overlapping the host, must not derail the
+// purge. Locating by EXPECT's @id (not first overlap) targets exactly the approved
+// owned route — no ErrConflictChanged re-classify loop, and the foreign route
+// survives untouched.
+func TestPurgeConflictLocatesApprovedNotPrecedingForeign(t *testing.T) {
+	const host = "app.example.com"
+	id := IDFor(host)
+	foreign := Route{
+		ID:     "third-party-app",
+		Match:  []Match{{Host: []string{host}}}, // overlaps, and PRECEDES the owned route
+		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "3rd:7000"}}}},
+	}
+	c, f := newFake(t, foreign, BuildRoute(host, "other-box", 9090, nil))
+
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != OwnedDiffBackend || info.ID != id {
+		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want OwnedDiffBackend of our @id", info.Kind, info.ID, err)
+	}
+	captured, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info))
+	if err != nil {
+		t.Fatalf("PurgeConflict should delete the owned route, not loop: %v", err)
+	}
+	if !captured.HadID || rawRouteID(captured.Raw) != id {
+		t.Errorf("must capture the OWNED route; hadID=%v id=%q", captured.HadID, rawRouteID(captured.Raw))
+	}
+	if len(f.delPaths) != 1 || f.delPaths[0] != "/id/"+id {
+		t.Errorf("the OWNED route must be deleted by /id; delPaths=%v", f.delPaths)
+	}
+	if len(f.routes) != 1 || rawRouteID(f.routes[0]) != "third-party-app" {
+		t.Errorf("the preceding foreign route must survive; routes=%d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictIdlessForeignByRawHashDespitePreceding (roborev hped #4): an
+// id-less foreign route pinned by RawHash resolves to EXACTLY that route even when
+// another overlapping route precedes it — the hash locate ignores position.
+func TestPurgeConflictIdlessForeignByRawHashDespitePreceding(t *testing.T) {
+	const host = "a.example.com"
+	preceding := json.RawMessage(`{"@id":"other","match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.2:80"}]}]}`)
+	target := json.RawMessage(`{"match":[{"host":["a.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.1:80"}]}]}`)
+	c, f := newFakeRaw(t, preceding, target)
+
+	expect := PurgeExpect{Owned: false, RawHash: rawIdentityHash(target)}
+	captured, err := c.PurgeConflict(context.Background(), host, expect)
+	if err != nil {
+		t.Fatalf("PurgeConflict: %v", err)
+	}
+	if string(captured.Raw) != string(target) {
+		t.Errorf("must capture the hash-pinned target; got %s", captured.Raw)
+	}
+	if len(f.delPaths) != 1 || f.delPaths[0] != f.routesPath()+"/1" {
+		t.Errorf("the target (index 1) must be deleted by index; delPaths=%v", f.delPaths)
+	}
+	if len(f.routes) != 1 || rawRouteID(f.routes[0]) != "other" {
+		t.Errorf("the preceding route must survive; routes=%d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictRefusesWithoutETag (roborev hped #6): when the edge returns no
+// ETag on the read guarding the delete (a pre-2.5.2 edge that ignores If-Match),
+// PurgeConflict REFUSES with ErrEdgeNoIfMatch rather than issue an unconditional
+// delete a concurrent shift could point at the wrong route — on BOTH the /id path
+// and the index path.
+func TestPurgeConflictRefusesWithoutETag(t *testing.T) {
+	const host = "app.example.com"
+
+	t.Run("id path", func(t *testing.T) {
+		c, f := newFake(t, BuildRoute(host, "other-box", 9090, nil))
+		f.noEtag = true
+		info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+		if err != nil || info.Kind != OwnedDiffBackend {
+			t.Fatalf("InspectConflict kind=%v err=%v", info.Kind, err)
+		}
+		if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); !errors.Is(err, ErrEdgeNoIfMatch) {
+			t.Fatalf("err = %v, want ErrEdgeNoIfMatch", err)
+		}
+		if f.del != 0 || len(f.routes) != 1 {
+			t.Errorf("nothing may be deleted without a guarding etag; del=%d routes=%d", f.del, len(f.routes))
+		}
+	})
+
+	t.Run("index path", func(t *testing.T) {
+		foreign := Route{
+			Match:  []Match{{Host: []string{host}}},
+			Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.1:80"}}}},
+		}
+		c, f := newFake(t, foreign)
+		f.noEtag = true
+		info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+		if err != nil || info.Kind != ForeignOverlap || info.ID != "" {
+			t.Fatalf("InspectConflict kind=%v id=%q err=%v", info.Kind, info.ID, err)
+		}
+		if _, err := c.PurgeConflict(context.Background(), host, ExpectFromConflict(info)); !errors.Is(err, ErrEdgeNoIfMatch) {
+			t.Fatalf("err = %v, want ErrEdgeNoIfMatch", err)
+		}
+		if f.del != 0 || len(f.routes) != 1 {
+			t.Errorf("nothing may be deleted without a guarding etag; del=%d routes=%d", f.del, len(f.routes))
+		}
+	})
+}
+
+// TestInspectConflictForeignHostsBlastRadius (roborev hped #3): a foreign wildcard
+// / multi-host route carries its FULL host-matcher list on ConflictInfo.Hosts, so
+// the UI can disclose the blast radius rather than name only the requested host.
+func TestInspectConflictForeignHostsBlastRadius(t *testing.T) {
+	const host = "app.example.com"
+	foreign := Route{
+		ID:     "foreign-multi",
+		Match:  []Match{{Host: []string{host, "other.example.com", "*.internal.example.com"}}},
+		Handle: []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.5:80"}}}},
+	}
+	c, _ := newFake(t, foreign)
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != ForeignOverlap {
+		t.Fatalf("InspectConflict kind=%v err=%v, want ForeignOverlap", info.Kind, err)
+	}
+	want := []string{host, "other.example.com", "*.internal.example.com"}
+	if len(info.Hosts) != len(want) {
+		t.Fatalf("Hosts = %v, want %v", info.Hosts, want)
+	}
+	for i, h := range want {
+		if info.Hosts[i] != h {
+			t.Errorf("Hosts[%d] = %q, want %q", i, info.Hosts[i], h)
+		}
 	}
 }

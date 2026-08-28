@@ -401,6 +401,29 @@ route is gone and each backend has to republish (press `P` again) — tailport
 itself keeps no per-port publish state to restore from; Caddy's live config
 is the only source of truth (see kata v1z5's Architecture notes).
 
+## Requirement: Caddy ≥ 2.5.2 (concurrency safety)
+
+tailport's publish, unpublish, and **force-purge** paths write into a **shared**
+routes array that every tailport machine — and any hand-authored config — can
+also touch. To keep concurrent writers from clobbering each other, every mutation
+is guarded by an `If-Match` conditional request against the ETag Caddy returned
+for the config it read: a racing edit moves the ETag, Caddy answers `412`, and
+tailport re-reads and retries instead of overwriting blind. Force-purge leans on
+this doubly — it deletes a route by index or `@id` under the ETag that pinned the
+array it read, so a concurrent shift can't make the delete land on the wrong
+route.
+
+**`ETag`/`If-Match` first shipped in Caddy v2.5.2.** On an **older** edge Caddy
+**ignores `If-Match` entirely** — no `412` is ever returned, the retry loops are
+dead code, and concurrent writers (and a force-delete racing an array shift) can
+clobber the wrong route silently. So **Caddy ≥ 2.5.2 is required**; tailport now
+**refuses** a force-purge outright when the edge returns no ETag rather than issue
+an unconditional delete. The bundled edge image pins **`caddy:2-alpine`**
+(`packaging/caddy-edge/Dockerfile`), currently well above the floor, so a
+from-our-packaging edge already satisfies this — the floor only matters if you
+point tailport at a **hand-run or pinned-older** Caddy. (For general security
+hygiene, tracking a recent 2.x is recommended regardless.)
+
 ## A note on resilience
 
 **This deployment is one Fly Machine with one attached volume — there is no

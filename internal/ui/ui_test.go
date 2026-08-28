@@ -6728,3 +6728,171 @@ func TestPurgeUnreachableToasts(t *testing.T) {
 		t.Errorf("a failed purge must not leave a confirm mode open; mode=%v", m.mode)
 	}
 }
+
+// TestPurgeForeignConfirmDisclosesBlastRadius (roborev hped #3): a foreign
+// wildcard / multi-host / catch-all route's confirm names every host pattern it
+// carries, so the user isn't deleting unrelated public hostnames blind. The
+// disclosure rides BOTH foreign gates (the y/n warning and the typed commit).
+func TestPurgeForeignConfirmDisclosesBlastRadius(t *testing.T) {
+	const host = "app.example.com"
+
+	t.Run("wildcard is named", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+			fc.routes["foreign-wild"] = caddyedge.Route{
+				ID:     "foreign-wild",
+				Match:  []caddyedge.Match{{Host: []string{"*.example.com"}}},
+				Handle: []caddyedge.Handler{{Handler: "reverse_proxy", Upstreams: []caddyedge.Upstream{{Dial: "10.0.0.5:80"}}}},
+			}
+		})
+		if m.mode != entryConfirmPurgeForeign {
+			t.Fatalf("want entryConfirmPurgeForeign; got %v", m.mode)
+		}
+		if got := stripANSI(m.renderBottom()); !strings.Contains(got, "also serves: *.example.com") {
+			t.Errorf("first gate = %q, want it to name the wildcard *.example.com", got)
+		}
+		// Advance to the typed gate — the disclosure must persist there too.
+		m = mustUpdate(t, m, rkey("y"))
+		if got := stripANSI(m.renderBottom()); !strings.Contains(got, "*.example.com") {
+			t.Errorf("typed gate = %q, want it to still name the wildcard", got)
+		}
+	})
+
+	t.Run("multi-host names the OTHER hosts", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+			fc.routes["foreign-multi"] = caddyedge.Route{
+				ID:     "foreign-multi",
+				Match:  []caddyedge.Match{{Host: []string{host, "other.example.com", "third.example.com"}}},
+				Handle: []caddyedge.Handler{{Handler: "reverse_proxy", Upstreams: []caddyedge.Upstream{{Dial: "10.0.0.6:80"}}}},
+			}
+		})
+		got := stripANSI(m.renderBottom())
+		if !strings.Contains(got, "other.example.com") || !strings.Contains(got, "third.example.com") {
+			t.Errorf("multi-host confirm = %q, want it to name other/third.example.com", got)
+		}
+	})
+
+	t.Run("bare star catch-all is called out prominently", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+			fc.routes["foreign-catchall"] = caddyedge.Route{
+				ID:     "foreign-catchall",
+				Match:  []caddyedge.Match{{Host: []string{"*"}}},
+				Handle: []caddyedge.Handler{{Handler: "reverse_proxy", Upstreams: []caddyedge.Upstream{{Dial: "10.0.0.7:80"}}}},
+			}
+		})
+		if got := stripANSI(m.renderBottom()); !strings.Contains(got, "CATCH-ALL") || !strings.Contains(got, "EVERY hostname") {
+			t.Errorf("catch-all confirm = %q, want a prominent CATCH-ALL callout", got)
+		}
+	})
+}
+
+// TestTakeoverResumeFailurePartialToast (roborev hped #5): when the RESUMED
+// take-over publish fails, the toast must disclose the partial outcome — the old
+// route was purged, so the host is now unpublished — not just the raw publish
+// error that hides the destructive half.
+func TestTakeoverResumeFailurePartialToast(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+	m, _ := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+		fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil) // OwnedDiffBackend
+	})
+	if m.mode != entryConfirmPurgeOwned {
+		t.Fatalf("want entryConfirmPurgeOwned; got %v", m.mode)
+	}
+
+	// y commits the purge; run the purge cmd to get the clean purgeDoneMsg.
+	res, cmd := m.Update(rkey("y"))
+	m = res.(model)
+	pdm, ok := cmd().(purgeDoneMsg)
+	if !ok || pdm.err != nil {
+		t.Fatalf("want a clean purgeDoneMsg; got %#v", cmd())
+	}
+	// The success handler arms the take-over resume (takeoverHost set).
+	res, _ = m.Update(pdm)
+	m = res.(model)
+	if m.takeoverHost != host {
+		t.Fatalf("purge success should arm the take-over; takeoverHost=%q", m.takeoverHost)
+	}
+
+	// The resumed publish FAILS (a third machine grabbed it, edge blip, …). Inject
+	// the failure directly rather than run the resume cmd.
+	res, _ = m.Update(publishDoneMsg{port: 8080, err: caddyedge.ErrUnreachable})
+	m = res.(model)
+	if m.flashLevel != flashError {
+		t.Errorf("a partial take-over failure should be an error toast; level=%v", m.flashLevel)
+	}
+	if !strings.Contains(m.flash, "purged the old route for "+host) ||
+		!strings.Contains(m.flash, "take-over publish failed") ||
+		!strings.Contains(m.flash, host+" is now unpublished") {
+		t.Errorf("partial-failure toast = %q, want it to disclose the purge + that %s is now unpublished", m.flash, host)
+	}
+	if m.takeoverHost != "" {
+		t.Errorf("takeoverHost must be cleared so a later ordinary error isn't mislabeled; got %q", m.takeoverHost)
+	}
+}
+
+// TestPurgeCancelFlashesServeLeftOn (roborev hped #7 / OQ-Serve): cancelling a
+// purge ladder flashes that serve was left on for the port — publishCmd turned it
+// on before the conflicting publish, so backing out must not leave it on silently.
+// Covers both the owned ladder and the foreign ladder (at both gates).
+func TestPurgeCancelFlashesServeLeftOn(t *testing.T) {
+	const host = "app.example.com"
+	id := caddyedge.IDFor(host)
+	wantFlash := "serve left on for :8080 — space to stop"
+
+	assertServeFlash := func(t *testing.T, m model) {
+		t.Helper()
+		if m.mode != entryNone {
+			t.Errorf("cancel should return to entryNone; mode=%v", m.mode)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, wantFlash) {
+			t.Errorf("cancel flash = %q level=%v, want %q at warn level", m.flash, m.flashLevel, wantFlash)
+		}
+	}
+
+	t.Run("owned ladder cancel", func(t *testing.T) {
+		m, fc := reachConflictLadder(t, host, false, func(fc *fakeCaddy) {
+			fc.routes[id] = caddyedge.BuildRoute(host, "other-box", 9090, nil)
+		})
+		if m.mode != entryConfirmPurgeOwned {
+			t.Fatalf("want entryConfirmPurgeOwned; got %v", m.mode)
+		}
+		m = mustUpdate(t, m, rkey("n")) // any non-y key cancels
+		assertServeFlash(t, m)
+		if len(fc.deletes) != 0 {
+			t.Errorf("a cancelled purge must not delete; deletes=%v", fc.deletes)
+		}
+	})
+
+	seedForeign := func(fc *fakeCaddy) {
+		foreign := caddyedge.BuildRoute(host, "3rd-party", 7000, nil)
+		foreign.ID = "foreign-app"
+		fc.routes[foreign.ID] = foreign
+	}
+
+	t.Run("foreign first gate cancel", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, seedForeign)
+		if m.mode != entryConfirmPurgeForeign {
+			t.Fatalf("want entryConfirmPurgeForeign; got %v", m.mode)
+		}
+		m = mustUpdate(t, m, rkey("n"))
+		assertServeFlash(t, m)
+	})
+
+	t.Run("foreign typed gate esc cancel", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, seedForeign)
+		m = mustUpdate(t, m, rkey("y")) // advance to the typed gate
+		if m.mode != entryConfirmPurgeForeignType {
+			t.Fatalf("want entryConfirmPurgeForeignType; got %v", m.mode)
+		}
+		m = mustUpdate(t, m, escKey)
+		assertServeFlash(t, m)
+	})
+
+	t.Run("foreign typed gate wrong word cancel", func(t *testing.T) {
+		m, _ := reachConflictLadder(t, host, false, seedForeign)
+		m = mustUpdate(t, m, rkey("y"))
+		m = mustUpdate(t, m, rkey("nope"))
+		m = mustUpdate(t, m, enterKey) // wrong word cancels
+		assertServeFlash(t, m)
+	})
+}
