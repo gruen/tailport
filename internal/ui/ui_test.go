@@ -7084,8 +7084,14 @@ func TestTakeoverResumeFailurePartialToast(t *testing.T) {
 	}
 	if !strings.Contains(m.flash, "purged the old route for "+host) ||
 		!strings.Contains(m.flash, "take-over publish failed") ||
-		!strings.Contains(m.flash, host+"'s current state is unknown") {
-		t.Errorf("partial-failure toast = %q, want it to disclose the purge + that %s's state is UNKNOWN", m.flash, host)
+		!strings.Contains(m.flash, host+"'s state on the edge is now uncertain") {
+		t.Errorf("partial-failure toast = %q, want it to disclose the purge + that %s's state is UNCERTAIN", m.flash, host)
+	}
+	// It must NOT promise the (owned-only) edge poll will reveal the state
+	// (roborev cmr5-#2): a foreign route that claimed the hostname is invisible to
+	// pollPublishedCmd, so that promise would be false.
+	if strings.Contains(m.flash, "next edge poll") {
+		t.Errorf("partial-failure toast must not promise the poll reveals the state; got %q", m.flash)
 	}
 	// It must NOT over-claim the host is now unpublished (roborev ve95 FIX 3): that
 	// isn't proven after a failed take-over publish.

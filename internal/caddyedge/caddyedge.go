@@ -41,7 +41,6 @@ import (
 	"hash/fnv"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -894,17 +893,6 @@ type PurgeExpect struct {
 	// exact hash of the element's raw bytes (design §3.2, for an id-less foreign
 	// route). Owned-ness is still checked alongside it.
 	RawHash string
-	// Hosts is the FULL host-matcher set the user was shown at confirm time (the
-	// disclosed blast radius). When non-empty, the structural re-verify additionally
-	// requires the LIVE route's matcher set to still equal it, order-insensitive
-	// (roborev ve95 FIX 2): a foreign route identified by @id could have its matcher
-	// WIDENED (more hostnames added) between confirm and delete while keeping the
-	// id+backend, and be deleted with a blast radius the user never saw. A grow or
-	// change → no match → ErrConflictChanged → the UI re-classifies and re-discloses.
-	// (An OWNED route is already pinned to exactly its hostname by hostMatcherIs, so
-	// this specifically closes the foreign-with-@id widen; Hosts is unset for owned
-	// classifications and the RawHash exact-bytes path already pins the id-less case.)
-	Hosts []string
 }
 
 // ExpectFromConflict builds the re-verify identity from a read-only conflict
@@ -925,9 +913,18 @@ func ExpectFromConflict(info ConflictInfo) PurgeExpect {
 		Label:            info.Label,
 		Port:             info.Port,
 		Handler:          info.Handler,
-		Hosts:            info.Hosts,
 	}
-	if info.ID == "" {
+	// Pin the EXACT bytes for EVERY foreign route (roborev cmr5-#1), not just the
+	// id-less one. A foreign @id route can keep the same flattened host list while
+	// widening what it matches -- adding a hostless OR match block, or dropping a
+	// path/method constraint -- so a host-SET check (the earlier ve95 approach) is
+	// insufficient. RawHash re-verifies the whole element, so ANY change to what
+	// the route matches → re-classify + re-disclose. For the scary force-delete
+	// path this is the correct, safe pin; a foreign route's stored bytes don't
+	// reformat on their own, so spurious re-confirms are unrealistic. Owned routes
+	// carry no RawHash: they stay on @id+backend identity and are pinned to exactly
+	// their hostname by hostMatcherIs.
+	if !info.Owned {
 		e.RawHash = info.RawHash
 	}
 	return e
@@ -942,17 +939,14 @@ func (e PurgeExpect) matches(r Route, raw json.RawMessage) bool {
 		return false // owned↔foreign escalation: never delete under a stale confirm
 	}
 	if e.RawHash != "" {
-		// Exact-bytes identity (id-less foreign): the raw pin already fixes the
-		// matcher, so no separate host-set check is needed.
+		// Exact-bytes identity for EVERY foreign route (roborev cmr5-#1, superseding
+		// the earlier host-SET pin): the raw hash fixes the WHOLE element -- every
+		// match block and constraint -- so a foreign route that widened what it
+		// matches while keeping its flattened host list (a hostless OR block, a
+		// dropped path constraint) fails here and is re-classified rather than
+		// deleted with a blast radius the user never saw. Owned routes carry no
+		// RawHash and stay on @id+backend below, pinned to their host by hostMatcherIs.
 		return raw != nil && rawIdentityHash(raw) == e.RawHash
-	}
-	// Pin the confirmed host-matcher set (roborev ve95 FIX 2): refuse to delete a
-	// route whose live matcher grew/changed since the user confirmed the blast
-	// radius, so a foreign @id route silently widened between confirm and delete is
-	// re-classified (ErrConflictChanged) rather than deleted with hosts the user
-	// never saw. Skipped when Hosts is unset (owned routes, pinned by hostMatcherIs).
-	if len(e.Hosts) > 0 && !sameHostSet(matcherHostList(r), e.Hosts) {
-		return false
 	}
 	if r.ID != e.ID {
 		return false
@@ -1408,35 +1402,6 @@ func matcherHostList(r Route) []string {
 // host matcher at all — e.g. a matcher of only path/method).
 func matcherHosts(r Route) string {
 	return strings.Join(matcherHostList(r), ", ")
-}
-
-// sameHostSet reports whether two host-matcher lists describe the same set of
-// hostnames, order-insensitively and case-insensitively (via canonHost). It is
-// the PurgeExpect.Hosts pin's comparator (roborev ve95 FIX 2): a live matcher that
-// gained, lost, or changed a host relative to the confirmed set is NOT the same
-// set, so the purge is refused. Lengths differing is an immediate mismatch (a
-// widen adds entries), then a sorted element-wise compare catches a same-count
-// swap.
-func sameHostSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	ca := make([]string, len(a))
-	for i, h := range a {
-		ca[i] = canonHost(h)
-	}
-	cb := make([]string, len(b))
-	for i, h := range b {
-		cb[i] = canonHost(h)
-	}
-	sort.Strings(ca)
-	sort.Strings(cb)
-	for i := range ca {
-		if ca[i] != cb[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // routeOverlaps reports whether any host matcher on r overlaps the already-

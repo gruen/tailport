@@ -1782,9 +1782,9 @@ func TestPurgeConflictForeignIdWidenedMatcherRefused(t *testing.T) {
 	if err != nil || info.Kind != ForeignOverlap || info.ID != "third-party-app" {
 		t.Fatalf("InspectConflict kind=%v id=%q err=%v, want foreign-with-@id ForeignOverlap", info.Kind, info.ID, err)
 	}
-	expect := ExpectFromConflict(info) // pins Hosts = [app.example.com]
-	if len(expect.Hosts) != 1 || expect.Hosts[0] != host {
-		t.Fatalf("ExpectFromConflict must pin the confirmed host set (FIX 2); got %v", expect.Hosts)
+	expect := ExpectFromConflict(info)
+	if expect.RawHash == "" {
+		t.Fatalf("ExpectFromConflict must pin a foreign route by exact bytes (RawHash, cmr5-#1); got empty")
 	}
 
 	// Between confirm and purge, a foreign edit WIDENS the matcher (adds an
@@ -1809,6 +1809,45 @@ func TestPurgeConflictForeignIdWidenedMatcherRefused(t *testing.T) {
 	}
 	if len(f.routes) != 1 {
 		t.Errorf("the route must survive so the UI can re-disclose the blast radius; got %d", len(f.routes))
+	}
+}
+
+// TestPurgeConflictForeignHostlessOrBlockRefused (roborev cmr5-#1): the case a
+// flattened host-SET pin MISSED. A foreign @id route keeps the SAME host list but
+// gains a second, HOSTLESS match block (a bare OR term that matches every
+// request) between confirm and delete. matcherHostList is unchanged, so the old
+// sameHostSet check would have passed and deleted a route now matching all
+// traffic. The exact-bytes RawHash pin catches it → ErrConflictChanged.
+func TestPurgeConflictForeignHostlessOrBlockRefused(t *testing.T) {
+	const host = "app.example.com"
+	foreign := Route{
+		ID:       "third-party-app",
+		Match:    []Match{{Host: []string{host}}},
+		Handle:   []Handler{{Handler: "reverse_proxy", Upstreams: []Upstream{{Dial: "10.0.0.5:80"}}}},
+		Terminal: true,
+	}
+	c, f := newFake(t, foreign)
+
+	info, err := c.InspectConflict(context.Background(), host, "dev-box", 8080)
+	if err != nil || info.Kind != ForeignOverlap {
+		t.Fatalf("InspectConflict kind=%v err=%v, want ForeignOverlap", info.Kind, err)
+	}
+	expect := ExpectFromConflict(info)
+
+	// A hostless OR match block is added; the host LIST is unchanged, so a
+	// host-set comparison would not notice, but the route now matches everything.
+	// Build the widened element as raw JSON (a hostless match block isn't
+	// expressible via the typed Match host-only builder).
+	widenedRaw := json.RawMessage(`{"@id":"third-party-app","match":[{"host":["app.example.com"]},{"path":["/*"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.0.5:80"}]}],"terminal":true}`)
+	f.mu.Lock()
+	f.routes[0] = widenedRaw
+	f.mu.Unlock()
+
+	if _, err := c.PurgeConflict(context.Background(), host, expect); !errors.Is(err, ErrConflictChanged) {
+		t.Fatalf("err = %v, want ErrConflictChanged (a same-host-list matcher widen must be caught by the exact-bytes pin)", err)
+	}
+	if f.del != 0 || f.mutations != 0 {
+		t.Errorf("a widened foreign route must not be deleted; del=%d mutations=%d", f.del, f.mutations)
 	}
 }
 

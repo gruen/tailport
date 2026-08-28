@@ -3310,7 +3310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// armed above: the take-over FAILED but the purge succeeded, so restore
 				// is still offered (design F4) and its timer must run.
 				return m, tea.Batch(
-					m.setErr(fmt.Sprintf("purged the old route for %s, but the take-over publish failed: %s — %s's current state is unknown; the next edge poll will show it",
+					m.setErr(fmt.Sprintf("purged the old route for %s, but the take-over publish failed: %s — %s's state on the edge is now uncertain; resolve it in Caddy",
 						tookOver, publishErrText(msg.err), tookOver)),
 					armTimer, refresh, m.pollPublishedCmd())
 			}
