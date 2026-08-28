@@ -5221,6 +5221,10 @@ type fakeCaddy struct {
 	// then drop the connection so the client sees a transport error -- a lost-
 	// response step-B commit (kata 7jy2 FIX 1). Consumed (reset) after it fires.
 	failNextPost bool
+	// failNextRoutesGet, when true, drops the connection on the NEXT GET /routes so
+	// the client sees a transport error -- used to fail the restore preflight's
+	// VerifyRestore read (roborev nk3b-#1). Consumed after it fires.
+	failNextRoutesGet bool
 }
 
 func newFakeCaddy() *fakeCaddy {
@@ -5257,6 +5261,15 @@ func (fc *fakeCaddy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/routes"):
 		switch r.Method {
 		case http.MethodGet:
+			if fc.failNextRoutesGet {
+				fc.failNextRoutesGet = false
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						_ = conn.Close()
+						return
+					}
+				}
+			}
 			out := make([]caddyedge.Route, 0, len(fc.routes))
 			for _, rt := range fc.routes {
 				out = append(out, rt)
@@ -7702,6 +7715,56 @@ func TestTtfhClearTriggers(t *testing.T) {
 			t.Error("horizontal nav must not clear the slot while a restore is in flight (design F11)")
 		}
 	})
+
+	// Other early-returning selection changes must clear too (roborev nk3b-#3).
+	t.Run("entering the filter (/) clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, rkey("/"))
+		if m.lastPurge != nil {
+			t.Error("entering the filter changes selection and must clear the restore affordance")
+		}
+	})
+	t.Run("switching all/favorites views (a) clears", func(t *testing.T) {
+		m := armedRestoreModel(t, nil)
+		m = mustUpdate(t, m, rkey("a"))
+		if m.lastPurge != nil {
+			t.Error("switching views changes selection and must clear the restore affordance")
+		}
+	})
+}
+
+// TestTtfhPreflightVerifyErrorStaysRetryable (roborev nk3b-#1): if the restore
+// preflight VerifyRestore read fails transiently, the flow must NOT fall through
+// to step A -- on the retry-after-a-committed-B path that would let Unpublish see
+// the restored route, refuse, and misreport restoreTakeoverChanged, permanently
+// clearing undo. A preflight transport error is retryable, keeping the slot.
+func TestTtfhPreflightVerifyErrorStaysRetryable(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := armedRestoreModel(t, srv)
+	// Simulate a committed-but-lost B: the captured OLD backend is already back
+	// under our @id (our take-over gone), and the preflight VerifyRestore GET
+	// fails transiently.
+	fc.mu.Lock()
+	fc.routes[caddyedge.IDFor(ttfhHost)] = caddyedge.BuildRoute(ttfhHost, "other-box", 9090, nil)
+	fc.failNextRoutesGet = true
+	fc.mu.Unlock()
+
+	res, cmd := m.Update(rkey("R"))
+	m = res.(model)
+	done := cmd().(restoreDoneMsg)
+	if done.result != restoreUnreachable {
+		t.Fatalf("a preflight verify failure must be retryable (unreachable), not fall through to A; got %v", done.result)
+	}
+	m = mustUpdate(t, m, done)
+	if m.lastPurge == nil {
+		t.Error("a retryable preflight failure must KEEP the slot armed for retry")
+	}
+	if len(fc.deletes) != 0 {
+		t.Errorf("the flow must stop at the failed preflight, before step A's delete; deletes=%v", fc.deletes)
+	}
 }
 
 // TestTtfhIdleTimeout: the ~60s idle timer clears the slot, a stale-gen expiry is

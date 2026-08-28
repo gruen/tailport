@@ -1849,9 +1849,24 @@ func restoreCmd(client *caddyedge.Client, hostname, label string, port int, capt
 		// non-Restored state and the flow proceeds A→B→C normally; only after a
 		// lost-response commit is it Restored. Any non-Restored outcome (including a
 		// read error) falls through to A, which surfaces the right result.
-		if state, err := client.VerifyRestore(ctx, hostname, captured); err == nil && state == caddyedge.Restored {
+		state, verr := client.VerifyRestore(ctx, hostname, captured)
+		if verr != nil {
+			// The preflight couldn't read the edge. Do NOT fall through to A
+			// (roborev nk3b-#1): a transient verify failure on the retry-after-a-
+			// committed-B path would let Unpublish see the already-restored route,
+			// refuse with ErrHostnameConflict, and misreport restoreTakeoverChanged
+			// — permanently clearing undo. A transport error stays retryable (keep
+			// the slot); anything else surfaces as an error.
+			if errors.Is(verr, caddyedge.ErrUnreachable) {
+				return restoreDoneMsg{hostname: hostname, result: restoreUnreachable}
+			}
+			return restoreDoneMsg{hostname: hostname, result: restoreError, err: verr}
+		}
+		if state == caddyedge.Restored {
 			return restoreDoneMsg{hostname: hostname, result: restoreRestored}
 		}
+		// A non-Restored, non-error state (on the first attempt, our take-over is
+		// present as a different backend under the same @id) — proceed A→B→C.
 		// (A) remove our take-over.
 		switch err := client.Unpublish(ctx, hostname, label, port); {
 		case err == nil, errors.Is(err, caddyedge.ErrNotFound):
@@ -4001,6 +4016,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// (4ye6): the list snapshots its current items when filtering
 			// begins, so the items must already be the full set. Rebuilding
 			// while still Unfiltered avoids bubbles/list's async re-filter path.
+			m.clearRestoreOnNav() // entering the filter changes scope + selection (roborev nk3b-#3)
 			m.filtering = true
 			m.rebuildItems() // Unfiltered list -> nil cmd
 			var cmd tea.Cmd
@@ -4024,6 +4040,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// capture the selected port number, switch views, then re-select
 			// that port if it survived into the new view (else the nearest
 			// remaining port -- see selectPort).
+			m.clearRestoreOnNav() // switching views changes the selection (roborev nk3b-#3)
 			var cur int
 			if sel, ok := m.list.SelectedItem().(portItem); ok {
 				cur = sel.port.Number
