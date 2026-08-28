@@ -5495,6 +5495,16 @@ func (m model) operatorHintText() string {
 	if !m.operatorNotSet {
 		return ""
 	}
+	return m.operatorHintTextRaw()
+}
+
+// operatorHintTextRaw builds the operator-banner TEXT unconditionally, ignoring
+// the m.operatorNotSet active flag. operatorHintText gates on that flag for the
+// RENDER path; bannerReservationLines calls this instead so it can measure the
+// banner's worst-case wrapped height even while the banner is currently off (it
+// can appear async with no intervening WindowSizeMsg). The two must build the
+// SAME text or the reservation would measure a different string than the render.
+func (m model) operatorHintTextRaw() string {
 	you := m.operatorUser
 	if you == "" {
 		you = "<you>"
@@ -5515,6 +5525,17 @@ func (m model) domainSetupHintText() string {
 	if !m.domainSetupPending {
 		return ""
 	}
+	return m.domainSetupTextRaw()
+}
+
+// domainSetupTextRaw builds the domain-setup-banner TEXT unconditionally,
+// ignoring the m.domainSetupPending active flag (mirrors operatorHintTextRaw).
+// bannerReservationLines uses this to measure the banner's worst-case wrapped
+// height while it's currently off. It reads the CURRENT m.cfg.Caddy.Domain, so
+// the reservation tracks the same (possibly long) domain the render will show
+// -- listBodyHeight is recomputed live per render (via gridDims), so a domain
+// captured without a fresh WindowSizeMsg is still measured against the truth.
+func (m model) domainSetupTextRaw() string {
 	return fmt.Sprintf("⚠ domain saved — you still need *.%s DNS pointed at your edge, and the edge deployed (see docs/caddy-edge.md)", m.cfg.Caddy.Domain)
 }
 
@@ -5526,6 +5547,45 @@ func (m model) domainSetupHintText() string {
 // accounting resizeList feeds to m.list.SetSize; the two must never drift
 // apart or the grid would compute a different row count than the space
 // list.Model itself was actually given.
+// renderBanner wraps a sticky-banner line to m.width with warnStyle, exactly as
+// renderStatusLine wraps its toast: lipgloss.Style.Width word-wraps content that
+// exceeds the width instead of bubbletea hard-truncating it (no ellipsis), so
+// the actionable tail of a long banner (e.g. "the edge deployed (see
+// docs/caddy-edge.md)") stays visible on an ~80-col terminal rather than being
+// clipped off. Returns "" for an empty hint so the render's active-flag gating
+// is preserved, and guards m.width <= 0 (pre-first-resize) so we never set a
+// zero/negative Width. This is the SINGLE wrapping used by BOTH the render
+// (renderBottom) and the reservation (bannerReservationLines) so the two can
+// never disagree on a banner's wrapped height -- the invariant
+// TestBannerReservationDominatesBothLive pins.
+func (m model) renderBanner(hint string) string {
+	if hint == "" {
+		return ""
+	}
+	if m.width <= 0 {
+		return warnStyle.Render(hint)
+	}
+	return warnStyle.Width(m.width).Render(hint)
+}
+
+// bannerReservationLines is the total height the two orthogonal sticky setup
+// banners can ever occupy below the list at the current width, WORST-CASED as if
+// BOTH are live -- mirroring legendReservationLines' unconditional reservation,
+// NOT gated on the current operatorNotSet/domainSetupPending. Either banner can
+// appear asynchronously (the operator hint from a failed toggle's toggleDoneMsg
+// or the startup detectOperatorMsg; the domain reminder from the P flow
+// capturing a blank caddy.domain) with no fresh WindowSizeMsg in between, so
+// sizing must already assume both. Each banner's would-be TEXT is built
+// regardless of its active flag (the *Raw builders) and wrapped through the SAME
+// renderBanner the render uses, so a banner that wraps to more than one line at
+// a narrow width is fully reserved and the reservation can never fall short of
+// the live wrapped height. Floor is 2 (each raw line is non-empty, so each wraps
+// to at least one row), matching the pre-w131 constant.
+func (m model) bannerReservationLines() int {
+	return lipgloss.Height(m.renderBanner(m.operatorHintTextRaw())) +
+		lipgloss.Height(m.renderBanner(m.domainSetupTextRaw()))
+}
+
 // legendReservationLines is the number of rows the bottom-bar legend can ever
 // occupy at the current width: the MAX of the two cleanEnabled renders (with
 // and without the contextual "C clean stale" hint). listBodyHeight reserves
@@ -5562,17 +5622,20 @@ func (m model) listBodyHeight() int {
 	legendLines := m.legendReservationLines()
 	// Reserve the WORST-CASE sticky-banner height too, unconditionally -- like
 	// cleanEnabled=true above, NOT gated on the CURRENT banner state. There are
-	// now TWO independent single-line sticky banners that can each appear
-	// asynchronously with no fresh WindowSizeMsg in between: the operator-hint
-	// banner (kata tapv -- a failed toggle's toggleDoneMsg, or the startup
-	// detectOperatorMsg) and the domain-setup reminder (kata w131 -- raised when
-	// the P flow captures a blank caddy.domain). They are ORTHOGONAL and can be
-	// on at the SAME time, and View stacks both above the status line, so sizing
-	// here must assume the worst case of both live or a later appearance would
-	// clip the list. operatorHintText()/domainSetupHintText() are each always
-	// exactly one line (no embedded newlines), so the worst-case reservation is
-	// a constant 2.
-	const bannerLines = 2
+	// now TWO independent sticky banners that can each appear asynchronously with
+	// no fresh WindowSizeMsg in between: the operator-hint banner (kata tapv -- a
+	// failed toggle's toggleDoneMsg, or the startup detectOperatorMsg) and the
+	// domain-setup reminder (kata w131 -- raised when the P flow captures a blank
+	// caddy.domain). They are ORTHOGONAL and can be on at the SAME time, and View
+	// stacks both above the status line, so sizing here must assume the worst
+	// case of both live or a later appearance would clip the list. Each banner is
+	// now WRAPPED to m.width at the render site (renderBanner) instead of being
+	// hard-truncated, so a long line (the domain reminder easily runs past 80
+	// cols) can span more than one row -- the reservation MEASURES that wrapped
+	// worst case (bannerReservationLines) through the SAME renderBanner the render
+	// uses, rather than assuming a flat one-line-each constant, so a wrapped
+	// banner can never clip the list. Floor is 2 (both lines non-empty).
+	bannerLines := m.bannerReservationLines()
 	// Reserve the persistent top header (one row) plus the bottom bar: one
 	// blank separator, the status line (now measured live -- see below,
 	// rather than a flat 1, since a wrapped flash toast can span multiple
@@ -5739,12 +5802,16 @@ func (m model) renderBottom() string {
 	// are rendered here, stacked. Each is styled via warnStyle (a NAMED style,
 	// not a hardcoded color) so it stays legible under any future light/dark
 	// AdaptiveColor conversion of that style, and listBodyHeight's bannerLines
-	// reserves the worst case of both being live.
-	if hint := m.domainSetupHintText(); hint != "" {
-		bar = warnStyle.Render(hint) + "\n" + bar
+	// reserves the worst case of both being live. Each is WRAPPED to m.width via
+	// renderBanner (the SAME helper the reservation measures with, mirroring how
+	// renderStatusLine wraps its toast) so a long banner word-wraps instead of
+	// being hard-truncated with its actionable tail lost -- and never introduces
+	// a horizontal scroll.
+	if banner := m.renderBanner(m.domainSetupHintText()); banner != "" {
+		bar = banner + "\n" + bar
 	}
-	if hint := m.operatorHintText(); hint != "" {
-		bar = warnStyle.Render(hint) + "\n" + bar
+	if banner := m.renderBanner(m.operatorHintText()); banner != "" {
+		bar = banner + "\n" + bar
 	}
 	if legend := m.renderLegend(); legend != "" {
 		bar += "\n" + legend

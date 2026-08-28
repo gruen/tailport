@@ -5686,13 +5686,21 @@ func TestTwoConcurrentBanners(t *testing.T) {
 }
 
 // TestBannerReservationDominatesBothLive mirrors TestOperatorHintSizingNoClip
-// but exercises BOTH sticky banners appearing after the last resize (kata w131):
-// the worst-case bannerLines reservation (now 2) must cover both live at once so
-// a late appearance never clips the list.
+// but exercises BOTH sticky banners appearing after the last resize (kata w131),
+// and now pins the WRAPPED-height invariant directly (roborev 7dbj finding 3):
+// the banners are wrapped to m.width at the render site (renderBanner) instead
+// of being hard-truncated, so a long one -- the domain reminder easily runs past
+// 80 cols -- can span more than one row. listBodyHeight must reserve that
+// measured worst case (bannerReservationLines), through the SAME renderBanner the
+// render uses, or a wrapped banner clips the list. Each case asserts the
+// reservation is never shorter than the live rendered banner height, that
+// listBodyHeight stays >=1, and that View never exceeds the viewport; one case
+// forces a LONG domain at a NARROW width so the domain banner genuinely wraps to
+// 2+ lines and proves the reservation still covers it.
 func TestBannerReservationDominatesBothLive(t *testing.T) {
-	build := func(w, h int, opAtRender, domAtRender bool) model {
+	build := func(w, h int, domain string, opAtRender, domAtRender bool) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{}})
-		m.cfg.Caddy.Domain = "apps.example.com"
+		m.cfg.Caddy.Domain = domain
 		m.operatorUser = "alice"
 		m.allPorts = []portscan.Port{
 			{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"},
@@ -5708,19 +5716,63 @@ func TestBannerReservationDominatesBothLive(t *testing.T) {
 		m.domainSetupPending = domAtRender
 		return m
 	}
+	// liveBannerHeight is the height the LIVE (active-flag-gated) banners actually
+	// render to, wrapped exactly as renderBottom wraps them -- the height the
+	// reservation must dominate.
+	liveBannerHeight := func(m model) int {
+		h := 0
+		if b := m.renderBanner(m.domainSetupHintText()); b != "" {
+			h += lipgloss.Height(b)
+		}
+		if b := m.renderBanner(m.operatorHintText()); b != "" {
+			h += lipgloss.Height(b)
+		}
+		return h
+	}
+	const longDomain = "staging.internal-tools.us-east-1.platform.example.com"
 	for _, tc := range []struct {
 		name        string
 		w, h        int
+		domain      string
 		opOn, domOn bool
+		wantDomWrap bool // domain banner must wrap to 2+ lines in this case
 	}{
-		{"wide/both", 100, 24, true, true},
-		{"narrow/both", 58, 24, true, true},
-		{"wide/op-only", 100, 24, true, false},
-		{"wide/dom-only", 100, 24, false, true},
-		{"narrow/dom-only", 58, 24, false, true},
+		{"wide/both", 100, 24, "apps.example.com", true, true, false},
+		{"narrow/both", 58, 24, "apps.example.com", true, true, false},
+		{"wide/op-only", 100, 24, "apps.example.com", true, false, false},
+		{"wide/dom-only", 100, 24, "apps.example.com", false, true, false},
+		{"narrow/dom-only", 58, 24, "apps.example.com", false, true, false},
+		// A long domain at a narrow width forces the domain banner across
+		// multiple rows -- the reservation must MEASURE that, not assume 1 line.
+		{"narrow/long-domain/both", 48, 24, longDomain, true, true, true},
+		{"narrow/long-domain/dom-only", 40, 24, longDomain, false, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := build(tc.w, tc.h, tc.opOn, tc.domOn)
+			m := build(tc.w, tc.h, tc.domain, tc.opOn, tc.domOn)
+
+			// The reservation must never fall short of the live wrapped banners --
+			// the exact invariant a wrapped (multi-line) banner could otherwise
+			// break. bannerReservationLines worst-cases BOTH banners, so it equals
+			// the live height when both are on and exceeds it when only one is.
+			reserved := m.bannerReservationLines()
+			if live := liveBannerHeight(m); reserved < live {
+				t.Errorf("banner reservation %d < live banner height %d -- a wrapped banner would clip the list", reserved, live)
+			}
+
+			// Prove the intended multi-line wrap is actually being exercised, so
+			// this case can't silently degrade into a single-line one.
+			if tc.wantDomWrap {
+				if dh := lipgloss.Height(m.renderBanner(m.domainSetupHintText())); dh < 2 {
+					t.Errorf("domain banner height %d at width %d -- expected a multi-line wrap (>=2) for this case", dh, tc.w)
+				}
+			}
+
+			// listBodyHeight must stay positive (never negative/zero) even with the
+			// larger wrapped reservation subtracted.
+			if bh := m.listBodyHeight(); bh < 1 {
+				t.Errorf("listBodyHeight %d < 1 -- reservation drove the body negative", bh)
+			}
+
 			view := m.View()
 			if got := lipgloss.Height(view); got > m.height {
 				t.Errorf("View height %d > terminal height %d (clip/overlap):\n%s", got, m.height, stripANSI(view))

@@ -34,9 +34,10 @@ type PortMeta struct {
 // the saved config -- see applyDefaults and the comment on Save -- so a new
 // user sees the available knobs (and what they mean) without reading docs.
 type CaddyConfig struct {
-	// Hostname is the tailnet name of the Caddy edge node (short MagicDNS
-	// label or FQDN); tailport reaches its admin API here. Defaults to
-	// "caddy".
+	// Hostname is the tailnet name of the Caddy edge node; tailport reaches
+	// its admin API here. Use the short MagicDNS label (e.g. "caddy"), not an
+	// FQDN -- the edge admits only its short name, so an FQDN silently 403s
+	// (and publishing rejects one). Defaults to "caddy".
 	Hostname string `yaml:"hostname"`
 	// Domain is the public base domain used to build publish hostnames.
 	// Blank (the default) means publishing is unconfigured: no safe
@@ -544,7 +545,7 @@ func applyCaddyComments(root *yaml.Node) {
 		return
 	}
 	setKeyHeadComment(caddy, "hostname",
-		"Tailnet name of the Caddy edge node (short MagicDNS label or FQDN);\ntailport reaches its admin API here.")
+		"Tailnet name of the Caddy edge node; tailport reaches its admin API\nhere. Use the short MagicDNS label, not an FQDN.")
 	setKeyHeadComment(caddy, "domain",
 		"\nPublic base domain used to build publish hostnames. Point its DNS\n"+
 			"(typically a wildcard) at the public Caddy edge before publishing.")

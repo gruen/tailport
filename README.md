@@ -288,14 +288,14 @@ reading docs:
 > feature landed has **no `caddy:` block yet** — that's expected, and it's why
 > you won't find a `domain:` line to edit. It appears on the next save — any
 > change that writes the file, e.g. favouriting or labelling a port — or just
-> paste the block below in by hand and set `domain:` there. (Publishing can't
-> be the trigger: `P` is refused until `domain` is set, which is the very thing
-> you're trying to add.)
+> paste the block below in by hand and set `domain:` there. (Publishing can
+> also be the trigger: pressing `P` with a blank `domain` captures it inline
+> and saves it for you, rather than refusing.)
 
 ```yaml
 caddy:
-    # Tailnet name of the Caddy edge node (short MagicDNS label or FQDN);
-    # tailport reaches its admin API here.
+    # Tailnet name of the Caddy edge node; tailport reaches its admin API
+    # here. Use the short MagicDNS label, not an FQDN.
     hostname: caddy
 
     # Public base domain used to build publish hostnames. Point its DNS
@@ -313,13 +313,16 @@ caddy:
 
 - **`hostname`** (default `caddy`) — the edge's own private tailnet
   identity, used only so tailport can find its admin API at
-  `http://<hostname>:<admin_port>`. It has nothing to do with any published
-  route's public hostname (e.g. `app.example.com`) — private edge identity
-  and public route identity are deliberately separate.
+  `http://<hostname>:<admin_port>`. Use the short MagicDNS label, **not** an
+  FQDN — the edge admits only its short name, so an FQDN silently 403s and
+  publishing rejects one. It has nothing to do with any published route's
+  public hostname (e.g. `app.example.com`) — private edge identity and public
+  route identity are deliberately separate.
 - **`domain`** (default `""`, blank) — the public base domain publish
-  hostnames are built from. Blank means publishing is unconfigured: `P`
-  refuses with an error naming this field, and the background
-  published-state poll doesn't run (zero cost until you set it).
+  hostnames are built from. Blank doesn't block publishing: pressing `P`
+  captures the domain inline and saves it before continuing (rather than
+  refusing), and until it's set the background published-state poll doesn't
+  run (zero cost until you set it).
 - **`server_name`** (default `tailport`) — the shared Caddy HTTP server
   tailport manages. Every tailport computer publishing through the same
   edge must agree on this value; it selects the routes array, it does not
@@ -382,8 +385,9 @@ domain whose DNS points at it, and a Tailscale auth key for the edge itself.
 See [`docs/caddy-edge.md`](docs/caddy-edge.md) for the full runbook (written
 for a Caddy/Fly first-timer) and the `caddy.*` fields under
 [Configuration](#configuration) above for what tailport needs once that edge
-exists. Until `caddy.domain` is set, publishing is unconfigured and refuses
-with an error naming the field and pointing at that doc.
+exists. Until `caddy.domain` is set, the background published-state poll
+stays off; the first time you press `P`, tailport captures the domain inline
+and saves it before continuing, so you don't have to edit the config by hand.
 
 Once configured, publishing a port works the same shape as Funnel: select a
 port, confirm the public hostname and (optionally) a shared basic-auth
