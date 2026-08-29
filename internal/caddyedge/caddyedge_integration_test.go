@@ -98,7 +98,11 @@ func startCaddy(t *testing.T, cfg any, adminURL string) {
 		t.Fatalf("mkdir XDG_DATA_HOME: %v", err)
 	}
 
-	cmd := exec.Command("caddy", "run", "--config", cfgPath, "--adapter", "json")
+	// JSON is caddy's NATIVE config format -- there is no "json" config adapter
+	// to name. Passing `--adapter json` errors ("unrecognized config adapter:
+	// json") on modern caddy (reproduced against v2.11.4); the config loads
+	// straight from --config with no adapter. Do not "helpfully" re-add it.
+	cmd := exec.Command("caddy", "run", "--config", cfgPath)
 	// No sudo, no user change -- runs as whoever invoked `go test`. Redirecting
 	// these two vars keeps caddy's autosave config, storage (certs, OCSP
 	// staples, ...), and any other state entirely inside the temp dir, never
@@ -315,17 +319,23 @@ func TestCaddyIntegration(t *testing.T) {
 			t.Errorf("second Unpublish = %v, want ErrNotFound", err)
 		}
 
-		// Proxying the now-unpublished hostname must stop working (Caddy 404s
-		// a host with no matching route).
+		// Proxying the now-unpublished hostname must stop reaching the backend.
+		// NOTE: a Caddy HTTP server with routes but none matching the request's
+		// Host returns an EMPTY 200 by default -- it does NOT 404 (verified
+		// against real caddy v2.11.4). So asserting on the status code is wrong;
+		// the real invariant is that the request no longer reaches the echo
+		// backend, which stamps every response it serves with X-Echo-Host. Its
+		// absence proves the route is gone and nothing proxied.
 		req2, _ := http.NewRequest(http.MethodGet, proxyBase+"/", nil)
 		req2.Host = "myapp.example.com"
 		resp2, err := http.DefaultClient.Do(req2)
 		if err != nil {
 			t.Fatalf("request after unpublish: %v", err)
 		}
+		body2, _ := io.ReadAll(resp2.Body)
 		resp2.Body.Close()
-		if resp2.StatusCode == http.StatusOK {
-			t.Errorf("myapp.example.com still proxies (status 200) after Unpublish")
+		if got := resp2.Header.Get("X-Echo-Host"); got != "" {
+			t.Errorf("myapp.example.com still reached the backend after Unpublish (X-Echo-Host=%q, status=%d, body=%q)", got, resp2.StatusCode, body2)
 		}
 	})
 
@@ -490,7 +500,8 @@ func TestBootstrapConfigAcceptedByCaddy(t *testing.T) {
 		}
 	}
 
-	cmd := exec.Command("caddy", "validate", "--config", bootstrapPath, "--adapter", "json")
+	// Native JSON -- no `--adapter json` (see startCaddy's note; it errors on modern caddy).
+	cmd := exec.Command("caddy", "validate", "--config", bootstrapPath)
 	cmd.Env = append(os.Environ(),
 		"XDG_CONFIG_HOME="+xdgConfig,
 		"XDG_DATA_HOME="+xdgData,
