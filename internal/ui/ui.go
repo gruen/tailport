@@ -3231,7 +3231,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeList()
-		return m, nil
+		// Rebuild so width-dependent row annotations refresh immediately on
+		// resize -- notably the reachPublish "· p to unpublish" hint, whose
+		// fit is decided from the per-build availDescWidth (71ga); without this
+		// it would stay stale until the next poll/nav rebuild (roborev v5d8).
+		return m, m.rebuildItems()
 
 	case refreshMsg:
 		if msg.err != nil {
@@ -6095,7 +6099,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
 		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. Needs caddy.domain/hostname\nconfigured (see docs/caddy-edge.md). Press p again to unpublish.",
-		"c":      "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
+		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). A PUBLISHED port copies its public https://<hostname>;\nevery other port copies its tailnet URL (http://<host>:<port>) — a\nfunnelled port too, and the toast names that mismatch. Copies even\nbefore it's served — the toast says so.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
 		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them. (To restore a\nforce-purged route is a SEPARATE affordance on its own key — R,\nshown in the status line right after the purge — not this.)",

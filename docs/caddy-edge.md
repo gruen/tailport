@@ -97,7 +97,8 @@ when you deploy it.
    ```json
    {
      "tagOwners": {
-       "tag:tailport-edge": ["autogroup:admin"],
+       "tag:tailport-edge":    ["autogroup:admin"],
+       "tag:tailport-backend": ["autogroup:admin"], // the tag your backend machine(s) carry
      },
 
      "grants": [
@@ -136,9 +137,9 @@ when you deploy it.
 
    ```json
    "acls": [
-     { "action": "accept", "src": ["tag:tailport-edge"],
+     { "action": "accept", "proto": "tcp", "src": ["tag:tailport-edge"],
        "dst": ["tag:tailport-backend:8080,8443,9000"] },
-     { "action": "accept", "src": ["alice@example.com", "bob@example.com"],
+     { "action": "accept", "proto": "tcp", "src": ["alice@example.com", "bob@example.com"],
        "dst": ["tag:tailport-edge:2019"] },
    ],
    ```
@@ -214,11 +215,14 @@ for what has to agree with tailport's `caddy.hostname`).
 **Do not run `fly certs add` (or set any Fly certificate).** Caddy owns TLS
 here: the `[[services]]` blocks are raw TCP passthrough, so Fly never sees the
 handshake — a Fly cert would do nothing, and Fly's proxy can't terminate on the
-same `:443` Caddy does. Each published hostname's certificate is issued and
-renewed by Caddy itself over Let's Encrypt (ACME), on demand, the first time a
-route for that hostname is published — provided its DNS (next step) resolves to
-this edge and `:80`/`:443` are reachable from the public internet. It's a
-per-hostname cert, not a wildcard (see §6 if issuance stalls).
+same `:443` Caddy does. Each published hostname's certificate is obtained and
+renewed automatically by Caddy through its default ACME issuers (Let's Encrypt,
+with ZeroSSL as fallback) when the route for that hostname is first published —
+provided its DNS (next step) resolves to this edge and `:80`/`:443` are
+reachable from the public internet. (This is Caddy's normal automatic HTTPS on
+route provisioning, not its separate On-Demand TLS feature, which this edge does
+not enable.) It's a per-hostname cert, not a wildcard (see §6 if issuance
+stalls).
 
 ## 3. DNS
 
@@ -507,7 +511,7 @@ Copy it to a gitignored `edge.env`, fill it in, and load it in the shell you
 deploy from — re-`source` it whenever you open a new shell:
 
 ```sh
-cd packaging/caddy-edge
+cd "$(git rev-parse --show-toplevel)/packaging/caddy-edge"
 cp edge.env.example edge.env
 $EDITOR edge.env
 . ./edge.env              # `source edge.env` in bash
@@ -539,7 +543,7 @@ becomes a Fly secret below, never a file in the repo.
 ### Fly: files, resources, deploy — shell, from `packaging/caddy-edge/` (§2)
 
 ```sh
-cd packaging/caddy-edge
+cd "$(git rev-parse --show-toplevel)/packaging/caddy-edge"
 
 # fly.toml is gitignored — generate it from the template with your app + region:
 cp fly.toml.example fly.toml

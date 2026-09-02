@@ -156,16 +156,21 @@ already documents this).
   against its `go 1.26` go.mod, so it's the real proof the packaged path works;
   a failure is a formula bug to fix forward against `nqmn`/`s3wn`, never a
   release re-cut. Record the run URL + verdict on the release ticket.
-- **Real-caddy edge path (opt-in `[ci caddy]`).** The `internal/caddyedge`
-  publish contract and `packaging/caddy-edge/bootstrap-caddy.json.example` are
-  proven against a real `caddy` binary by `caddy-integration.yml`, which
-  self-skips everywhere except when explicitly asked. Those assertions are
-  already verified locally (kata `pxrx`, against caddy v2.11.4), so this is
-  belt-and-suspenders for the runner-side apt-install path — dispatch it once
-  around the release to confirm that too:
+- **Real-caddy edge path (opt-in `[ci caddy]`).** `caddy-integration.yml`
+  exercises `internal/caddyedge`'s publish contract against a real `caddy` run
+  (Host rewrite, basic auth, idempotent PATCH republish, DELETE, a real 412),
+  and runs `caddy validate` on
+  `packaging/caddy-edge/bootstrap-caddy.json.example` to prove it parses and
+  provisions. It self-skips everywhere except when explicitly asked. Those
+  assertions are already verified locally (kata `pxrx`, against caddy v2.11.4),
+  so this is belt-and-suspenders for the runner-side apt-install path — dispatch
+  it once around the release to confirm that too:
   ```sh
   gh workflow run caddy-integration.yml --ref main
   ```
   The job never binds `:80`/`:443` (it runs only the test's own ephemeral-port
-  caddy). It does **not** cover the live Fly edge — that is the operator deploy,
+  caddy). Two things it does **not** cover, by construction: the entrypoint's
+  env-substitution and whether the derived `admin.origins` actually accepts
+  tailport's Host header (`caddy validate` never parses `admin.origins`), and
+  the live Fly edge end to end. Both are proven only by the operator deploy,
   kata `9kgt`.
