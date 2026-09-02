@@ -25,6 +25,7 @@ smoke test, troubleshooting), see
 | [`entrypoint.sh`](./entrypoint.sh) | Container entrypoint: starts `tailscaled`, joins the tailnet, exposes Caddy's admin API tailnet-only via `tailscale serve`, sed-templates the live Caddy config from env (see below), then `exec`s `caddy run --resume`. |
 | [`bootstrap-caddy.json.example`](./bootstrap-caddy.json.example) | Template for Caddy's first-boot admin config: an empty `tailport` HTTP server on `:443`/`:80`, plus a widened `admin.origins` list with a placeholder token (see below). Tracked as-is and `COPY`ied straight into the image — nothing to fill in before building. `entrypoint.sh` fills the token in from env at container boot. |
 | [`fly.toml.example`](./fly.toml.example) | Template for a Fly.io deployment: raw-TCP passthrough on 80/443, the state volume, and deliberately no service for the admin port. |
+| [`edge.env.example`](./edge.env.example) | Template for the deploy variables (`APP`/`REGION`/`DOMAIN`/`HOSTNAME`/`TAG`) the runbook's scripted appendix uses. Copy to a gitignored `edge.env` and `source` it instead of retyping them each shell. Not secrets — `TS_AUTHKEY` stays in `fly secrets`. |
 
 ## How this maps to tailport's `caddy.*` config
 

@@ -447,12 +447,11 @@ value is a shell variable set once up front; the two Tailscale **admin-console**
 steps (ACL, key) aren't shell and are marked as such. The `§N` links point back
 to the full rationale.
 
-### Set these once (shell variables)
+### Set these once (a file you source)
 
-These are ordinary shell variables — they live only in the terminal session you
-set them in (not written anywhere, gone when that shell closes), so set them in
-the **same** shell you run the rest from, and re-run this block if you open a
-new one.
+Five values feed the whole appendix. Rather than retyping them into every new
+shell, keep them in a file and `source` it — that's what the tracked
+`edge.env.example` template is for. Its values:
 
 ```sh
 APP=my-tailport-edge      # Fly app name — globally unique across all of Fly; pick anything free
@@ -460,10 +459,25 @@ REGION=iad                # Fly region id (`fly platform regions`), near your vi
 DOMAIN=example.com        # your public base domain → tailport's caddy.domain (§4)
 HOSTNAME=caddy            # the edge's TAILNET name → tailport's caddy.hostname (§4); default `caddy`
 TAG=tag:tailport-edge     # the Tailscale ACL tag the edge registers under (§1)
+```
 
+Copy it to a gitignored `edge.env`, fill it in, and load it in the shell you
+deploy from — re-`source` it whenever you open a new shell:
+
+```sh
+cd packaging/caddy-edge
+cp edge.env.example edge.env
+$EDITOR edge.env
+. ./edge.env              # `source edge.env` in bash
 echo "APP=$APP REGION=$REGION DOMAIN=$DOMAIN HOSTNAME=$HOSTNAME TAG=$TAG"
 # ↑ all five must be non-empty before you continue.
 ```
+
+`edge.env` matches the gitignore's `*.env` rule so it can't be committed — keep
+it that way: the one real secret, `TS_AUTHKEY`, is set with `fly secrets set`
+below, never in this file. (Prefer not to keep a file? Paste the value block
+inline instead; those are ordinary shell variables that just vanish when the
+shell closes.)
 
 ### Tailscale: ACL, then key — admin console (§1)
 
