@@ -47,7 +47,7 @@ const (
 	// Always rendered distinctly from ModeServe -- see WriteTable.
 	ModeFunnel Mode = "funnel"
 	// ModePublish is public-internet exposure via a user-controlled Caddy edge
-	// node (the `P` publish path, kata v1z5): reachable by anyone at a custom
+	// node (the `p` publish path, kata v1z5; swapped from `P` under vzj4): reachable by anyone at a custom
 	// public hostname (no ts.net, no Funnel slot). For a tailport-driven port,
 	// ModeFunnel and ModePublish are mutually exclusive by construction (the
 	// UI refuses to create one where the other already exists) -- see Build's

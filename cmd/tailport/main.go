@@ -339,7 +339,7 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 // paragraph on what tailport does, a prerequisites note (tailscale's own
 // operator requirement -- kata tapv), its safety model (serve is
 // tailnet-only and the only automatic path; funnel is public and opt-in
-// ONLY via the `p` key behind a strong confirm; :22 is hard-blocked from
+// ONLY via the `P` key (swapped from `p` under vzj4) behind a strong confirm; :22 is hard-blocked from
 // funnel -- see AGENTS.md's "Design constraints" section, which this
 // wording tracks closely), the resolved config path, and the full
 // keybinding legend.
@@ -377,7 +377,7 @@ func quickstartText(configPath string, emoji bool, operatorUser string) string {
 	fmt.Fprintln(&b, "  tailnet devices at http://<host>:<port>, always a 1:1 port mapping (same")
 	fmt.Fprintln(&b, "  port in and out).")
 	fmt.Fprintln(&b, "  `tailscale funnel` (public internet exposure) IS supported, but only as")
-	fmt.Fprintln(&b, "  a deliberate, per-service opt-in via the `p` key behind a strong y/n")
+	fmt.Fprintln(&b, "  a deliberate, per-service opt-in via the `P` key behind a strong y/n")
 	fmt.Fprintln(&b, "  confirm that names the port and shows the resulting public URL. tailport")
 	fmt.Fprintln(&b, "  never funnels implicitly, in bulk, or without that confirm.")
 	fmt.Fprintln(&b, "  `:22` (SSH) is hard-blocked from funnel.")

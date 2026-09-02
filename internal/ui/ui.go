@@ -146,7 +146,8 @@ type keyMap struct {
 	Toggle key.Binding
 	Funnel key.Binding
 	// Publish exposes a port to the public internet through a user-controlled
-	// Caddy edge (the `P` key, kata v1z5). It is a SECOND public path, sibling
+	// Caddy edge (the `p` key, kata v1z5; swapped from `P` under vzj4). It is a
+	// SECOND public path, sibling
 	// to Funnel and mutually exclusive with it per port -- never ranked above.
 	Publish  key.Binding
 	Filter   key.Binding
@@ -226,10 +227,13 @@ func newKeyMap() keyMap {
 		// space performs, matching the approved p39s grouping table. The "?"
 		// overlay keeps the fuller "toggle serve on/off" prose (keyLegendDescs).
 		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "serve")),
-		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "funnel public")),
+		// p/P swapped (vzj4): capital guards the more-permanent exposure, so
+		// funnel (tailnet-only cert, easy to drop) takes the shifted key and
+		// publish (custom domain via Caddy edge) takes the bare key.
+		Funnel: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "funnel public")),
 		// "publish edge": the second public path (kata v1z5), a Caddy-edge
 		// publish sibling to funnel, listed right after it in the Expose group.
-		Publish: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "publish edge")),
+		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "publish edge")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -277,6 +281,12 @@ type portItem struct {
 	// way to see both is external mutation, surfaced as explicit drift (reach).
 	publishHostname string
 	publishAuth     bool
+	// availDescWidth is the delegate's available title/description budget
+	// (m.availableDescriptionWidth() at build time), threaded onto the item so
+	// the otherwise-pure plainDescription can decide whether the reachPublish
+	// "· p to unpublish" discoverability hint (71ga) would fit without being
+	// truncated -- omitted rather than clipped when it wouldn't.
+	availDescWidth int
 	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
 	// Favorites view by an active "/" filter (4ye6), so real favorites still
 	// stand out among the wider search results. See portDelegate.Render.
@@ -517,18 +527,18 @@ func (i portItem) reach() reachState {
 
 // inlineCopyState reports whether a `c` copy on this row confirms INLINE
 // (append a transient "✓ copied" to the row's description) rather than via the
-// bottom-bar toast (vqa3). True for the four healthy copyable states whose row
-// text already states what was copied; false for funnel (shown public URL ≠
-// copied tailnet URL), stale (dangling — the copied URL resolves to nothing),
-// and offline (nothing live to copy), which keep the one disambiguating toast.
+// bottom-bar toast (vqa3). True for the healthy copyable states whose row
+// text already states what was copied -- including reachPublish (d80p): `c`
+// now copies the exact "https://<publishHostname>" the row shows, so
+// shown==copied and it joins the inline group. False for funnel (shown
+// PUBLIC funnel URL ≠ copied TAILNET URL — a genuine shown≠copied mismatch),
+// stale (dangling — the copied URL resolves to nothing), and offline (nothing
+// live to copy), which keep the one disambiguating toast.
 func (i portItem) inlineCopyState() bool {
 	switch i.reach() {
-	case reachLocalhost, reachLAN, reachTailnet, reachServed:
+	case reachLocalhost, reachLAN, reachTailnet, reachServed, reachPublish:
 		return true
-	default: // reachFunnel, reachPublish, reachStale, reachOffline
-		// reachPublish joins funnel as a shown≠copied case: the row shows the
-		// PUBLIC https URL but `c` copies the TAILNET url, so it keeps the
-		// disambiguating toast rather than a bare inline ✓.
+	default: // reachFunnel, reachStale, reachOffline
 		return false
 	}
 }
@@ -545,6 +555,11 @@ func (i portItem) plainDescription() string {
 		d := "published to the internet · https://" + i.publishHostname
 		if i.publishAuth {
 			d += " · basic auth"
+		}
+		// 71ga: surface that (now) `p` unpublishes, but only when it fits --
+		// omit the hint rather than let bubbles/list truncate it away.
+		if publishHintFits(lipgloss.Width(d), i.availDescWidth) {
+			d += unpublishHint
 		}
 		return d
 	case reachStale:
@@ -896,7 +911,8 @@ const (
 	// stray "x" must not remove it. Only unlocking is gated -- locking :22 and
 	// any non-:22 lock toggle stay a single instant keypress.
 	entryConfirmUnlockSSH
-	// The publish (`P`) flow (kata v1z5) is a small state machine of its own,
+	// The publish (`p`) flow (kata v1z5; swapped from `P` under vzj4) is a
+	// small state machine of its own,
 	// all handled in updatePublishEntry. It gathers a public hostname, an
 	// optional shared basic-auth credential (first authed publish only), then a
 	// funnel-grade confirm before touching the Caddy edge. The domain step is
@@ -1084,7 +1100,8 @@ type model struct {
 	funnelPort   int
 	funnelPublic int
 	funnelTurnOn bool
-	// Publish (`P`) flow state (kata v1z5), carried across the dialog steps and
+	// Publish (`p`) flow state (kata v1z5; swapped from `P` under vzj4), carried
+	// across the dialog steps and
 	// cleared by clearPublishFlow on esc/abort/confirm. publishInput is the ONE
 	// shared textinput reused for the host / cred-user / cred-pass steps (its
 	// EchoMode is flipped to EchoPassword only for the password step).
@@ -1152,8 +1169,9 @@ type model struct {
 	// operatorHintText, and the detectOperatorMsg/toggleDoneMsg handlers.
 	operatorNotSet bool
 	// domainSetupPending is a SECOND sticky banner, PARALLEL to and independent
-	// of operatorNotSet (kata w131, ycv1 r3-NEW-1): it is raised when the `P`
-	// flow captures a blank caddy.domain inline (entryPublishDomain) and reminds
+	// of operatorNotSet (kata w131, ycv1 r3-NEW-1): it is raised when the `p`
+	// flow (swapped from `P` under vzj4) captures a blank caddy.domain inline
+	// (entryPublishDomain) and reminds
 	// the user that saving the config FIELD is not the same as doing the edge
 	// SETUP -- they still owe the *.<domain> wildcard DNS pointed at the edge and
 	// a deployed edge. It is deliberately NOT a reuse of operatorNotSet: that one
@@ -1983,6 +2001,22 @@ func publishErrText(err error) string {
 // (portItem.Description) can never drift out of sync about its width.
 const copiedSuffix = "  ✓ copied"
 
+// unpublishHint is the plain discoverability hint (71ga) appended to a
+// reachPublish row's description, surfacing that the (now) `p` key
+// unpublishes an already-published port. See publishHintFits for the
+// width-fit check that decides whether it's shown at all.
+const unpublishHint = " · p to unpublish"
+
+// publishHintFits reports whether appending unpublishHint to a description of
+// descWidth (its PLAIN, unstyled rendered width) would still fit within
+// availWidth, the delegate's available title/description budget
+// (availableDescriptionWidth). Same measurement approach as inlineCopyFits,
+// kept separate since the two annotations have different widths and can be
+// present independently of each other.
+func publishHintFits(descWidth, availWidth int) bool {
+	return descWidth+lipgloss.Width(unpublishHint) <= availWidth
+}
+
 // descTruncateStyle mirrors the style bubbles/list's DefaultDelegate.Render
 // uses to compute its available text width (vendored
 // github.com/charmbracelet/bubbles/list@v1.0.0, defaultitem.go: textwidth =
@@ -2123,7 +2157,10 @@ func httpURL(host string, port int) string {
 // bind copies its real http://<lan-ip>:PORT; a localhost-only port or an
 // offline favorite copies http://localhost:PORT instead of a dead tailnet URL.
 // (Funnelled ports deliberately keep the tailnet form -- the toast names the
-// public-vs-tailnet mismatch.)
+// public-vs-tailnet mismatch.) reachPublish is the one exception (d80p): it
+// copies the exact public "https://<publishHostname>" the row shows, not the
+// tailnet form, since that's the URL the port is actually reachable at from
+// the public internet.
 func (m *model) copyTargetURL(sel portItem) string {
 	tailnetURL := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
 	switch sel.reach() {
@@ -2134,7 +2171,9 @@ func (m *model) copyTargetURL(sel portItem) string {
 		return httpURL(sel.port.BindHost, sel.port.Number)
 	case reachLocalhost, reachOffline:
 		return fmt.Sprintf("http://localhost:%d", sel.port.Number)
-	default: // reachTailnet, reachServed, reachFunnel, reachPublish, reachStale
+	case reachPublish:
+		return "https://" + sel.publishHostname
+	default: // reachTailnet, reachServed, reachFunnel, reachStale
 		return tailnetURL
 	}
 }
@@ -2146,16 +2185,19 @@ func (m *model) copyTargetURL(sel portItem) string {
 // http://localhost:<port> for a localhost-only port or an offline favorite --
 // never a dead tailnet URL for a port that can't actually be reached that way.
 // A funnelled port still copies the tailnet form on purpose (the toast names
-// the public-vs-tailnet mismatch). The inline "✓ copied" confirmation is now
-// UNIVERSAL (vqa3) across every inlineCopyState() row -- reachLocalhost,
-// reachLAN, reachTailnet, reachServed -- because each row's description
-// already states exactly what got copied, so -- provided the annotation fits
-// the terminal width (inlineCopyFits) -- the confirmation goes inline as a
-// transient "✓ copied" on the row instead of the bottom-bar toast (py5b).
-// The three principled exceptions keep the toast: funnel (row shows the
-// PUBLIC url but c copies the TAILNET url -- shown≠copied), stale (dangling
-// -- the copied URL resolves to nothing), and offline (nothing live to
-// copy). A too-narrow row for an inline state also falls back to the toast.
+// the public-vs-tailnet mismatch). A published port copies its exact public
+// "https://<publishHostname>" (d80p) -- shown==copied, unlike funnel. The
+// inline "✓ copied" confirmation is now UNIVERSAL (vqa3) across every
+// inlineCopyState() row -- reachLocalhost, reachLAN, reachTailnet,
+// reachServed, reachPublish -- because each row's description already states
+// exactly what got copied, so -- provided the annotation fits the terminal
+// width (inlineCopyFits) -- the confirmation goes inline as a transient
+// "✓ copied" on the row instead of the bottom-bar toast (py5b). The two
+// remaining principled exceptions keep the toast: funnel (row shows the
+// PUBLIC url but c copies the TAILNET url -- shown≠copied) and stale
+// (dangling -- the copied URL resolves to nothing); offline has nothing live
+// to copy either. A too-narrow row for an inline state also falls back to
+// the toast.
 func (m *model) copyURL(sel portItem) tea.Cmd {
 	url := m.copyTargetURL(sel)
 
@@ -2196,15 +2238,11 @@ func (m *model) copyURL(sel portItem) tea.Cmd {
 		// is the one principled exception to universal inline (vqa3): a toast
 		// that names what was actually copied.
 		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public funnel url)", url), flashInfo)
-	case reachPublish:
-		// Same shown≠copied split as funnel (kata v1z5): the row shows the
-		// public https URL but c copies the tailnet url; the toast says so.
-		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public published url)", url), flashInfo)
 	default:
 		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
-		// favorite) -- "press space to serve it" is TRUE here. reachServed
-		// (the inline path didn't fit) / reachFunnel / reachStale are all
-		// `active`, so keep the plain "copied ✓ url" confirmation.
+		// favorite) -- "press space to serve it" is TRUE here. reachServed /
+		// reachPublish (the inline path didn't fit) / reachFunnel / reachStale
+		// are all `active`, so keep the plain "copied ✓ url" confirmation.
 		if sel.active {
 			flash = m.setFlash("copied ✓  "+url, flashInfo)
 		} else {
@@ -2519,7 +2557,8 @@ func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
 	return tea.Batch(saveCmd, toggle(port, turnOn))
 }
 
-// requestFunnel begins toggling the public funnel for a port (the "p" key).
+// requestFunnel begins toggling the public funnel for a port (the "P" key,
+// swapped from "p" under vzj4).
 // Turning ON is the escalation to the public internet, so it's hard-blocked
 // for :22 (SSH), refused when all three ingress ports are taken, and
 // otherwise deferred to a strong y/n confirm (entryConfirmFunnel). Turning
@@ -2537,7 +2576,7 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 	// carry a funnel is refused, with the same no-ranking treatment publish
 	// gives a funnelled port. The user removes the other exposure first.
 	if info, ok := m.published[port]; ok {
-		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (P) before funnelling", port, info.hostname))
+		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (p) before funnelling", port, info.hostname))
 	}
 	if port == 22 {
 		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
@@ -2611,7 +2650,8 @@ func looksHTTP(port int, process string) bool {
 	return false
 }
 
-// requestPublish is the `P` key's up-front gate (kata v1z5 step 3), mirroring
+// requestPublish is the `p` key's up-front gate (swapped from `P` under vzj4;
+// kata v1z5 step 3), mirroring
 // requestFunnel. It runs the local guards IN ORDER before opening the publish
 // dialog (or, for de-escalation, before the immediate unpublish). Beyond these
 // local guards, caddyedge.Publish itself enforces route ownership (a hostname
@@ -2636,7 +2676,7 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	// 4. mutual exclusion: a funnelled port must lose the funnel first (no
 	// ranking -- publish does not outrank funnel; they're independent paths).
 	if pub, on := m.funnel[port]; on {
-		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (p) before publishing", port, pub))
+		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (P) before publishing", port, pub))
 	}
 	// 5. already published by tailport on THIS exact port -> de-escalation:
 	// unpublish immediately, no confirm (reducing exposure is never gated).
@@ -3346,6 +3386,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// stale "took over" toast. Only a success below uses it.
 		tookOver := m.takeoverHost
 		m.takeoverHost = ""
+		// Capture BEFORE the terminal-success clear below (mirroring tookOver):
+		// the hostname THIS publish targeted, confirmPublish's pendingPublish
+		// carry (kata qfbf) -- used only for the plain publish-success toast's
+		// "press p to unpublish" teaching clause (71ga).
+		publishedHost := m.pendingPublish.hostname
 		// ── ttfh stage 2: ARM the restore slot. m.pendingArm is set ONLY just before
 		// the take-over resume publish (purgeDoneMsg success, OWNED), so its presence
 		// marks THIS publishDoneMsg as that resume. Arm whether the take-over
@@ -3440,8 +3485,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over. armTimer (ttfh) starts the
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
-			// take-over, which arms nothing).
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+			// take-over, which arms nothing). "press p to unpublish" (71ga) teaches
+			// the de-escalation path same as the plain publish toast below.
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+		}
+		if !msg.unpublish {
+			// A plain publish success (71ga): teach the de-escalation path --
+			// requestPublish's own key, pressed again on an already-published
+			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
+			// !msg.unpublish only: an unpublish success stays silent, as before.
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
@@ -3846,7 +3899,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			// The publish (`P`) flow (kata v1z5) is a self-contained state
+			// The publish (`p`) flow (kata v1z5; swapped from `P` under vzj4) is
+			// a self-contained state
 			// machine handled here, BEFORE the generic esc/enter switch and the
 			// textinput fallthrough below -- so its keystrokes reach publishInput
 			// and never leak into labelInput.
@@ -4238,7 +4292,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestToggle applies the lock guard and, for :22 only, the SSH
 			// y/n confirm before any serve call.
 			return m, m.requestToggle(sel.port.Number, !sel.active)
-		case "p":
+		case "P": // funnel key (swapped from "p", vzj4)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel is already in flight
 			}
@@ -4249,7 +4303,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestFunnel hard-blocks :22, refuses when all ingress ports are
 			// taken, and defers a turn-on to the strong public-internet confirm.
 			return m, m.requestFunnel(sel.port.Number)
-		case "P":
+		case "p": // publish key (swapped from "P", vzj4)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel/publish is already in flight
 			}
@@ -4302,6 +4356,8 @@ func (m *model) rebuildItems() tea.Cmd {
 	for _, p := range m.allPorts {
 		portsByNumber[p.Number] = p
 	}
+	// Computed once per rebuild (not per row) -- see portItem.availDescWidth.
+	availDescWidth := m.availableDescriptionWidth()
 
 	if m.showAllPorts || m.filtering {
 		// Non-favorite matches recede only when filtering FROM the Favorites
@@ -4333,7 +4389,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			}
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, availDescWidth: availDescWidth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -4357,7 +4413,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, availDescWidth: availDescWidth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
@@ -6035,9 +6091,10 @@ func keyLegendDescs(emoji bool) map[string]string {
 		served, funneled, published, dangling = "🌒", "🌑", "🌐", "🌫️"
 	}
 	return map[string]string{
-		"space":  "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
-		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
-		"P":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. Needs caddy.domain/hostname\nconfigured (see docs/caddy-edge.md). Press P again to unpublish.",
+		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
+		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
+		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
+		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. Needs caddy.domain/hostname\nconfigured (see docs/caddy-edge.md). Press p again to unpublish.",
 		"c":      "Copy the selected port's tailnet URL (http://<host>:<port>) to the\nclipboard, via OSC 52 so it works even over SSH (needs a terminal\nthat supports it; tmux: set -g set-clipboard on). Copies even before\nit's served — the toast says so.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
@@ -6203,8 +6260,8 @@ func (m model) helpContent() string {
 			"wildcard-bound port (0.0.0.0) is already reachable on the tailnet\n" +
 			"without serving — see the marker legend and each row's description.\n" +
 			"A port can also be exposed to the PUBLIC internet two independent,\n" +
-			"mutually-exclusive ways (opt-in, see below): `p` funnels it via\n" +
-			"tailscale, and `P` publishes it at a custom hostname through your own\n" +
+			"mutually-exclusive ways (opt-in, see below): `P` funnels it via\n" +
+			"tailscale, and `p` publishes it at a custom hostname through your own\n" +
 			"Caddy edge (configure caddy.domain/hostname first — see\n" +
 			"docs/caddy-edge.md)."))
 	b.WriteString("\n\n")
@@ -6387,7 +6444,7 @@ func (m model) emptyStateMessage() string {
 		t("tailport exposes your machine's listening TCP ports to your tailnet."),
 		t("It discovers them with ") + k("ss") + t(" (Linux) / ") + k("lsof") + t(" (macOS), and turns"),
 		t("each one on or off with ") + k("tailscale serve --http=<port>") + t(" -- tailnet-only,"),
-		t("plain HTTP, same port in and out. Press ") + k("p") + t(" to funnel one publicly."),
+		t("plain HTTP, same port in and out. Press ") + k("P") + t(" to funnel one publicly."),
 		"",
 	}
 	if m.showAllPorts {
@@ -6605,7 +6662,8 @@ func (m model) operatorHintTextRaw() string {
 }
 
 // domainSetupHintText returns the STICKY setup-reminder banner raised after the
-// `P` flow captures a blank caddy.domain inline (kata w131, ycv1 r3-NEW-1), or
+// `p` flow (swapped from `P` under vzj4) captures a blank caddy.domain inline
+// (kata w131, ycv1 r3-NEW-1), or
 // "" when it isn't active (see m.domainSetupPending). It follows
 // operatorHintText's PATTERN -- sticky, single line, warnStyle at the render
 // site -- but is a SEPARATE, parallel slot: filling the config field is not the

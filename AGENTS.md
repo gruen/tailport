@@ -19,16 +19,18 @@ contract. The short version:
 
 - Tailnet-first. `tailscale serve` (tailnet-only exposure) is the default
   path. `tailscale funnel` (public internet exposure) IS supported, but only
-  as a deliberate, per-service opt-in via the `p` key behind a strong y/n
+  as a deliberate, per-service opt-in via the `P` key (swapped from `p` under
+  kata vzj4 — capital guards the more-permanent exposure) behind a strong y/n
   confirm that names the port and shows the resulting public URL. `:22` (SSH)
   is hard-blocked from funnel. Never funnel implicitly, in bulk, or without
-  that confirm. (Implemented under kata yt69: the `p` key, `entryConfirmFunnel`
+  that confirm. (Implemented under kata yt69: the `P` key, `entryConfirmFunnel`
   gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`.)
-- Publish-via-edge is a SECOND public path (the `P` key, kata v1z5),
-  **independent of and mutually exclusive with Funnel — not layered or ranked
-  above it**. A local port can carry funnel OR publish, never both: the `P`
-  path refuses a funnelled port and the `p` path refuses a Caddy-published
-  port, each instructing the user to remove the other exposure first. There is
+- Publish-via-edge is a SECOND public path (the `p` key, kata v1z5; swapped
+  from `P` under vzj4), **independent of and mutually exclusive with Funnel —
+  not layered or ranked above it**. A local port can carry funnel OR publish,
+  never both: the `p` path refuses a funnelled port and the `P` path refuses a
+  Caddy-published port, each instructing the user to remove the other
+  exposure first. There is
   no implicit precedence between them — dual exposure created outside tailport
   (a foreign Funnel or a manual Caddy edit) is surfaced as explicit drift (the
   warning affordance + a "funnelled AND published" description), never silently
@@ -43,7 +45,7 @@ contract. The short version:
   live from the edge's `@id`-tagged routes on a separate poll, never persisted
   per-port — Caddy is the source of truth, the same philosophy as serve/funnel
   state being read live. (Implemented under kata v1z5: `internal/caddyedge`,
-  the `caddy:` config block, and the `P` key / `entryConfirmPublish` gate /
+  the `caddy:` config block, and the `p` key / `entryConfirmPublish` gate /
   published-state poll in `internal/ui`.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel

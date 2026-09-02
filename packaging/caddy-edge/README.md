@@ -2,15 +2,15 @@
 
 Build artifacts for the **Caddy edge**: a small, user-run Docker image
 (tailscaled + Caddy) that lets tailport publish a local port to a custom
-public hostname (`https://app.example.com`) over your tailnet — the `P`
-(publish) path, kata v1z5. It mirrors [`packaging/aur/`](../aur/) and
+public hostname (`https://app.example.com`) over your tailnet — the `p`
+(publish, swapped from `P` under vzj4) path, kata v1z5. It mirrors [`packaging/aur/`](../aur/) and
 [`packaging/brew/`](../brew/): the artifacts live here under version
 control; deploying them (a Fly.io app, in this case) is a step you run
 yourself, not something CI does on a release tag.
 
 **This is not required to use tailport.** It's opt-in infrastructure for the
-one feature (`P`) that needs a public-facing component. Everything else —
-`tailscale serve`/`space`, Funnel/`p` — works with no edge at all.
+one feature (`p`) that needs a public-facing component. Everything else —
+`tailscale serve`/`space`, Funnel/`P` — works with no edge at all.
 
 For the full deploy runbook (Tailscale ACL, Fly setup, DNS, first-publish
 smoke test, troubleshooting), see

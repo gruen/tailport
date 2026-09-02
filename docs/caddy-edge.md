@@ -3,7 +3,8 @@
 Runbook for standing up the **Caddy edge**: a small Fly.io app (tailscaled +
 Caddy) that lets tailport publish a local port to a custom public hostname —
 `https://app.example.com`, no port in the URL, no `*.ts.net` — over your
-tailnet (the `P` key, kata v1z5). Short and skimmable, written for someone
+tailnet (the `p` key, kata v1z5; swapped from `P` under vzj4). Short and
+skimmable, written for someone
 who has never used Caddy or Fly.io before — cross-reference
 [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md) for
 what each file does and the root [README](../README.md#configuration) for
@@ -11,7 +12,7 @@ the `caddy.*` config fields this deploy has to line up with.
 
 **This is a one-time (or occasional) operator task**, separate from
 day-to-day tailport use — everything else (`tailscale serve`/`space`,
-Funnel/`p`) needs no edge at all. Do it once per edge, not once per
+Funnel/`P`) needs no edge at all. Do it once per edge, not once per
 tailport machine: several tailport computers can publish through the same
 edge (see step 4).
 
@@ -266,7 +267,7 @@ Set **`domain`** to the base whose DNS you pointed at the edge in step 3, at the
 wildcard depth you actually publish at (`*.apps.example.com` → `domain:
 apps.example.com`). While it's blank the background published-state poll stays
 off (zero cost until you opt in); you don't have to hand-edit it, though —
-pressing `P` on a port with a blank `domain` prompts for it inline and saves it
+pressing `p` on a port with a blank `domain` prompts for it inline and saves it
 for you (a targeted write that preserves the rest of the file), then continues
 the publish.
 
@@ -275,7 +276,7 @@ config, so normally you only edit the `domain:` line. **If your `config.yaml`
 predates the publish feature the block won't be there yet** — trigger one save
 with any change that writes the file (favouriting or labelling a port), or
 paste the block above in by hand, then set `domain:`. Publishing can also seed
-it: pressing `P` with a blank `domain` captures it inline and saves it rather
+it: pressing `p` with a blank `domain` captures it inline and saves it rather
 than refusing. Full field reference: the root README's
 [Configuration](../README.md#configuration) section.
 
@@ -305,7 +306,7 @@ effectively-first, boot.
 
 Do this once, after the edge is deployed, DNS points at it, and you've
 published at least one port from a tailport-managed backend machine (press
-`P`). It deliberately checks **two separate things**, so a failure tells you
+`p`). It deliberately checks **two separate things**, so a failure tells you
 which half broke:
 
 ```sh
@@ -438,7 +439,7 @@ stale after changing `caddy.hostname`/`TS_HOSTNAME`, per step 4's Known
 limitation) you have to either clear the autosave file on the volume
 (`fly ssh console`, remove `$XDG_CONFIG_HOME/caddy/autosave.json`) or destroy
 and recreate the volume outright. Either way, every previously published
-route is gone and each backend has to republish (press `P` again) — tailport
+route is gone and each backend has to republish (press `p` again) — tailport
 itself keeps no per-port publish state to restore from; Caddy's live config
 is the only source of truth (see kata v1z5's Architecture notes).
 
@@ -586,7 +587,7 @@ echo "*.$DOMAIN   AAAA   <v6>"
 
 A wildcard matches exactly one label: `*.$DOMAIN` covers `foo.$DOMAIN` but not
 `foo.bar.$DOMAIN`, so `*.$DOMAIN` suffices **only** for hostnames exactly one
-label beneath `$DOMAIN`. The publish hostname is editable in the `P` flow and
+label beneath `$DOMAIN`. The publish hostname is editable in the `p` flow and
 its prefill can nest (e.g. `<label>.<group>.$DOMAIN`), so if you publish nested
 names, add a matching wildcard/record for each level — §3 covers this in full.
 
@@ -594,12 +595,12 @@ names, add a matching wildcard/record for each level — §3 covers this in full
 
 On **each** machine that will publish, set in `~/.config/tailport/config.yaml`:
 `caddy.domain: <your DOMAIN>` (and `caddy.hostname: <your HOSTNAME>` if you
-changed it off `caddy`). Restart tailport, publish a port with `P` — note the
+changed it off `caddy`). Restart tailport, publish a port with `p` — note the
 **exact** hostname it confirms (that's what DNS must cover and what you test,
 not an assumed `<label>.$DOMAIN`) — then from a host **not** on your tailnet:
 
 ```sh
-curl -sS -o /dev/null -w '%{http_code}\n' https://<the-hostname-P-confirmed>/
+curl -sS -o /dev/null -w '%{http_code}\n' https://<the-hostname-p-confirmed>/
 ```
 
 `2xx`/`3xx` with a valid certificate means the whole chain — DNS, the dedicated

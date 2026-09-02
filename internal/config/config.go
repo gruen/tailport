@@ -29,8 +29,8 @@ type PortMeta struct {
 }
 
 // CaddyConfig holds the settings for publishing a tailnet-served port to a
-// custom public hostname through a user-controlled Caddy edge node (the `P`
-// key, kata v1z5). Unlike PortMeta entries, this block is ALWAYS present in
+// custom public hostname through a user-controlled Caddy edge node (the `p`
+// key, kata v1z5; swapped from `P` under vzj4). Unlike PortMeta entries, this block is ALWAYS present in
 // the saved config -- see applyDefaults and the comment on Save -- so a new
 // user sees the available knobs (and what they mean) without reading docs.
 type CaddyConfig struct {
@@ -301,7 +301,7 @@ func writeConfigAtomic(target string, data []byte) error {
 // leaving every other byte of the file -- its comments, its formatting, and any
 // top-level keys this build's Config struct does not model -- untouched. It is
 // the write-back primitive the TUI's mid-flow domain-capture prompt (kata w131)
-// calls after the user types a domain during a `P` publish.
+// calls after the user types a domain during a `p` publish.
 //
 // Unlike Save, it deliberately does NOT re-encode the in-memory Config. A
 // struct re-encode would DROP any unknown top-level key on disk (a field a

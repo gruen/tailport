@@ -1185,7 +1185,7 @@ func TestUnlockSSHConfirm(t *testing.T) {
 		t.Errorf("x on :8080 should lock instantly; mode=%v locked=%v", m.mode, m.cfg.Ports[8080].Locked)
 	}
 
-	// (8) Modality: space/p while confirming must NOT toggle serve/funnel.
+	// (8) Modality: space/P while confirming must NOT toggle serve/funnel.
 	m = lockedModel()
 	res, _ = m.Update(xKey)
 	m = res.(model)
@@ -1194,10 +1194,11 @@ func TestUnlockSSHConfirm(t *testing.T) {
 	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
 		t.Errorf("space in ssh-confirm must not toggle; pending=%d mode=%v", m.pending, m.mode)
 	}
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	// P is the funnel key (swapped from p, vzj4).
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
 	m = res.(model)
 	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
-		t.Errorf("p in ssh-confirm must not funnel; pending=%d mode=%v", m.pending, m.mode)
+		t.Errorf("P in ssh-confirm must not funnel; pending=%d mode=%v", m.pending, m.mode)
 	}
 }
 
@@ -1388,11 +1389,12 @@ func TestCopyURLInlineVsToast(t *testing.T) {
 // TestCopyURLReachAware covers 83wv/vqa3: copyURL's confirmation must be
 // reach()-aware (parallel to Description()/markerGlyph()), not the pre-79xb
 // binary sel.active, so it can never contradict the space guard
-// (TestSpaceGuardForReachablePorts) for the same state. Since vqa3, the four
-// healthy states -- A (reachLocalhost), B (reachTailnet), B' (reachLAN), and
-// C (reachServed) -- all go inline (copiedPort set, no toast) at a wide
-// width; the three principled exceptions -- D (reachFunnel), E (reachStale),
-// F (reachOffline) -- keep the toast, unchanged.
+// (TestSpaceGuardForReachablePorts) for the same state. Since vqa3, the
+// healthy states -- A (reachLocalhost), B (reachTailnet), B' (reachLAN),
+// C (reachServed), and (since d80p) G (reachPublish) -- all go inline
+// (copiedPort set, no toast) at a wide width; the two remaining principled
+// exceptions -- D (reachFunnel) and E (reachStale) -- plus F (reachOffline)
+// keep the toast.
 func TestCopyURLReachAware(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -1485,6 +1487,17 @@ func TestCopyURLReachAware(t *testing.T) {
 		t.Errorf("reachFunnel copy flash = %q (level=%v), want a toast naming 'the tailnet url'", m.flash, m.flashLevel)
 	}
 
+	// G: reachPublish (d80p). Unlike funnel, the row's public https URL and
+	// what `c` copies are now the SAME string (shown==copied), so it joins the
+	// inline group -- no more "tailnet url" toast.
+	pm := newModel(8080, portscan.ScopeWildcard, true, true, "")
+	pm.published = map[int]publishInfo{8080: {hostname: "app.example.com"}}
+	pm.rebuildItems()
+	m = press(pm)
+	if m.copiedPort != 8080 || m.flash != "" {
+		t.Errorf("reachPublish copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
+	}
+
 	// C, but too narrow to inline: falls back to the toast rather than
 	// silently truncating the confirmation off the row.
 	nm := newModel(8080, portscan.ScopeWildcard, true, true, "")
@@ -1501,10 +1514,10 @@ func TestCopyURLReachAware(t *testing.T) {
 
 // TestInlineCopyUniversal covers vqa3's core change: the inline "✓ copied"
 // confirmation is no longer state-C-only. It fires for every healthy
-// copyable state (localhost/LAN/tailnet/served) when the annotation fits,
-// gracefully falls back to the toast when the row is too narrow, and the
-// annotation correctly migrates when the selection moves between two
-// eligible rows.
+// copyable state (localhost/LAN/tailnet/served, and -- since d80p --
+// published) when the annotation fits, gracefully falls back to the toast
+// when the row is too narrow, and the annotation correctly migrates when the
+// selection moves between two eligible rows.
 func TestInlineCopyUniversal(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -1561,8 +1574,34 @@ func TestInlineCopyUniversal(t *testing.T) {
 		})
 	}
 
-	// inlineCopyState() itself: true for the four healthy states, false for
-	// the three toast exceptions (funnel/stale/offline).
+	// reachPublish (d80p) joins the inline group too: the row's public https
+	// URL and what `c` copies are now the same string, so it goes inline like
+	// the four states above, and the row's own justCopied suffix confirms it.
+	t.Run("published", func(t *testing.T) {
+		pm := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+		pm.host = "host"
+		pm.width = 80
+		pm.allPorts = []portscan.Port{{Number: 8080, Process: "srv"}}
+		pm.active = map[int]bool{8080: true}
+		pm.published = map[int]publishInfo{8080: {hostname: "app.example.com"}}
+		pm.showAllPorts = true
+		pm.rebuildItems()
+		m := press(pm)
+		if m.copiedPort != 8080 || m.flash != "" {
+			t.Fatalf("published copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
+		}
+		sel, ok := m.list.SelectedItem().(portItem)
+		if !ok || !sel.justCopied {
+			t.Fatalf("published: selected item justCopied = %v, want true", ok && sel.justCopied)
+		}
+		if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") {
+			t.Errorf("published Description() = %q, want it to carry the ✓ copied suffix", got)
+		}
+	})
+
+	// inlineCopyState() itself: true for the healthy states -- including (since
+	// d80p) reachPublish -- false for the two remaining toast exceptions
+	// (funnel/stale) plus offline.
 	elig := []struct {
 		name string
 		item portItem
@@ -1572,6 +1611,7 @@ func TestInlineCopyUniversal(t *testing.T) {
 		{"reachLAN", portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "10.0.0.9"}, listening: true}, true},
 		{"reachTailnet", portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true}, true},
 		{"reachServed", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true}, true},
+		{"reachPublish", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true, publishHostname: "app.example.com"}, true},
 		{"reachFunnel", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true, funnelPublic: 443}, false},
 		{"reachStale", portItem{port: portscan.Port{Number: 8025}, active: true}, false},
 		{"reachOffline", portItem{port: portscan.Port{Number: 8025}}, false},
@@ -1678,6 +1718,14 @@ func TestCopyTargetURL(t *testing.T) {
 			name: "reachFunnel",
 			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true, funnelPublic: 443},
 			want: "http://host:8080",
+		},
+		{
+			// d80p: unlike funnel, a published port copies its exact PUBLIC
+			// "https://<publishHostname>" -- the same URL the row shows -- not
+			// the tailnet form.
+			name: "reachPublish",
+			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true, publishHostname: "app.example.com"},
+			want: "https://app.example.com",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2018,8 +2066,9 @@ func TestFunnelItemRender(t *testing.T) {
 	}
 }
 
-// TestUpdateFunnelKey covers the "p" key at the Update layer: on a selected
-// non-:22 port it opens the public-internet confirm.
+// TestUpdateFunnelKey covers the "P" key (swapped from "p", vzj4) at the
+// Update layer: on a selected non-:22 port it opens the public-internet
+// confirm.
 func TestUpdateFunnelKey(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
@@ -2028,12 +2077,12 @@ func TestUpdateFunnelKey(t *testing.T) {
 	m.showAllPorts = true
 	m.rebuildItems()
 
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
 	if cmd != nil {
-		t.Error("p should defer to the confirm (nil cmd)")
+		t.Error("P should defer to the confirm (nil cmd)")
 	}
 	if got := res.(model); got.mode != entryConfirmFunnel || got.funnelPort != 8080 {
-		t.Errorf("after p, mode=%v funnelPort=%d, want entryConfirmFunnel/8080", got.mode, got.funnelPort)
+		t.Errorf("after P, mode=%v funnelPort=%d, want entryConfirmFunnel/8080", got.mode, got.funnelPort)
 	}
 }
 
@@ -3931,7 +3980,7 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
 	// documents it even though barGroups hides it from the bottom bar.
 	wantKeys := [][]string{
-		{"space", "p", "P", "C", "x"},
+		{"space", "P", "p", "C", "x"}, // Funnel=P, Publish=p (swapped, vzj4)
 		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "?", "q"},
@@ -4122,15 +4171,16 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
-	// Expose folded too (4 bindings since kata v1z5 added P publish edge, so
+	// Expose folded too (4 bindings since kata v1z5 added publish edge, so
 	// it's now taller than View's 3 and tried right after Favorites). Its 2/2
-	// top-heavy split puts space serve | P publish edge on one row and
-	// p funnel public | x lock/unlock on the next.
-	if r1, r2 := lineOf(wideLines, "space serve"), lineOf(wideLines, "P publish edge"); r1 < 0 || r1 != r2 {
-		t.Errorf("Expose should fold space serve/P publish edge onto the same row; space serve row %d, P publish edge row %d:\n%s", r1, r2, wide)
+	// top-heavy split puts space serve | p publish edge on one row and
+	// P funnel public | x lock/unlock on the next. (p/P swapped, vzj4: Funnel
+	// is now P, Publish is now p.)
+	if r1, r2 := lineOf(wideLines, "space serve"), lineOf(wideLines, "p publish edge"); r1 < 0 || r1 != r2 {
+		t.Errorf("Expose should fold space serve/p publish edge onto the same row; space serve row %d, p publish edge row %d:\n%s", r1, r2, wide)
 	}
 	if r1, r2 := lineOf(wideLines, "funnel public"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
-		t.Errorf("Expose should fold p funnel public/x lock/unlock onto the same row; p funnel public row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+		t.Errorf("Expose should fold P funnel public/x lock/unlock onto the same row; P funnel public row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
 
 	// App (3 bar bindings since 3cwx -- u undo, ? help, q quit; ctrl+r redo is
@@ -4162,11 +4212,11 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("App's folded second sub-col holds only q quit; ? help should be on its own row, not beside q quit; ? help row %d, q quit row %d:\n%s", r1, r2, ceiling)
 	}
 
-	// Still no truncation/ellipsis at the ceiling: every hint present. ("p
+	// Still no truncation/ellipsis at the ceiling: every hint present. ("P
 	// funnel public" isn't checked as a single-space literal here: unlike the
 	// wrapped fallback, the grid pads keys to their sub-column's gutter --
-	// Expose's folded left sub-col gutter is 5 (from "space"), so "p" renders
-	// padded ("p     funnel public") -- checking the description alone
+	// Expose's folded left sub-col gutter is 5 (from "space"), so "P" renders
+	// padded ("P     funnel public") -- checking the description alone
 	// sidesteps that padding.)
 	for _, want := range []string{
 		"space serve", "funnel public", "x lock/unlock",
@@ -4263,7 +4313,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	// and absent with no dangling.)
 	for _, want := range []string{
 		"Expose", "Favorites", "View", "App",
-		"space serve", "p funnel public", "c copy URL",
+		"space serve", "P funnel public", "c copy URL",
 		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
 		"u undo", "? help", "q quit",
@@ -4279,10 +4329,11 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
 // Protect is folded into Expose: with no dangling the Expose column ends at
-// "x lock/unlock" (space/p/P/x, no clean, no reserved blank slot); when a
+// "x lock/unlock" (space/P/p/x, no clean, no reserved blank slot); when a
 // dangling forward exists it gains "C clean stale" -- inserted just ABOVE lock
 // so "x lock/unlock" stays the last item in the column in either state.
-// (kata v1z5 added P publish edge to Expose, after p funnel.)
+// (kata v1z5 added publish edge to Expose, after funnel; p/P swapped under
+// vzj4 so it's now P funnel, p publish.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.help.Width = 100
@@ -5198,7 +5249,8 @@ func TestRenderGridPageIndicator(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Publish (`P`) path -- kata v1z5 steps 3/4/5. These are the primary
+// Publish (`p`) path -- kata v1z5 steps 3/4/5; swapped from `P` under vzj4.
+// These are the primary
 // verification for w7k4: bubbletea Model.Update walks driving the whole dialog
 // state machine, the requestPublish guards in order, funnel<->publish mutual
 // exclusion in both directions, drift surfaced-not-ranked, the quiet poll
@@ -5322,7 +5374,7 @@ func routeHasAuth(rt caddyedge.Route) bool {
 var enterKey = tea.KeyMsg{Type: tea.KeyEnter}
 var escKey = tea.KeyMsg{Type: tea.KeyEsc}
 
-// rkey builds a rune KeyMsg from a string ("P", "y", "n", or typed text).
+// rkey builds a rune KeyMsg from a string ("p", "y", "n", or typed text).
 func rkey(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
 // newPublishModel builds a model wired for the publish path: publish
@@ -5371,7 +5423,7 @@ func TestShortLabel(t *testing.T) {
 func TestPublishFlowWalkNoAuth(t *testing.T) {
 	m := newPublishModel(t, nil)
 
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	if m.mode != entryPublishHost {
 		t.Fatalf("after P, mode = %v, want entryPublishHost", m.mode)
 	}
@@ -5422,7 +5474,7 @@ func TestPublishFlowWalkNoAuth(t *testing.T) {
 func TestPublishConfirmViewEnablesServe(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.active = map[int]bool{} // serve OFF -> confirm should say it'll turn serve on
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m = mustUpdate(t, m, enterKey) // accept prefill host
 	m = mustUpdate(t, m, rkey("n"))
 	if !m.publishEnableServe {
@@ -5448,7 +5500,7 @@ func TestPublishConfirmViewEnablesServe(t *testing.T) {
 func TestPublishFlowWithAuthPersistsHash(t *testing.T) {
 	m := newPublishModel(t, nil)
 
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user (no stored cred yet)
 	if m.mode != entryPublishCredUser {
@@ -5514,7 +5566,7 @@ func TestPublishSaveFailureAbortsPublish(t *testing.T) {
 
 	// Walk P -> host -> auth(y) -> user -> pass -> confirm, gathering a NEW
 	// shared credential (none stored yet, so confirm must Save).
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user
 	m = mustUpdate(t, m, rkey("admin"))
@@ -5559,7 +5611,7 @@ func TestPublishAuthReusesStoredCredential(t *testing.T) {
 	m.cfg.Caddy.AuthHash = "$2a$10$abcdefghijklmnopqrstuv" // opaque stored hash
 	before := m.cfg.Caddy.AuthHash
 
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> should SKIP cred steps
 	if m.mode != entryConfirmPublish {
@@ -5584,11 +5636,11 @@ func TestPublishEscClearsPlaintext(t *testing.T) {
 		name string
 		walk []tea.KeyMsg // keys to reach the step (before the esc)
 	}{
-		{"host", []tea.KeyMsg{rkey("P")}},
-		{"auth", []tea.KeyMsg{rkey("P"), enterKey}},
-		{"credUser", []tea.KeyMsg{rkey("P"), enterKey, rkey("y")}},
-		{"credPass", []tea.KeyMsg{rkey("P"), enterKey, rkey("y"), rkey("bob"), enterKey}},
-		{"confirm", []tea.KeyMsg{rkey("P"), enterKey, rkey("y"), rkey("bob"), enterKey, rkey("hunter2"), enterKey}},
+		{"host", []tea.KeyMsg{rkey("p")}},
+		{"auth", []tea.KeyMsg{rkey("p"), enterKey}},
+		{"credUser", []tea.KeyMsg{rkey("p"), enterKey, rkey("y")}},
+		{"credPass", []tea.KeyMsg{rkey("p"), enterKey, rkey("y"), rkey("bob"), enterKey}},
+		{"confirm", []tea.KeyMsg{rkey("p"), enterKey, rkey("y"), rkey("bob"), enterKey, rkey("hunter2"), enterKey}},
 	}
 	for _, s := range steps {
 		t.Run(s.name, func(t *testing.T) {
@@ -5773,7 +5825,7 @@ func TestPublishPrefillPrecedence(t *testing.T) {
 // on the step with an error, never advancing to the auth gate.
 func TestPublishInvalidHostnameRefused(t *testing.T) {
 	m := newPublishModel(t, nil)
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m.publishInput.SetValue("not a host") // spaces are invalid
 	m = mustUpdate(t, m, enterKey)
 	if m.mode != entryPublishHost {
@@ -5819,7 +5871,7 @@ func TestPublishDomainCaptureHappyPath(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = "" // force the capture path
 
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	if m.mode != entryPublishDomain {
 		t.Fatalf("blank domain: mode=%v, want entryPublishDomain", m.mode)
 	}
@@ -5865,7 +5917,7 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 		t.Run(bad, func(t *testing.T) {
 			m := newPublishModel(t, nil)
 			m.cfg.Caddy.Domain = ""
-			m = mustUpdate(t, m, rkey("P"))
+			m = mustUpdate(t, m, rkey("p"))
 			if bad != "" {
 				m.publishInput.SetValue(bad)
 			}
@@ -5891,7 +5943,7 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 func TestPublishDomainEscAborts(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = ""
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	if m.mode != entryPublishDomain {
 		t.Fatalf("setup: mode=%v, want entryPublishDomain", m.mode)
 	}
@@ -5941,6 +5993,33 @@ func TestPublishSuccessClearsPendingPublish(t *testing.T) {
 	if got.pendingPublish != (pendingPublish{}) {
 		t.Errorf("a successful publish should clear pendingPublish; got %+v", got.pendingPublish)
 	}
+}
+
+// TestPublishSuccessTeachesUnpublish covers 71ga: a successful PLAIN publish
+// (not a take-over resume, not an unpublish) teaches the de-escalation path --
+// its toast names the (now) `p` key. An unpublish success stays silent about
+// it: pressing p again on an unpublished port would just re-publish, not
+// "unpublish an unpublish", so the clause is scoped to !msg.unpublish only.
+func TestPublishSuccessTeachesUnpublish(t *testing.T) {
+	t.Run("plain publish success mentions press p to unpublish", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080}
+		res, _ := m.Update(publishDoneMsg{port: 8080, err: nil})
+		got := res.(model)
+		if !strings.Contains(got.flash, "press p to unpublish") {
+			t.Errorf("publish-success flash = %q, want it to contain %q", got.flash, "press p to unpublish")
+		}
+	})
+
+	t.Run("unpublish success does not mention it", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080}
+		res, _ := m.Update(publishDoneMsg{port: 8080, err: nil, unpublish: true})
+		got := res.(model)
+		if strings.Contains(got.flash, "unpublish") {
+			t.Errorf("unpublish-success flash = %q, should not teach the unpublish clause on an unpublish outcome", got.flash)
+		}
+	})
 }
 
 // TestTwoConcurrentBanners proves the two sticky banners are genuinely PARALLEL
@@ -6109,8 +6188,9 @@ func TestDeEscalationImmediateUnpublish(t *testing.T) {
 	}
 }
 
-// TestFunnelRefusesPublished is the OTHER mutual-exclusion direction: the p
-// funnel key refuses a port that is currently Caddy-published.
+// TestFunnelRefusesPublished is the OTHER mutual-exclusion direction: the P
+// funnel key (swapped from p, vzj4) refuses a port that is currently
+// Caddy-published.
 func TestFunnelRefusesPublished(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
@@ -6153,6 +6233,33 @@ func TestPublishReachDriftSurfaced(t *testing.T) {
 	}
 	if d := drift.plainDescription(); !strings.Contains(d, "funnelled AND published") {
 		t.Errorf("drift description = %q, want it to name the dual exposure", d)
+	}
+}
+
+// TestPublishUnpublishHint covers 71ga: a published row's description
+// surfaces that (now) `p` unpublishes, scoped to reachPublish only, and only
+// when it actually fits availableDescriptionWidth() -- omitted rather than
+// left for bubbles/list to truncate.
+func TestPublishUnpublishHint(t *testing.T) {
+	base := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com"}
+	baseDesc := "published to the internet · https://web.example.com"
+	if got := base.plainDescription(); got != baseDesc {
+		t.Fatalf("sanity: zero-width plainDescription() = %q, want the bare base %q (hint must be omitted, not just untested)", got, baseDesc)
+	}
+
+	// Exact fit: the hint is appended.
+	wide := base
+	wide.availDescWidth = lipgloss.Width(baseDesc) + lipgloss.Width(unpublishHint)
+	want := baseDesc + unpublishHint
+	if got := wide.plainDescription(); got != want {
+		t.Errorf("exact-fit plainDescription() = %q, want %q (hint fits)", got, want)
+	}
+
+	// One cell too narrow: the hint is dropped whole, not truncated.
+	narrow := base
+	narrow.availDescWidth = lipgloss.Width(baseDesc) + lipgloss.Width(unpublishHint) - 1
+	if got := narrow.plainDescription(); got != baseDesc {
+		t.Errorf("one-cell-too-narrow plainDescription() = %q, want the bare base %q (hint omitted, never truncated)", got, baseDesc)
 	}
 }
 
@@ -6765,7 +6872,7 @@ func TestPublishTickNeverStops(t *testing.T) {
 // publish host step feeds publishInput, never labelInput.
 func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
 	m := newPublishModel(t, nil)
-	m = mustUpdate(t, m, rkey("P"))
+	m = mustUpdate(t, m, rkey("p"))
 	m.publishInput.SetValue("") // clear the prefill to type fresh
 	m = mustUpdate(t, m, rkey("abc"))
 	if got := m.publishInput.Value(); got != "abc" {
@@ -7534,7 +7641,16 @@ func TestTtfhLostResponseCommitRetryReportsRestored(t *testing.T) {
 		t.Fatal("a lost-response commit must KEEP the slot armed for retry")
 	}
 	// The commit actually landed: the captured OLD backend is now under our @id.
-	if rt, ok := fc.routes[caddyedge.IDFor(ttfhHost)]; !ok || routeDial(rt) != "other-box:9090" {
+	// Locked (mirroring TestTtfhPreflightVerifyErrorStaysRetryable): the POST's
+	// hijack-and-close means the client observes the transport error via a raw
+	// socket close, which races the server goroutine's ServeHTTP (and its
+	// deferred fc.mu.Unlock) from the Go memory model's point of view even
+	// though the write happens-before the close in wall-clock time -- so a bare
+	// unsynchronized read here is a genuine data race under -race.
+	fc.mu.Lock()
+	rt, ok := fc.routes[caddyedge.IDFor(ttfhHost)]
+	fc.mu.Unlock()
+	if !ok || routeDial(rt) != "other-box:9090" {
 		t.Fatalf("step B should have committed the captured route despite the lost response; got %+v", rt)
 	}
 

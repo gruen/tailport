@@ -212,7 +212,7 @@ func TestRunQuickstart(t *testing.T) {
 		"Prerequisites:", "operator", "sudo tailscale set --operator=",
 		// Safety model wording (AGENTS.md's design constraints).
 		"tailnet-only", "tailscale funnel", "public", "deliberate",
-		"p` key", "y/n confirm", ":22", "hard-blocked",
+		"P` key", "y/n confirm", ":22", "hard-blocked",
 		// Resolved config path.
 		"Config path:", filepath.Join(xdg, "tailport", "config.yaml"),
 		// The keybinding legend (spot-check a few rows).

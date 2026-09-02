@@ -11,7 +11,7 @@
 
 ## 1. Problem
 
-A `P` publish takes a public hostname over the Caddy edge — a **shared** routes array every tailport machine on the tailnet writes into, and which can also carry hand-authored routes. So a publish can collide with a hostname the edge already holds. `caddyedge.Publish` (caddyedge.go:474) already **refuses** every such collision with `ErrHostnameConflict`, mutating nothing — three sub-cases:
+A `p` publish (swapped from `P` under vzj4) takes a public hostname over the Caddy edge — a **shared** routes array every tailport machine on the tailnet writes into, and which can also carry hand-authored routes. So a publish can collide with a hostname the edge already holds. `caddyedge.Publish` (caddyedge.go:474) already **refuses** every such collision with `ErrHostnameConflict`, mutating nothing — three sub-cases:
 
 1. our `@id` exists but points at a **different backend/port** (caddyedge.go:496–499);
 2. our `@id` exists but its host matcher was **hijacked** by a foreign edit (`hostMatcherIs` fails, caddyedge.go:488–491);

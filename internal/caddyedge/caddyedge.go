@@ -1,6 +1,7 @@
 // Package caddyedge drives a user-controlled Caddy edge node through its
 // tailnet-only admin API to publish a local HTTP service at a custom public
-// hostname (see kata v1z5, the `P` publish path). Caddy owns the public trust
+// hostname (see kata v1z5, the `p` publish path; swapped from `P` under
+// vzj4). Caddy owns the public trust
 // plane (custom-domain DNS, :443 ingress, TLS termination and renewal); this
 // package only computes the route JSON and talks to Caddy's admin API over the
 // tailnet.

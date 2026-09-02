@@ -18,11 +18,11 @@ network of devices you've authenticated into Tailscale — by shelling out to
 `tailscale serve` (plain HTTP, tailnet-only).
 
 It can also expose a port to the **public internet**, but only as an explicit
-opt-in: the `p` key funnels the selected port via `tailscale funnel`, behind
+opt-in: the `P` key funnels the selected port via `tailscale funnel`, behind
 a strong y/n confirmation. Funnel is HTTPS-only and uses one of Tailscale's
 three public ingress ports (443, 8443, 10000), so a funnelled port is
 reachable by anyone on the internet — not just your tailnet. Public exposure
-is never automatic; it happens only when you press `p` and confirm, `:22`
+is never automatic; it happens only when you press `P` and confirm, `:22`
 (SSH) is refused outright, and funnelled ports are drawn with a distinct
 marker (`●` / 🐦).
 
@@ -141,7 +141,7 @@ is actually reachable — localhost only, already on your tailnet, or served
 | Key | Action |
 | --- | --- |
 | `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port — only offered for a loopback-bound port; an already-reachable (tailnet/LAN) port shows an info toast instead |
-| `p` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
+| `P` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
 | `c` | Copy the selected port's tailnet URL to the clipboard (via OSC 52, so it works over SSH) |
 | `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
 | `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
@@ -289,7 +289,7 @@ reading docs:
 > you won't find a `domain:` line to edit. It appears on the next save — any
 > change that writes the file, e.g. favouriting or labelling a port — or just
 > paste the block below in by hand and set `domain:` there. (Publishing can
-> also be the trigger: pressing `P` with a blank `domain` captures it inline
+> also be the trigger: pressing `p` with a blank `domain` captures it inline
 > and saves it for you, rather than refusing.)
 
 ```yaml
@@ -319,7 +319,7 @@ caddy:
   public hostname (e.g. `app.example.com`) — private edge identity and public
   route identity are deliberately separate.
 - **`domain`** (default `""`, blank) — the public base domain publish
-  hostnames are built from. Blank doesn't block publishing: pressing `P`
+  hostnames are built from. Blank doesn't block publishing: pressing `p`
   captures the domain inline and saves it before continuing (rather than
   refusing), and until it's set the background published-state poll doesn't
   run (zero cost until you set it).
@@ -386,7 +386,7 @@ See [`docs/caddy-edge.md`](docs/caddy-edge.md) for the full runbook (written
 for a Caddy/Fly first-timer) and the `caddy.*` fields under
 [Configuration](#configuration) above for what tailport needs once that edge
 exists. Until `caddy.domain` is set, the background published-state poll
-stays off; the first time you press `P`, tailport captures the domain inline
+stays off; the first time you press `p`, tailport captures the domain inline
 and saves it before continuing, so you don't have to edit the config by hand.
 
 Once configured, publishing a port works the same shape as Funnel: select a
