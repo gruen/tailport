@@ -210,6 +210,15 @@ device list, tagged, with the hostname you expect (`caddy` by default —
 see [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md)
 for what has to agree with tailport's `caddy.hostname`).
 
+**Do not run `fly certs add` (or set any Fly certificate).** Caddy owns TLS
+here: the `[[services]]` blocks are raw TCP passthrough, so Fly never sees the
+handshake — a Fly cert would do nothing, and Fly's proxy can't terminate on the
+same `:443` Caddy does. Each published hostname's certificate is issued and
+renewed by Caddy itself over Let's Encrypt (ACME), on demand, the first time a
+route for that hostname is published — provided its DNS (next step) resolves to
+this edge and `:80`/`:443` are reachable from the public internet. It's a
+per-hostname cert, not a wildcard (see §6 if issuance stalls).
+
 ## 3. DNS
 
 Point your domain at the edge's dedicated IPs (`fly ips list` to see them):
@@ -366,7 +375,10 @@ on the edge's dedicated IPv4/IPv6 — which is exactly what
 actually resolves to the edge's IPs yet (step 3); the dedicated IPv4 was
 allocated, not left shared (step 2); `fly logs` for ACME errors (rate
 limits, DNS not yet propagated — Caddy retries with backoff, so a transient
-failure often self-heals).
+failure often self-heals). Do **not** reach for `fly certs add`: that manages
+certs for Fly's own TLS-terminating proxy, which this raw-passthrough setup
+bypasses — the cert is Caddy's to issue, so the fix is always DNS/reachability,
+never a Fly certificate.
 
 **tailport reports the admin API returned `403`.** The `Host` header on the
 request tailport made isn't in the live config's `admin.origins`. The edge
@@ -550,6 +562,8 @@ fly ips allocate-v4                                        # DEDICATED IPv4 (~$2
 fly ips allocate-v6                                        # free, dedicated by default
 fly secrets set TS_AUTHKEY=tskey-auth-...                  # the key from the ACL step (Fly-side only)
 fly deploy                                                 # builds the image and boots it (entrypoint templates admin.origins from env)
+# NO `fly certs add` / no Fly certificate: raw TCP passthrough means Caddy issues
+# and renews each published hostname's TLS cert itself via Let's Encrypt (ACME).
 fly logs                                                   # follow: tailscaled → up → serve → templating → caddy run
 fly ips list                                               # the v4/v6 you point DNS at
 ```
