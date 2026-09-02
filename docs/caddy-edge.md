@@ -74,12 +74,24 @@ when you deploy it.
      machines you intend to administer it from.
 
    Tailscale's policy file is [HuJSON](https://tailscale.com/kb/1018/acls)
-   (JSON plus comments and trailing commas), so both rules can be spelled
-   out inline. The exact grammar has evolved (older `acls` entries vs.
-   newer `grants`) and depends on what's already in your policy file, so
-   treat the following as an example to adapt against
-   [Tailscale's current ACL syntax reference](https://tailscale.com/kb/1337/acl-syntax)
-   rather than something to paste in verbatim:
+   (JSON plus comments and trailing commas). Tailscale's current syntax is
+   **`grants`**; the older `acls` array still works but is frozen (no new
+   features), and new tailnets default to `grants`. What you actually need
+   depends on your tailnet:
+
+   - **Open (default) tailnet — `tagOwners` above is all you need to get
+     running.** A new tailnet's starter policy already lets every node reach
+     every other, so both reachability rules below are already satisfied; add
+     the `tagOwners` entry, save, and go mint the key. (Heads-up: that same
+     openness means the edge's admin API on `:2019` is reachable by *every*
+     tailnet member — see the hardening note after the example.)
+   - **Locked-down tailnet (default-deny or scoped) — add the two grants
+     too**, or the edge can't reach your backends (rule 1) and/or the wrong
+     people can manage it (rule 2).
+
+   Current syntax (`grants`) — adapt against
+   [Tailscale's grants reference](https://tailscale.com/docs/reference/syntax/grants)
+   rather than pasting verbatim:
 
    ```json
    {
@@ -87,40 +99,57 @@ when you deploy it.
        "tag:tailport-edge": ["autogroup:admin"],
      },
 
-     "acls": [
-       // ... whatever rules your tailnet already has ...
+     "grants": [
+       // ... whatever grants your tailnet already has ...
 
-       // 1) Let the edge reach the backend tailport machine(s) it proxies
-       //    to, on the ports they actually serve. Replace the dst tag/user
-       //    and port list with your real backend(s) -- this example scopes
-       //    it to a "tailport-backend" tag rather than opening every port.
+       // 1) Let the edge reach the backend tailport machine(s) it proxies to,
+       //    on the ports they actually serve. Scope dst to your real
+       //    backend(s) -- a "tailport-backend" tag here -- not every port.
        {
-         "action": "accept",
          "src": ["tag:tailport-edge"],
-         "dst": ["tag:tailport-backend:8080,8443,9000"],
+         "dst": ["tag:tailport-backend"],
+         "ip":  ["tcp:8080", "tcp:8443", "tcp:9000"],
        },
 
-       // 2) Restrict the admin API (:2019) to only the node(s)/user(s) you
-       //    actually run tailport from. Do NOT use "autogroup:member" or
-       //    "*" as src here -- that's precisely the over-broad grant this
-       //    step exists to avoid. Replace the src with your own
-       //    user/tag.
+       // 2) Grant ONLY specific people the ability to manage this edge --
+       //    i.e. reach Caddy's admin API on :2019, which is add/remove/rewrite
+       //    of every published route (it has no auth of its own, so this grant
+       //    IS the access control). List the exact users, a group, or a tag on
+       //    the machines they drive tailport from. Do NOT use
+       //    "autogroup:member" or "*" here -- that's the over-broad grant this
+       //    rule exists to prevent.
        {
-         "action": "accept",
-         "src": ["<your-user-or-tag-that-runs-tailport>"],
-         "dst": ["tag:tailport-edge:2019"],
+         "src": ["alice@example.com", "bob@example.com"], // or ["group:caddy-admins"]
+         "dst": ["tag:tailport-edge"],
+         "ip":  ["tcp:2019"],
        },
      ],
    }
    ```
 
-   If your tailnet's default policy already grants broad `src: ["*"]`
-   reachability to `dst: ["*:*"]`, rule 2 alone does **not** narrow that —
-   Tailscale ACLs are additive (any matching `accept` rule grants access,
-   there is no `deny`). In that case the fix is to narrow the existing
-   broad rule's ports (e.g. exclude `2019`) rather than to rely on adding a
-   second, more specific rule on top of it. Check what your policy already
-   allows before assuming rule 2 is sufficient on its own.
+   `grants` differ from the older `acls` form in exactly two ways: there is no
+   `"action": "accept"` (grants always allow), and the port moves off the `dst`
+   into its own `ip` field (`"dst": ["tag:x"]` + `"ip": ["tcp:2019"]`, not
+   `"dst": ["tag:x:2019"]`). If your policy still uses the older `acls` array,
+   the equivalent is:
+
+   ```json
+   "acls": [
+     { "action": "accept", "src": ["tag:tailport-edge"],
+       "dst": ["tag:tailport-backend:8080,8443,9000"] },
+     { "action": "accept", "src": ["alice@example.com", "bob@example.com"],
+       "dst": ["tag:tailport-edge:2019"] },
+   ],
+   ```
+
+   **On an already-open tailnet, rule 2 alone does not lock down `:2019`.**
+   Grants and ACLs are additive — any matching rule *allows*, there is no
+   `deny` — so a narrow "only alice+bob" grant does not subtract the starter
+   policy's broad `src: ["*"] → dst: ["*"]` reach to the admin port. To
+   actually limit who can manage the edge you must narrow that existing broad
+   grant (or move off allow-all to explicit grants) so it no longer covers
+   `tag:tailport-edge:2019`; rule 2 then defines who *does* get in. Check what
+   your policy already allows before assuming rule 2 is enough on its own.
 
 2. Generate an auth key (admin console → **Settings → Keys → Generate auth
    key**) with:
@@ -483,10 +512,12 @@ shell closes.)
 
 **ACL first** — Tailscale refuses to register a node under a tag it doesn't yet
 own. In the [admin console](https://login.tailscale.com/admin/acls): add a
-`tagOwners` entry for `$TAG`, plus two ACL rules — (a) let `$TAG` reach the
-backend machines on the ports they serve, and (b) restrict the admin API
-(`:2019`) to only the user/node you drive tailport from (Caddy's admin API has
-no auth of its own). Full JSON and the "ACLs are additive, no deny" caveat: §1.
+`tagOwners` entry for `$TAG`. On an **open (default) tailnet that's all you
+need here** — skip to the key. On a **locked-down** tailnet also add two
+`grants` (§1): (a) let `$TAG` reach the backend machines on the ports they
+serve, and (b) grant only the specific users who may manage the edge access to
+the admin API (`:2019`) — Caddy's admin API has no auth of its own. Full JSON,
+the `grants`↔`acls` mapping, and the "additive, no deny" caveat: §1.
 
 Then **mint an auth key** (Settings → Keys): **reusable**, **non-ephemeral**,
 tagged `$TAG` — tagging is what disables key expiry. Copy the `tskey-auth-…`; it
