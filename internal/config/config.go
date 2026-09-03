@@ -58,6 +58,18 @@ type CaddyConfig struct {
 	// produced by `caddy hash-password`) -- NEVER a plaintext password.
 	// Empty by default.
 	AuthHash string `yaml:"auth_hash,omitempty"`
+	// SilentRepublish, when true, skips the `p` key's y/n confirm (kata prp1)
+	// when RE-publishing a port that was already published earlier in THIS
+	// session -- its hostname and auth are remembered in the TUI's in-memory
+	// lastPublish map, so a repeat `p` press republishes them directly with no
+	// prompt at all. This is a deliberate, owner-approved, documented
+	// exception to tailport's normal always-confirm-before-publishing rule
+	// (AGENTS.md): it is scoped strictly to RE-publishing an
+	// already-consented hostname within the SAME session -- a port's FIRST
+	// publish this session (and every funnel operation) always confirms
+	// regardless of this setting. Default false (the bool zero value): the
+	// confirm is shown unless the user explicitly opts in.
+	SilentRepublish bool `yaml:"silent_republish"`
 }
 
 // applyDefaults fills any zero-value field that has a sensible default,
@@ -681,6 +693,10 @@ func applyCaddyComments(root *yaml.Node) {
 			"use the same value; this does not identify the source computer.")
 	setKeyHeadComment(caddy, "admin_port",
 		"\nPort of the Caddy admin API on the edge (reachable tailnet-only).")
+	setKeyHeadComment(caddy, "silent_republish",
+		"\nSkip the y/n confirm when re-publishing a port already published\n"+
+			"earlier this session (remembered hostname + auth). First publish\n"+
+			"always confirms. Default false (confirm shown).")
 }
 
 // mappingValueNode returns the value node for key within mapping node m, or

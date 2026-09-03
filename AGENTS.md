@@ -37,7 +37,19 @@ contract. The short version:
   collapsed to one marker. It carries the same funnel-grade guardrails:
   per-service opt-in, a strong y/n confirm naming the exact `https://<hostname>`
   URL, `:22` hard-blocked, ungated de-escalation (an immediate unpublish, no
-  confirm), and unpublish never touches serve state. In this path **Tailscale
+  confirm), and unpublish never touches serve state. The `p` key is a TOGGLE
+  (kata prp1): pressed again on a port published earlier THIS session
+  (remembered hostname + auth, session-only, never persisted), it re-publishes
+  with that remembered config, skipping the host/auth setup prompts — still
+  behind the same y/n confirm naming the exact hostname, UNLESS the owner has
+  opted into `caddy.silent_republish` (config, default OFF), an
+  owner-approved, documented exception to the always-confirm rule that skips
+  even that confirm. This exception is scoped strictly to RE-publishing an
+  ALREADY-consented hostname within the SAME session — a port's FIRST publish
+  always confirms regardless of this setting, and Funnel's confirm is
+  completely unaffected. A dedicated `e` key opens the same setup flow to
+  CHANGE a published port's hostname/auth without unpublishing first (also
+  always confirming); it never de-escalates. In this path **Tailscale
   supplies private tailnet transport only; Caddy owns the entire public trust
   plane** (custom-domain DNS, public `:443` ingress, TLS termination and
   renewal, hostname routing). Basic auth at the edge is a single SHARED
@@ -46,7 +58,9 @@ contract. The short version:
   per-port — Caddy is the source of truth, the same philosophy as serve/funnel
   state being read live. (Implemented under kata v1z5: `internal/caddyedge`,
   the `caddy:` config block, and the `p` key / `entryConfirmPublish` gate /
-  published-state poll in `internal/ui`.)
+  published-state poll in `internal/ui`. The `p` toggle, the `e` edit key, the
+  session-only `lastPublish` memory, and `caddy.silent_republish` were added
+  under kata prp1.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel
   already encrypts peer-to-peer traffic, so app-layer TLS added no real

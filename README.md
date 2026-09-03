@@ -309,6 +309,11 @@ caddy:
 
     # Port of the Caddy admin API on the edge (reachable tailnet-only).
     admin_port: 2019
+
+    # Skip the y/n confirm when re-publishing a port already published
+    # earlier this session (remembered hostname + auth). First publish
+    # always confirms. Default false (confirm shown).
+    silent_republish: false
 ```
 
 - **`hostname`** (default `caddy`) — the edge's own private tailnet
@@ -334,6 +339,13 @@ caddy:
   of the password you typed then, never the plaintext; every published
   route that opts into auth shares this one credential — it isn't
   per-hostname.
+- **`silent_republish`** (default `false`) — skips the `p` key's y/n confirm
+  when RE-publishing a port that was already published earlier in the SAME
+  session (its hostname and auth are remembered in memory only; see
+  [Publish is a toggle](#publish-is-a-toggle-p) below). A port's first
+  publish this session always confirms regardless of this setting, and
+  Funnel's confirm is unaffected. Off by default: the confirm is shown
+  unless you explicitly opt in.
 
 None of this configures the edge itself — it only tells tailport where an
 **already-deployed** edge lives. Standing up the edge (on Fly.io or any host
@@ -395,6 +407,30 @@ port, confirm the public hostname and (optionally) a shared basic-auth
 credential, and confirm again against the exact `https://` URL before
 anything goes live — the same funnel-grade guardrails (`:22` hard-blocked,
 public exposure never automatic) apply here too.
+
+### Publish is a toggle (`p`)
+
+`p` behaves differently depending on the port's state:
+
+- **Already published** — `p` unpublishes immediately. No confirm: reducing
+  exposure is never gated.
+- **Published earlier this SESSION, then unpublished** — tailport remembers
+  that port's hostname and auth in memory (never written to config; the edge
+  stays the source of truth) for as long as the process runs. Pressing `p`
+  again re-publishes with that remembered config, skipping the hostname/auth
+  setup prompts entirely — straight to the same y/n confirm naming the exact
+  `https://<hostname>`, unless you've set `silent_republish: true` (see
+  [Configuration](#configuration) above), in which case it re-publishes with
+  no confirm at all.
+- **Never published this session** — `p` runs the full setup: hostname,
+  optional basic auth, then the confirm. This always happens on a port's
+  first publish, regardless of `silent_republish`.
+
+Press **`e`** to change a published port's hostname or auth **without**
+unpublishing it first: `e` always runs the full setup flow (prefilled with
+the port's current/remembered hostname when known), ending in the same y/n
+confirm `p` uses. Confirming replaces the live route with the new
+hostname/auth in place — the port is never briefly unpublished in between.
 
 ## Troubleshooting
 

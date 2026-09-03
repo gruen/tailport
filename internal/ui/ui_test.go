@@ -3980,7 +3980,7 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
 	// documents it even though barGroups hides it from the bottom bar.
 	wantKeys := [][]string{
-		{"space", "P", "p", "C", "x"}, // Funnel=P, Publish=p (swapped, vzj4)
+		{"space", "P", "p", "C", "x", "e"}, // Funnel=P, Publish=p (swapped, vzj4); Edit=e (kata prp1)
 		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "?", "q"},
@@ -4014,18 +4014,19 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 }
 
 // TestBottomBarGridAligned drives the real model at a width just below the
-// 04rb fold threshold (~70, the width Favorites' fold needs to fit -- see
+// 04rb fold threshold (~80, the width Serve Toggles' fold needs to fit -- see
 // TestBottomBarGridFolds) and asserts the bar renders the four grouped
 // columns UNFOLDED, at their exact packed floor width, with a header row and
 // aligned gutters: descriptions line up within a column and columns line up
-// across rows. With no dangling, Serve Toggles is space/p/x (lock last, clean
-// dropped) and Favorites is the tallest column (f/u/n/c/l), so the grid is a
-// header + 5 rows. (Previously this used width=100, which now has enough
-// surplus to fold Favorites/Serve Toggles/View -- see TestBottomBarGridFolds for
-// that behavior instead.)
+// across rows. With no dangling, Serve Toggles is space/P/p/x/e (edit last,
+// kata prp1; clean dropped) and Favorites is f/F/n/c/l -- now TIED for
+// tallest column at 5 rows each -- so the grid is a header + 5 rows.
+// (Previously this used width=100, which now has enough surplus to fold
+// Serve Toggles/Favorites/View -- see TestBottomBarGridFolds for that
+// behavior instead.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
-	const width = 65 // packed floor is 63 wide; Favorites' fold needs >=75
+	const width = 65 // packed floor is 64 wide; Serve Toggles' fold needs >=86
 	m.help.Width = width
 	m.width = width
 
@@ -4087,18 +4088,24 @@ func TestBottomBarGridAligned(t *testing.T) {
 		t.Errorf("c copy URL should be the row directly under n new favorite; n at (%d,%d), c at (%d,%d)", nRow, nCol, cRow, cCol)
 	}
 
-	// Lock is the LAST Serve Toggles row, and its key sits flush at the Serve
-	// Toggles column start. (Match the desc "lock/unlock" since the padded "x
-	// lock/unlock" cell isn't a single-space substring; lockRow indexes lines[1:].)
-	lockRow, _ := at("lock/unlock")
-	lockLine := lines[lockRow+1]
+	// Edit (e, kata prp1) is now the LAST Serve Toggles row -- added right
+	// after Lock -- and its key sits flush at the Serve Toggles column start;
+	// Lock sits directly above it. (Match the desc "edit publish config" since
+	// the padded "e     edit publish config" cell isn't a single-space
+	// substring; editRow/lockRow index lines[1:].)
+	editRow, _ := at("edit publish config")
+	editLine := lines[editRow+1]
 	exposeCol := strings.Index(hdr, "Serve Toggles")
-	if exposeCol >= len(lockLine) || lockLine[exposeCol] != 'x' {
-		t.Errorf("lock's key should sit flush at the Serve Toggles column start (col %d); line: %q", exposeCol, lockLine)
+	if exposeCol >= len(editLine) || editLine[exposeCol] != 'e' {
+		t.Errorf("edit's key should sit flush at the Serve Toggles column start (col %d); line: %q", exposeCol, editLine)
 	}
-	for li := lockRow + 2; li < len(lines); li++ {
+	lockRow, _ := at("lock/unlock")
+	if lockRow != editRow-1 {
+		t.Errorf("lock (x) should sit directly ABOVE edit (e) in Serve Toggles; lock row %d, edit row %d", lockRow, editRow)
+	}
+	for li := editRow + 2; li < len(lines); li++ {
 		if ln := lines[li]; len(ln) > exposeCol && ln[exposeCol] != ' ' {
-			t.Errorf("Serve Toggles column has content below lock (line %d): %q", li, ln)
+			t.Errorf("Serve Toggles column has content below edit (line %d): %q", li, ln)
 		}
 	}
 
@@ -4131,11 +4138,11 @@ func TestBottomBarGridFolds(t *testing.T) {
 
 	m := New(config.Config{})
 
-	// Floor: below the fold threshold (Favorites' fold needs total width
-	// >=75; see the 63-wide packed floor in TestBottomBarNarrowFallback -- both
-	// grew with the longer "Serve Toggles" labels), the grid is the exact packed
-	// layout -- header + 5 rows (Favorites, the tallest group unfolded, is
-	// f/u/n/c/l).
+	// Floor: below the fold threshold (the first fold -- Serve Toggles, see
+	// below -- needs total width >=86; see the 64-wide packed floor in
+	// TestBottomBarNarrowFallback), the grid is the exact packed layout --
+	// header + 5 rows. Serve Toggles (space/P/p/x/e, kata prp1 added e) and
+	// Favorites (f/F/n/c/l) are now TIED for tallest at 5 rows each.
 	m.help.Width, m.width = 65, 65
 	floor := stripANSI(m.renderLegend())
 	floorLines := strings.Split(floor, "\n")
@@ -4143,12 +4150,14 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Fatalf("floor (width 65) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
 	}
 
-	// Wide: 100 cols is enough surplus to fold Favorites (tallest, 5 rows) and
-	// then Serve Toggles (4 bindings here -- Clean is contextual/absent -- tried
-	// next), but NOT View (3 rows; folding it needs >=107, checked below) or App
-	// (tried last). Folding SHORTENS the bar: Favorites' fold (ceil(5/2) = 3
-	// rows) is now the tallest group, so header+3 = 4 lines, fewer than the
-	// floor's 6 -- not just wider-gapped.
+	// Wide: 100 cols is enough surplus to fold Serve Toggles and Favorites
+	// (kata prp1: Serve Toggles is now tied with Favorites at 5 rows, and --
+	// since the fold candidates are sorted STABLE by row count and Serve
+	// Toggles comes first in groups() -- it is now tried FIRST on a tie, so
+	// the fold ORDER flipped from before prp1) but NOT View (3 rows; folding
+	// it needs >=109, checked below) or App (tried last). Folding SHORTENS
+	// the bar: after both folds, the tallest group is ceil(5/2) = 3 rows, so
+	// header+3 = 4 lines, fewer than the floor's 6 -- not just wider-gapped.
 	m.help.Width, m.width = 100, 100
 	wide := stripANSI(m.renderLegend())
 	wideLines := strings.Split(wide, "\n")
@@ -4157,9 +4166,31 @@ func TestBottomBarGridFolds(t *testing.T) {
 			len(wideLines), len(floorLines), floor, wide)
 	}
 
-	// Favorites folded: top-heavy column-major split -- f/u/n down the first
-	// sub-column, c/l down the second (never a dangling item left stranded
-	// atop an empty second sub-column). "c copy URL" now sits beside
+	// Serve Toggles folded (kata prp1 -- now tried FIRST, see above): top-heavy
+	// column-major split -- space/P/p down the first sub-column, x/e down the
+	// second (never a dangling item left stranded atop an empty second
+	// sub-column). "x lock/unlock" sits beside "space on tailscale" on the
+	// SAME row, and "e edit publish config" beside "P on ts.net (public)";
+	// "p on caddy (public)" is left alone on the third row (top-heavy 3/2
+	// split of 5 items). (p/P swapped, vzj4: Funnel is now P, Publish is now p.)
+	if r1, r2 := lineOf(wideLines, "space on tailscale"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
+		t.Errorf("Serve Toggles should fold space on tailscale/x lock/unlock onto the same row; space on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+	}
+	if r1, r2 := lineOf(wideLines, "on ts.net (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
+		t.Errorf("Serve Toggles should fold P on ts.net (public)/e edit publish config onto the same row; P on ts.net (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
+	}
+	// "on caddy (public)" (desc only, not "p on caddy (public)" -- the folded
+	// left sub-col's key gutter is 5 wide (from "space"), so the rendered key
+	// is padded: "p     on caddy (public)").
+	if r := lineOf(wideLines, "on caddy (public)"); r < 0 {
+		t.Errorf("p on caddy (public) missing from wide grid:\n%s", wide)
+	} else if strings.Contains(wideLines[r], "edit publish config") {
+		t.Errorf("p on caddy (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+	}
+
+	// Favorites folded too: top-heavy column-major split -- f/F/n down the
+	// first sub-column, c/l down the second (never a dangling item left
+	// stranded atop an empty second sub-column). "c copy URL" now sits beside
 	// "f favorite" on the SAME row, not two rows below it as in the floor.
 	if r1, r2 := lineOf(wideLines, "f favorite"), lineOf(wideLines, "c copy URL"); r1 < 0 || r1 != r2 {
 		t.Errorf("Favorites should fold f favorite/c copy URL onto the same row; f favorite row %d, c copy URL row %d:\n%s", r1, r2, wide)
@@ -4173,18 +4204,6 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
-	// Serve Toggles folded too (4 bindings since kata v1z5 added publish edge, so
-	// it's now taller than View's 3 and tried right after Favorites). Its 2/2
-	// top-heavy split puts space on tailscale | p on caddy (public) on one row and
-	// P on ts.net (public) | x lock/unlock on the next. (p/P swapped, vzj4: Funnel
-	// is now P, Publish is now p.)
-	if r1, r2 := lineOf(wideLines, "space on tailscale"), lineOf(wideLines, "p on caddy (public)"); r1 < 0 || r1 != r2 {
-		t.Errorf("Serve Toggles should fold space on tailscale/p on caddy (public) onto the same row; space on tailscale row %d, p on caddy (public) row %d:\n%s", r1, r2, wide)
-	}
-	if r1, r2 := lineOf(wideLines, "on ts.net (public)"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
-		t.Errorf("Serve Toggles should fold P on ts.net (public)/x lock/unlock onto the same row; P on ts.net (public) row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
-	}
-
 	// App (3 bar bindings since 3cwx -- u undo, ? help, q quit; ctrl+r redo is
 	// hidden from the bar) is tried last and doesn't fit the fold at width 100,
 	// so it stays a single unfolded column: help and quit on SEPARATE rows.
@@ -4192,10 +4211,11 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("App should NOT fold at width 100 (no surplus left after the other 3 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
 	}
 
-	// View folds only once there's room for it (the wider "Serve Toggles" labels
-	// pushed its threshold to >=107, past the 100 above). At 110 its 3 items
-	// split column-major: "/ filter" beside "r refresh" on one row, "a switch
-	// view" below. (roborev 95j1: 100 no longer exercised this.)
+	// View folds only once there's room for it (kata prp1's longer Serve
+	// Toggles column pushed its threshold to >=109, past the 100 above). At
+	// 110 its 3 items split column-major: "/ filter" beside "r refresh" on
+	// one row, "a switch view" below. (roborev 95j1: 100 no longer exercised
+	// this.)
 	m.help.Width, m.width = 110, 110
 	w110 := strings.Split(stripANSI(m.renderLegend()), "\n")
 	if r1, r2 := lineOf(w110, "/ filter"), lineOf(w110, "r refresh"); r1 < 0 || r1 != r2 {
@@ -4231,7 +4251,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// padded ("P     on ts.net (public)") -- checking the description alone
 	// sidesteps that padding.)
 	for _, want := range []string{
-		"space on tailscale", "on ts.net (public)", "x lock/unlock",
+		"space on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
 		"f favorite", "F forget", "n new favorite", "c copy URL", "l label",
 		"/ filter", "a switch view", "r refresh",
 		"u undo", "? help", "q quit",
@@ -4300,7 +4320,7 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	// The 4-column grid is 63 cells wide; 50 forces the wrapped fallback.
+	// The 4-column grid is 64 cells wide; 50 forces the wrapped fallback.
 	const width = 50
 	m := New(config.Config{})
 	m.help.Width = width
@@ -4341,11 +4361,13 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
 // Protect is folded into Serve Toggles: with no dangling the Serve Toggles
-// column ends at "x lock/unlock" (space/P/p/x, no clean, no reserved blank
-// slot); when a dangling forward exists it gains "C clean stale" -- inserted
-// just ABOVE lock so "x lock/unlock" stays the last item in the column in
-// either state. (kata v1z5 added publish edge to Serve Toggles, after funnel;
-// p/P swapped under vzj4 so it's now P funnel, p publish.)
+// column ends at "e edit publish config" (space/P/p/x/e, no clean, no
+// reserved blank slot); when a dangling forward exists it gains "C clean
+// stale" -- inserted just ABOVE lock so "x lock/unlock" then "e edit publish
+// config" stay the last two items, in that order, in either state. (kata
+// v1z5 added publish edge to Serve Toggles, after funnel; p/P swapped under
+// vzj4 so it's now P funnel, p publish; kata prp1 added e edit right after
+// lock, so edit -- not lock -- is now the column's last item.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.help.Width = 100
@@ -4367,31 +4389,31 @@ func TestExposeContextualClean(t *testing.T) {
 		return g.bindings[len(g.bindings)-1].Help().Key
 	}
 
-	// No dangling -> Serve Toggles is space/p/P/x (clean dropped), lock last, and the
-	// rendered bar omits "clean".
+	// No dangling -> Serve Toggles is space/P/p/x/e (clean dropped), edit
+	// last, and the rendered bar omits "clean".
 	noClean := expose(m.barGroups(false))
-	if got := len(noClean.bindings); got != 4 {
-		t.Errorf("Serve Toggles should be 4 bindings (space/p/P/x) with no dangling; got %d", got)
+	if got := len(noClean.bindings); got != 5 {
+		t.Errorf("Serve Toggles should be 5 bindings (space/P/p/x/e) with no dangling; got %d", got)
 	}
-	if k := lastKey(noClean); k != "x" {
-		t.Errorf("lock (x) should be the last Serve Toggles binding with no dangling; got %q", k)
+	if k := lastKey(noClean); k != "e" {
+		t.Errorf("edit (e) should be the last Serve Toggles binding with no dangling; got %q", k)
 	}
 	if noDangle := stripANSI(m.renderLegend()); strings.Contains(noDangle, "clean") {
 		t.Errorf("bar should not show 'clean' with no dangling:\n%s", noDangle)
 	}
 
 	// A served-but-not-listening port is dangling -> Serve Toggles gains "C clean",
-	// still with lock (x) last.
+	// still with edit (e) last (and lock directly above it).
 	m.active = map[int]bool{9999: true}
 	if !m.hasDangling() {
 		t.Fatal("setup: expected a dangling forward")
 	}
 	withClean := expose(m.barGroups(true))
-	if got := len(withClean.bindings); got != 5 {
-		t.Errorf("Serve Toggles should be 5 bindings (space/p/P/C/x) with a dangling; got %d", got)
+	if got := len(withClean.bindings); got != 6 {
+		t.Errorf("Serve Toggles should be 6 bindings (space/P/p/C/x/e) with a dangling; got %d", got)
 	}
-	if k := lastKey(withClean); k != "x" {
-		t.Errorf("lock (x) should STILL be the last Serve Toggles binding with a dangling; got %q", k)
+	if k := lastKey(withClean); k != "e" {
+		t.Errorf("edit (e) should STILL be the last Serve Toggles binding with a dangling; got %q", k)
 	}
 	if dangle := stripANSI(m.renderLegend()); !strings.Contains(dangle, "clean stale") {
 		t.Errorf("bar should show 'C clean stale' with a dangling:\n%s", dangle)
@@ -4435,7 +4457,7 @@ func TestLegendSizingNoClip(t *testing.T) {
 		{"wide/no-dangling", 100, 24, false, false},
 		{"wide/dangling", 100, 24, true, true},
 		{"wide/dangling-appears-after-resize", 100, 24, false, true},
-		// Below the 63-wide grid threshold, so these exercise the wrapped fallback.
+		// Below the 64-wide grid threshold, so these exercise the wrapped fallback.
 		{"narrow/no-dangling", 50, 24, false, false},
 		{"narrow/dangling", 50, 24, true, true},
 		{"narrow/dangling-appears-after-resize", 50, 24, false, true},
@@ -5891,6 +5913,39 @@ func TestPublishPrefillPrecedence(t *testing.T) {
 	}
 }
 
+// TestPublishPrefillFromRemembered (kata prp1) covers enterPublishHostDialog's
+// top-priority prefill source: a port's remembered/current publishInfo
+// (m.lastPublish) beats the label/process/short-label chain below it. This is
+// what makes `e` open pre-filled with what's actually (or was) live instead
+// of guessing from the port's label.
+func TestPublishPrefillFromRemembered(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Label: "dashboard"} // would otherwise win (see TestPublishPrefillPrecedence)
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "custom-name.example.com"}}
+	m.requestEditPublish(8080)
+	if m.mode != entryPublishHost {
+		t.Fatalf("requestEditPublish should open the host dialog; mode=%v", m.mode)
+	}
+	if got := m.publishInput.Value(); got != "custom-name" {
+		t.Errorf("host prefill = %q, want custom-name (the remembered hostname's label, beating the port label)", got)
+	}
+}
+
+// TestPublishPrefillFromRememberedStaleDomainFallsBack (kata prp1): if the
+// remembered hostname's domain no longer matches caddy.domain (e.g. it
+// changed mid-session), the remembered value isn't a valid label under the
+// CURRENT domain, so enterPublishHostDialog must fall back to the ordinary
+// label/process/short-label chain instead of prefilling an unsubmittable
+// dotted string.
+func TestPublishPrefillFromRememberedStaleDomainFallsBack(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "custom-name.old-domain.com"}}
+	m.requestEditPublish(8080)
+	if got := m.publishInput.Value(); got != "web" { // falls back to the live process name
+		t.Errorf("host prefill = %q, want web (fallback -- remembered hostname belongs to a different domain)", got)
+	}
+}
+
 // TestPublishHostLockedSuffix covers the single-hostname editing model: the
 // buffer holds only the label, a typed "." is refused, the View renders the
 // locked ".<domain>" suffix, and submit re-appends it. An empty or dotted label
@@ -6609,6 +6664,345 @@ func TestDeEscalationImmediateUnpublish(t *testing.T) {
 	}
 	if len(fc.deletes) != 1 {
 		t.Errorf("expected exactly one DELETE; got %d", len(fc.deletes))
+	}
+}
+
+// TestPublishToggleNeverPublishedRunsFullSetup (kata prp1) pins the "only if
+// originally published" scope (mg): with NO m.lastPublish entry for the port
+// -- even though caddy.domain/hostname are fully configured (newPublishModel)
+// -- `p` must run the full setup flow (the host dialog), never the
+// remembered-republish shortcut. This is the control case the two republish
+// tests below are contrasted against.
+func TestPublishToggleNeverPublishedRunsFullSetup(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.SilentRepublish = true // even with silent on, no memory -> no shortcut
+	cmd := m.requestPublish(8080)
+	if m.mode != entryPublishHost {
+		t.Fatalf("never-published port should open the host dialog; mode=%v", m.mode)
+	}
+	if cmd != nil {
+		t.Error("opening the host dialog should not itself return a cmd")
+	}
+}
+
+// TestPublishToggleRepublishFromMemorySilent (kata prp1): a port published
+// earlier THIS session (m.lastPublish) but not currently published, with
+// caddy.silent_republish=true, re-publishes DIRECTLY -- no dialog, no confirm
+// -- reusing confirmPublish's own cmd-building path, and the remembered
+// hostname/auth (not the port's label/process guess) is what actually gets
+// POSTed to the edge.
+func TestPublishToggleRepublishFromMemorySilent(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := newPublishModel(t, srv)
+	m.cfg.Caddy.SilentRepublish = true
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com", auth: false}}
+
+	cmd := m.requestPublish(8080)
+	if m.mode != entryNone {
+		t.Errorf("silent re-publish must not open a dialog or confirm; mode=%v", m.mode)
+	}
+	if m.pending != 8080 {
+		t.Errorf("silent re-publish should set pending; got %d", m.pending)
+	}
+	if cmd == nil {
+		t.Fatal("silent re-publish should return a publish cmd directly")
+	}
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("re-publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	if len(fc.mutations) != 1 {
+		t.Fatalf("expected exactly one POST to the edge; got %d", len(fc.mutations))
+	}
+	rt := fc.mutations[0]
+	if rt.ID != caddyedge.IDFor("web.example.com") {
+		t.Errorf("route @id = %q, want the REMEMBERED hostname's id (%q)", rt.ID, caddyedge.IDFor("web.example.com"))
+	}
+	if dial := routeDial(rt); dial != "dev-box:8080" {
+		t.Errorf("backend dial = %q, want dev-box:8080", dial)
+	}
+}
+
+// TestPublishToggleRepublishFromMemoryConfirms (kata prp1): the same
+// remembered-hostname shortcut, but with caddy.silent_republish left false
+// (the default) -- `p` must jump straight to entryConfirmPublish, SKIPPING
+// the host/auth setup prompts, naming the exact remembered
+// https://<hostname>, and only publish on "y".
+func TestPublishToggleRepublishFromMemoryConfirms(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := newPublishModel(t, srv)
+	// SilentRepublish left at its zero value (false): confirm must be shown.
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "app.example.com", auth: true}}
+	m.cfg.Caddy.AuthUser = "admin"
+	m.cfg.Caddy.AuthHash = "$2a$10$deadbeefdeadbeefdeadbe"
+
+	cmd := m.requestPublish(8080)
+	if cmd != nil {
+		t.Error("the confirm path should not itself return a cmd yet")
+	}
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("remembered republish without silent_republish should reach entryConfirmPublish; mode=%v", m.mode)
+	}
+	if m.publishHostname != "app.example.com" {
+		t.Errorf("publishHostname = %q, want the REMEMBERED hostname app.example.com (setup prompts must be skipped)", m.publishHostname)
+	}
+	if !m.publishWithAuth {
+		t.Error("publishWithAuth should carry the remembered auth=true")
+	}
+	view := stripANSI(m.renderBottom())
+	if !strings.Contains(view, "https://app.example.com") {
+		t.Errorf("confirm should name the exact remembered URL; view:\n%s", view)
+	}
+
+	// "y" publishes using the remembered hostname/auth -- no host/auth prompts
+	// were ever visited.
+	res, confirmCmd := m.Update(rkey("y"))
+	got := res.(model)
+	if got.mode != entryNone {
+		t.Errorf("after confirm, mode = %v, want entryNone", got.mode)
+	}
+	if got.pending != 8080 {
+		t.Errorf("after confirm, pending = %d, want 8080", got.pending)
+	}
+	if confirmCmd == nil {
+		t.Fatal("confirming should return a publish cmd")
+	}
+	msg, ok := confirmCmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	if len(fc.mutations) != 1 {
+		t.Fatalf("expected exactly one POST to the edge; got %d", len(fc.mutations))
+	}
+	rt := fc.mutations[0]
+	if rt.ID != caddyedge.IDFor("app.example.com") {
+		t.Errorf("route @id = %q, want %q", rt.ID, caddyedge.IDFor("app.example.com"))
+	}
+	if !routeHasAuth(rt) {
+		t.Error("route should carry the basic-auth handler (remembered auth=true, reusing the stored shared credential)")
+	}
+}
+
+// TestPublishKeyToggleDispatch (kata prp1) drives the actual "p" keybinding
+// through Update (not requestPublish directly) across all three toggle
+// states, proving the dispatch itself -- not just the guard/shortcut
+// functions -- behaves as documented: unpublish on a published port,
+// silent direct re-publish on a remembered port with silent_republish, and
+// the full setup dialog on a never-published port.
+func TestPublishKeyToggleDispatch(t *testing.T) {
+	t.Run("published -> unpublish", func(t *testing.T) {
+		fc := newFakeCaddy()
+		rt := caddyedge.BuildRoute("web.example.com", "dev-box", 8080, nil)
+		fc.routes[rt.ID] = rt
+		srv := httptest.NewServer(fc)
+		defer srv.Close()
+
+		m := newPublishModel(t, srv)
+		m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+		m = mustUpdate(t, m, rkey("p"))
+		if m.mode != entryNone {
+			t.Errorf("unpublish should not open a dialog; mode=%v", m.mode)
+		}
+		if m.pending != 8080 {
+			t.Errorf("unpublish should set pending; got %d", m.pending)
+		}
+	})
+
+	t.Run("remembered + silent_republish -> direct publish", func(t *testing.T) {
+		fc := newFakeCaddy()
+		srv := httptest.NewServer(fc)
+		defer srv.Close()
+
+		m := newPublishModel(t, srv)
+		m.cfg.Caddy.SilentRepublish = true
+		m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+		m = mustUpdate(t, m, rkey("p"))
+		if m.mode != entryNone {
+			t.Errorf("silent re-publish should not open a dialog; mode=%v", m.mode)
+		}
+		if m.pending != 8080 {
+			t.Errorf("silent re-publish should set pending (cmd issued); got %d", m.pending)
+		}
+	})
+
+	t.Run("never published -> full setup dialog", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m = mustUpdate(t, m, rkey("p"))
+		if m.mode != entryPublishHost {
+			t.Fatalf("never-published port should open the host dialog; mode=%v", m.mode)
+		}
+	})
+}
+
+// TestLastPublishPopulatedOnPublishSuccess (kata prp1): a successful,
+// non-unpublish publishDoneMsg records the port's hostname/auth into
+// m.lastPublish, from the SAME pendingPublish carry the toast/re-fetch logic
+// already reads -- so a subsequent `p` on that port can take the
+// remembered-republish shortcut.
+func TestLastPublishPopulatedOnPublishSuccess(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080, withAuth: true}
+	res, _ := m.Update(publishDoneMsg{port: 8080, err: nil})
+	got := res.(model)
+	info, ok := got.lastPublish[8080]
+	if !ok {
+		t.Fatal("a successful publish should record the port in lastPublish")
+	}
+	if info.hostname != "app.example.com" || !info.auth {
+		t.Errorf("lastPublish[8080] = %+v, want hostname=app.example.com auth=true", info)
+	}
+
+	// An UNPUBLISH success must NOT populate lastPublish from its (unrelated)
+	// leftover pendingPublish -- only a genuine publish success does.
+	m2 := newPublishModel(t, nil)
+	m2.pendingPublish = pendingPublish{hostname: "stale.example.com", label: "dev-box", port: 9090}
+	res2, _ := m2.Update(publishDoneMsg{port: 9090, err: nil, unpublish: true})
+	if _, ok := res2.(model).lastPublish[9090]; ok {
+		t.Error("an unpublish success should not add a lastPublish entry")
+	}
+}
+
+// TestLastPublishPopulatedOnPoll (kata prp1): every port the live edge poll
+// reports as published is recorded into m.lastPublish too -- not just ports
+// THIS process itself published -- so a route still live on the edge from
+// before this process started (e.g. across a tailport restart) is
+// toggle-able/editable via its remembered config as well.
+func TestLastPublishPopulatedOnPoll(t *testing.T) {
+	m := newPublishModel(t, nil)
+	if len(m.lastPublish) != 0 {
+		t.Fatalf("setup: expected an empty lastPublish, got %+v", m.lastPublish)
+	}
+	res, _ := m.Update(publishPollMsg{gen: 1, published: map[int]publishInfo{
+		8080: {hostname: "web.example.com", auth: false},
+		9090: {hostname: "api.example.com", auth: true},
+	}})
+	got := res.(model)
+	if len(got.lastPublish) != 2 {
+		t.Fatalf("lastPublish after poll = %+v, want 2 entries", got.lastPublish)
+	}
+	if info := got.lastPublish[8080]; info.hostname != "web.example.com" {
+		t.Errorf("lastPublish[8080] = %+v, want hostname web.example.com", info)
+	}
+	if info := got.lastPublish[9090]; info.hostname != "api.example.com" || !info.auth {
+		t.Errorf("lastPublish[9090] = %+v, want hostname api.example.com auth=true", info)
+	}
+}
+
+// TestLastPublishNeverClearedOnUnpublish (kata prp1) pins the field's whole
+// point: unpublishing a port must NOT remove it from lastPublish, so `p`
+// pressed again later still takes the remembered-republish shortcut instead
+// of falling back to full setup.
+func TestLastPublishNeverClearedOnUnpublish(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	res, _ := m.Update(publishDoneMsg{port: 8080, err: nil, unpublish: true})
+	got := res.(model)
+	if _, ok := got.lastPublish[8080]; !ok {
+		t.Error("unpublish must NOT remove the port's lastPublish entry")
+	}
+}
+
+// TestRequestEditPublishGuards (kata prp1) mirrors p's non-de-escalation
+// refuse-guards: busy, :22, funnel-conflict, and locked all refuse `e` exactly
+// like `p` -- edit must not be a backdoor around any of them (AGENTS.md: a
+// port can carry funnel OR publish, never both).
+func TestRequestEditPublishGuards(t *testing.T) {
+	t.Run("refuses :22", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		cmd := m.requestEditPublish(22)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, ":22") {
+			t.Errorf("edit on :22 should refuse; mode=%v flash=%q", m.mode, m.flash)
+		}
+		_ = cmd
+	})
+
+	t.Run("refuses a locked port", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Locked: true}
+		cmd := m.requestEditPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "locked") {
+			t.Errorf("edit on a locked port should refuse; mode=%v flash=%q", m.mode, m.flash)
+		}
+		_ = cmd
+	})
+
+	t.Run("refuses a funnelled port", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.funnel = map[int]int{8080: 443}
+		cmd := m.requestEditPublish(8080)
+		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "funnelled") {
+			t.Errorf("edit on a funnelled port should refuse (funnel/publish mutual exclusion); mode=%v flash=%q", m.mode, m.flash)
+		}
+		_ = cmd
+	})
+
+	t.Run("busy refuses silently", func(t *testing.T) {
+		m := newPublishModel(t, nil)
+		m.pending = 9999
+		cmd := m.requestEditPublish(8080)
+		if cmd != nil || m.mode != entryNone {
+			t.Errorf("edit while busy should be a silent no-op; mode=%v cmd=%v", m.mode, cmd)
+		}
+	})
+}
+
+// TestRequestEditPublishNeverUnpublishes (kata prp1): unlike p, e must NOT
+// de-escalate an already-published port -- it always opens the setup flow so
+// the hostname/auth can be changed WITHOUT unpublishing first. The existing
+// @id PATCH path (caddyedge.Publish) is what makes the eventual publish
+// REPLACE the live route rather than erroring on a duplicate.
+func TestRequestEditPublishNeverUnpublishes(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	cmd := m.requestEditPublish(8080)
+	if m.mode != entryPublishHost {
+		t.Fatalf("edit on a published port should open the host dialog, not unpublish; mode=%v", m.mode)
+	}
+	if cmd != nil {
+		t.Error("opening the host dialog should not itself return an unpublish (or any) cmd")
+	}
+}
+
+// TestRequestEditPublishFreshDomainReusesCaptureFlow (kata prp1): with
+// caddy.domain blank, e runs the SAME inline hostname/domain capture as p's
+// first run (publishSetupOrHostDialog is the shared tail both call), not a
+// bespoke flow.
+func TestRequestEditPublishFreshDomainReusesCaptureFlow(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m.fqdn = "dev-box.tailnet.ts.net"
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
+	m.active = map[int]bool{8080: true}
+	m.rebuildItems()
+	// caddy.Domain left at its zero value (blank): unconfigured.
+	cmd := m.requestEditPublish(8080)
+	if m.mode != entryPublishHostname {
+		t.Fatalf("e with a blank caddy.domain should open the SAME hostname-capture step p uses; mode=%v", m.mode)
+	}
+	_ = cmd
+}
+
+// TestEditKeyDispatch (kata prp1) drives the actual "e" keybinding through
+// Update (not requestEditPublish directly), proving the case "e" dispatch is
+// wired up: it opens the SAME host dialog requestEditPublish does, without
+// unpublishing an already-published port.
+func TestEditKeyDispatch(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+	m = mustUpdate(t, m, rkey("e"))
+	if m.mode != entryPublishHost {
+		t.Fatalf("pressing e should open the host dialog; mode=%v", m.mode)
+	}
+	if _, ok := m.published[8080]; !ok {
+		t.Error("pressing e must not unpublish -- the port should still be published")
 	}
 }
 

@@ -211,6 +211,7 @@ func TestFreshSeedIncludesCaddyBlockAndComments(t *testing.T) {
 		`domain: ""`,
 		`server_name: tailport`,
 		`admin_port: 2019`,
+		`silent_republish: false`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("expected seeded config to contain %q, got:\n%s", want, text)
@@ -221,6 +222,7 @@ func TestFreshSeedIncludesCaddyBlockAndComments(t *testing.T) {
 		"Public base domain used to build publish hostnames",
 		"Name of the shared Caddy JSON HTTP server under apps.http.servers",
 		"Port of the Caddy admin API on the edge",
+		"Skip the y/n confirm when re-publishing a port already published",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("expected seeded config to contain comment %q, got:\n%s", want, text)
@@ -268,6 +270,104 @@ func TestCaddyRoundTrip(t *testing.T) {
 	// Untouched fields still carry their defaults.
 	if got.Caddy.Hostname != "caddy" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
 		t.Errorf("Load().Caddy = %+v, want defaults for hostname/server_name/admin_port", got.Caddy)
+	}
+}
+
+// TestSilentRepublishRoundTrip mirrors TestCaddyRoundTrip (kata prp1):
+// caddy.silent_republish persists across a Save/Load cycle like any other
+// caddy field, and Default() leaves it false -- the safe, confirm-shown
+// state -- until a user explicitly opts in.
+func TestSilentRepublishRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if Default().Caddy.SilentRepublish {
+		t.Fatal("Default().Caddy.SilentRepublish = true, want false (safe default)")
+	}
+
+	cfg := Default()
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.SilentRepublish = true
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !got.Caddy.SilentRepublish {
+		t.Error("Load().Caddy.SilentRepublish = false, want true")
+	}
+}
+
+// caddySilentRepublishFixture mirrors caddyDomainWritebackFixture (below) but
+// adds silent_republish: true to the caddy block, so the SaveCaddyDomain/
+// SaveCaddyHostname merge tests can prove the new field survives a targeted
+// single-field write-back exactly like auth_user/auth_hash already do (kata
+// prp1's foreign-key-preservation requirement).
+const caddySilentRepublishFixture = `# tailport config (hand-tuned by a human)
+ports:
+    22:
+        locked: true
+caddy:
+    hostname: caddy
+    domain: old.example.com
+    server_name: tailport
+    admin_port: 2019
+    auth_user: mg
+    auth_hash: $2a$10$abcdefghijklmnopqrstuvABCDEFghijklmnopqrstuvwxyz012
+    silent_republish: true
+`
+
+// TestSaveCaddyDomainPreservesSilentRepublish (kata prp1): a targeted
+// SaveCaddyDomain write-back must not clobber an existing silent_republish
+// value -- it's a merge onto the parsed Node tree, not a struct re-encode.
+func TestSaveCaddyDomainPreservesSilentRepublish(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddySilentRepublishFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyDomain("newdomain.example.org"); err != nil {
+		t.Fatalf("SaveCaddyDomain() error: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !got.Caddy.SilentRepublish {
+		t.Error("Load().Caddy.SilentRepublish = false after SaveCaddyDomain, want true (foreign-key preservation)")
+	}
+	if got.Caddy.Domain != "newdomain.example.org" {
+		t.Errorf("Load().Caddy.Domain = %q, want %q", got.Caddy.Domain, "newdomain.example.org")
+	}
+}
+
+// TestSaveCaddyHostnamePreservesSilentRepublish mirrors
+// TestSaveCaddyDomainPreservesSilentRepublish exactly, but for
+// SaveCaddyHostname (kata prp1).
+func TestSaveCaddyHostnamePreservesSilentRepublish(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddySilentRepublishFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyHostname("caddy-on-fly"); err != nil {
+		t.Fatalf("SaveCaddyHostname() error: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !got.Caddy.SilentRepublish {
+		t.Error("Load().Caddy.SilentRepublish = false after SaveCaddyHostname, want true (foreign-key preservation)")
+	}
+	if got.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("Load().Caddy.Hostname = %q, want %q", got.Caddy.Hostname, "caddy-on-fly")
 	}
 }
 

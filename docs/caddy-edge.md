@@ -299,6 +299,7 @@ caddy:
     domain: apps.example.com   # the base domain from step 3 -- public hostnames are built from this
     server_name: tailport      # must match on every computer publishing through this same edge
     admin_port: 2019
+    silent_republish: false    # opt-in: skip the confirm when re-publishing a port already published this session
 ```
 
 Set **`domain`** to the base whose DNS you pointed at the edge in step 3, at the
@@ -315,8 +316,11 @@ predates the publish feature the block won't be there yet** — trigger one save
 with any change that writes the file (favouriting or labelling a port), or
 paste the block above in by hand, then set `domain:`. Publishing can also seed
 it: pressing `p` with a blank `domain` captures it inline and saves it rather
-than refusing. Full field reference: the root README's
-[Configuration](../README.md#configuration) section.
+than refusing. Full field reference, including `silent_republish` (`p`'s
+opt-in to skip the confirm when re-publishing a port already published this
+session): the root README's [Configuration](../README.md#configuration)
+section and its [Publish is a toggle](../README.md#publish-is-a-toggle-p)
+section.
 
 `hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
 tailport can find its admin API over the tailnet — it is unrelated to any
