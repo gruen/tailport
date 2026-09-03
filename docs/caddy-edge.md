@@ -501,7 +501,7 @@ changes. Map the Fly steps to their generic equivalents:
 | §2 `fly ips allocate-v4` | **Not needed** — you already have a public IP. This step is a Fly quirk: Fly's *shared* IPv4 routes through Fly's own TLS-terminating proxy, so Fly makes you buy a *dedicated* IPv4 to get raw passthrough. A normal host's IP is already direct. |
 | §3 DNS | **Unchanged** — point your domain at *this* host's public IP(s) instead of Fly's. |
 | §4 Point tailport at the edge | **Unchanged** — `caddy.hostname` is the edge's MagicDNS name whatever it runs on. |
-| §5 Smoke test | **Same checks**, minus the `fly ssh console` wrapper — but run them *inside the edge*: `docker exec`/`docker compose exec` into the container (a host-shell probe tests the host's own `tailscaled` + resolver, not the container's, and can pass while the container can't reach the backend); on a native systemd deploy the host shell **is** the edge, so a local shell is correct there. |
+| §5 Smoke test | The definitive end-to-end check — `curl https://<hostname>/` from a machine **off** your tailnet — is provider-agnostic and unchanged. To localize a failure *inside* the edge, run §5's diagnostics there (`docker exec`/`compose exec` into the container, or a host shell for a native systemd deploy — a host-shell probe otherwise tests the host's own `tailscaled`/resolver, not the container's): `tailscale ping` works as-is, but the `curl -H "Host: …"` probe needs a `curl` the minimal image doesn't ship (bash + CA certs only), so run that one from the host or a throwaway container sharing the edge's network. |
 
 Two Fly-specific warnings in this runbook simply don't apply off Fly:
 
