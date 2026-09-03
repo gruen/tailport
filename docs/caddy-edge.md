@@ -1,11 +1,20 @@
 # Deploying a Caddy edge
 
-Runbook for standing up the **Caddy edge**: a small Fly.io app (tailscaled +
-Caddy) that lets tailport publish a local port to a custom public hostname —
-`https://app.example.com`, no port in the URL, no `*.ts.net` — over your
-tailnet (the `p` key, kata v1z5; swapped from `P` under vzj4). Short and
-skimmable, written for someone
-who has never used Caddy or Fly.io before — cross-reference
+Runbook for standing up the **Caddy edge**: a small always-on host running
+tailscaled + Caddy that lets tailport publish a local port to a custom public
+hostname — `https://app.example.com`, no port in the URL, no `*.ts.net` — over
+your tailnet (the `p` key, kata v1z5; swapped from `P` under vzj4).
+
+**The edge is not tied to any one provider.** tailport only ever speaks Caddy's
+admin API over the tailnet, so *any* host that meets the [requirements
+below](#requirements-any-host) works — a cloud VM, a VPS, a home server, a
+Raspberry Pi. This runbook uses **Fly.io as the reference recipe** because it
+makes the "public IP + tailscaled + a persistent volume + a container" bundle
+cheap and turnkey; [Self-hosting / other
+providers](#self-hosting--other-providers) maps every step to a box you manage.
+
+Short and skimmable, written for someone who has never used Caddy (or Fly.io)
+before — cross-reference
 [`packaging/caddy-edge/README.md`](../packaging/caddy-edge/README.md) for
 what each file does and the root [README](../README.md#configuration) for
 the `caddy.*` config fields this deploy has to line up with.
@@ -27,6 +36,24 @@ appendix](#appendix-the-whole-deploy-as-one-scripted-sequence) at the end is
 every step below collapsed into one parameterized sequence — fill a few shell
 variables and run it, each command explained inline. The numbered sections
 remain the reference for *why* each piece is there.
+
+## Requirements (any host)
+
+The edge is a contract, not a Fly thing. Whatever you run it on has to supply
+all five of these — that's the whole list:
+
+| # | Requirement | Why it's needed |
+| - | ----------- | --------------- |
+| 1 | A **public IP** with **`:80` and `:443` reaching Caddy directly** — raw TCP, nothing in front terminating TLS | Caddy terminates TLS and answers the ACME `HTTP-01` challenge itself; anything intercepting the handshake first breaks issuance and passthrough |
+| 2 | **tailscaled** on that host, joined to your tailnet under the edge tag | how the edge reaches your backends, and how tailport reaches the edge's admin API — all tailnet-only, never public |
+| 3 | **Caddy ≥ 2.5.2**, admin API reachable **over the tailnet only** (never the public interface) | the version floor is for concurrency safety (see the Caddy ≥ 2.5.2 requirement below); the admin API has no auth of its own, so tailnet-only + the ACL *is* the access control |
+| 4 | **DNS** for your publish domain (a wildcard, or per-host records) pointing at that public IP | so published hostnames resolve to the edge and ACME can validate them |
+| 5 | **Persistent storage** for tailscaled's state and Caddy's autosaved live config + issued certs | so published routes and TLS certs survive a restart instead of re-issuing every boot |
+
+Meet those five and the publish flow can't tell the difference between Fly and
+anything else. The Fly recipe in §§1–7 is one concrete way to satisfy them;
+[Self-hosting / other providers](#self-hosting--other-providers) is the same
+five requirements on a box you manage.
 
 ## 1. Tailscale ACL and auth key
 
@@ -170,6 +197,13 @@ when you deploy it.
    secret in step 2, never into a file in this repo.
 
 ## 2. Fly.io: app, volume, IP, secret, deploy
+
+This is the **reference recipe** — Fly's concrete way to satisfy
+[requirements](#requirements-any-host) 1, 3, and 5 (the public IP, the
+tailscaled + Caddy container, and a persistent volume) in one place. On a host
+you manage you provision those differently; see [Self-hosting / other
+providers](#self-hosting--other-providers). Steps 1, 3, and 4 are not
+Fly-specific and apply verbatim wherever the edge runs.
 
 From [`packaging/caddy-edge/`](../packaging/caddy-edge/):
 
@@ -446,6 +480,41 @@ and recreate the volume outright. Either way, every previously published
 route is gone and each backend has to republish (press `p` again) — tailport
 itself keeps no per-port publish state to restore from; Caddy's live config
 is the only source of truth (see kata v1z5's Architecture notes).
+
+## Self-hosting / other providers
+
+Everything above is the Fly recipe; this is the *same edge* on a box you manage
+— a VPS (Hetzner, DigitalOcean, Linode, Vultr…), a cloud VM, or a home server
+with `:80`/`:443` forwarded to it. You're satisfying the exact five
+[requirements](#requirements-any-host); only *how* you provision each one
+changes. Map the Fly steps to their generic equivalents:
+
+| Fly step | On a host you manage |
+| -------- | -------------------- |
+| §1 Tailscale ACL + auth key | **Unchanged** — the tailnet is provider-independent. Same tag, same reusable, non-ephemeral key. |
+| §2 `fly launch` (the container) | Run tailscaled + Caddy however you like: `docker compose`/`docker run` off the bundled [`Dockerfile`](../packaging/caddy-edge/Dockerfile) + [`entrypoint.sh`](../packaging/caddy-edge/entrypoint.sh) — both provider-neutral, they just read `TS_AUTHKEY`/`TS_HOSTNAME`/`CADDY_ADMIN_PORT` from the environment — or run the two daemons directly under systemd. Pass `TS_AUTHKEY` as an env var / secret the same way, never in a committed file. |
+| §2 `fly volumes create` | Any persistent path: a bind mount, a named Docker volume, or just a directory on disk — it holds tailscaled state + Caddy's autosave/certs ([requirement 5](#requirements-any-host)). |
+| §2 `fly ips allocate-v4` | **Not needed** — you already have a public IP. This step is a Fly quirk: Fly's *shared* IPv4 routes through Fly's own TLS-terminating proxy, so Fly makes you buy a *dedicated* IPv4 to get raw passthrough. A normal host's IP is already direct. |
+| §3 DNS | **Unchanged** — point your domain at *this* host's public IP(s) instead of Fly's. |
+| §4 Point tailport at the edge | **Unchanged** — `caddy.hostname` is the edge's MagicDNS name whatever it runs on. |
+| §5 Smoke test | **Same checks**, minus the wrapper: run the `tailscale ping` / `curl -H "Host: …"` probes over `ssh` (or a local shell) on the edge instead of `fly ssh console`. |
+
+Two Fly-specific warnings in this runbook simply don't apply off Fly:
+
+- **The dedicated-IPv4 dance (§2) evaporates.** A self-hosted box's public IP
+  already reaches Caddy directly — there's no proxy to route around.
+- **"Do NOT `fly certs add`" (§2, §6) is moot** — there's no Fly certificate to
+  mis-issue. But the *rule underneath it* holds everywhere: **nothing may sit in
+  front of Caddy on `:80`/`:443` terminating TLS.** If your provider or home
+  router puts a reverse proxy / load balancer with its own TLS ahead of the
+  host, either disable it for those two ports or give Caddy its own IP — Caddy
+  must own the handshake, exactly as [requirement
+  1](#requirements-any-host) says.
+
+Everything else applies identically no matter where the edge runs: the
+admin-API hardening (§1), the Caddy ≥ 2.5.2 floor (below), and the single-node
+[resilience caveat](#a-note-on-resilience) — a self-hosted box is likewise one
+node with one data directory unless you build redundancy yourself.
 
 ## Requirement: Caddy ≥ 2.5.2 (concurrency safety)
 

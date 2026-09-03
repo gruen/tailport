@@ -336,9 +336,9 @@ caddy:
   per-hostname.
 
 None of this configures the edge itself — it only tells tailport where an
-**already-deployed** edge lives. Standing up the edge (Fly.io, Tailscale ACL
-and auth key, DNS) is a separate one-time operator task; see
-[`docs/caddy-edge.md`](docs/caddy-edge.md).
+**already-deployed** edge lives. Standing up the edge (on Fly.io or any host
+you run — Tailscale ACL and auth key, DNS) is a separate one-time operator
+task; see [`docs/caddy-edge.md`](docs/caddy-edge.md).
 
 ## How it works
 
@@ -363,7 +363,8 @@ yourself.
 Tailnet `serve` and Funnel aren't the only way out to the world: tailport can
 also publish a port to a **custom public hostname** —
 `https://app.example.com`, no port in the URL, no `*.ts.net` — through a
-Caddy edge node you run yourself (on Fly.io; see below). This is a third
+Caddy edge node you run yourself (on Fly.io, or any host that meets the
+requirements; see below). This is a third
 exposure level, architecturally independent of both `serve` (tailnet) and
 Funnel: Tailscale's role in this path is private WireGuard transport from
 the edge to your machine only, and nothing more — Caddy owns the entire
