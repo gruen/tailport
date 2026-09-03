@@ -5429,9 +5429,10 @@ func TestPublishFlowWalkNoAuth(t *testing.T) {
 	if m.mode != entryPublishHost {
 		t.Fatalf("after P, mode = %v, want entryPublishHost", m.mode)
 	}
-	// Prefill precedence: no label, process "web" -> "web.example.com".
-	if got := m.publishInput.Value(); got != "web.example.com" {
-		t.Errorf("host prefill = %q, want web.example.com", got)
+	// Prefill precedence: no label, process "web" -> label "web" (the buffer
+	// holds only the label now; ".example.com" is the locked suffix).
+	if got := m.publishInput.Value(); got != "web" {
+		t.Errorf("host prefill (label only) = %q, want web", got)
 	}
 
 	m = mustUpdate(t, m, enterKey)
@@ -5796,30 +5797,67 @@ func TestRequestPublishGuards(t *testing.T) {
 	})
 }
 
-// TestPublishPrefillPrecedence pins the host prefill: label > process >
-// machine short-label, then "."+domain.
+// TestPublishPrefillPrecedence pins the host-LABEL prefill: label > process >
+// machine short-label. The domain (".example.com") is a locked suffix, not in
+// the buffer; submit re-appends it to form the full hostname.
 func TestPublishPrefillPrecedence(t *testing.T) {
 	// user label wins.
 	m := newPublishModel(t, nil)
 	m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Label: "dashboard"}
 	m.requestPublish(8080)
-	if got := m.publishInput.Value(); got != "dashboard.example.com" {
-		t.Errorf("label prefill = %q, want dashboard.example.com", got)
+	if got := m.publishInput.Value(); got != "dashboard" {
+		t.Errorf("label prefill (label only) = %q, want dashboard", got)
+	}
+	// submit re-appends the locked ".example.com" suffix.
+	m = mustUpdate(t, m, enterKey)
+	if m.publishHostname != "dashboard.example.com" {
+		t.Errorf("submit host = %q, want dashboard.example.com", m.publishHostname)
 	}
 
 	// no label, process name.
 	m = newPublishModel(t, nil)
 	m.requestPublish(8080)
-	if got := m.publishInput.Value(); got != "web.example.com" {
-		t.Errorf("process prefill = %q, want web.example.com", got)
+	if got := m.publishInput.Value(); got != "web" {
+		t.Errorf("process prefill (label only) = %q, want web", got)
 	}
 
 	// no label, no process -> machine short-label.
 	m = newPublishModel(t, nil)
 	m.allPorts = []portscan.Port{{Number: 8080}} // no Process
 	m.requestPublish(8080)
-	if got := m.publishInput.Value(); got != "dev-box.example.com" {
-		t.Errorf("short-label prefill = %q, want dev-box.example.com", got)
+	if got := m.publishInput.Value(); got != "dev-box" {
+		t.Errorf("short-label prefill (label only) = %q, want dev-box", got)
+	}
+}
+
+// TestPublishHostLockedSuffix covers the single-hostname editing model: the
+// buffer holds only the label, a typed "." is refused, the View renders the
+// locked ".<domain>" suffix, and submit re-appends it. An empty or dotted label
+// is rejected rather than producing a bad host.
+func TestPublishHostLockedSuffix(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.requestPublish(8080) // process "web" -> label "web"; domain example.com
+
+	// A typed "." is blocked -- the buffer stays the label.
+	m = mustUpdate(t, m, rkey("."))
+	if got := m.publishInput.Value(); got != "web" {
+		t.Errorf("after typing '.', label = %q, want unchanged \"web\"", got)
+	}
+
+	// Editing the label then submitting re-appends the locked ".example.com".
+	m = mustUpdate(t, m, rkey("api"))
+	m = mustUpdate(t, m, enterKey)
+	if m.publishHostname != "webapi.example.com" {
+		t.Errorf("submit host = %q, want webapi.example.com", m.publishHostname)
+	}
+
+	// Empty label is refused (stays on the host step).
+	m = newPublishModel(t, nil)
+	m.requestPublish(8080)
+	m.publishInput.SetValue("")
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishHost {
+		t.Errorf("empty label should stay on entryPublishHost; mode = %v", m.mode)
 	}
 }
 
@@ -5900,8 +5938,11 @@ func TestPublishDomainCaptureHappyPath(t *testing.T) {
 	if m.mode != entryPublishHost {
 		t.Fatalf("after domain save, mode=%v, want entryPublishHost", m.mode)
 	}
-	if got := m.publishInput.Value(); !strings.HasSuffix(got, ".apps.example.com") {
-		t.Errorf("host prefill = %q, want suffix .apps.example.com", got)
+	// The shared host dialog now holds the LABEL only; ".apps.example.com" is the
+	// locked suffix (rendered in View, re-appended on submit), so the buffer is a
+	// non-empty dotless label.
+	if got := m.publishInput.Value(); got == "" || strings.Contains(got, ".") {
+		t.Errorf("host prefill (label only) = %q, want a non-empty dotless label", got)
 	}
 	// The parallel sticky setup-banner is now active and names the domain.
 	if !m.domainSetupPending {

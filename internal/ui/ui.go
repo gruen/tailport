@@ -922,7 +922,7 @@ const (
 	//   [entryPublishDomain ->] entryPublishHost -> entryPublishAuth ->
 	//   [entryPublishCredUser -> entryPublishCredPass ->] entryConfirmPublish
 	entryPublishDomain   // text: the public base domain, captured when caddy.domain is blank (w131)
-	entryPublishHost     // text: the public hostname, prefilled <label-or-process>.<domain>
+	entryPublishHost     // text: the editable label only; ".<domain>" is a locked suffix (single label)
 	entryPublishAuth     // 3-way y/n/esc: require basic auth? ("no auth" != "abort")
 	entryPublishCredUser // text: shared basic-auth username (first authed publish)
 	entryPublishCredPass // text (masked): shared basic-auth password (first authed publish)
@@ -2721,6 +2721,7 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if m.cfg.Caddy.Domain == "" {
 		m.publishInput.Reset()
 		m.publishInput.EchoMode = textinput.EchoNormal
+		m.publishInput.Width = 40 // a normal padded field (the host step sets 0)
 		m.publishInput.Placeholder = "example.com"
 		m.publishInput.Focus()
 		m.mode = entryPublishDomain
@@ -2729,14 +2730,17 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	return m.enterPublishHostDialog()
 }
 
-// enterPublishHostDialog opens the entryPublishHost step for m.publishPort with
-// the public hostname prefilled <label-or-process>.<domain>. Prefill precedence:
-// the port's user label, else its live process name, else this machine's short
-// label -- then "."+caddy.domain. It's editable and nested subdomains are
-// allowed; ValidHostname checks it on submit. This is the SHARED continuation
-// (kata w131, ycv1 r2-#5) called from BOTH requestPublish (caddy.domain already
-// set) and the entryPublishDomain enter-handler (caddy.domain just saved) -- both
-// set m.publishPort first, which this reads.
+// enterPublishHostDialog opens the entryPublishHost step for m.publishPort. Only
+// the editable LABEL goes in the input; ".<domain>" is a LOCKED suffix rendered
+// after it (View) and re-appended on submit, so the field reads as one
+// <label>.<domain> with the cursor sitting before the first dot ("expand out"
+// from there). Prefill (the label) precedence: the port's user label, else its
+// live process name, else this machine's short label. Single-label only for now
+// -- a typed "." is refused and a dotted label is rejected on submit;
+// ValidHostname checks the full host. This is the SHARED continuation (kata
+// w131, ycv1 r2-#5) called from BOTH requestPublish (caddy.domain already set)
+// and the entryPublishDomain enter-handler (caddy.domain just saved) -- both set
+// m.publishPort first, which this reads.
 func (m *model) enterPublishHostDialog() tea.Cmd {
 	port := m.publishPort
 	prefix := m.cfg.Ports[port].Label
@@ -2747,7 +2751,13 @@ func (m *model) enterPublishHostDialog() tea.Cmd {
 		prefix = shortLabel(m.fqdn)
 	}
 	m.publishInput.EchoMode = textinput.EchoNormal
-	m.publishInput.SetValue(prefix + "." + m.cfg.Caddy.Domain)
+	// Width 0 = no field padding, so the locked ".<domain>" suffix (rendered in
+	// View) sits flush against the label instead of after ~40 blank columns.
+	// (Restored to 40 on the domain/cred steps that share this input.)
+	m.publishInput.Width = 0
+	// Label only; the ".<domain>" suffix is locked (rendered in View, re-appended
+	// on submit). Cursor at the label's end sits right before that first dot.
+	m.publishInput.SetValue(prefix)
 	m.publishInput.CursorEnd()
 	m.publishInput.Focus()
 	m.mode = entryPublishHost
@@ -2828,8 +2838,23 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 		case "esc":
 			m.clearPublishFlow()
 			return nil
+		case ".":
+			// The ".<domain>" suffix is locked and lives OUTSIDE the buffer
+			// (rendered in View), so a typed "." would only start an unsupported
+			// nested label. Refuse it silently, like any rejected keystroke.
+			return nil
 		case "enter":
-			host := strings.TrimSpace(m.publishInput.Value())
+			// The buffer holds the label only; re-append the locked domain suffix.
+			label := strings.TrimSpace(m.publishInput.Value())
+			if label == "" {
+				return m.setErr("enter a hostname label before the domain")
+			}
+			if strings.Contains(label, ".") {
+				// Guards a dotted prefill or a pasted label (the "." keystroke is
+				// already blocked above): single <label>.<domain> only for now.
+				return m.setErr("one label only — nested subdomains aren't supported yet")
+			}
+			host := label + "." + m.cfg.Caddy.Domain
 			if !caddyedge.ValidHostname(host) {
 				return m.setErr(fmt.Sprintf("invalid public hostname: %q", host))
 			}
@@ -2852,6 +2877,7 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 				// First authed publish: gather the single shared credential.
 				m.publishInput.Reset()
 				m.publishInput.EchoMode = textinput.EchoNormal
+				m.publishInput.Width = 40 // padded field (the host step sets 0)
 				m.publishInput.Placeholder = "username"
 				m.publishInput.Focus()
 				m.mode = entryPublishCredUser
@@ -2882,6 +2908,7 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			m.publishCredUser = user
 			m.publishInput.Reset()
 			m.publishInput.EchoMode = textinput.EchoPassword // mask the password
+			m.publishInput.Width = 40                        // padded field (the host step sets 0)
 			m.publishInput.Placeholder = "password"
 			m.publishInput.Focus()
 			m.mode = entryPublishCredPass
@@ -6958,8 +6985,12 @@ func (m model) renderBottom() string {
 		return helpStyle.Render(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort)) +
 			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")
 	case entryPublishHost:
+		// The input holds only the editable label; render the locked ".<domain>"
+		// suffix contiguously after it (plain, same style as typed text) so it
+		// reads as one field with the cursor before the first dot -- the suffix
+		// can't be deleted because it isn't in the buffer.
 		return helpStyle.Render(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort)) +
-			m.publishInput.View() + helpStyle.Render("  (enter: next, esc: cancel)")
+			m.publishInput.View() + "." + m.cfg.Caddy.Domain + helpStyle.Render("  (enter: next, esc: cancel)")
 	case entryPublishAuth:
 		return helpStyle.Render(fmt.Sprintf("protect :%d behind basic auth at the edge? ", m.publishPort)) +
 			helpStyle.Render("(y: yes / n: no auth / esc: cancel)")
