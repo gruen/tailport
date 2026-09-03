@@ -551,9 +551,9 @@ func (i portItem) inlineCopyState() bool {
 func (i portItem) plainDescription() string {
 	switch i.reach() {
 	case reachFunnel:
-		return "on the internet · " + tsserve.PublicURL(i.fqdn, i.funnelPublic)
+		return tsserve.PublicURL(i.fqdn, i.funnelPublic) + " · on the internet"
 	case reachPublish:
-		d := "published to the internet · https://" + i.publishHostname
+		d := "https://" + i.publishHostname + " · published to the internet"
 		if i.publishAuth {
 			d += " · basic auth"
 		}
@@ -623,13 +623,13 @@ func (i portItem) Description() string {
 	return desc
 }
 
-// servedDescPlain returns the UNSTYLED state-C description text ("on
-// tailnet · http://host:port") -- the row text Description() renders for
+// servedDescPlain returns the UNSTYLED state-C description text
+// ("http://host:port · on tailnet") -- the row text Description() renders for
 // reachServed, and the exact string whose URL copyURL copies. Shared by
 // Description() and copyURL's inlineCopyFits width check (py5b) so the two
 // can never drift out of sync about what the row actually shows.
 func (i portItem) servedDescPlain() string {
-	return fmt.Sprintf("on tailnet · http://%s:%d", i.host, i.port.Number)
+	return fmt.Sprintf("http://%s:%d · on tailnet", i.host, i.port.Number)
 }
 
 func (i portItem) FilterValue() string {

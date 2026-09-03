@@ -2058,7 +2058,7 @@ func TestFunnelItemRender(t *testing.T) {
 		t.Errorf("reach() = %v, want reachFunnel", got)
 	}
 	desc := it.Description()
-	if !strings.Contains(desc, "on the internet · https://host.example.ts.net:8443") {
+	if !strings.Contains(desc, "https://host.example.ts.net:8443 · on the internet") {
 		t.Errorf("funnelled Description should show the honest 'on the internet' prefix and public URL; got %q", desc)
 	}
 	if strings.Contains(desc, "http://host:3000") {
@@ -2688,7 +2688,7 @@ func TestDanglingDescription(t *testing.T) {
 
 	// Healthy serve: the tailnet URL, no scary hint.
 	healthy := portItem{port: portscan.Port{Number: 8025}, active: true, listening: true, host: "host"}
-	if got := stripANSI(healthy.Description()); got != "on tailnet · http://host:8025" {
+	if got := stripANSI(healthy.Description()); got != "http://host:8025 · on tailnet" {
 		t.Errorf("healthy description = %q, want the tailnet URL", got)
 	}
 
@@ -2727,7 +2727,7 @@ func TestReachStateDescriptions(t *testing.T) {
 			name:  "B wildcard unserved -> on tailnet",
 			item:  portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
 			state: reachTailnet,
-			desc:  "on tailnet · http://host:8080",
+			desc:  "http://host:8080 · on tailnet",
 		},
 		{
 			name:  "B :22 on a wildcard bind -> on tailnet, reachable via SSH",
@@ -2745,7 +2745,7 @@ func TestReachStateDescriptions(t *testing.T) {
 			name:  "C served and listening -> on tailnet URL",
 			item:  portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, host: "host"},
 			state: reachServed,
-			desc:  "on tailnet · http://host:8080",
+			desc:  "http://host:8080 · on tailnet",
 		},
 		{
 			name:  "E served but nothing listening -> stale",
@@ -6292,7 +6292,7 @@ func TestPublishReachDriftSurfaced(t *testing.T) {
 	if got := stripANSI(pub.markerGlyph()); got != "◆" {
 		t.Errorf("published marker = %q, want ◆", got)
 	}
-	if d := pub.plainDescription(); !strings.Contains(d, "published to the internet · https://web.example.com") || !strings.Contains(d, "basic auth") {
+	if d := pub.plainDescription(); !strings.Contains(d, "https://web.example.com · published to the internet") || !strings.Contains(d, "basic auth") {
 		t.Errorf("published description = %q", d)
 	}
 
@@ -6316,7 +6316,7 @@ func TestPublishReachDriftSurfaced(t *testing.T) {
 // left for bubbles/list to truncate.
 func TestPublishUnpublishHint(t *testing.T) {
 	base := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com"}
-	baseDesc := "published to the internet · https://web.example.com"
+	baseDesc := "https://web.example.com · published to the internet"
 	if got := base.plainDescription(); got != baseDesc {
 		t.Fatalf("sanity: zero-width plainDescription() = %q, want the bare base %q (hint must be omitted, not just untested)", got, baseDesc)
 	}
