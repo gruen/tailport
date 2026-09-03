@@ -6304,6 +6304,20 @@ func TestEntryPromptsFitViewport(t *testing.T) {
 	}
 }
 
+// TestMarkerLegendDocumentsAuthGlyph: the published-row auth glyph (kata 157r)
+// must be explained in the marker legend, so 👤 / @ isn't an unlabeled symbol
+// (roborev hbs0 -- the mono @ is especially ambiguous without a legend entry).
+func TestMarkerLegendDocumentsAuthGlyph(t *testing.T) {
+	m := model{markerEmoji: true}
+	if leg := m.markerLegend(); !strings.Contains(leg, authGlyphEmoji) || !strings.Contains(leg, "basic auth") {
+		t.Errorf("emoji marker legend must document the auth glyph + \"basic auth\"; got:\n%s", leg)
+	}
+	m.markerEmoji = false
+	if leg := m.markerLegend(); !strings.Contains(leg, authGlyphMono) || !strings.Contains(leg, "basic auth") {
+		t.Errorf("mono marker legend must document the auth glyph + \"basic auth\"; got:\n%s", leg)
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).

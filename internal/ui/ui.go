@@ -6298,11 +6298,11 @@ func (m model) markerLegend() string {
 	if m.markerEmoji {
 		return "🌕 localhost   🌔 local network   🌒 on tailnet (served or bound wide)\n" +
 			"🌑 internet (funnel)   🌐 internet (published)   🌫️ stale   ✕ offline\n" +
-			"🔒 locked   ★ favorite"
+			"🔒 locked   ★ favorite   " + authGlyphEmoji + " basic auth (published)"
 	}
 	return "○ localhost   ◔ local network   ◉ on tailnet (served or bound wide)\n" +
 		"● internet (funnel)   ◆ internet (published)   ▲ stale   ✕ offline\n" +
-		"🔒 locked   ★ favorite"
+		"🔒 locked   ★ favorite   " + authGlyphMono + " basic auth (published)"
 }
 
 // OperatorSetupText is the prerequisites prose shared by the "?" overlay's
