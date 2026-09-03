@@ -17,12 +17,41 @@ permissions:
 # Serialise releases. Two tags in flight would race the bot-commits to main and
 # could publish to the AUR out of order, leaving it describing the older one.
 # Never cancel: a half-cancelled run could publish the AUR and not the tap.
+# Real tag releases serialise on one `publish` group (never cancel -- a
+# half-cancelled run could publish the AUR and not the tap). A workflow_dispatch
+# dry-run gets its own per-run group instead (roborev 7nsp), so a dry-run can
+# never evict or delay a queued/running tag release, and dry-runs don't queue
+# behind each other.
 concurrency:
-  group: publish
+  group: ${{ github.event_name == 'workflow_dispatch' && format('build-dryrun-{0}', github.run_id) || 'publish' }}
   cancel-in-progress: false
 
 jobs:
+  # Validate before building or publishing anything (roborev 7nsp): both a
+  # workflow_dispatch dry-run and a real tag release run the full gate first, so
+  # neither can produce release candidates -- or publish -- from a revision
+  # whose checks fail. (A push/PR-triggered version of this is gghj #1.)
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: gofmt (must be clean)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs running on:"; echo "$unformatted"; exit 1
+          fi
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go test -race ./internal/ui/
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
