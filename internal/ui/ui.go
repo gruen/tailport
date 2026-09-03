@@ -179,21 +179,21 @@ type keyGroup struct {
 	bindings []key.Binding
 }
 
-// groups returns the approved like-for-like grouping: Expose, Favorites, View,
-// App -- in display order, one group per bottom-bar column and one "?"-overlay
-// section. (p39s introduced this grouping with a separate Protect column;
-// folded into Expose here -- lock/unlock and the contextual clean-stale are
-// exposure guards, so they live at the end of Expose with x lock/unlock always
-// the last item. Clean is contextual: barGroups drops it unless a dangling
-// forward exists, so ordering it before Lock keeps Lock last in every state.
-// Copy moved from Expose to sit under "n new favorite" in Favorites.)
+// groups returns the approved like-for-like grouping: Serve Toggles, Favorites,
+// View, App -- in display order, one group per bottom-bar column and one
+// "?"-overlay section. (p39s introduced this grouping with a separate Protect
+// column; folded into Serve Toggles here -- lock/unlock and the contextual
+// clean-stale are exposure guards, so they live at the end of the group with x
+// lock/unlock always the last item. Clean is contextual: barGroups drops it
+// unless a dangling forward exists, so ordering it before Lock keeps Lock last
+// in every state. Copy moved out to sit under "n new favorite" in Favorites.)
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Expose", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Clean, k.Lock}},
+		{"Serve Toggles", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Clean, k.Lock}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
-		// edit, including the lock changes that live in the Expose column, so
+		// edit, including the lock changes that live in the Serve Toggles column, so
 		// filing them under Favorites would understate their reach.
 		{"App", []key.Binding{k.Undo, k.Redo, k.Help, k.Quit}},
 	}
@@ -223,17 +223,18 @@ func (k keyMap) FullHelp() [][]key.Binding {
 
 func newKeyMap() keyMap {
 	return keyMap{
-		// "serve" (not "toggle") in the bar's Expose column: it names the action
-		// space performs, matching the approved p39s grouping table. The "?"
-		// overlay keeps the fuller "toggle serve on/off" prose (keyLegendDescs).
-		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "serve")),
+		// "on tailscale" in the bar's Serve Toggles column: it names what space
+		// does -- serve the port on the tailnet -- as one of three parallel serve
+		// toggles (p on caddy, P on ts.net). The "?" overlay keeps the fuller
+		// "toggle serve on/off" prose (keyLegendDescs).
+		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "on tailscale")),
 		// p/P swapped (vzj4): capital guards the more-permanent exposure, so
 		// funnel (tailnet-only cert, easy to drop) takes the shifted key and
 		// publish (custom domain via Caddy edge) takes the bare key.
-		Funnel: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "funnel public")),
-		// "publish edge": the second public path (kata v1z5), a Caddy-edge
-		// publish sibling to funnel, listed right after it in the Expose group.
-		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "publish edge")),
+		Funnel: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "on ts.net (public)")),
+		// "on caddy (public)": the second public path (kata v1z5), a Caddy-edge
+		// publish sibling to funnel, in the Serve Toggles group.
+		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "on caddy (public)")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -4494,13 +4495,13 @@ func (m model) renderLegend() string {
 // height; the live render passes m.hasDangling().
 //
 // TODO(79xb): the issue's secondary polish asks for a SECOND contextual hint
-// here -- grey/hide "space serve" when the selected port is already B/B'
-// tailnet/LAN reachable (space would just no-op it with an info toast; see
-// the pt3 guard in the space key handler). Prototyped as a second
+// here -- grey/hide "space on tailscale" when the selected port is already
+// B/B' tailnet/LAN reachable (space would just no-op it with an info toast;
+// see the pt3 guard in the space key handler). Prototyped as a second
 // spaceEnabled bool threaded through here/barGroups exactly like
 // cleanEnabled, but MEASURED to break TestLegendReservationDominatesLive's
 // brute-force width scan: at width 54, hiding "space" while "clean" stays
-// shown renders the Expose column at 6 lines against a 4-line worst-case
+// shown renders the Serve Toggles column at 6 lines against a 4-line worst-case
 // reservation (both hints assumed shown) -- i.e. hiding one hint does NOT
 // always make the bar shorter, because it can shift which fold split the
 // shared-width-budget search (renderLegendGrid) picks for other groups too.
@@ -4521,7 +4522,7 @@ func (m model) renderLegendWith(cleanEnabled bool) string {
 // barGroups adapts keyMap.groups() for the bottom bar: it relabels "a" to
 // "switch view" (its keymap help is "filtered"; the active view is shown by the
 // header indicator, renderViewIndicator) and drops the contextual "C clean
-// stale" unless cleanEnabled. The Expose column therefore ends at "x
+// stale" unless cleanEnabled. The Serve Toggles column therefore ends at "x
 // lock/unlock" (no reserved blank slot) when nothing is dangling, and gains
 // "C clean stale" just above lock when a dangling forward exists.
 func (m model) barGroups(cleanEnabled bool) []keyGroup {
@@ -6117,7 +6118,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 }
 
 // KeyLegendGroups returns the full keybinding legend grouped into the same four
-// sections, in the same order, as the bottom-bar grid -- Expose, Favorites,
+// sections, in the same order, as the bottom-bar grid -- Serve Toggles, Favorites,
 // View, App -- each row carrying the RICH prose (keyLegendDescs), not the terse
 // bar label. The sections and their membership are taken from keyMap.groups(),
 // the one grouping source, so the "?" overlay and the bar cannot diverge.
@@ -6283,7 +6284,7 @@ func (m model) helpContent() string {
 	b.WriteString(helpTextStyle.Render(m.operatorSetupText()))
 	b.WriteString("\n\n")
 	// Keys, grouped into the same four sections/order as the bottom-bar grid
-	// (Expose, Favorites, View, App) -- each section's own header stands in for
+	// (Serve Toggles, Favorites, View, App) -- each section's own header stands in for
 	// the old flat "Keys" title -- but keeping the rich per-key prose.
 	// Laid out side by side when the terminal is wide enough (v10j) to shorten
 	// the overlay; falls back to a single column otherwise.
