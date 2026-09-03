@@ -6331,6 +6331,26 @@ func TestMarkerLegendDocumentsAuthGlyph(t *testing.T) {
 	}
 }
 
+// TestPublishedRowDescriptionGrayBold: a published row's description uses the
+// gray+bold publishDescStyle, not publicStyle's selection-magenta (e0e7). Style
+// getters are checked directly so the assertion doesn't depend on the test's
+// (colorless) terminal profile.
+func TestPublishedRowDescriptionGrayBold(t *testing.T) {
+	if !publishDescStyle.GetBold() {
+		t.Error("publishDescStyle should keep bold (\"bold is great\")")
+	}
+	if publishDescStyle.GetForeground() == publicStyle.GetForeground() {
+		t.Error("publishDescStyle must not reuse publicStyle's selection-magenta foreground")
+	}
+	pub := portItem{publishHostname: "web.example.com"}
+	if pub.reach() != reachPublish {
+		t.Fatalf("reach=%v, want reachPublish", pub.reach())
+	}
+	if got, want := pub.styledDescription(), publishDescStyle.Render(pub.plainDescription()); got != want {
+		t.Errorf("published row must render its description via publishDescStyle;\n got=%q\nwant=%q", got, want)
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).

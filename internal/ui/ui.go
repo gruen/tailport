@@ -85,6 +85,14 @@ var (
 	// is a strong, high-contrast magenta (>=4.5:1), not a token nudge -- this
 	// marker must be unambiguous on both backgrounds.
 	publicStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8b008b", Dark: "201"}).Bold(true)
+	// publishDescStyle renders a PUBLISHED row's DESCRIPTION (the https URL +
+	// "· published to the internet") in the default row colour -- like the
+	// healthy served/tailnet/localhost rows, which are unstyled -- but BOLD.
+	// Deliberately NOT publicStyle's magenta: magenta is the list SELECTION
+	// highlight, so a magenta description made a non-selected published row read
+	// as selected (e0e7). The safety-critical ◆ marker glyph stays publicStyle
+	// magenta; only the description text is toned down here.
+	publishDescStyle = lipgloss.NewStyle().Bold(true)
 
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#006644", Dark: "42"}).Bold(true)
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
@@ -595,8 +603,12 @@ func (i portItem) plainDescription() string {
 // stale dangling forward. The healthy states stay unstyled.
 func (i portItem) styledDescription() string {
 	switch i.reach() {
-	case reachFunnel, reachPublish:
+	case reachFunnel:
 		return publicStyle.Render(i.plainDescription())
+	case reachPublish:
+		// Gray+bold, not publicStyle's magenta -- magenta reads as "selected"
+		// (e0e7). The ◆ marker glyph keeps the magenta safety signal.
+		return publishDescStyle.Render(i.plainDescription())
 	case reachStale:
 		return warnStyle.Render(i.plainDescription())
 	default:
