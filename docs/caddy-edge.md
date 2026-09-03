@@ -496,12 +496,12 @@ changes. Map the Fly steps to their generic equivalents:
 | Fly step | On a host you manage |
 | -------- | -------------------- |
 | §1 Tailscale ACL + auth key | **Unchanged** — the tailnet is provider-independent. Same tag, same reusable, non-ephemeral key. |
-| §2 `fly launch` (the container) | Run tailscaled + Caddy however you like: `docker compose`/`docker run` off the bundled [`Dockerfile`](../packaging/caddy-edge/Dockerfile) + [`entrypoint.sh`](../packaging/caddy-edge/entrypoint.sh) — both provider-neutral, they just read `TS_AUTHKEY`/`TS_HOSTNAME`/`CADDY_ADMIN_PORT` from the environment — or run the two daemons directly under systemd. Pass `TS_AUTHKEY` as an env var / secret the same way, never in a committed file. |
+| §2 `fly launch` (the container) | Run the bundled [`Dockerfile`](../packaging/caddy-edge/Dockerfile) + [`entrypoint.sh`](../packaging/caddy-edge/entrypoint.sh) under `docker run`/`docker compose` — they're provider-neutral (reading `TS_AUTHKEY`/`TS_HOSTNAME`/`CADDY_ADMIN_PORT` from the env) — but a real run also needs what Fly supplied implicitly: the `/dev/net/tun` device + `NET_ADMIN` capability for `tailscaled`, published `:80`/`:443`, the persistent volume from the next row, and `TS_AUTHKEY` as a secret (never a committed file). Running the two daemons *directly* under systemd instead means reproducing everything `entrypoint.sh` does — admin-origins templating, `tailscale up` with the tag, `tailscale serve` to expose `:2019` tailnet-only, `caddy run --resume` — so read it first: simply starting both processes is **not** a functional edge. |
 | §2 `fly volumes create` | Any persistent path: a bind mount, a named Docker volume, or just a directory on disk — it holds tailscaled state + Caddy's autosave/certs ([requirement 5](#requirements-any-host)). |
 | §2 `fly ips allocate-v4` | **Not needed** — you already have a public IP. This step is a Fly quirk: Fly's *shared* IPv4 routes through Fly's own TLS-terminating proxy, so Fly makes you buy a *dedicated* IPv4 to get raw passthrough. A normal host's IP is already direct. |
 | §3 DNS | **Unchanged** — point your domain at *this* host's public IP(s) instead of Fly's. |
 | §4 Point tailport at the edge | **Unchanged** — `caddy.hostname` is the edge's MagicDNS name whatever it runs on. |
-| §5 Smoke test | **Same checks**, minus the wrapper: run the `tailscale ping` / `curl -H "Host: …"` probes over `ssh` (or a local shell) on the edge instead of `fly ssh console`. |
+| §5 Smoke test | **Same checks**, minus the `fly ssh console` wrapper — but run them *inside the edge*: `docker exec`/`docker compose exec` into the container (a host-shell probe tests the host's own `tailscaled` + resolver, not the container's, and can pass while the container can't reach the backend); on a native systemd deploy the host shell **is** the edge, so a local shell is correct there. |
 
 Two Fly-specific warnings in this runbook simply don't apply off Fly:
 
