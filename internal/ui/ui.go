@@ -91,8 +91,9 @@ var (
 	// are unstyled), but BOLD. Deliberately NOT publicStyle's magenta: magenta
 	// is the list SELECTION highlight, so a magenta description made a
 	// non-selected public row read as selected (e0e7 for publish, ze1z for
-	// funnel). The safety-critical ●/◆ marker glyphs stay publicStyle magenta;
-	// only the description text is toned down here.
+	// funnel). The safety-critical marker glyphs stay coloured -- funnel's ●
+	// publicStyle magenta, publish's ◆ publishMarkerStyle blue (f5sg); only the
+	// description text is toned down here.
 	publicDescStyle = lipgloss.NewStyle().Bold(true)
 	// publishMarkerStyle colours the PUBLISHED marker (◆) blue rather than
 	// publicStyle's magenta (mg 2026-09-03). It keeps the two public paths

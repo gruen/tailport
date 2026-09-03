@@ -49,6 +49,7 @@ func absDiff(a, b int) int {
 // Dark side without depending on any particular terminal's color-profile
 // detection at test time.
 var ansiHexByIndex = map[string]string{
+	"39":  "#00afff",
 	"42":  "#00d787",
 	"51":  "#00ffff",
 	"81":  "#5fd7ff",
@@ -138,8 +139,9 @@ type mustFixStyle struct {
 // which bar applies here -- see ui.go's style-color comment.
 func mustFixStyleTable() []mustFixStyle {
 	return []mustFixStyle{
-		{"warnStyle", warnStyle, "214", 4.5},     // safety-critical
-		{"publicStyle", publicStyle, "201", 4.5}, // safety-critical
+		{"warnStyle", warnStyle, "214", 4.5},                  // safety-critical
+		{"publicStyle", publicStyle, "201", 4.5},              // safety-critical (funnel ●)
+		{"publishMarkerStyle", publishMarkerStyle, "39", 4.5}, // safety-critical (publish ◆, kata f5sg)
 		{"helpTextStyle", helpTextStyle, "252", 4.5},
 		{"logoStyle", logoStyle, "51", 4.5},
 		{"helpKeyStyle", helpKeyStyle, "81", 4.5},
