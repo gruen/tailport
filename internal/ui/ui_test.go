@@ -5742,7 +5742,9 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
-	// unresolvable caddy.hostname: a blank hostname is refused (guard 7).
+	// CONFIGURED path (base() has a domain set): a blank hostname can't be fixed
+	// inline (no prompt on this path), so it's refused (guard 8). A BLANK domain
+	// would instead open the prompt -- see the fresh-setup regression below.
 	t.Run("no hostname configured", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Hostname = ""
@@ -5752,8 +5754,9 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
-	// FQDN-shaped caddy.hostname: refused with the short-MagicDNS-label
-	// guidance (§4d) -- the edge admits only the short name, so an FQDN 403s.
+	// FQDN-shaped caddy.hostname on the CONFIGURED path (domain set): refused
+	// with the short-MagicDNS-label guidance (§4d) -- the edge admits only the
+	// short name, so an FQDN 403s, and there's no prompt on this path to fix it.
 	t.Run("fqdn hostname refused", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Hostname = "caddy.tailnet.ts.net"
@@ -5763,6 +5766,25 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 		if !strings.Contains(m.flash, "short MagicDNS label") {
 			t.Errorf("fqdn hostname refusal should name the short label; flash=%q", m.flash)
+		}
+	})
+
+	// GUARD-ORDER REGRESSION (roborev 6tas): FRESH setup (blank domain) with an
+	// invalid STORED hostname must OPEN THE PROMPT, prefilled with it, NOT refuse
+	// -- the prompt is the fix. The hostname-validity refusal (guard 8) must not
+	// shadow the capture prompt for exactly the configs that need correcting.
+	t.Run("fresh setup with an FQDN stored hostname opens the prompt to fix it", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Domain = ""
+		m.cfg.Caddy.Hostname = "caddy.tailnet.ts.net"
+		if cmd := m.requestPublish(8080); cmd != nil {
+			t.Error("opening the hostname-capture prompt should return a nil cmd")
+		}
+		if m.mode != entryPublishHostname {
+			t.Errorf("fresh setup + FQDN hostname: mode=%v flash=%q (want the capture prompt, NOT a refusal)", m.mode, m.flash)
+		}
+		if got := m.publishInput.Value(); got != "caddy.tailnet.ts.net" {
+			t.Errorf("prompt must prefill the current (invalid) hostname so the user can fix it; got %q", got)
 		}
 	})
 

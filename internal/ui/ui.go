@@ -2683,39 +2683,21 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if m.cfg.Ports[port].Locked {
 		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
 	}
-	// 7. hostname validity: we dial the edge admin API by caddy.hostname, and
-	// the edge derives its admin origin from the SHORT MagicDNS label only
-	// (ycv1 §4d). A blank hostname (it defaults to "caddy", so this is unusual,
-	// but the default is applied at config load, not here) leaves nothing to
-	// dial; an FQDN-shaped one (contains a dot) would silently 403 at the edge.
-	// Both are REFUSED here -- this is a refusal, not a capture: the hostname is
-	// not gathered in this flow. Refused before the domain is resolved.
-	if m.cfg.Caddy.Hostname == "" {
-		where := m.configPath
-		if where == "" {
-			where = "your tailport config"
-		}
-		return m.setErr(fmt.Sprintf("publish is unconfigured: set caddy.hostname in %s (see docs/caddy-edge.md)", where))
-	}
-	if strings.Contains(m.cfg.Caddy.Hostname, ".") {
-		return m.setErr(fmt.Sprintf("caddy.hostname %q looks like an FQDN — use the short MagicDNS label (the edge admits only its short name; an FQDN silently 403s). See docs/caddy-edge.md", m.cfg.Caddy.Hostname))
-	}
-
 	// All refuse-guards passed. Record the port ONCE, up front, so both the
-	// domain-capture step and the shared host-dialog continuation can read it.
+	// hostname/domain-capture steps and the shared host-dialog continuation can
+	// read it.
 	m.publishPort = port
 
-	// 8. hostname + domain: publishing needs a public base domain, and a
-	// reachable caddy.hostname to dial the edge's admin API in the first place.
-	// A set caddy.domain means both are already configured (the domain can't be
-	// set without having gone through this flow, or a hand edit) -- open the
-	// host dialog directly. A BLANK caddy.domain means FRESH setup: capture the
-	// hostname FIRST (kata ztzg -- prefilled with the CURRENT caddy.hostname, so
-	// accepting the default is a same-value no-op), then the domain (kata w131,
-	// unchanged). Both are captured inline instead of refusing, resolved LAST
-	// so an un-publishable port was already refused above rather than prompted
-	// then refused. Already-configured users are NEVER re-prompted for the
-	// hostname -- only this blank-domain branch reaches entryPublishHostname.
+	// 7. FRESH setup (blank caddy.domain): capture the hostname FIRST (kata
+	// ztzg), then the domain (kata w131). This runs BEFORE any hostname-validity
+	// refusal on purpose: the prompt is prefilled with the current caddy.hostname
+	// and validates the typed value (caddyedge.ValidLabel), so it IS the fix for
+	// a blank or FQDN-shaped stored hostname -- refusing first would shadow the
+	// very prompt meant to correct it, leaving hand-editing as the only recovery
+	// for exactly those configs (roborev 6tas). Resolved LAST among the guards so
+	// an un-publishable port (locked, :22, funnelled, …) was already refused
+	// above rather than prompted then refused. Accepting the prefilled default is
+	// a same-value no-op. Configured users (domain set) fall through untouched.
 	if m.cfg.Caddy.Domain == "" {
 		m.publishInput.Reset()
 		m.publishInput.EchoMode = textinput.EchoNormal
@@ -2726,6 +2708,25 @@ func (m *model) requestPublish(port int) tea.Cmd {
 		m.publishInput.Focus()
 		m.mode = entryPublishHostname
 		return nil
+	}
+
+	// 8. CONFIGURED (caddy.domain set): open the host dialog directly, with NO
+	// hostname prompt -- so an invalid stored hostname can't be corrected inline
+	// here and must be REFUSED. We dial the edge admin API by caddy.hostname, and
+	// the edge derives its admin origin from the SHORT MagicDNS label only (ycv1
+	// §4d): a blank hostname (it defaults to "caddy" at config load, so this is
+	// unusual) leaves nothing to dial; an FQDN-shaped one (contains a dot) would
+	// silently 403 at the edge. A configured user who hand-broke caddy.hostname
+	// is pointed at the docs (the ztzg prompt is fresh-setup only).
+	if m.cfg.Caddy.Hostname == "" {
+		where := m.configPath
+		if where == "" {
+			where = "your tailport config"
+		}
+		return m.setErr(fmt.Sprintf("publish is unconfigured: set caddy.hostname in %s (see docs/caddy-edge.md)", where))
+	}
+	if strings.Contains(m.cfg.Caddy.Hostname, ".") {
+		return m.setErr(fmt.Sprintf("caddy.hostname %q looks like an FQDN — use the short MagicDNS label (the edge admits only its short name; an FQDN silently 403s). See docs/caddy-edge.md", m.cfg.Caddy.Hostname))
 	}
 	return m.enterPublishHostDialog()
 }
