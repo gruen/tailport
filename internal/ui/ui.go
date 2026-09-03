@@ -2701,8 +2701,9 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if m.cfg.Caddy.Domain == "" {
 		m.publishInput.Reset()
 		m.publishInput.EchoMode = textinput.EchoNormal
-		m.publishInput.Width = 40     // a normal padded field (the host step sets 0)
-		m.publishInput.CharLimit = 63 // a single DNS label max, like the host step
+		m.publishInput.Width = 40            // a normal padded field (the host step sets 0)
+		m.publishInput.CharLimit = 63        // a single DNS label max, like the host step
+		m.publishInput.Placeholder = "caddy" // a VALID short label -- shown only when the stored hostname is blank; never a dotted example this step would reject (roborev 452s)
 		m.publishInput.SetValue(m.cfg.Caddy.Hostname)
 		m.publishInput.CursorEnd()
 		m.publishInput.Focus()

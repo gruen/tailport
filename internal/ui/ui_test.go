@@ -5788,6 +5788,25 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
+	// roborev 452s: a fresh setup with a BLANK stored hostname opens the prompt
+	// with an EMPTY field, so its placeholder renders -- it must be a VALID short
+	// label (no dots), never a dotted example this very step would reject.
+	t.Run("fresh setup with a blank stored hostname shows a valid placeholder", func(t *testing.T) {
+		m := base()
+		m.cfg.Caddy.Domain = ""
+		m.cfg.Caddy.Hostname = ""
+		m.requestPublish(8080)
+		if m.mode != entryPublishHostname {
+			t.Fatalf("blank stored hostname: mode=%v (want the capture prompt)", m.mode)
+		}
+		if got := m.publishInput.Value(); got != "" {
+			t.Errorf("blank stored hostname should leave the field empty; got %q", got)
+		}
+		if ph := m.publishInput.Placeholder; ph == "" || strings.Contains(ph, ".") {
+			t.Errorf("hostname placeholder %q must be a non-empty short label with no dots (it renders for a blank field; a dotted example would be rejected by this step)", ph)
+		}
+	})
+
 	// The guard REORDER's whole point (ycv1 r1-#10): a locked port with a BLANK
 	// domain must be REFUSED for the lock, never prompted for a domain first.
 	t.Run("locked port with blank domain refused (not prompted)", func(t *testing.T) {
