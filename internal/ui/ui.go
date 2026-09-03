@@ -2721,7 +2721,8 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if m.cfg.Caddy.Domain == "" {
 		m.publishInput.Reset()
 		m.publishInput.EchoMode = textinput.EchoNormal
-		m.publishInput.Width = 40 // a normal padded field (the host step sets 0)
+		m.publishInput.Width = 40      // a normal padded field (the host step sets 0)
+		m.publishInput.CharLimit = 253 // full-hostname limit (the host step sets 63)
 		m.publishInput.Placeholder = "example.com"
 		m.publishInput.Focus()
 		m.mode = entryPublishDomain
@@ -2755,6 +2756,10 @@ func (m *model) enterPublishHostDialog() tea.Cmd {
 	// View) sits flush against the label instead of after ~40 blank columns.
 	// (Restored to 40 on the domain/cred steps that share this input.)
 	m.publishInput.Width = 0
+	// A single DNS label maxes at 63 chars -- bound the buffer to that (the full
+	// hostname's 253 limit is for the domain step). This also caps how far an
+	// over-long label can run now that Width 0 does no horizontal clipping.
+	m.publishInput.CharLimit = 63
 	// Label only; the ".<domain>" suffix is locked (rendered in View, re-appended
 	// on submit). Cursor at the label's end sits right before that first dot.
 	m.publishInput.SetValue(prefix)
@@ -2877,7 +2882,8 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 				// First authed publish: gather the single shared credential.
 				m.publishInput.Reset()
 				m.publishInput.EchoMode = textinput.EchoNormal
-				m.publishInput.Width = 40 // padded field (the host step sets 0)
+				m.publishInput.Width = 40      // padded field (the host step sets 0)
+				m.publishInput.CharLimit = 253 // full limit (the host step sets 63)
 				m.publishInput.Placeholder = "username"
 				m.publishInput.Focus()
 				m.mode = entryPublishCredUser
@@ -2909,6 +2915,7 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			m.publishInput.Reset()
 			m.publishInput.EchoMode = textinput.EchoPassword // mask the password
 			m.publishInput.Width = 40                        // padded field (the host step sets 0)
+			m.publishInput.CharLimit = 253                   // full limit (the host step sets 63)
 			m.publishInput.Placeholder = "password"
 			m.publishInput.Focus()
 			m.mode = entryPublishCredPass

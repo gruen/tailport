@@ -5872,6 +5872,26 @@ func TestPublishHostLockedSuffix(t *testing.T) {
 	}
 }
 
+// TestPublishHostSuffixRendersFlush guards the one-field look (roborev nzwd): the
+// locked ".<domain>" suffix must render immediately after the label -- at most
+// one cell (the end-of-input cursor block) between them -- not after ~40 columns
+// of field padding, which a stray Width>0 on the host step would reintroduce.
+func TestPublishHostSuffixRendersFlush(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.requestPublish(8080) // label "web", domain example.com
+	m.width, m.help.Width = 100, 100
+	v := stripANSI(m.renderBottom())
+	i := strings.Index(v, "web")
+	j := strings.Index(v, ".example.com")
+	if i < 0 || j < 0 {
+		t.Fatalf("render %q should contain the label and the .example.com suffix", v)
+	}
+	// "web" is 3 cols; allow at most one cell (the cursor) before the dot.
+	if gap := j - (i + 3); gap > 1 {
+		t.Errorf("domain suffix should render flush after the label (gap %d cells); got %q", gap, v)
+	}
+}
+
 // TestPublishInvalidHostnameRefused: an invalid hostname at the host step stays
 // on the step with an error, never advancing to the auth gate.
 func TestPublishInvalidHostnameRefused(t *testing.T) {
