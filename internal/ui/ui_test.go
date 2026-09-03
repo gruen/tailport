@@ -6413,6 +6413,19 @@ func TestPublicRowDescriptionGrayBold(t *testing.T) {
 	}
 }
 
+// TestPublishMarkerIsBlueNotMagenta: the published marker (◆) is blue
+// (publishMarkerStyle), not publicStyle's magenta, so the two public paths are
+// tellable apart -- funnel's ● stays magenta.
+func TestPublishMarkerIsBlueNotMagenta(t *testing.T) {
+	if publishMarkerStyle.GetForeground() == publicStyle.GetForeground() {
+		t.Error("publishMarkerStyle must not reuse publicStyle's magenta foreground")
+	}
+	pub := portItem{publishHostname: "web.example.com"} // reachPublish, mono
+	if got, want := pub.markerGlyph(), publishMarkerStyle.Render("◆"); got != want {
+		t.Errorf("published marker must render via publishMarkerStyle; got %q, want %q", got, want)
+	}
+}
+
 // TestEditRefusesLiveHostnameChange: `e` can change the AUTH of a live
 // published port in place, but changing it to a NEW hostname while still
 // published is refused (kata sw2y) -- pointing at unpublish-first -- rather than

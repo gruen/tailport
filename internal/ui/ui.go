@@ -94,6 +94,12 @@ var (
 	// funnel). The safety-critical ●/◆ marker glyphs stay publicStyle magenta;
 	// only the description text is toned down here.
 	publicDescStyle = lipgloss.NewStyle().Bold(true)
+	// publishMarkerStyle colours the PUBLISHED marker (◆) blue rather than
+	// publicStyle's magenta (mg 2026-09-03). It keeps the two public paths
+	// tellable apart at a glance -- funnel's ● stays magenta, publish's ◆ is
+	// blue -- and stays high-contrast (>=4.5:1) on either background so the
+	// "reachable by anyone" signal remains unambiguous.
+	publishMarkerStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#005fd7", Dark: "39"}).Bold(true)
 
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#006644", Dark: "42"}).Bold(true)
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
@@ -374,12 +380,13 @@ func (i portItem) markerGlyph() string {
 	case reachPublish:
 		// Published to the public internet via the Caddy edge (kata v1z5). A
 		// DISTINCT public marker from funnel's ●/🌑 per the safety-marker
-		// mandate (the two public paths must be tellable apart at a glance),
-		// same publicStyle magenta since both mean "reachable by anyone".
+		// mandate (the two public paths must be tellable apart at a glance) --
+		// a BLUE ◆ (publishMarkerStyle, mg) vs funnel's magenta ●, both still
+		// meaning "reachable by anyone".
 		if i.emoji {
 			m = "🌐"
 		} else {
-			m = publicStyle.Render("◆")
+			m = publishMarkerStyle.Render("◆")
 		}
 	case reachServed, reachTailnet:
 		// Served AND already-tailnet-reachable-by-IP (wildcard/tailnet bind)
