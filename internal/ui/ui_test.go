@@ -6406,6 +6406,34 @@ func TestPublishedRowDescriptionGrayBold(t *testing.T) {
 	}
 }
 
+// TestEditChangedHostnameRetiresOldRoute: editing a PUBLISHED port's hostname
+// (via e) must mark the OLD hostname's route for retirement so it isn't left
+// live + public (kata 8tnf) -- confirmPublish captures it in
+// pendingPublish.replacingHostname, which the publishDoneMsg success handler
+// then unpublishes. An unchanged-hostname edit (auth only) is a same-@id PATCH
+// and must mark nothing.
+func TestEditChangedHostnameRetiresOldRoute(t *testing.T) {
+	changed := newPublishModel(t, nil)
+	changed.published = map[int]publishInfo{8080: {hostname: "old.example.com"}}
+	changed.publishPort = 8080
+	changed.publishHostname = "new.example.com"
+	changed.publishWithAuth = false
+	_ = changed.confirmPublish()
+	if got := changed.pendingPublish.replacingHostname; got != "old.example.com" {
+		t.Errorf("changing a published port's hostname must retire the old route; replacingHostname=%q, want old.example.com", got)
+	}
+
+	same := newPublishModel(t, nil)
+	same.published = map[int]publishInfo{8080: {hostname: "keep.example.com"}}
+	same.publishPort = 8080
+	same.publishHostname = "keep.example.com"
+	same.publishWithAuth = false
+	_ = same.confirmPublish()
+	if got := same.pendingPublish.replacingHostname; got != "" {
+		t.Errorf("an unchanged-hostname edit must retire nothing (same-@id PATCH); replacingHostname=%q", got)
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).

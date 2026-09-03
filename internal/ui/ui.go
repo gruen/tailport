@@ -863,6 +863,14 @@ type pendingPublish struct {
 	port     int
 	withAuth bool // auth was requested; rebuild from cfg.Caddy.AuthUser/AuthHash
 	retried  bool // a Kind==None retry has already fired (bounds it to once)
+	// replacingHostname is set (kata 8tnf) when this publish CHANGES the
+	// hostname of a port that is already published -- reachable only via `e`
+	// edit. Route @ids are hostname-derived, so publishing the new hostname
+	// creates a SECOND route and leaves the OLD one live + public; the
+	// publishDoneMsg success handler unpublishes this old hostname once the new
+	// route lands. Empty when the hostname is unchanged (a same-@id PATCH) or
+	// the port wasn't published.
+	replacingHostname string
 }
 
 // publishPollMsg carries one edge-poll result (kata v1z5 step 5). On err the
@@ -3235,7 +3243,17 @@ func (m *model) confirmPublish() tea.Cmd {
 	// Carry the (secret-free) publish parameters so the conflict path can name
 	// the attempted hostname and, on a cleared conflict (Kind==None), re-issue
 	// the publish once (kata qfbf). retried starts false: this is a fresh attempt.
-	m.pendingPublish = pendingPublish{hostname: hostname, label: label, port: port, withAuth: auth != nil}
+	// kata 8tnf: if this publish CHANGES the hostname of a port that is
+	// currently published (only reachable via `e` edit -- `p` unpublishes a
+	// published port, it never re-hosts it), the new hostname yields a new
+	// @id, so caddyedge.Publish creates a SECOND route and leaves the OLD
+	// hostname's route live + public (possibly without the auth just added).
+	// Carry the old hostname so the success handler removes it.
+	var replacing string
+	if cur, ok := m.published[port]; ok && cur.hostname != hostname {
+		replacing = cur.hostname
+	}
+	m.pendingPublish = pendingPublish{hostname: hostname, label: label, port: port, withAuth: auth != nil, replacingHostname: replacing}
 
 	// Drop the flow state (esp. the plaintext password) BEFORE the op runs.
 	m.clearPublishFlow()
@@ -3639,6 +3657,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// m.lastPublish on a successful, non-unpublish outcome below.
 		publishedHost := m.pendingPublish.hostname
 		publishedAuth := m.pendingPublish.withAuth
+		// kata 8tnf: the old hostname to retire when an `e` edit changed a
+		// published port's hostname (captured before the carry is cleared).
+		replacingHostname := m.pendingPublish.replacingHostname
 		// ── ttfh stage 2: ARM the restore slot. m.pendingArm is set ONLY just before
 		// the take-over resume publish (purgeDoneMsg success, OWNED), so its presence
 		// marks THIS publishDoneMsg as that resume. Arm whether the take-over
@@ -3740,20 +3761,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.lastPublish[msg.port] = publishInfo{hostname: publishedHost, auth: publishedAuth}
 		}
+		// kata 8tnf: an `e` edit that CHANGED a published port's hostname just
+		// created a NEW route; retire the OLD hostname's route so it isn't left
+		// publicly exposed (possibly without the auth just added). Fires after
+		// the new route landed -- a brief overlap of two of the user's OWN routes
+		// to the same backend. tea.Batch ignores a nil cmd, so this is a no-op
+		// for an unchanged-hostname publish or an unpublish.
+		var cleanupOld tea.Cmd
+		if !msg.unpublish && replacingHostname != "" && replacingHostname != publishedHost {
+			cleanupOld = unpublishCmd(m.caddyClient(), replacingHostname, shortLabel(m.fqdn), msg.port)
+		}
 		if tookOver != "" {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over. armTimer (ttfh) starts the
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
 			// take-over, which arms nothing). "press p to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, cleanupOld, m.pollPublishedCmd())
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, cleanupOld, m.pollPublishedCmd())
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
