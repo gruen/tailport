@@ -6434,6 +6434,26 @@ func TestEditChangedHostnameRetiresOldRoute(t *testing.T) {
 	}
 }
 
+// TestFitFieldPreservesCursorWindow: fitField must render the scroll window
+// around the REAL cursor, not force it to the end (roborev qp6d). With the
+// cursor at the START of a long bounded value, the rendered field shows the
+// value's HEAD -- with the old CursorEnd() nudge it would show only the tail,
+// so edits would land at an invisible position.
+func TestFitFieldPreservesCursorWindow(t *testing.T) {
+	in := textinput.New()
+	in.Width = 40 // fixed width wider than the viewport below -> bounded
+	in.SetValue("abcdefghijklmnopqrstuvwxyz0123456789")
+	in.CursorStart() // user navigated to the beginning of a long value
+	m := model{width: 30}
+	got := m.fitField(in, "")
+	if !strings.Contains(got, "abc") {
+		t.Errorf("cursor at start: fitField should show the value's head, got %q", got)
+	}
+	if strings.Contains(got, "6789") {
+		t.Errorf("cursor at start: fitField should NOT be scrolled to the tail, got %q", got)
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).

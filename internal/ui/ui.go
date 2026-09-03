@@ -7282,11 +7282,17 @@ func (m model) fitField(in textinput.Model, suffix string) string {
 			bounded = true
 		}
 		if bounded {
-			// textinput computes its horizontal scroll window when the value or
-			// cursor moves, not when Width is set after the fact -- nudge the
-			// cursor so the new width actually takes effect and the tail (where
-			// the cursor and the locked suffix live) stays visible.
+			// textinput recomputes its horizontal scroll window on a cursor
+			// move, not when Width is set after the fact. Nudge it so the new
+			// width takes effect -- but PRESERVE the real cursor position
+			// (roborev qp6d): forcing it to the end would render the cursor in
+			// the wrong place for a value the user has navigated into, so their
+			// next edit would land at an invisible position. Move once (to force
+			// the recompute) then restore the real position, so the rendered
+			// window is centred on where the cursor actually is.
+			pos := in.Position()
 			in.CursorEnd()
+			in.SetCursor(pos)
 		}
 	}
 	return in.View() + suffix
