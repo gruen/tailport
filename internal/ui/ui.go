@@ -863,14 +863,6 @@ type pendingPublish struct {
 	port     int
 	withAuth bool // auth was requested; rebuild from cfg.Caddy.AuthUser/AuthHash
 	retried  bool // a Kind==None retry has already fired (bounds it to once)
-	// replacingHostname is set (kata 8tnf) when this publish CHANGES the
-	// hostname of a port that is already published -- reachable only via `e`
-	// edit. Route @ids are hostname-derived, so publishing the new hostname
-	// creates a SECOND route and leaves the OLD one live + public; the
-	// publishDoneMsg success handler unpublishes this old hostname once the new
-	// route lands. Empty when the hostname is unchanged (a same-@id PATCH) or
-	// the port wasn't published.
-	replacingHostname string
 }
 
 // publishPollMsg carries one edge-poll result (kata v1z5 step 5). On err the
@@ -3082,6 +3074,18 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			if !caddyedge.ValidHostname(host) {
 				return m.setErr(fmt.Sprintf("invalid public hostname: %q", host))
 			}
+			// kata sw2y: `e` can change the AUTH of a live published port in
+			// place (a same-@id PATCH), but MOVING it to a new hostname while
+			// it's still published would be a delete-and-create that can't be
+			// done atomically here -- refuse and point at unpublish-first, rather
+			// than leave the old route dangling and publicly exposed. EqualFold:
+			// Caddy canonicalises hostnames, so a case-only change is the SAME
+			// route and is allowed. Only reachable via `e` (a published port's
+			// `p` unpublishes; it never enters this host dialog).
+			if cur, ok := m.published[m.publishPort]; ok && !strings.EqualFold(host, cur.hostname) {
+				m.clearPublishFlow()
+				return m.setErr(fmt.Sprintf("port :%d is published at %s — press p to unpublish first, then publish it at the new hostname", m.publishPort, cur.hostname))
+			}
 			m.publishHostname = host
 			m.mode = entryPublishAuth
 			return nil
@@ -3243,17 +3247,7 @@ func (m *model) confirmPublish() tea.Cmd {
 	// Carry the (secret-free) publish parameters so the conflict path can name
 	// the attempted hostname and, on a cleared conflict (Kind==None), re-issue
 	// the publish once (kata qfbf). retried starts false: this is a fresh attempt.
-	// kata 8tnf: if this publish CHANGES the hostname of a port that is
-	// currently published (only reachable via `e` edit -- `p` unpublishes a
-	// published port, it never re-hosts it), the new hostname yields a new
-	// @id, so caddyedge.Publish creates a SECOND route and leaves the OLD
-	// hostname's route live + public (possibly without the auth just added).
-	// Carry the old hostname so the success handler removes it.
-	var replacing string
-	if cur, ok := m.published[port]; ok && cur.hostname != hostname {
-		replacing = cur.hostname
-	}
-	m.pendingPublish = pendingPublish{hostname: hostname, label: label, port: port, withAuth: auth != nil, replacingHostname: replacing}
+	m.pendingPublish = pendingPublish{hostname: hostname, label: label, port: port, withAuth: auth != nil}
 
 	// Drop the flow state (esp. the plaintext password) BEFORE the op runs.
 	m.clearPublishFlow()
@@ -3657,9 +3651,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// m.lastPublish on a successful, non-unpublish outcome below.
 		publishedHost := m.pendingPublish.hostname
 		publishedAuth := m.pendingPublish.withAuth
-		// kata 8tnf: the old hostname to retire when an `e` edit changed a
-		// published port's hostname (captured before the carry is cleared).
-		replacingHostname := m.pendingPublish.replacingHostname
 		// ── ttfh stage 2: ARM the restore slot. m.pendingArm is set ONLY just before
 		// the take-over resume publish (purgeDoneMsg success, OWNED), so its presence
 		// marks THIS publishDoneMsg as that resume. Arm whether the take-over
@@ -3761,30 +3752,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.lastPublish[msg.port] = publishInfo{hostname: publishedHost, auth: publishedAuth}
 		}
-		// kata 8tnf: an `e` edit that CHANGED a published port's hostname just
-		// created a NEW route; retire the OLD hostname's route so it isn't left
-		// publicly exposed (possibly without the auth just added). Fires after
-		// the new route landed -- a brief overlap of two of the user's OWN routes
-		// to the same backend. tea.Batch ignores a nil cmd, so this is a no-op
-		// for an unchanged-hostname publish or an unpublish.
-		var cleanupOld tea.Cmd
-		if !msg.unpublish && replacingHostname != "" && replacingHostname != publishedHost {
-			cleanupOld = unpublishCmd(m.caddyClient(), replacingHostname, shortLabel(m.fqdn), msg.port)
-		}
 		if tookOver != "" {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over. armTimer (ttfh) starts the
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
 			// take-over, which arms nothing). "press p to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, cleanupOld, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, cleanupOld, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
@@ -6410,7 +6391,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
 		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of and\nmutually exclusive with funnel — a port can carry one or the other,\nnever both. Press e to change hostname/auth without unpublishing.",
-		"e":      "Edit the selected port's publish hostname/auth through the Caddy\nedge (kata prp1), WITHOUT unpublishing it first: always runs the full\nsetup flow (prefilled with its current/remembered hostname when\nknown) ending in the same y/n confirm p uses. If the port is already\npublished, confirming REPLACES its live route with the new\nhostname/auth. Same refuse-guards as p (busy, :22, funnel conflict,\nlocked) but e never de-escalates — press p on a published port to\nunpublish instead.",
+		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, funnel conflict, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",

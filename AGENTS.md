@@ -47,9 +47,12 @@ contract. The short version:
   even that confirm. This exception is scoped strictly to RE-publishing an
   ALREADY-consented hostname within the SAME session — a port's FIRST publish
   always confirms regardless of this setting, and Funnel's confirm is
-  completely unaffected. A dedicated `e` key opens the same setup flow to
-  CHANGE a published port's hostname/auth without unpublishing first (also
-  always confirming); it never de-escalates. In this path **Tailscale
+  completely unaffected. A dedicated `e` key opens the same setup flow (also
+  always confirming) to edit a port's publish config: it changes the AUTH of an
+  already-published port in place, but REFUSES to move a still-published port to
+  a new hostname (that would be a non-atomic delete-and-create that could leave
+  the old route dangling — the user unpublishes first, kata sw2y); it never
+  de-escalates. In this path **Tailscale
   supplies private tailnet transport only; Caddy owns the entire public trust
   plane** (custom-domain DNS, public `:443` ingress, TLS termination and
   renewal, hostname routing). Basic auth at the edge is a single SHARED
