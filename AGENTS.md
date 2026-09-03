@@ -52,7 +52,11 @@ contract. The short version:
   already-published port in place, but REFUSES to move a still-published port to
   a new hostname (that would be a non-atomic delete-and-create that could leave
   the old route dangling — the user unpublishes first, kata sw2y); it never
-  de-escalates. In this path **Tailscale
+  de-escalates. That refuse is BEST-EFFORT: it keys off the poll cache, which can
+  be stale/empty, so a rename can still slip through in that narrow window (a
+  pre-existing property of the cache-based model, not a regression; roborev
+  44n7) — the authoritative fix (a live-route scan / atomic replace at publish
+  time) is tracked in srx1 for v0.2.1. In this path **Tailscale
   supplies private tailnet transport only; Caddy owns the entire public trust
   plane** (custom-domain DNS, public `:443` ingress, TLS termination and
   renewal, hostname routing). Basic auth at the edge is a single SHARED

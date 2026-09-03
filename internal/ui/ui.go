@@ -3089,6 +3089,17 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			// Caddy canonicalises hostnames, so a case-only change is the SAME
 			// route and is allowed. Only reachable via `e` (a published port's
 			// `p` unpublishes; it never enters this host dialog).
+			//
+			// BEST-EFFORT (roborev 44n7): this keys off the poll cache
+			// (m.published), which can be stale/empty -- before the first poll,
+			// after a failed poll, or after an external edge change -- so a
+			// rename can still slip through in that narrow window and create a
+			// dangling route. That's a pre-existing property of the cache-based
+			// publish model (v1z5: the edge is the source of truth, read live via
+			// poll), not something this guard introduced; the guard strictly
+			// improves on the prior always-dangling behaviour. The reliable fix
+			// -- an authoritative scan of the backend's live routes at publish
+			// time / an atomic replace -- is tracked in srx1 (v0.2.1).
 			if cur, ok := m.published[m.publishPort]; ok && !strings.EqualFold(host, cur.hostname) {
 				m.clearPublishFlow()
 				return m.setErr(fmt.Sprintf("port :%d is published at %s — press p to unpublish first, then publish it at the new hostname", m.publishPort, cur.hostname))
