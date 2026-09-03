@@ -142,7 +142,7 @@ is actually reachable — localhost only, already on your tailnet, or served
 | --- | --- |
 | `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port — only offered for a loopback-bound port; an already-reachable (tailnet/LAN) port shows an info toast instead |
 | `P` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
-| `c` | Copy the selected port's URL to the clipboard (via OSC 52, so it works over SSH). The URL matches how the port is reachable: a **published** port copies its public `https://…`, a LAN-bound port its LAN address, a localhost-only/offline port `http://localhost:…`, everything else (served/tailnet, funnel) the tailnet URL |
+| `c` | Copy the selected port's URL to the clipboard (via OSC 52, so it works over SSH). It copies the URL for the port's current exposure — a **published** port's public `https://…`, a LAN bind's LAN address, a localhost-only/offline port's `http://localhost:…`, otherwise the tailnet URL (served/tailnet/funnel). The toast names what was copied, including a stale forward's dead target |
 | `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
 | `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
 | `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to serve it once its service is up |
