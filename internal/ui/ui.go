@@ -2703,8 +2703,19 @@ func (m *model) requestPublish(port int) tea.Cmd {
 		m.publishInput.EchoMode = textinput.EchoNormal
 		m.publishInput.Width = 40            // a normal padded field (the host step sets 0)
 		m.publishInput.CharLimit = 63        // a single DNS label max, like the host step
-		m.publishInput.Placeholder = "caddy" // a VALID short label -- shown only when the stored hostname is blank; never a dotted example this step would reject (roborev 452s)
-		m.publishInput.SetValue(m.cfg.Caddy.Hostname)
+		m.publishInput.Placeholder = "caddy" // a valid short label, for the rare case the user clears the field (roborev 452s)
+		// Prefill the CURRENT caddy.hostname, falling back to the "caddy" default
+		// when it's blank -- so the field holds a VALID, SUBMITTABLE value (Enter
+		// accepts it and advances) rather than an empty field behind a
+		// display-only placeholder, which validation rejects and, with the error
+		// hidden mid-modal (0jjk), would look like Enter did nothing (roborev). A
+		// blank stored hostname is unusual (config load defaults it to "caddy")
+		// but reachable, so make it behave like the real default.
+		prefill := m.cfg.Caddy.Hostname
+		if prefill == "" {
+			prefill = "caddy"
+		}
+		m.publishInput.SetValue(prefill)
 		m.publishInput.CursorEnd()
 		m.publishInput.Focus()
 		m.mode = entryPublishHostname

@@ -5788,10 +5788,12 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
-	// roborev 452s: a fresh setup with a BLANK stored hostname opens the prompt
-	// with an EMPTY field, so its placeholder renders -- it must be a VALID short
-	// label (no dots), never a dotted example this very step would reject.
-	t.Run("fresh setup with a blank stored hostname shows a valid placeholder", func(t *testing.T) {
+	// roborev (452s follow-up): a fresh setup with a BLANK stored hostname must
+	// prefill the "caddy" default as the field VALUE -- not merely a display-only
+	// placeholder -- so pressing Enter submits a VALID value and advances, rather
+	// than submitting "" and silently failing validation. (Placeholder stays a
+	// valid dot-free label for the rare cleared-field case.)
+	t.Run("fresh setup with a blank stored hostname prefills the caddy default", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Domain = ""
 		m.cfg.Caddy.Hostname = ""
@@ -5799,11 +5801,11 @@ func TestRequestPublishGuards(t *testing.T) {
 		if m.mode != entryPublishHostname {
 			t.Fatalf("blank stored hostname: mode=%v (want the capture prompt)", m.mode)
 		}
-		if got := m.publishInput.Value(); got != "" {
-			t.Errorf("blank stored hostname should leave the field empty; got %q", got)
+		if got := m.publishInput.Value(); got != "caddy" {
+			t.Errorf("blank stored hostname must prefill the \"caddy\" default as the VALUE (submittable), got %q", got)
 		}
 		if ph := m.publishInput.Placeholder; ph == "" || strings.Contains(ph, ".") {
-			t.Errorf("hostname placeholder %q must be a non-empty short label with no dots (it renders for a blank field; a dotted example would be rejected by this step)", ph)
+			t.Errorf("hostname placeholder %q must be a non-empty short label with no dots", ph)
 		}
 	})
 
@@ -6194,6 +6196,42 @@ func TestPublishHostnameValidAdvancesAndPersists(t *testing.T) {
 	}
 	if _, err := os.Stat(loaded.ResolvedPath() + ".bak"); err != nil {
 		t.Errorf("expected a .bak of the pre-write config; stat error: %v", err)
+	}
+}
+
+// TestPublishHostnameBlankStoredAcceptsDefaultOnEnter: a fresh setup whose
+// STORED caddy.hostname is blank prefills the "caddy" default as the field VALUE
+// (not just a placeholder), so pressing Enter unedited submits "caddy" (valid),
+// persists it, and advances to the domain step -- never a silent no-op (roborev,
+// 452s follow-up).
+func TestPublishHostnameBlankStoredAcceptsDefaultOnEnter(t *testing.T) {
+	m := newPublishModel(t, nil)
+	if err := m.cfg.Save(); err != nil {
+		t.Fatalf("seeding config: %v", err)
+	}
+	m.cfg.Caddy.Domain = ""
+	m.cfg.Caddy.Hostname = ""
+	m = mustUpdate(t, m, rkey("p"))
+	if m.mode != entryPublishHostname {
+		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
+	}
+	if got := m.publishInput.Value(); got != "caddy" {
+		t.Fatalf("blank stored hostname must prefill the \"caddy\" default value; got %q", got)
+	}
+	// Accept the prefilled default unedited.
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishDomain {
+		t.Fatalf("accepting the default hostname: mode=%v, want entryPublishDomain (not a silent no-op)", m.mode)
+	}
+	if m.cfg.Caddy.Hostname != "caddy" {
+		t.Errorf("in-memory caddy.hostname = %q, want caddy", m.cfg.Caddy.Hostname)
+	}
+	loaded, err := config.Load("")
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if loaded.Caddy.Hostname != "caddy" {
+		t.Errorf("persisted caddy.hostname = %q, want caddy", loaded.Caddy.Hostname)
 	}
 }
 
