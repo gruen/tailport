@@ -6461,6 +6461,28 @@ func TestFitFieldPreservesCursorWindow(t *testing.T) {
 	}
 }
 
+// TestSetupPromptShowsValidationFlash: an error flash set while a text-step
+// modal is on screen must be visible in renderBottom -- the modal hides the
+// status line, so promptLine surfaces the flash itself (kata 0jjk). An INFO
+// flash is not surfaced (it doesn't fire mid-text-entry).
+func TestSetupPromptShowsValidationFlash(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.width = 80
+	m.mode = entryPublishHostname
+	m.publishPort = 8080
+	m.publishInput.SetValue("bad.fqdn")
+	m.flash = "invalid tailnet hostname"
+	m.flashLevel = flashError
+	if out := m.renderBottom(); !strings.Contains(out, "invalid tailnet hostname") {
+		t.Errorf("renderBottom during a setup modal must surface the error flash; got:\n%s", out)
+	}
+	m.flash = "just some info"
+	m.flashLevel = flashInfo
+	if strings.Contains(m.renderBottom(), "just some info") {
+		t.Error("an INFO flash should not be surfaced during a text modal")
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).

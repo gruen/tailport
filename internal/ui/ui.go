@@ -7235,19 +7235,40 @@ func (m model) renderStatusLine() string {
 // (you're typing into it). Everything is derived from m.width at render time, so
 // a resize just re-renders correctly -- View runs after every WindowSizeMsg --
 // with no stored width to keep in sync. label and hint are RAW text (styled here
-// with helpStyle); field is the already-styled input content.
+// with helpStyle); field is the already-styled input content. A WARN/ERROR
+// m.flash is surfaced on its own row above the prompt (kata 0jjk) so a
+// validation error is visible even though the modal hides the status line.
 func (m model) promptLine(label, field, hint string) string {
+	var prompt string
 	oneLine := helpStyle.Render(label) + field + helpStyle.Render(hint)
 	if m.width <= 0 || lipgloss.Width(oneLine) <= m.width {
-		return oneLine
+		prompt = oneLine
+	} else {
+		fieldRow := field
+		if lipgloss.Width(field)+lipgloss.Width(hint) <= m.width {
+			fieldRow += helpStyle.Render(hint)
+		}
+		// helpStyle.Width wraps the (foreground-only) label to the viewport; the
+		// field, which must stay whole, sits on its own row below.
+		prompt = helpStyle.Width(m.width).Render(label) + "\n" + fieldRow
 	}
-	fieldRow := field
-	if lipgloss.Width(field)+lipgloss.Width(hint) <= m.width {
-		fieldRow += helpStyle.Render(hint)
+	// kata 0jjk: a validation error set via setErr while a text-step modal is on
+	// screen is otherwise invisible -- renderBottom returns this prompt, never
+	// the status line's m.flash. Surface a WARN/ERROR flash on its own
+	// (width-bounded) row ABOVE the prompt so "invalid …" feedback is seen. An
+	// INFO toast doesn't fire mid-text-entry, so it's excluded.
+	if m.flash != "" && m.flashLevel != flashInfo {
+		toast := warnStyle
+		if m.flashLevel == flashError {
+			toast = errStyle
+		}
+		flashRow := toast.Render(m.flash)
+		if m.width > 0 {
+			flashRow = toast.Width(m.width).Render(m.flash)
+		}
+		return flashRow + "\n" + prompt
 	}
-	// helpStyle.Width wraps the (foreground-only) label to the viewport; the
-	// field, which must stay whole, sits on its own row below.
-	return helpStyle.Width(m.width).Render(label) + "\n" + fieldRow
+	return prompt
 }
 
 // fitField renders a modal input for a prompt row, bounding it to the viewport
