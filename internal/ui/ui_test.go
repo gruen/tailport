@@ -6292,8 +6292,8 @@ func TestPublishReachDriftSurfaced(t *testing.T) {
 	if got := stripANSI(pub.markerGlyph()); got != "◆" {
 		t.Errorf("published marker = %q, want ◆", got)
 	}
-	if d := pub.plainDescription(); !strings.Contains(d, "https://web.example.com · published to the internet") || !strings.Contains(d, "basic auth") {
-		t.Errorf("published description = %q", d)
+	if d := pub.plainDescription(); !strings.Contains(d, "https://web.example.com · published to the internet") || !strings.Contains(d, authGlyphMono) {
+		t.Errorf("published description = %q (want url + auth glyph)", d)
 	}
 
 	// Drift: both funnel AND publish (external mutation) -> reachStale (warning
@@ -6310,67 +6310,33 @@ func TestPublishReachDriftSurfaced(t *testing.T) {
 	}
 }
 
-// TestPublishUnpublishHint covers 71ga: a published row's description
-// surfaces that (now) `p` unpublishes, scoped to reachPublish only, and only
-// when it actually fits availableDescriptionWidth() -- omitted rather than
-// left for bubbles/list to truncate.
-func TestPublishUnpublishHint(t *testing.T) {
+// TestPublishRowAuthGlyph covers the published row's auth indicator: no glyph
+// (and no leftover "basic auth"/"p to unpublish" text) without auth, a person
+// glyph with auth in emoji mode, and a mono fallback in no-emoji mode.
+func TestPublishRowAuthGlyph(t *testing.T) {
 	base := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com"}
 	baseDesc := "https://web.example.com · published to the internet"
+
+	// No auth: bare description, and none of the retired text.
 	if got := base.plainDescription(); got != baseDesc {
-		t.Fatalf("sanity: zero-width plainDescription() = %q, want the bare base %q (hint must be omitted, not just untested)", got, baseDesc)
+		t.Errorf("no-auth published row = %q, want the bare %q", got, baseDesc)
 	}
 
-	// Exact fit: the hint is appended.
-	wide := base
-	wide.availDescWidth = lipgloss.Width(baseDesc) + lipgloss.Width(unpublishHint)
-	want := baseDesc + unpublishHint
-	if got := wide.plainDescription(); got != want {
-		t.Errorf("exact-fit plainDescription() = %q, want %q (hint fits)", got, want)
+	// Auth + emoji: person glyph appended, no "basic auth" spelled out.
+	e := base
+	e.publishAuth, e.emoji = true, true
+	if got := e.plainDescription(); got != baseDesc+" "+authGlyphEmoji {
+		t.Errorf("authed (emoji) row = %q, want %q", got, baseDesc+" "+authGlyphEmoji)
 	}
 
-	// One cell too narrow: the hint is dropped whole, not truncated.
-	narrow := base
-	narrow.availDescWidth = lipgloss.Width(baseDesc) + lipgloss.Width(unpublishHint) - 1
-	if got := narrow.plainDescription(); got != baseDesc {
-		t.Errorf("one-cell-too-narrow plainDescription() = %q, want the bare base %q (hint omitted, never truncated)", got, baseDesc)
+	// Auth + mono: the mono fallback, never the emoji.
+	mo := base
+	mo.publishAuth, mo.emoji = true, false
+	if got := mo.plainDescription(); got != baseDesc+" "+authGlyphMono {
+		t.Errorf("authed (mono) row = %q, want %q", got, baseDesc+" "+authGlyphMono)
 	}
-}
-
-// TestPublishHintRefreshesOnResize is the model-level companion to
-// TestPublishUnpublishHint (roborev hctg): it proves the WindowSizeMsg handler
-// REBUILDS items, so the reachPublish "· p to unpublish" hint appears/disappears
-// as the terminal crosses the fit threshold -- not only on the next poll/nav
-// rebuild. (A unit test on portItem.plainDescription can't catch a missing
-// WindowSizeMsg rebuild; this can.)
-func TestPublishHintRefreshesOnResize(t *testing.T) {
-	m := newPublishModel(t, nil)
-	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
-
-	rowDesc := func(m model) string {
-		for _, it := range m.list.Items() {
-			if p, ok := it.(portItem); ok && p.publishHostname != "" {
-				return p.plainDescription()
-			}
-		}
-		return ""
-	}
-
-	// A width where the row is single-column and wide enough for the hint. (Note
-	// the port list goes MULTI-column at very wide terminals, which SHRINKS
-	// per-row description width -- so "wide enough" is ~80, not 200.)
-	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m = m2.(model)
-	if d := rowDesc(m); !strings.Contains(d, unpublishHint) {
-		t.Errorf("after fit-width resize, published row = %q, want the %q hint", d, unpublishHint)
-	}
-
-	// Narrow: resizing must DROP the hint immediately -- the WindowSizeMsg rebuild
-	// is what refreshes availDescWidth; without it the stale hint would remain.
-	m2, _ = m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
-	m = m2.(model)
-	if d := rowDesc(m); strings.Contains(d, unpublishHint) {
-		t.Errorf("after narrow resize, published row = %q, want the hint dropped", d)
+	if strings.Contains(mo.plainDescription(), authGlyphEmoji) {
+		t.Errorf("mono row must not contain the emoji glyph; got %q", mo.plainDescription())
 	}
 }
 

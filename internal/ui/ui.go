@@ -282,12 +282,6 @@ type portItem struct {
 	// way to see both is external mutation, surfaced as explicit drift (reach).
 	publishHostname string
 	publishAuth     bool
-	// availDescWidth is the delegate's available title/description budget
-	// (m.availableDescriptionWidth() at build time), threaded onto the item so
-	// the otherwise-pure plainDescription can decide whether the reachPublish
-	// "· p to unpublish" discoverability hint (71ga) would fit without being
-	// truncated -- omitted rather than clipped when it wouldn't.
-	availDescWidth int
 	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
 	// Favorites view by an active "/" filter (4ye6), so real favorites still
 	// stand out among the wider search results. See portDelegate.Render.
@@ -555,12 +549,13 @@ func (i portItem) plainDescription() string {
 	case reachPublish:
 		d := "https://" + i.publishHostname + " · published to the internet"
 		if i.publishAuth {
-			d += " · basic auth"
-		}
-		// 71ga: surface that (now) `p` unpublishes, but only when it fits --
-		// omit the hint rather than let bubbles/list truncate it away.
-		if publishHintFits(lipgloss.Width(d), i.availDescWidth) {
-			d += unpublishHint
+			// A glyph marks a basic-auth-protected route rather than spelling out
+			// "basic auth"; emoji-gated like the exposure markers (markerGlyph).
+			if i.emoji {
+				d += " " + authGlyphEmoji
+			} else {
+				d += " " + authGlyphMono
+			}
 		}
 		return d
 	case reachStale:
@@ -2002,21 +1997,13 @@ func publishErrText(err error) string {
 // (portItem.Description) can never drift out of sync about its width.
 const copiedSuffix = "  ✓ copied"
 
-// unpublishHint is the plain discoverability hint (71ga) appended to a
-// reachPublish row's description, surfacing that the (now) `p` key
-// unpublishes an already-published port. See publishHintFits for the
-// width-fit check that decides whether it's shown at all.
-const unpublishHint = " · p to unpublish"
-
-// publishHintFits reports whether appending unpublishHint to a description of
-// descWidth (its PLAIN, unstyled rendered width) would still fit within
-// availWidth, the delegate's available title/description budget
-// (availableDescriptionWidth). Same measurement approach as inlineCopyFits,
-// kept separate since the two annotations have different widths and can be
-// present independently of each other.
-func publishHintFits(descWidth, availWidth int) bool {
-	return descWidth+lipgloss.Width(unpublishHint) <= availWidth
-}
+// authGlyph{Emoji,Mono} mark a basic-auth-protected published row in place of
+// the words "basic auth". Emoji-gated like the exposure markers (markerGlyph):
+// a person for emoji terminals, a plain "@" (login-ish) for the mono fallback.
+const (
+	authGlyphEmoji = "👤"
+	authGlyphMono  = "@"
+)
 
 // descTruncateStyle mirrors the style bubbles/list's DefaultDelegate.Render
 // uses to compute its available text width (vendored
@@ -3266,11 +3253,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeList()
-		// Rebuild so width-dependent row annotations refresh immediately on
-		// resize -- notably the reachPublish "· p to unpublish" hint, whose
-		// fit is decided from the per-build availDescWidth (71ga); without this
-		// it would stay stale until the next poll/nav rebuild (roborev v5d8).
-		return m, m.rebuildItems()
+		return m, nil
 
 	case refreshMsg:
 		if msg.err != nil {
@@ -4395,8 +4378,6 @@ func (m *model) rebuildItems() tea.Cmd {
 	for _, p := range m.allPorts {
 		portsByNumber[p.Number] = p
 	}
-	// Computed once per rebuild (not per row) -- see portItem.availDescWidth.
-	availDescWidth := m.availableDescriptionWidth()
 
 	if m.showAllPorts || m.filtering {
 		// Non-favorite matches recede only when filtering FROM the Favorites
@@ -4428,7 +4409,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			}
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, availDescWidth: availDescWidth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -4452,7 +4433,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, availDescWidth: availDescWidth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
