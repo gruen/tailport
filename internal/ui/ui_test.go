@@ -5720,18 +5720,25 @@ func TestRequestPublishGuards(t *testing.T) {
 	})
 
 	// blank caddy.domain: no longer refused -- it opens the inline
-	// domain-capture prompt (kata w131), and ONLY after all refuse-guards pass.
-	t.Run("blank domain opens capture prompt", func(t *testing.T) {
+	// hostname-capture prompt FIRST (kata ztzg), and ONLY after all
+	// refuse-guards pass. The domain-capture prompt (kata w131) follows once
+	// the hostname step is satisfied -- see TestPublishDomainCaptureHappyPath.
+	t.Run("blank domain opens hostname capture prompt first", func(t *testing.T) {
 		m := base()
 		m.cfg.Caddy.Domain = ""
 		if cmd := m.requestPublish(8080); cmd != nil {
-			t.Error("opening the domain-capture prompt should return a nil cmd")
+			t.Error("opening the hostname-capture prompt should return a nil cmd")
 		}
-		if m.mode != entryPublishDomain {
-			t.Errorf("blank domain: mode=%v flash=%q (want entryPublishDomain capture prompt)", m.mode, m.flash)
+		if m.mode != entryPublishHostname {
+			t.Errorf("blank domain: mode=%v flash=%q (want entryPublishHostname capture prompt)", m.mode, m.flash)
 		}
 		if m.publishPort != 8080 {
 			t.Errorf("blank domain: publishPort=%d, want 8080", m.publishPort)
+		}
+		// Prefilled with the CURRENT caddy.hostname (the default "caddy" here),
+		// never hardcoded -- so accepting it unedited is a same-value no-op.
+		if got := m.publishInput.Value(); got != "caddy" {
+			t.Errorf("hostname prefill = %q, want the current caddy.hostname %q", got, "caddy")
 		}
 	})
 
@@ -5934,20 +5941,32 @@ func TestValidPublishDomain(t *testing.T) {
 }
 
 // TestPublishDomainCaptureHappyPath is the guard-reorder assist's happy path
-// (kata w131): a blank caddy.domain opens the inline capture prompt, a valid
-// domain is persisted (disk + memory), the flow advances into the SHARED host
-// dialog with the prefill rebuilt against the just-saved domain, and the
-// parallel sticky setup-banner goes active.
+// (kata w131): a blank caddy.domain opens the inline hostname-capture prompt
+// FIRST (kata ztzg), accepting its prefilled default advances to the domain
+// capture prompt, a valid domain is persisted (disk + memory), the flow
+// advances into the SHARED host dialog with the prefill rebuilt against the
+// just-saved domain, and the parallel sticky setup-banner goes active.
 func TestPublishDomainCaptureHappyPath(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = "" // force the capture path
 
 	m = mustUpdate(t, m, rkey("p"))
-	if m.mode != entryPublishDomain {
-		t.Fatalf("blank domain: mode=%v, want entryPublishDomain", m.mode)
+	if m.mode != entryPublishHostname {
+		t.Fatalf("blank domain: mode=%v, want entryPublishHostname", m.mode)
 	}
 	if m.publishPort != 8080 {
 		t.Fatalf("publishPort=%d, want 8080", m.publishPort)
+	}
+
+	// Accept the prefilled default hostname unedited (a same-value no-op --
+	// covered in detail by TestPublishHostnameCaptureSkipsWriteWhenUnchanged)
+	// and land on the domain-capture step.
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishDomain {
+		t.Fatalf("after hostname step: mode=%v, want entryPublishDomain", m.mode)
+	}
+	if m.cfg.Caddy.Hostname != "caddy" {
+		t.Errorf("accepting the default hostname unedited should leave it unchanged; got %q", m.cfg.Caddy.Hostname)
 	}
 
 	m = mustUpdate(t, m, rkey("apps.example.com"))
@@ -5992,6 +6011,7 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 			m := newPublishModel(t, nil)
 			m.cfg.Caddy.Domain = ""
 			m = mustUpdate(t, m, rkey("p"))
+			m = mustUpdate(t, m, enterKey) // accept the default hostname, land on the domain step
 			if bad != "" {
 				m.publishInput.SetValue(bad)
 			}
@@ -6013,11 +6033,13 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 }
 
 // TestPublishDomainEscAborts: esc at the domain-capture step aborts cleanly back
-// to entryNone, persisting nothing and raising no banner (kata w131).
+// to entryNone, persisting nothing and raising no banner (kata w131). It first
+// walks through the (ztzg) hostname step ahead of it, accepting the default.
 func TestPublishDomainEscAborts(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = ""
 	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, enterKey) // accept the default hostname, land on the domain step
 	if m.mode != entryPublishDomain {
 		t.Fatalf("setup: mode=%v, want entryPublishDomain", m.mode)
 	}
@@ -6030,6 +6052,139 @@ func TestPublishDomainEscAborts(t *testing.T) {
 	}
 	if m.domainSetupPending {
 		t.Error("esc at domain step must not raise the setup banner")
+	}
+}
+
+// TestPublishHostnameEscAborts: esc at the NEW (ztzg) hostname-capture step --
+// reached before the domain step -- aborts cleanly back to entryNone,
+// persisting nothing.
+func TestPublishHostnameEscAborts(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.Domain = ""
+	m = mustUpdate(t, m, rkey("p"))
+	if m.mode != entryPublishHostname {
+		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
+	}
+	m = mustUpdate(t, m, escKey)
+	if m.mode != entryNone {
+		t.Errorf("esc at hostname step -> mode %v, want entryNone", m.mode)
+	}
+	if m.publishPort != 0 {
+		t.Errorf("esc at hostname step left publishPort=%d", m.publishPort)
+	}
+	if m.cfg.Caddy.Hostname != "caddy" {
+		t.Errorf("esc at hostname step must not persist a change; got %q", m.cfg.Caddy.Hostname)
+	}
+}
+
+// TestPublishHostnameSkippedWhenConfigured: an already-configured setup
+// (non-blank caddy.domain) is NEVER prompted for the hostname -- `p` goes
+// straight to the shared host dialog, matching pre-ztzg behavior exactly.
+func TestPublishHostnameSkippedWhenConfigured(t *testing.T) {
+	m := newPublishModel(t, nil) // domain "example.com" (already configured)
+	m = mustUpdate(t, m, rkey("p"))
+	if m.mode == entryPublishHostname {
+		t.Fatal("an already-configured setup must not be prompted for the hostname")
+	}
+	if m.mode != entryPublishHost {
+		t.Errorf("configured setup: mode=%v, want entryPublishHost", m.mode)
+	}
+}
+
+// TestPublishHostnameInvalidStaysOnPrompt: a blank, dotted, or FQDN-shaped
+// hostname at the capture step stays on the step with an error and persists
+// nothing -- the exact input shape that used to silently 403 the admin API
+// (kata ztzg).
+func TestPublishHostnameInvalidStaysOnPrompt(t *testing.T) {
+	for _, bad := range []string{"", "caddy.tailnet.ts.net", "not a host"} {
+		t.Run(bad, func(t *testing.T) {
+			m := newPublishModel(t, nil)
+			m.cfg.Caddy.Domain = ""
+			m = mustUpdate(t, m, rkey("p"))
+			m.publishInput.SetValue(bad)
+			m = mustUpdate(t, m, enterKey)
+			if m.mode != entryPublishHostname {
+				t.Errorf("invalid hostname %q should stay on the capture step; mode=%v", bad, m.mode)
+			}
+			if m.flashLevel != flashError {
+				t.Errorf("invalid hostname %q should raise an error toast; level=%v flash=%q", bad, m.flashLevel, m.flash)
+			}
+			if m.cfg.Caddy.Hostname != "caddy" {
+				t.Errorf("invalid hostname %q must not persist a change; got %q", bad, m.cfg.Caddy.Hostname)
+			}
+		})
+	}
+}
+
+// TestPublishHostnameValidAdvancesAndPersists: a valid single-label hostname
+// (including a hyphenated one, e.g. "caddy-on-fly") advances to the domain
+// step, persists to memory AND disk when it CHANGED from the current value,
+// and the on-disk .bak exists (SaveCaddyHostname's write-back contract; see
+// the config package's own SaveCaddyHostname tests for the full merge/backup
+// coverage). kata ztzg.
+func TestPublishHostnameValidAdvancesAndPersists(t *testing.T) {
+	m := newPublishModel(t, nil)
+	// Seed a real on-disk config first (a fresh install's config.yaml already
+	// exists by the time someone gets to publishing) so SaveCaddyHostname takes
+	// its merge-and-backup path rather than its no-file-yet seed path.
+	if err := m.cfg.Save(); err != nil {
+		t.Fatalf("seeding config: %v", err)
+	}
+	m.cfg.Caddy.Domain = ""
+	m = mustUpdate(t, m, rkey("p"))
+	if m.mode != entryPublishHostname {
+		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
+	}
+	m.publishInput.SetValue("caddy-on-fly")
+	m = mustUpdate(t, m, enterKey)
+
+	if m.mode != entryPublishDomain {
+		t.Fatalf("after valid hostname: mode=%v, want entryPublishDomain", m.mode)
+	}
+	if m.cfg.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("in-memory caddy.hostname = %q, want caddy-on-fly", m.cfg.Caddy.Hostname)
+	}
+	loaded, err := config.Load("")
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if loaded.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("persisted caddy.hostname = %q, want caddy-on-fly", loaded.Caddy.Hostname)
+	}
+	if _, err := os.Stat(loaded.ResolvedPath() + ".bak"); err != nil {
+		t.Errorf("expected a .bak of the pre-write config; stat error: %v", err)
+	}
+}
+
+// TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
+// default hostname unedited must NOT write to disk at all -- no needless .bak,
+// no SaveCaddyHostname call (kata ztzg).
+func TestPublishHostnameCaptureSkipsWriteWhenUnchanged(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.cfg.Caddy.Domain = ""
+	m = mustUpdate(t, m, rkey("p"))
+	if got := m.publishInput.Value(); got != "caddy" {
+		t.Fatalf("setup: hostname prefill = %q, want caddy", got)
+	}
+	m = mustUpdate(t, m, enterKey) // unedited: same value as the current caddy.hostname
+
+	if m.mode != entryPublishDomain {
+		t.Fatalf("after unchanged hostname: mode=%v, want entryPublishDomain", m.mode)
+	}
+	if m.cfg.Caddy.Hostname != "caddy" {
+		t.Errorf("in-memory caddy.hostname changed unexpectedly: %q", m.cfg.Caddy.Hostname)
+	}
+	// No config file (and so no .bak) should exist yet: newPublishModel never
+	// wrote one, and an unchanged hostname must not trigger SaveCaddyHostname.
+	path, err := config.Path("")
+	if err != nil {
+		t.Fatalf("config.Path: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("accepting the unchanged default should not write config.yaml; stat err=%v", err)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("accepting the unchanged default should not write a .bak; stat err=%v", err)
 	}
 }
 

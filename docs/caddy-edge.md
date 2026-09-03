@@ -320,9 +320,13 @@ than refusing. Full field reference: the root README's
 
 `hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
 tailport can find its admin API over the tailnet — it is unrelated to any
-published *public* hostname. `server_name` must be identical on every tailport
-computer sharing this edge (it selects the shared routes array); it does not
-identify the source machine.
+published *public* hostname. Hand-editing it is no longer the only path: on a
+fresh setup (blank `domain`), pressing `p` also prompts for `hostname` first
+(prefilled with the current value, so accepting the default is a no-op),
+*before* the `domain` prompt above — it's needed to reach the admin API at all.
+Already-configured setups aren't re-prompted. `server_name` must be identical
+on every tailport computer sharing this edge (it selects the shared routes
+array); it does not identify the source machine.
 
 **Known limitation:** the edge derives its admin API's identity — both the
 allow-list (`admin.origins`) and the listener/origin *port* — from

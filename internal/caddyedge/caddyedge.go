@@ -376,16 +376,25 @@ func ValidHostname(s string) bool {
 		return false
 	}
 	for _, label := range strings.Split(s, ".") {
-		if !validLabel(label) {
+		if !ValidLabel(label) {
 			return false
 		}
 	}
 	return true
 }
 
-// validLabel reports whether one dot-separated component is a valid DNS label.
-// An empty label (from a leading/trailing/doubled dot) fails here.
-func validLabel(label string) bool {
+// ValidLabel reports whether one dot-separated component is a valid DNS label:
+// non-empty, no more than 63 characters, alphanumeric-or-hyphen only, and never
+// leading/trailing with a hyphen. An empty label (from a leading/trailing/
+// doubled dot) fails here.
+//
+// Exported (kata ztzg) so internal/ui can validate a caddy.hostname the user
+// types during the first-run publish assist against the SAME rule
+// ValidHostname applies per-label: a single label like "caddy-on-fly" passes,
+// while blank or dotted/FQDN-shaped input fails -- an FQDN silently 403s the
+// edge's admin API (it admits only its short MagicDNS name), which is exactly
+// the bug class the hostname prompt exists to prevent.
+func ValidLabel(label string) bool {
 	if len(label) == 0 || len(label) > 63 {
 		return false
 	}

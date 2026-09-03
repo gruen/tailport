@@ -50,6 +50,34 @@ func TestValidHostname(t *testing.T) {
 	}
 }
 
+// TestValidLabel pins the exported single-label validator (kata ztzg) directly
+// -- internal/ui's entryPublishHostname step calls this, not ValidHostname, to
+// validate a typed caddy.hostname: it must accept a hyphenated MagicDNS label
+// like "caddy-on-fly" and reject blank or dotted/FQDN-shaped input outright
+// (an FQDN silently 403s the edge's admin API, which only admits its short
+// name).
+func TestValidLabel(t *testing.T) {
+	cases := []struct {
+		in string
+		ok bool
+	}{
+		{"caddy", true},
+		{"caddy-on-fly", true},           // hyphenated label -- the motivating example
+		{"x-y", true},                    // internal hyphen ok
+		{"", false},                      // blank
+		{"caddy.tailnet.ts.net", false},  // FQDN-shaped -- contains dots
+		{"-bad", false},                  // leading hyphen
+		{"bad-", false},                  // trailing hyphen
+		{"under_score", false},           // underscore not LDH
+		{strings.Repeat("a", 64), false}, // over the 63-char label max
+	}
+	for _, c := range cases {
+		if got := ValidLabel(c.in); got != c.ok {
+			t.Errorf("ValidLabel(%q) = %v, want %v", c.in, got, c.ok)
+		}
+	}
+}
+
 // TestBuildRouteSchemeAlwaysHTTP is the load-bearing invariant test: the emitted
 // upstream is a plain dial with NO tls/transport, and there is no API to request
 // https. It also pins the Host rewrite and @id.

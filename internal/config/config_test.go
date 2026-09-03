@@ -739,6 +739,182 @@ func TestSaveCaddyDomainLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveCaddyHostnameMergePreservesForeignContent mirrors
+// TestSaveCaddyDomainMergePreservesForeignContent exactly, but for
+// SaveCaddyHostname (kata ztzg -- the TUI's first-run hostname-capture
+// prompt): starting from the same fixture (ports, a foreign top-level key +
+// comments, a full caddy block, a markers pref), a SaveCaddyHostname changes
+// ONLY caddy.hostname. The foreign key, its comments, the OTHER caddy fields
+// (domain included), the ports, and the markers pref all survive.
+func TestSaveCaddyHostnameMergePreservesForeignContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o644); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(fixture) error: %v", err)
+	}
+	if err := cfg.SaveCaddyHostname("caddy-on-fly"); err != nil {
+		t.Fatalf("SaveCaddyHostname() error: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading merged config: %v", err)
+	}
+	text := string(raw)
+
+	// The hostname changed to the new value; the old bare value is gone.
+	if !strings.Contains(text, "hostname: caddy-on-fly") {
+		t.Errorf("expected merged config to contain the new hostname, got:\n%s", text)
+	}
+	if strings.Contains(text, "hostname: caddy\n") {
+		t.Errorf("expected the old hostname to be gone from the merged config, got:\n%s", text)
+	}
+
+	// The foreign top-level key SURVIVES -- the load-bearing proof of a
+	// Node-tree merge (a struct re-encode would drop it entirely).
+	if !strings.Contains(text, "future_field: 42") {
+		t.Errorf("expected the unknown top-level key future_field to survive the merge, got:\n%s", text)
+	}
+	for _, want := range []string{
+		"future_field is a top-level key this build's Config struct does not model",
+		"keep this inline comment too",
+		"tailport config (hand-tuned by a human)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected foreign comment %q to survive the merge, got:\n%s", want, text)
+		}
+	}
+	// The self-documenting caddy comments are present (applyCaddyComments is
+	// re-applied on the merged tree, matching Save's invariant).
+	for _, want := range []string{
+		"Tailnet name of the Caddy edge node",
+		"Public base domain used to build publish hostnames",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected caddy comment %q present after merge, got:\n%s", want, text)
+		}
+	}
+
+	// Everything else round-trips unchanged through Load.
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after merge error: %v", err)
+	}
+	if got.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("Load().Caddy.Hostname = %q, want %q", got.Caddy.Hostname, "caddy-on-fly")
+	}
+	if got.Caddy.Domain != "old.example.com" || got.Caddy.ServerName != "tailport" || got.Caddy.AdminPort != 2019 {
+		t.Errorf("Load().Caddy = %+v, want domain/server_name/admin_port untouched", got.Caddy)
+	}
+	if got.Caddy.AuthUser != "mg" || got.Caddy.AuthHash != "$2a$10$abcdefghijklmnopqrstuvABCDEFghijklmnopqrstuvwxyz012" {
+		t.Errorf("Load().Caddy auth = user %q hash %q, want the fixture's auth untouched", got.Caddy.AuthUser, got.Caddy.AuthHash)
+	}
+	if got.Markers != "emoji" {
+		t.Errorf("Load().Markers = %q, want %q (unrelated field must survive)", got.Markers, "emoji")
+	}
+	if meta, ok := got.Ports[3000]; !ok || meta.Label != "dev server" || !meta.Favorite || meta.LastProcess != "vite" {
+		t.Errorf("Load().Ports[3000] = %+v (ok=%v), want the fixture's port entry untouched", meta, ok)
+	}
+	if meta, ok := got.Ports[22]; !ok || !meta.Locked {
+		t.Errorf("Load().Ports[22] = %+v (ok=%v), want locked SSH port untouched", meta, ok)
+	}
+}
+
+// TestSaveCaddyHostnameWritesBackup mirrors TestSaveCaddyDomainWritesBackup:
+// before overwriting, SaveCaddyHostname copies the file's CURRENT on-disk
+// bytes to <path>.bak, mode 0600, containing the pre-write bytes exactly.
+func TestSaveCaddyHostnameWritesBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyHostname("caddy-on-fly"); err != nil {
+		t.Fatalf("SaveCaddyHostname() error: %v", err)
+	}
+
+	bakPath := path + ".bak"
+	info, err := os.Stat(bakPath)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", bakPath, err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf(".bak mode = %o, want 600 (may hold an auth_hash)", got)
+	}
+	bak, err := os.ReadFile(bakPath)
+	if err != nil {
+		t.Fatalf("reading .bak: %v", err)
+	}
+	if string(bak) != caddyDomainWritebackFixture {
+		t.Errorf(".bak contents = %q, want the exact pre-write bytes", string(bak))
+	}
+	assertNoLeftoverTempFiles(t, dir)
+}
+
+// TestSaveCaddyHostnameLoadRoundTrip covers the basic contract: after
+// SaveCaddyHostname, a fresh Load yields the new hostname.
+func TestSaveCaddyHostnameLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(caddyDomainWritebackFixture), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyHostname("caddy-on-fly"); err != nil {
+		t.Fatalf("SaveCaddyHostname() error: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("Load().Caddy.Hostname = %q, want %q", got.Caddy.Hostname, "caddy-on-fly")
+	}
+}
+
+// TestSaveCaddyHostnameCreatesFileWhenAbsent mirrors
+// TestSaveCaddyDomainCreatesFileWhenAbsent: with nothing on disk to back up,
+// SaveCaddyHostname seeds a fresh Default() with the hostname set, writes it
+// 0600, and drops NO .bak.
+func TestSaveCaddyHostnameCreatesFileWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	cfg := Config{path: path}
+	if err := cfg.SaveCaddyHostname("caddy-on-fly"); err != nil {
+		t.Fatalf("SaveCaddyHostname() error: %v", err)
+	}
+
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("no file existed to back up; expected no .bak, stat err=%v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("fresh config mode = %o, want 600", got)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.Caddy.Hostname != "caddy-on-fly" {
+		t.Errorf("Load().Caddy.Hostname = %q, want caddy-on-fly", got.Caddy.Hostname)
+	}
+	if got.Caddy.Domain != "" {
+		t.Errorf("Load().Caddy.Domain = %q, want blank (Default() leaves it unset)", got.Caddy.Domain)
+	}
+}
+
 // TestSaveCaddyDomainCreatesFileWhenAbsent covers the no-file-yet branch: with
 // nothing on disk to back up, SaveCaddyDomain seeds a fresh Default() with the
 // domain set (defaults + caddy comments), writes it 0600, creates any missing

@@ -911,11 +911,15 @@ const (
 	// small state machine of its own,
 	// all handled in updatePublishEntry. It gathers a public hostname, an
 	// optional shared basic-auth credential (first authed publish only), then a
-	// funnel-grade confirm before touching the Caddy edge. The domain step is
-	// reached ONLY when caddy.domain is blank (kata w131 -- captured inline
-	// instead of refusing), and once saved, feeds the same host step:
-	//   [entryPublishDomain ->] entryPublishHost -> entryPublishAuth ->
+	// funnel-grade confirm before touching the Caddy edge. The hostname and
+	// domain steps are reached ONLY on FRESH setup -- the SAME blank-caddy.domain
+	// condition -- and run in that order: hostname first (kata ztzg; it's needed
+	// to reach the admin API at all), THEN domain (kata w131; unchanged, captured
+	// inline instead of refusing). Once both are saved, they feed the same host
+	// step, exactly as the domain step alone did before ztzg:
+	//   [entryPublishHostname -> entryPublishDomain ->] entryPublishHost -> entryPublishAuth ->
 	//   [entryPublishCredUser -> entryPublishCredPass ->] entryConfirmPublish
+	entryPublishHostname // text: the edge's tailnet (MagicDNS) hostname, prefilled from caddy.hostname, captured when caddy.domain is blank (ztzg)
 	entryPublishDomain   // text: the public base domain, captured when caddy.domain is blank (w131)
 	entryPublishHost     // text: the editable label only; ".<domain>" is a locked suffix (single label)
 	entryPublishAuth     // 3-way y/n/esc: require basic auth? ("no auth" != "abort")
@@ -2701,18 +2705,26 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	// domain-capture step and the shared host-dialog continuation can read it.
 	m.publishPort = port
 
-	// 8. domain: publishing needs a public base domain. A set caddy.domain opens
-	// the host dialog directly; a BLANK one is captured inline (kata w131, ycv1
-	// §4b) instead of refusing -- resolved LAST so an un-publishable port was
-	// already refused above, rather than prompted for a domain then refused.
+	// 8. hostname + domain: publishing needs a public base domain, and a
+	// reachable caddy.hostname to dial the edge's admin API in the first place.
+	// A set caddy.domain means both are already configured (the domain can't be
+	// set without having gone through this flow, or a hand edit) -- open the
+	// host dialog directly. A BLANK caddy.domain means FRESH setup: capture the
+	// hostname FIRST (kata ztzg -- prefilled with the CURRENT caddy.hostname, so
+	// accepting the default is a same-value no-op), then the domain (kata w131,
+	// unchanged). Both are captured inline instead of refusing, resolved LAST
+	// so an un-publishable port was already refused above rather than prompted
+	// then refused. Already-configured users are NEVER re-prompted for the
+	// hostname -- only this blank-domain branch reaches entryPublishHostname.
 	if m.cfg.Caddy.Domain == "" {
 		m.publishInput.Reset()
 		m.publishInput.EchoMode = textinput.EchoNormal
-		m.publishInput.Width = 40      // a normal padded field (the host step sets 0)
-		m.publishInput.CharLimit = 253 // full-hostname limit (the host step sets 63)
-		m.publishInput.Placeholder = "example.com"
+		m.publishInput.Width = 40     // a normal padded field (the host step sets 0)
+		m.publishInput.CharLimit = 63 // a single DNS label max, like the host step
+		m.publishInput.SetValue(m.cfg.Caddy.Hostname)
+		m.publishInput.CursorEnd()
 		m.publishInput.Focus()
-		m.mode = entryPublishDomain
+		m.mode = entryPublishHostname
 		return nil
 	}
 	return m.enterPublishHostDialog()
@@ -2792,6 +2804,50 @@ func (m *model) clearPublishFlow() {
 // at every step.
 func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 	switch m.mode {
+	case entryPublishHostname:
+		// Hostname-capture assist (kata ztzg): reached only on FRESH setup, the
+		// SAME blank-caddy.domain condition that opens the domain-capture step
+		// below -- hostname runs FIRST because it's needed to reach the edge's
+		// admin API at all. The input is prefilled with the CURRENT
+		// caddy.hostname (default "caddy"), so hitting enter unedited is a
+		// same-value no-op. esc aborts; enter validates a single MagicDNS label
+		// (caddyedge.ValidLabel -- blank or dotted/FQDN-shaped both fail, which
+		// is exactly the silent-403 bug class this prompt exists to prevent),
+		// persists caddy.hostname ONLY when the value actually CHANGED (skipping
+		// a needless disk write + .bak otherwise), then feeds the (unchanged)
+		// domain-capture step.
+		switch msg.String() {
+		case "esc":
+			m.clearPublishFlow()
+			return nil
+		case "enter":
+			hostname := strings.TrimSpace(m.publishInput.Value())
+			if !caddyedge.ValidLabel(hostname) {
+				return m.setErr(fmt.Sprintf("invalid tailnet hostname %q — enter the edge's short MagicDNS label (letters, digits, hyphens; no dots)", hostname))
+			}
+			if hostname != m.cfg.Caddy.Hostname {
+				if err := m.cfg.SaveCaddyHostname(hostname); err != nil {
+					m.clearPublishFlow()
+					return m.setErr("could not save caddy.hostname: " + err.Error())
+				}
+				// SaveCaddyHostname persists to DISK ONLY -- mirror it in memory.
+				m.cfg.Caddy.Hostname = hostname
+			}
+			// Feed the (unchanged) domain-capture step, matching requestPublish's
+			// own setup of it exactly.
+			m.publishInput.Reset()
+			m.publishInput.EchoMode = textinput.EchoNormal
+			m.publishInput.Width = 40      // a normal padded field (the host step sets 0)
+			m.publishInput.CharLimit = 253 // full-hostname limit (the host step sets 63)
+			m.publishInput.Placeholder = "example.com"
+			m.publishInput.Focus()
+			m.mode = entryPublishDomain
+			return nil
+		}
+		var cmd tea.Cmd
+		m.publishInput, cmd = m.publishInput.Update(msg)
+		return cmd
+
 	case entryPublishDomain:
 		// Domain-capture assist (kata w131, ycv1 §4b): reached only when
 		// caddy.domain was blank, so the base domain is gathered inline instead
@@ -3927,7 +3983,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// textinput fallthrough below -- so its keystrokes reach publishInput
 			// and never leak into labelInput.
 			switch m.mode {
-			case entryPublishDomain, entryPublishHost, entryPublishAuth,
+			case entryPublishHostname, entryPublishDomain, entryPublishHost, entryPublishAuth,
 				entryPublishCredUser, entryPublishCredPass, entryConfirmPublish:
 				return m, m.updatePublishEntry(msg)
 			case entryConfirmPurgeOwned, entryConfirmPurgeForeign, entryConfirmPurgeForeignType:
@@ -6114,7 +6170,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
-		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. Needs caddy.domain/hostname\nconfigured (see docs/caddy-edge.md). Press p again to unpublish.",
+		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5), behind a strong\ny/n confirm naming the exact https://<hostname>. A SECOND public path,\nindependent of and mutually exclusive with funnel — a port can carry\none or the other, never both. Optional basic auth at the edge; :22\nrefused; auto-enables serve first. First publish prompts for\ncaddy.hostname/domain if unset (see docs/caddy-edge.md). Press p\nagain to unpublish.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
@@ -6282,8 +6338,8 @@ func (m model) helpContent() string {
 			"A port can also be exposed to the PUBLIC internet two independent,\n" +
 			"mutually-exclusive ways (opt-in, see below): `P` funnels it via\n" +
 			"tailscale, and `p` publishes it at a custom hostname through your own\n" +
-			"Caddy edge (configure caddy.domain/hostname first — see\n" +
-			"docs/caddy-edge.md)."))
+			"Caddy edge (first publish prompts for caddy.hostname/domain if\n" +
+			"unset — see docs/caddy-edge.md)."))
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Markers"))
 	b.WriteString("\n")
@@ -6969,6 +7025,9 @@ func (m model) renderBottom() string {
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
+	case entryPublishHostname:
+		return helpStyle.Render(fmt.Sprintf("publish :%d — Caddy edge's tailnet hostname (short MagicDNS label, default \"caddy\"): ", m.publishPort)) +
+			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")
 	case entryPublishDomain:
 		return helpStyle.Render(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort)) +
 			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")

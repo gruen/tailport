@@ -451,6 +451,132 @@ func setCaddyDomainNode(doc *yaml.Node, domain string) error {
 	return nil
 }
 
+// SaveCaddyHostname persists ONLY the caddy.hostname field to the on-disk
+// config, leaving every other byte of the file -- comments, formatting, and any
+// top-level keys this build's Config struct does not model -- untouched. It is
+// the write-back primitive the TUI's first-run hostname-capture prompt (kata
+// ztzg) calls after the user types (or accepts the prefilled default for) the
+// Caddy edge's tailnet hostname during a `p` publish, mirroring
+// SaveCaddyDomain (immediately above) field-for-field: the same
+// re-read-into-a-yaml.Node-tree merge (never a struct re-encode, which would
+// drop unknown keys and stale-overwrite a concurrent edit -- the ycv1/OQ3
+// config-clobber history), the same pre-overwrite .bak of the CURRENT on-disk
+// bytes at 0600 (the config can hold a bcrypt auth_hash), the same
+// symlink-safe atomic write via writeConfigAtomic/resolveSaveTarget, and the
+// same no-file-yet fallback that seeds a fresh Default() with the hostname set
+// and skips the .bak. See SaveCaddyDomain's doc comment for the full
+// rationale -- nothing here differs except the field and the merge helper
+// (setCaddyHostnameNode vs setCaddyDomainNode).
+//
+// It persists to DISK ONLY, exactly like SaveCaddyDomain: the caller must
+// mirror the change into its own in-memory cfg.Caddy.Hostname after a
+// successful return. No hostname validation happens here either -- this is a
+// pure persistence primitive, and the caller (the ui's entryPublishHostname
+// step) validates the label (caddyedge.ValidLabel) before calling, and skips
+// the call entirely when the typed value is unchanged from the current one.
+func (c Config) SaveCaddyHostname(hostname string) error {
+	path := c.path
+	if path == "" {
+		var err error
+		path, err = Path("")
+		if err != nil {
+			return err
+		}
+	}
+	target, err := resolveSaveTarget(path)
+	if err != nil {
+		return err
+	}
+
+	current, readErr := os.ReadFile(target)
+	if os.IsNotExist(readErr) {
+		// Nothing on disk to merge or back up: seed a fresh default with the
+		// hostname set, matching what a first Save would write (defaults +
+		// caddy comments), and skip the .bak.
+		cfg := Default()
+		cfg.Caddy.Hostname = hostname
+		var root yaml.Node
+		if err := root.Encode(cfg); err != nil {
+			return err
+		}
+		applyCaddyComments(&root)
+		data, err := yaml.Marshal(&root)
+		if err != nil {
+			return err
+		}
+		return writeConfigAtomic(target, data)
+	}
+	if readErr != nil {
+		return readErr
+	}
+
+	// Merge path: parse the current file into a Node tree and set only
+	// caddy.hostname, so comments and unknown/foreign keys are preserved.
+	var root yaml.Node
+	if err := yaml.Unmarshal(current, &root); err != nil {
+		return err
+	}
+	if err := setCaddyHostnameNode(&root, hostname); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(&root)
+	if err != nil {
+		return err
+	}
+
+	// Back up the CURRENT on-disk bytes (0600) BEFORE overwriting, so a
+	// failure or a bad merge is recoverable and the backup never leaks a hash.
+	if err := writeConfigAtomic(target+".bak", current); err != nil {
+		return err
+	}
+	return writeConfigAtomic(target, data)
+}
+
+// setCaddyHostnameNode mutates a parsed config Node tree in place so that
+// caddy.hostname equals hostname, touching nothing else. Mirrors
+// setCaddyDomainNode exactly -- see its comment for the empty-caddy-block and
+// non-mapping-caddy edge cases -- only the target key differs.
+func setCaddyHostnameNode(doc *yaml.Node, hostname string) error {
+	root := documentRootMapping(doc)
+	caddy := mappingValueNode(root, "caddy")
+	switch {
+	case caddy == nil:
+		caddy = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "caddy"},
+			caddy,
+		)
+	case caddy.Kind != yaml.MappingNode:
+		// An empty `caddy:` block parses to a null scalar -- convert it in
+		// place to an empty mapping so the hostname key has somewhere to land.
+		// Any non-null, non-mapping value is malformed; refuse rather than
+		// silently overwrite whatever the user put there.
+		if caddy.Kind == yaml.ScalarNode && (caddy.Tag == "!!null" || (caddy.Tag == "" && caddy.Value == "")) {
+			caddy.Kind = yaml.MappingNode
+			caddy.Tag = "!!map"
+			caddy.Value = ""
+			caddy.Content = nil
+		} else {
+			return fmt.Errorf("config: caddy is not a mapping (found %s); refusing to overwrite it", caddy.Tag)
+		}
+	}
+	if v := mappingValueNode(caddy, "hostname"); v != nil {
+		// Update in place; reset Style so a real hostname renders plain the
+		// way an encoded struct would, rather than inheriting a quoted style.
+		v.Kind = yaml.ScalarNode
+		v.Tag = "!!str"
+		v.Value = hostname
+		v.Style = 0
+	} else {
+		caddy.Content = append(caddy.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "hostname"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: hostname},
+		)
+	}
+	applyCaddyComments(root)
+	return nil
+}
+
 // documentRootMapping returns the mapping node setCaddyDomainNode should mutate:
 // the content of a DocumentNode (the normal yaml.Unmarshal shape), a bare
 // MappingNode as-is, or -- for an empty/whitespace-only file that parsed to a
