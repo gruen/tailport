@@ -568,7 +568,8 @@ fly ips allocate-v6                                        # free, dedicated by 
 fly secrets set TS_AUTHKEY=tskey-auth-...                  # the key from the ACL step (Fly-side only)
 fly deploy                                                 # builds the image and boots it (entrypoint templates admin.origins from env)
 # NO `fly certs add` / no Fly certificate: raw TCP passthrough means Caddy issues
-# and renews each published hostname's TLS cert itself via Let's Encrypt (ACME).
+# and renews each published hostname's TLS cert itself via its default ACME
+# issuers (Let's Encrypt, ZeroSSL fallback) when the route is published.
 fly logs                                                   # follow: tailscaled → up → serve → templating → caddy run
 fly ips list                                               # the v4/v6 you point DNS at
 ```

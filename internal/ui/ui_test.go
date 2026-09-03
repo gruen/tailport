@@ -4025,7 +4025,7 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 // that behavior instead.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
-	const width = 65 // packed floor is 58 wide; Favorites' fold needs >=70
+	const width = 65 // packed floor is 63 wide; Favorites' fold needs >=75
 	m.help.Width = width
 	m.width = width
 
@@ -4132,9 +4132,10 @@ func TestBottomBarGridFolds(t *testing.T) {
 	m := New(config.Config{})
 
 	// Floor: below the fold threshold (Favorites' fold needs total width
-	// >=70; see the 58-wide packed floor in TestBottomBarNarrowFallback), the
-	// grid is the exact packed layout -- header + 5 rows (Favorites, the
-	// tallest group unfolded, is f/u/n/c/l).
+	// >=75; see the 63-wide packed floor in TestBottomBarNarrowFallback -- both
+	// grew with the longer "Serve Toggles" labels), the grid is the exact packed
+	// layout -- header + 5 rows (Favorites, the tallest group unfolded, is
+	// f/u/n/c/l).
 	m.help.Width, m.width = 65, 65
 	floor := stripANSI(m.renderLegend())
 	floorLines := strings.Split(floor, "\n")
@@ -4142,12 +4143,12 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Fatalf("floor (width 65) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
 	}
 
-	// Wide: 100 cols is enough surplus to fold Favorites (tallest, 5 rows),
-	// then Serve Toggles and View (tied at 3, Serve Toggles first since it's
-	// earlier in group order), but not App (2 rows, tried last) -- folding it would push
-	// the grid past 100. Folding SHORTENS the bar: Favorites' fold (ceil(5/2)
-	// = 3 rows) is now the tallest group, so header+3 = 4 lines, fewer than
-	// the floor's 6 -- not just wider-gapped.
+	// Wide: 100 cols is enough surplus to fold Favorites (tallest, 5 rows) and
+	// then Serve Toggles (4 bindings here -- Clean is contextual/absent -- tried
+	// next), but NOT View (3 rows; folding it needs >=107, checked below) or App
+	// (tried last). Folding SHORTENS the bar: Favorites' fold (ceil(5/2) = 3
+	// rows) is now the tallest group, so header+3 = 4 lines, fewer than the
+	// floor's 6 -- not just wider-gapped.
 	m.help.Width, m.width = 100, 100
 	wide := stripANSI(m.renderLegend())
 	wideLines := strings.Split(wide, "\n")
@@ -4189,6 +4190,16 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// so it stays a single unfolded column: help and quit on SEPARATE rows.
 	if r1, r2 := lineOf(wideLines, "? help"), lineOf(wideLines, "q quit"); r1 < 0 || r2 < 0 || r1 == r2 {
 		t.Errorf("App should NOT fold at width 100 (no surplus left after the other 3 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
+	}
+
+	// View folds only once there's room for it (the wider "Serve Toggles" labels
+	// pushed its threshold to >=107, past the 100 above). At 110 its 3 items
+	// split column-major: "/ filter" beside "r refresh" on one row, "a switch
+	// view" below. (roborev 95j1: 100 no longer exercised this.)
+	m.help.Width, m.width = 110, 110
+	w110 := strings.Split(stripANSI(m.renderLegend()), "\n")
+	if r1, r2 := lineOf(w110, "/ filter"), lineOf(w110, "r refresh"); r1 < 0 || r1 != r2 {
+		t.Errorf("View should fold / filter and r refresh onto the same row at width 110; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w110, "\n"))
 	}
 
 	// Ceiling: a very wide terminal folds ALL FOUR groups, App included,
@@ -4289,7 +4300,7 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	// The 4-column grid is 58 cells wide; 50 forces the wrapped fallback.
+	// The 4-column grid is 63 cells wide; 50 forces the wrapped fallback.
 	const width = 50
 	m := New(config.Config{})
 	m.help.Width = width
@@ -4424,7 +4435,7 @@ func TestLegendSizingNoClip(t *testing.T) {
 		{"wide/no-dangling", 100, 24, false, false},
 		{"wide/dangling", 100, 24, true, true},
 		{"wide/dangling-appears-after-resize", 100, 24, false, true},
-		// Below the 58-wide grid threshold, so these exercise the wrapped fallback.
+		// Below the 63-wide grid threshold, so these exercise the wrapped fallback.
 		{"narrow/no-dangling", 50, 24, false, false},
 		{"narrow/dangling", 50, 24, true, true},
 		{"narrow/dangling-appears-after-resize", 50, 24, false, true},
@@ -6303,6 +6314,43 @@ func TestPublishUnpublishHint(t *testing.T) {
 	narrow.availDescWidth = lipgloss.Width(baseDesc) + lipgloss.Width(unpublishHint) - 1
 	if got := narrow.plainDescription(); got != baseDesc {
 		t.Errorf("one-cell-too-narrow plainDescription() = %q, want the bare base %q (hint omitted, never truncated)", got, baseDesc)
+	}
+}
+
+// TestPublishHintRefreshesOnResize is the model-level companion to
+// TestPublishUnpublishHint (roborev hctg): it proves the WindowSizeMsg handler
+// REBUILDS items, so the reachPublish "· p to unpublish" hint appears/disappears
+// as the terminal crosses the fit threshold -- not only on the next poll/nav
+// rebuild. (A unit test on portItem.plainDescription can't catch a missing
+// WindowSizeMsg rebuild; this can.)
+func TestPublishHintRefreshesOnResize(t *testing.T) {
+	m := newPublishModel(t, nil)
+	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
+
+	rowDesc := func(m model) string {
+		for _, it := range m.list.Items() {
+			if p, ok := it.(portItem); ok && p.publishHostname != "" {
+				return p.plainDescription()
+			}
+		}
+		return ""
+	}
+
+	// A width where the row is single-column and wide enough for the hint. (Note
+	// the port list goes MULTI-column at very wide terminals, which SHRINKS
+	// per-row description width -- so "wide enough" is ~80, not 200.)
+	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = m2.(model)
+	if d := rowDesc(m); !strings.Contains(d, unpublishHint) {
+		t.Errorf("after fit-width resize, published row = %q, want the %q hint", d, unpublishHint)
+	}
+
+	// Narrow: resizing must DROP the hint immediately -- the WindowSizeMsg rebuild
+	// is what refreshes availDescWidth; without it the stale hint would remain.
+	m2, _ = m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	m = m2.(model)
+	if d := rowDesc(m); strings.Contains(d, unpublishHint) {
+		t.Errorf("after narrow resize, published row = %q, want the hint dropped", d)
 	}
 }
 
