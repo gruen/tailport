@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  # Dry-run (kata gghj #4): `gh workflow run build.yml --ref main` (or the
+  # Actions tab) builds the FULL release matrix + checksums so a release build
+  # can be validated on main BEFORE tagging. The publish jobs (release/aur/brew)
+  # are each gated to a real tag push and skip on a dispatch, so a dry-run
+  # produces downloadable artifacts but ships nothing.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -72,6 +78,10 @@ jobs:
 
   release:
     needs: build
+    # Publish only on a real tag push -- a workflow_dispatch dry-run stops after
+    # `build`. Each publish job carries this guard independently (defensive: a
+    # dry-run must never reach the GitHub Release / AUR / tap). (kata gghj #4)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -92,6 +102,7 @@ jobs:
   # being testable by cutting a real tag.
   aur:
     needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # makepkg --printsrcinfo needs a real Arch environment; base-devel carries
     # makepkg but not git/openssh.
@@ -196,6 +207,7 @@ jobs:
   # non-fast-forward. Serialising is cheaper than teaching both to rebase.
   brew:
     needs: [release, aur]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # No Arch container and no makepkg here: the formula is a url + sha256
     # rewrite, and Homebrew infers `version` from the url.
     runs-on: ubuntu-latest
