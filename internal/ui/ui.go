@@ -6999,6 +6999,30 @@ func (m model) renderStatusLine() string {
 	return helpStyle.Render(m.statusText())
 }
 
+// promptLine composes a modal entry prompt so it fits the viewport width (kata
+// 78p6). On a normal-width terminal the one-line form -- styled label + the
+// active input field + a trailing key-hint -- renders inline, exactly as
+// before. When that one line would exceed m.width (a narrow terminal), the label
+// WRAPS to width on its own row(s) and the field drops to the next row, keeping
+// the hint only if that field row still fits; the input field is never truncated
+// (you're typing into it). Everything is derived from m.width at render time, so
+// a resize just re-renders correctly -- View runs after every WindowSizeMsg --
+// with no stored width to keep in sync. label and hint are RAW text (styled here
+// with helpStyle); field is the already-styled input content.
+func (m model) promptLine(label, field, hint string) string {
+	oneLine := helpStyle.Render(label) + field + helpStyle.Render(hint)
+	if m.width <= 0 || lipgloss.Width(oneLine) <= m.width {
+		return oneLine
+	}
+	fieldRow := field
+	if lipgloss.Width(field)+lipgloss.Width(hint) <= m.width {
+		fieldRow += helpStyle.Render(hint)
+	}
+	// helpStyle.Width wraps the (foreground-only) label to the viewport; the
+	// field, which must stay whole, sits on its own row below.
+	return helpStyle.Width(m.width).Render(label) + "\n" + fieldRow
+}
+
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
 // for that flow; otherwise it's the status line, with the shortcuts legend on
 // the last row(s). The Favorites|All-ports toggle lives in the top header
@@ -7007,9 +7031,9 @@ func (m model) renderStatusLine() string {
 func (m model) renderBottom() string {
 	switch m.mode {
 	case entryAddPort:
-		return helpStyle.Render("add port to favorites: ") + m.portInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
+		return m.promptLine("add port to favorites: ", m.portInput.View(), "  (enter: confirm, esc: cancel)")
 	case entryLabel:
-		return helpStyle.Render(fmt.Sprintf("label :%d: ", m.labelPort)) + m.labelInput.View() + helpStyle.Render("  (enter: confirm, esc: cancel)")
+		return m.promptLine(fmt.Sprintf("label :%d: ", m.labelPort), m.labelInput.View(), "  (enter: confirm, esc: cancel)")
 	case entryConfirmClean:
 		targets := make([]string, len(m.cleanTargets))
 		for i, p := range m.cleanTargets {
@@ -7039,27 +7063,25 @@ func (m model) renderBottom() string {
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
 	case entryPublishHostname:
-		return helpStyle.Render(fmt.Sprintf("publish :%d — Caddy edge's tailnet hostname (short MagicDNS label, default \"caddy\"): ", m.publishPort)) +
-			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")
+		return m.promptLine(fmt.Sprintf("publish :%d — Caddy edge's tailnet hostname (short MagicDNS label, default \"caddy\"): ", m.publishPort),
+			m.publishInput.View(), "  (enter: save & next, esc: cancel)")
 	case entryPublishDomain:
-		return helpStyle.Render(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort)) +
-			m.publishInput.View() + helpStyle.Render("  (enter: save & next, esc: cancel)")
+		return m.promptLine(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort),
+			m.publishInput.View(), "  (enter: save & next, esc: cancel)")
 	case entryPublishHost:
 		// The input holds only the editable label; render the locked ".<domain>"
 		// suffix contiguously after it (plain, same style as typed text) so it
 		// reads as one field with the cursor before the first dot -- the suffix
 		// can't be deleted because it isn't in the buffer.
-		return helpStyle.Render(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort)) +
-			m.publishInput.View() + "." + m.cfg.Caddy.Domain + helpStyle.Render("  (enter: next, esc: cancel)")
+		return m.promptLine(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort),
+			m.publishInput.View()+"."+m.cfg.Caddy.Domain, "  (enter: next, esc: cancel)")
 	case entryPublishAuth:
 		return helpStyle.Render(fmt.Sprintf("protect :%d behind basic auth at the edge? ", m.publishPort)) +
 			helpStyle.Render("(y: yes / n: no auth / esc: cancel)")
 	case entryPublishCredUser:
-		return helpStyle.Render("basic-auth username: ") + m.publishInput.View() +
-			helpStyle.Render("  (enter: next, esc: cancel)")
+		return m.promptLine("basic-auth username: ", m.publishInput.View(), "  (enter: next, esc: cancel)")
 	case entryPublishCredPass:
-		return helpStyle.Render("basic-auth password: ") + m.publishInput.View() +
-			helpStyle.Render("  (enter: confirm, esc: cancel)")
+		return m.promptLine("basic-auth password: ", m.publishInput.View(), "  (enter: confirm, esc: cancel)")
 	case entryConfirmPublish:
 		url := "https://" + m.publishHostname
 		lines := []string{

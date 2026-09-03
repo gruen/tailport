@@ -6235,6 +6235,75 @@ func TestPublishHostnameBlankStoredAcceptsDefaultOnEnter(t *testing.T) {
 	}
 }
 
+// TestEntryPromptsFitViewport: the modal setup prompts must never render a line
+// wider than the viewport (kata 78p6). On a narrow terminal an overflowing line
+// re-wraps and shoves the bottom-pinned bar around, so promptLine wraps the
+// label and drops the field (and, if tight, the hint) below it. Drive each
+// prompt through renderBottom across a range of widths and assert every
+// newline-split line fits m.width.
+func TestEntryPromptsFitViewport(t *testing.T) {
+	widths := []int{44, 55, 72, 80, 120}
+	cases := []struct {
+		name  string
+		setup func(m *model)
+	}{
+		{"hostname", func(m *model) {
+			m.mode = entryPublishHostname
+			m.publishPort = 8080
+			m.publishInput.Width = 40
+			m.publishInput.SetValue("caddy")
+		}},
+		{"domain", func(m *model) {
+			m.mode = entryPublishDomain
+			m.publishPort = 8080
+			m.publishInput.Width = 40
+			m.publishInput.SetValue("example.com")
+		}},
+		{"host", func(m *model) {
+			m.mode = entryPublishHost
+			m.publishPort = 8080
+			m.cfg.Caddy.Domain = "ex.io"
+			m.publishInput.Width = 0
+			m.publishInput.SetValue("app")
+		}},
+		{"credUser", func(m *model) {
+			m.mode = entryPublishCredUser
+			m.publishInput.Width = 40
+			m.publishInput.SetValue("alice")
+		}},
+		{"credPass", func(m *model) {
+			m.mode = entryPublishCredPass
+			m.publishInput.Width = 40
+			m.publishInput.SetValue("secret")
+		}},
+		{"label", func(m *model) {
+			m.mode = entryLabel
+			m.labelPort = 8080
+			m.labelInput.Width = 40
+			m.labelInput.SetValue("web")
+		}},
+		{"addPort", func(m *model) {
+			m.mode = entryAddPort
+			m.portInput.Width = 10
+			m.portInput.SetValue("9000")
+		}},
+	}
+	for _, w := range widths {
+		for _, tc := range cases {
+			m := newPublishModel(t, nil)
+			m.width = w
+			m.height = 24
+			tc.setup(&m)
+			out := m.renderBottom()
+			for i, line := range strings.Split(out, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Errorf("%s @ width %d: line %d is %d wide (> %d): %q", tc.name, w, i, lw, w, line)
+				}
+			}
+		}
+	}
+}
+
 // TestPublishHostnameCaptureSkipsWriteWhenUnchanged: accepting the prefilled
 // default hostname unedited must NOT write to disk at all -- no needless .bak,
 // no SaveCaddyHostname call (kata ztzg).
