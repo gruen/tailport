@@ -6242,7 +6242,10 @@ func TestPublishHostnameBlankStoredAcceptsDefaultOnEnter(t *testing.T) {
 // prompt through renderBottom across a range of widths and assert every
 // newline-split line fits m.width.
 func TestEntryPromptsFitViewport(t *testing.T) {
-	widths := []int{44, 55, 72, 80, 120}
+	// Includes sub-40-column terminals (the fixed 40-wide inputs must scroll, not
+	// overflow) and a published hostname longer than the viewport, both of which
+	// fitField bounds (roborev a05w).
+	widths := []int{20, 30, 44, 55, 72, 80, 120}
 	cases := []struct {
 		name  string
 		setup func(m *model)
@@ -6252,6 +6255,16 @@ func TestEntryPromptsFitViewport(t *testing.T) {
 			m.publishPort = 8080
 			m.publishInput.Width = 40
 			m.publishInput.SetValue("caddy")
+		}},
+		{"host-long", func(m *model) {
+			// A published hostname far longer than the viewport: the long label
+			// must scroll inside the field. Domain kept short so the immutable
+			// suffix isn't itself wider than the narrowest test width.
+			m.mode = entryPublishHost
+			m.publishPort = 8080
+			m.cfg.Caddy.Domain = "ex.io"
+			m.publishInput.Width = 0
+			m.publishInput.SetValue("a-really-long-service-name-that-overflows-a-normal-terminal")
 		}},
 		{"domain", func(m *model) {
 			m.mode = entryPublishDomain

@@ -7023,6 +7023,48 @@ func (m model) promptLine(label, field, hint string) string {
 	return helpStyle.Width(m.width).Render(label) + "\n" + fieldRow
 }
 
+// fitField renders a modal input for a prompt row, bounding it to the viewport
+// so a value (or the publish host step's locked ".<domain>" suffix) longer than
+// the terminal scrolls INSIDE the field rather than overflowing the line (kata
+// 78p6 / roborev a05w). suffix is plain text appended after the input. The
+// input's render width is only ever REDUCED to fit -- never grown -- so a
+// normal, wide terminal renders exactly as before. An immutable suffix wider
+// than the whole viewport (a domain longer than the terminal) is the one thing
+// that can't be shrunk -- truncating it would hide which domain you're
+// publishing under -- so it sets the practical floor.
+func (m model) fitField(in textinput.Model, suffix string) string {
+	if m.width > 0 {
+		// Width bounds the VALUE cells; the textinput also renders its prompt
+		// glyph and a trailing block-cursor cell on top, so leave room for both.
+		avail := m.width - lipgloss.Width(suffix) - lipgloss.Width(in.Prompt) - 1
+		if avail < 1 {
+			avail = 1
+		}
+		bounded := false
+		switch {
+		case in.Width == 0:
+			// Content-sized: only bound it when content + suffix would overflow;
+			// then a fixed width makes the textinput scroll to keep the cursor
+			// visible.
+			if lipgloss.Width(in.View())+lipgloss.Width(suffix) > m.width {
+				in.Width = avail
+				bounded = true
+			}
+		case in.Width > avail:
+			in.Width = avail
+			bounded = true
+		}
+		if bounded {
+			// textinput computes its horizontal scroll window when the value or
+			// cursor moves, not when Width is set after the fact -- nudge the
+			// cursor so the new width actually takes effect and the tail (where
+			// the cursor and the locked suffix live) stays visible.
+			in.CursorEnd()
+		}
+	}
+	return in.View() + suffix
+}
+
 // renderBottom builds the bottom bar. In a modal entry mode it's the prompt
 // for that flow; otherwise it's the status line, with the shortcuts legend on
 // the last row(s). The Favorites|All-ports toggle lives in the top header
@@ -7031,9 +7073,9 @@ func (m model) promptLine(label, field, hint string) string {
 func (m model) renderBottom() string {
 	switch m.mode {
 	case entryAddPort:
-		return m.promptLine("add port to favorites: ", m.portInput.View(), "  (enter: confirm, esc: cancel)")
+		return m.promptLine("add port to favorites: ", m.fitField(m.portInput, ""), "  (enter: confirm, esc: cancel)")
 	case entryLabel:
-		return m.promptLine(fmt.Sprintf("label :%d: ", m.labelPort), m.labelInput.View(), "  (enter: confirm, esc: cancel)")
+		return m.promptLine(fmt.Sprintf("label :%d: ", m.labelPort), m.fitField(m.labelInput, ""), "  (enter: confirm, esc: cancel)")
 	case entryConfirmClean:
 		targets := make([]string, len(m.cleanTargets))
 		for i, p := range m.cleanTargets {
@@ -7064,24 +7106,24 @@ func (m model) renderBottom() string {
 		return strings.Join(lines, "\n")
 	case entryPublishHostname:
 		return m.promptLine(fmt.Sprintf("publish :%d — Caddy edge's tailnet hostname (short MagicDNS label, default \"caddy\"): ", m.publishPort),
-			m.publishInput.View(), "  (enter: save & next, esc: cancel)")
+			m.fitField(m.publishInput, ""), "  (enter: save & next, esc: cancel)")
 	case entryPublishDomain:
 		return m.promptLine(fmt.Sprintf("publish :%d — set your public base domain: ", m.publishPort),
-			m.publishInput.View(), "  (enter: save & next, esc: cancel)")
+			m.fitField(m.publishInput, ""), "  (enter: save & next, esc: cancel)")
 	case entryPublishHost:
 		// The input holds only the editable label; render the locked ".<domain>"
 		// suffix contiguously after it (plain, same style as typed text) so it
 		// reads as one field with the cursor before the first dot -- the suffix
 		// can't be deleted because it isn't in the buffer.
 		return m.promptLine(fmt.Sprintf("publish :%d — public hostname: ", m.publishPort),
-			m.publishInput.View()+"."+m.cfg.Caddy.Domain, "  (enter: next, esc: cancel)")
+			m.fitField(m.publishInput, "."+m.cfg.Caddy.Domain), "  (enter: next, esc: cancel)")
 	case entryPublishAuth:
 		return helpStyle.Render(fmt.Sprintf("protect :%d behind basic auth at the edge? ", m.publishPort)) +
 			helpStyle.Render("(y: yes / n: no auth / esc: cancel)")
 	case entryPublishCredUser:
-		return m.promptLine("basic-auth username: ", m.publishInput.View(), "  (enter: next, esc: cancel)")
+		return m.promptLine("basic-auth username: ", m.fitField(m.publishInput, ""), "  (enter: next, esc: cancel)")
 	case entryPublishCredPass:
-		return m.promptLine("basic-auth password: ", m.publishInput.View(), "  (enter: confirm, esc: cancel)")
+		return m.promptLine("basic-auth password: ", m.fitField(m.publishInput, ""), "  (enter: confirm, esc: cancel)")
 	case entryConfirmPublish:
 		url := "https://" + m.publishHostname
 		lines := []string{
