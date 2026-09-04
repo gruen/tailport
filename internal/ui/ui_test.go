@@ -1256,7 +1256,7 @@ func TestCopyURL(t *testing.T) {
 	if m.copiedPort != 8080 || m.copiedRouteIdx != 0 {
 		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/0", m.copiedPort, m.copiedRouteIdx)
 	}
-	body, _ := m.bodyLines()
+	body, _, _ := m.bodyLines()
 	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://localhost:8080") {
 		t.Errorf("body = %q, want the localhost URL plus the ✓ copied suffix on the selected route", got)
 	}
@@ -1281,7 +1281,7 @@ func TestCopyURL(t *testing.T) {
 	if m.copiedPort != 8080 || m.copiedRouteIdx != 1 {
 		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/1 (annotation should move to the tailnet route)", m.copiedPort, m.copiedRouteIdx)
 	}
-	body, _ = m.bodyLines()
+	body, _, _ = m.bodyLines()
 	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://host:8080") {
 		t.Errorf("body = %q, want the tailnet URL plus the ✓ copied suffix", got)
 	}
@@ -1370,7 +1370,7 @@ func TestInlineCopyUniversal(t *testing.T) {
 			if m.copiedPort != tc.port || m.flash != "" {
 				t.Fatalf("%s copy: copiedPort=%d flash=%q, want inline (copiedPort %d, no toast)", tc.name, m.copiedPort, m.flash, tc.port)
 			}
-			body, _ := m.bodyLines()
+			body, _, _ := m.bodyLines()
 			plain := stripANSI(strings.Join(body, "\n"))
 			if !strings.Contains(plain, "✓ copied") || !strings.Contains(plain, tc.wantURL) {
 				t.Errorf("%s body = %q, want the ✓ copied suffix beside %q", tc.name, plain, tc.wantURL)
@@ -1397,7 +1397,7 @@ func TestInlineCopyUniversal(t *testing.T) {
 		if m.copiedPort != 8080 || m.copiedRouteIdx != 2 || m.flash != "" {
 			t.Fatalf("published route copy: copiedPort=%d routeIdx=%d flash=%q, want 8080/2 inline", m.copiedPort, m.copiedRouteIdx, m.flash)
 		}
-		body, _ := m.bodyLines()
+		body, _, _ := m.bodyLines()
 		if plain := stripANSI(strings.Join(body, "\n")); !strings.Contains(plain, "✓ copied") || !strings.Contains(plain, "https://app.example.com") {
 			t.Errorf("published body = %q, want the ✓ copied suffix beside the public https URL", plain)
 		}
@@ -4835,6 +4835,44 @@ func TestRenderListScrollIndicator(t *testing.T) {
 	}
 	if strings.HasPrefix(bottom, "1–") {
 		t.Errorf("after scrolling to the end the range should no longer start at 1; got %q", bottom)
+	}
+}
+
+// TestScrollTopHeaderVisible guards the v0.2.3 fix for the scroll-to-top header
+// drop: on an OVERFLOWING list, scrolling back to the very top must keep the
+// first record's HEADER on screen, not just its first (selectable) route.
+// ensureRouteVisible used to anchor the viewport top on the selected route line
+// -- one row BELOW the header -- so the offset floored there and the first
+// record's header (usually :22 in the real app) fell off the top.
+func TestScrollTopHeaderVisible(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m = res.(model)
+
+	// Scroll to the bottom, then back to the very top.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m = res.(model)
+
+	if m.scrollOff != 0 {
+		t.Errorf("after scrolling back to the top, scrollOff = %d, want 0 (the first header must sit at the very top)", m.scrollOff)
+	}
+	firstLine := stripANSI(strings.Split(m.renderList(), "\n")[0])
+	// The first record's HEADER carries both the port and its process name;
+	// a route sub-row carries the name of neither. proc0 in the top line proves
+	// the header wasn't clipped.
+	if !strings.Contains(firstLine, ":3000") || !strings.Contains(firstLine, "proc0") {
+		t.Errorf("top line = %q, want the :3000 record header (with its name proc0) visible, not a clipped route row", firstLine)
 	}
 }
 

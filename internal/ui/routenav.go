@@ -167,9 +167,9 @@ func (m *model) jumpService(delta int) {
 // currently-selected route (-1 when the list is empty). It is the SINGLE layout
 // shared by the renderer (renderList) and the scroll-keeper (ensureRouteVisible),
 // so the two can never disagree about where a given route sits.
-func (m model) bodyLines() (lines []string, selLine int) {
+func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 	items := m.list.VisibleItems()
-	selLine = -1
+	headerLine, selLine = -1, -1
 	cur := m.list.Index()
 	for i, it := range items {
 		pi, ok := it.(portItem)
@@ -201,11 +201,12 @@ func (m model) bodyLines() (lines []string, selLine int) {
 			lines = append(lines, "") // blank separator between records
 		}
 		if i == cur {
-			selLine = len(lines) + 1 + b.selectedRoute // +1 for the header line
+			headerLine = len(lines)
+			selLine = headerLine + 1 + b.selectedRoute // +1 for the header line
 		}
 		lines = append(lines, renderServiceBlock(b)...)
 	}
-	return lines, selLine
+	return lines, headerLine, selLine
 }
 
 // ensureRouteVisible nudges m.scrollOff just enough to keep the selected route
@@ -215,12 +216,25 @@ func (m *model) ensureRouteVisible() {
 		return
 	}
 	h := m.listBodyHeight()
-	lines, selLine := m.bodyLines()
+	lines, headerLine, selLine := m.bodyLines()
 	if selLine >= 0 {
-		if selLine < m.scrollOff {
-			m.scrollOff = selLine
-		} else if selLine >= m.scrollOff+h {
+		// Scroll DOWN just enough if the selected route sits below the viewport.
+		if selLine >= m.scrollOff+h {
 			m.scrollOff = selLine - h + 1
+		}
+		// Scroll UP to reveal the current service's HEADER (so you always see
+		// which service the selected route belongs to), not merely the selected
+		// route line. Anchoring on the route left the top record's header
+		// (usually :22) clipped when you scrolled to the top: the topmost
+		// SELECTABLE line is the first route, one row BELOW the header, so the
+		// offset floored there and dropped the header. For a block taller than
+		// the viewport we can't show both, so fall back to keeping the route on
+		// screen.
+		if headerLine < m.scrollOff {
+			m.scrollOff = headerLine
+			if selLine >= m.scrollOff+h {
+				m.scrollOff = selLine - h + 1
+			}
 		}
 	}
 	m.scrollOff = clampInt(m.scrollOff, 0, maxInt(0, len(lines)-h))
@@ -232,7 +246,7 @@ func (m *model) ensureRouteVisible() {
 // emits exactly the body-height + pageIndicatorLines rows listBodyHeight
 // reserves. Called from View in place of the retired renderGrid.
 func (m model) renderList() string {
-	lines, _ := m.bodyLines()
+	lines, _, _ := m.bodyLines()
 	h := m.listBodyHeight()
 	off := clampInt(m.scrollOff, 0, maxInt(0, len(lines)-h))
 	end := off + h
