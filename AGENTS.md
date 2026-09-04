@@ -26,14 +26,14 @@ contract. The short version:
   that confirm. (Implemented under kata yt69: the `P` key, `entryConfirmFunnel`
   gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`.)
 - Publish-via-edge is a SECOND public path (the `p` key, kata v1z5; swapped
-  from `P` under vzj4), **independent of and mutually exclusive with Funnel —
-  not layered or ranked above it**. A local port can carry funnel OR publish,
-  never both: the `p` path refuses a funnelled port and the `P` path refuses a
-  Caddy-published port, each instructing the user to remove the other
-  exposure first. There is
-  no implicit precedence between them — dual exposure created outside tailport
-  (a foreign Funnel or a manual Caddy edit) is surfaced as explicit drift (the
-  warning affordance + a "funnelled AND published" description), never silently
+  from `P` under vzj4), **independent of Funnel — not layered or ranked above
+  it, and no longer mutually exclusive with it: kata th05 relaxed that rule
+  (an owner-approved reversal)**. A local port may now carry Funnel AND
+  Publish at once, each its own navigable route sub-row: the `p` path no
+  longer refuses a funnelled port, nor does the `P` path refuse a
+  Caddy-published one — there's no more "remove the other exposure first."
+  There is no implicit precedence between them, and multiple public paths on
+  one port are now a legitimate, expected state, not drift — never silently
   collapsed to one marker. It carries the same funnel-grade guardrails:
   per-service opt-in, a strong y/n confirm naming the exact `https://<hostname>`
   URL, `:22` hard-blocked, ungated de-escalation (an immediate unpublish, no
@@ -69,15 +69,17 @@ contract. The short version:
   session-only `lastPublish` memory, and `caddy.silent_republish` were added
   under kata prp1.)
 - Cloudflare Tunnel is a THIRD public path (the `t` key, kata nc1j),
-  **mutually exclusive with BOTH Funnel and Publish — never layered or
-  ranked above either**. A local port can carry at most one public
-  exposure: `t` refuses an already-funnelled or already-published port, and
-  `P`/`p` each refuse an already-tunnelled one, each instructing the user to
-  remove the other exposure first. Exposure created outside tailport is
-  surfaced as explicit drift (a "funnelled AND tunnelled — remove one"
-  description, extending to "multiple public exposures — remove all but
-  one" when all three collide), never silently collapsed to one marker.
-  `:22` is hard-blocked, same as Funnel/Publish. Two flavours, matching
+  **independent of both Funnel and Publish — never layered or ranked above
+  either, and no longer mutually exclusive with them: kata th05 relaxed that
+  rule (an owner-approved reversal)**. A local port may now carry all three
+  public paths at once, each its own navigable route sub-row: `t` no longer
+  refuses an already-funnelled or already-published port, and `P`/`p` no
+  longer refuse an already-tunnelled one — there's no more "remove the other
+  exposure first." Coexistence across the three public paths is a
+  legitimate, expected state, never silently collapsed to one marker or
+  flagged as drift for simply being plural. `:22` is hard-blocked, same as
+  Funnel/Publish, and each of the three still requires its own strong
+  per-service y/n confirm before going live. Two flavours, matching
   Cloudflare's two account scenarios: a QUICK tunnel needs no account and
   gets a random, ephemeral `*.trycloudflare.com` hostname assigned only
   after cloudflared actually starts — so its confirm CANNOT name the exact

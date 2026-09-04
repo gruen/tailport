@@ -141,12 +141,14 @@ is actually reachable — localhost only, already on your tailnet, or served
 
 | Key | Action |
 | --- | --- |
+| `↑`/`↓`, `j`/`k` | Move the selection between **route** sub-rows — a flattened walk across every service's active routes |
+| `Shift+↑`/`Shift+↓`, `J`/`K` | Jump the selection between **services**, landing on the target service's first route |
 | `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port — only offered for a loopback-bound port; an already-reachable (tailnet/LAN) port shows an info toast instead |
 | `P` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
 | `p` | Publish the selected port to the **public internet** via a Caddy edge (a custom `https://` hostname, no port in the URL), behind a strong y/n confirm (`:22` refused). Press again to unpublish |
 | `e` | Change a published port's hostname or auth without unpublishing it first — runs the same setup flow as `p`, ending in the same confirm |
 | `t` | Tunnel the selected port to the **public internet** via a Cloudflare Tunnel (`cloudflared`), quick (random `*.trycloudflare.com`) or named (your routed hostname). Press again to tear it down. Only offered when `cloudflared` is installed; `:22` refused |
-| `c` | Copy the selected port's URL to the clipboard (via OSC 52, so it works over SSH). It copies the URL for the port's current exposure — a **published** port's public `https://…`, a LAN bind's LAN address, a localhost-only/offline port's `http://localhost:…`, otherwise the tailnet URL (served/tailnet/funnel). The copy is confirmed inline with a ✓, or by a toast naming the exact URL copied |
+| `c` / `y` | Copy the **selected route's** exact URL to the clipboard (via OSC 52, so it works over SSH) — `y` is a yank alias for `c`. Every other action stays service-scoped; only copy acts on the specific route sub-row you've navigated to. The copy is confirmed inline with a ✓ on that route's line, or by a toast (e.g. an `offline` route or a still-starting quick tunnel has no URL yet) |
 | `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
 | `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
 | `n` | Add a port by number to Favorites (even one nothing is listening on yet). It does **not** serve — press `space` there to serve it once its service is up |
@@ -161,16 +163,20 @@ is actually reachable — localhost only, already on your tailnet, or served
 | `?` | Toggle the full help overlay |
 | `q` / `ctrl+c` | Quit |
 
-Each row's leading marker encodes the port's state — listening, served on
-tailnet, public (funnel), or served-but-nothing-listening; see
-[Status markers](#status-markers) below for the exact glyphs. The
-description below the port name spells out who can actually reach it:
-`localhost only` (loopback-bound, unserved), `on tailnet` (already
-reachable — e.g. a wildcard-bound `sshd` on `:22` — no serving needed),
-`local network only` (bound to a specific LAN IP, not the tailnet), the
-served `http://<hostname>:<port>` URL, or the funnelled public HTTPS URL. A
-favorited port additionally shows a star (★). The name shown next
-to a port is its custom label if you've set one, otherwise its resolved
+Each service is shown as a small record: a header line (port number, name,
+★/🔒 badges) followed by one **route** sub-row for every way it's actually
+reachable right now — `localhost` (loopback), `LAN` (bound to a specific LAN
+IP), `tailnet` (already reachable, or served via `tailscale serve`), `ts.net`
+(funnelled), `caddy` (published), and `cloudflare` (tunnelled). A service can
+show several routes at once, and — since the three public paths are
+independent of each other — that includes multiple *public* routes
+simultaneously: a port can be funnelled, published, and tunnelled all at the
+same time, each its own row with its own marker and its own exact URL. A down
+favorite (nothing listening, nothing served) shows a single `offline`
+pseudo-route instead. Every route has its own leading marker encoding its
+type; see [Status markers](#status-markers) below for the exact glyphs. A
+favorited service additionally shows a star (★) on its header. The name shown
+next to a port is its custom label if you've set one, otherwise its resolved
 process name (or `was <name>` for a favorite whose process has since exited)
 — or `?` if that can't be determined, which happens when the port belongs to
 a process owned by a different user (most commonly `root`) than the one
@@ -242,7 +248,7 @@ per port automatically (the name it last saw listening, used for the
 ### Status markers
 
 A top-level `markers` key (or the equivalent `--markers` flag, which wins
-over the config value for that run only) selects how a port's exposure-state
+over the config value for that run only) selects how each route sub-row's
 marker is drawn:
 
 ```yaml
@@ -436,13 +442,12 @@ public trust plane (custom-domain DNS, `:443` ingress, TLS termination and
 certificate issuance/renewal, hostname routing). No Funnel slots, Funnel
 commands, or Tailscale-managed public TLS participate in a publish.
 
-Publishing and Funnel are **mutually exclusive per port**: tailport refuses
-to publish a currently-funnelled port (and refuses to funnel a
-currently-published one), naming the conflicting exposure and asking you to
-remove it first. There is no "publish outranks funnel" — normal use never
-needs to rank them, and dual exposure created outside tailport (a foreign
-tool, or a manual edit) is surfaced as an explicit conflict rather than
-silently picked for you.
+Publishing and Funnel are **independent, not ranked** — and, since kata th05,
+no longer mutually exclusive: a port can be funnelled AND published at the
+same time, each showing as its own route sub-row with its own marker and
+exact URL. There is no "publish outranks funnel" — normal use never needs to
+rank them — and each still requires its own strong per-service confirm before
+going live; `:22` stays hard-blocked from both.
 
 **Setup is a separate, one-time operator task**, not something tailport
 does for you: a Caddy edge deployed and reachable on your tailnet, a
@@ -525,20 +530,18 @@ tunnels — the ones carrying a sentinel `--logfile` flag tailport always
 passes — are tracked this way; a `cloudflared` process started outside
 tailport is left alone entirely, never signalled or touched.
 
-Tunnelling, Funnel, and Publish are **mutually exclusive per port**: a local
-port can carry at most one public exposure. tailport refuses to tunnel an
-already-funnelled or already-published port (and refuses to funnel or
-publish an already-tunnelled one), naming the conflicting exposure and asking
-you to remove it first. As with Funnel/Publish, there is no implicit
-precedence between any of the three — exposure created outside tailport (a
-foreign process, or a manual edit) is surfaced as explicit drift rather than
-silently picked for you: two colliding paths read e.g. "funnelled AND
-tunnelled — remove one", and three collapse to "multiple public exposures —
-remove all but one".
+Tunnelling, Funnel, and Publish are **independent, not ranked** — and, since
+kata th05, no longer mutually exclusive: a port can carry all three public
+exposures at once, each showing as its own route sub-row. There is no
+implicit precedence between any of the three, and multiple public routes on
+one port is a legitimate, expected state, not something tailport flags or
+collapses. Every public path still requires its own strong per-service
+confirm before going live, and `:22` stays hard-blocked from all three.
 
-A tunnelled port is drawn with its own distinct marker (`◈` / ☁️) — see
-[Status markers](#status-markers) above — and its description shows the
-exact public URL once known: `https://<host> · tunnelled to the internet`.
+A tunnelled service shows its own `cloudflare` route sub-row with a distinct
+marker (`◈` / ☁️) — see [Status markers](#status-markers) above — with the
+exact public URL once known, alongside any other active routes for that same
+service.
 
 ### The tunnel toggle (`t`)
 
