@@ -73,18 +73,18 @@ Empty means "cut the next patch off the newest tag above."
 **1. Pick the version.** Default to the next PATCH. Only depart when the user
 says so or the scope forces it, and say why.
 
-tailport is pre-1.0, and `install.sh`'s `is_breaking` gives that real teeth:
+`install.sh`'s `is_breaking` gives majors real teeth (mmgv):
 
-- **PATCH** (`0.1.x` → `0.1.y`) is non-breaking. Existing installs upgrade on
-  their own. This is the normal path.
-- **MINOR** (`0.x` → `0.y`) pre-1.0, or any **MAJOR**, is treated as
-  **BREAKING**. `install.sh` *refuses* the upgrade until the user sets
-  `TAILPORT_ALLOW_BREAKING=1` by hand, on every host.
+- **PATCH** (`0.1.x` → `0.1.y`) and **MINOR** (`0.x` → `0.y`) are both
+  non-breaking. Existing installs upgrade on their own. This is the normal path.
+- Only a **MAJOR** bump (`X` → `Y`) is treated as **BREAKING**: `install.sh`
+  *refuses* the upgrade until the user sets `TAILPORT_ALLOW_BREAKING=1` by hand,
+  on every host.
 
-So a minor bump is not a bigger patch — it's a wall the whole fleet has to
-climb over manually. Never pick one to signal that a release feels
-substantial. If the user asks for one, confirm they mean the upgrade refusal,
-naming that cost.
+A minor bump upgrades the fleet cleanly now, so pick the bump for what actually
+changed. A major is the wall the whole fleet has to climb over manually —
+reserve it for a genuine break, and if the user asks for one, confirm they mean
+the upgrade refusal, naming that cost.
 
 **2. Check the gate.** The owner's standing rule, recorded in `j68f`: *bump
 patch after all < p3 done*. The query is injected above; `count=0` means clear.
@@ -320,7 +320,7 @@ Two things v0.1.6 learned the hard way, both worth knowing before you debug:
 - a real blocker is open (see the gate's two blind spots above)
 - the tag already exists
 - the build fails
-- the bump would be minor/major — i.e. breaking, per step 1
+- the bump would be major — i.e. breaking, per step 1
 - there's nothing but docs/packaging/tooling since the last tag. Say the cut
   would be empty and ask whether to hold. Thin isn't automatically wrong —
   `5qzt` argues for cutting a single string fix precisely because an

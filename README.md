@@ -112,13 +112,14 @@ dotfiles bootstrap:
 - If the upgrade (or downgrade) isn't breaking, it backs up the previous
   binary to `tailport.bak` next to the install, installs the new one, and
   prints the old → new version.
-- If the transition **is** breaking — a major version change, or, while
-  tailport is still pre-1.0, a minor version change — the script refuses to
-  install and exits non-zero, leaving the existing binary untouched. Review
-  the release notes, then opt in explicitly with `TAILPORT_ALLOW_BREAKING=1`
-  to install anyway (this also backs up the old binary first). This gate is
-  skipped, with a note, only when the currently-installed binary's version
-  can't be determined (e.g. it predates `--version` support).
+- If the transition **is** breaking — a **major** version change (a `0.x`
+  minor bump is *not* breaking; it upgrades like any other) — the script
+  refuses to install and exits non-zero, leaving the existing binary
+  untouched. Review the release notes, then opt in explicitly with
+  `TAILPORT_ALLOW_BREAKING=1` to install anyway (this also backs up the old
+  binary first). This gate is skipped, with a note, only when the
+  currently-installed binary's version can't be determined (e.g. it predates
+  `--version` support).
 
 A rolling backup (`~/.local/bin/tailport.bak`, or `$TAILPORT_INSTALL_DIR/tailport.bak`)
 is kept whenever the script replaces an existing install; roll back with

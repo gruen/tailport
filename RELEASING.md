@@ -16,20 +16,21 @@ cross-reference the linked files for the authoritative behavior.
 tailport is pre-1.0, so `install.sh` treats version bumps specially
 (`is_breaking` in `install.sh`):
 
-- **PATCH** (`0.1.x` → `0.1.y`): not breaking. `install.sh` upgrades
-  existing installs automatically.
-- **MINOR** (`0.x` → `0.y`) while still pre-1.0, or any **MAJOR** bump: is
-  treated as **BREAKING**. `install.sh` refuses the upgrade unless the user
-  sets `TAILPORT_ALLOW_BREAKING=1`:
+- **PATCH** (`0.1.x` → `0.1.y`) and **MINOR** (`0.x` → `0.y`): not breaking.
+  `install.sh` upgrades existing installs automatically (mmgv — a `0.x` minor
+  is a normal upgrade, not a wall).
+- **MAJOR** (`X` → `Y`) only: treated as **BREAKING**. `install.sh` refuses the
+  upgrade unless the user sets `TAILPORT_ALLOW_BREAKING=1`:
   ```
   tailport: refusing breaking upgrade v$installed_ver -> v$target_ver
   ...
   tailport: re-run with TAILPORT_ALLOW_BREAKING=1 to install anyway.
   ```
 
-Pick the bump accordingly — a plain fix/feature release should stay a PATCH
-so existing fleet installs upgrade without intervention. See README.md
-around lines 90-104 for the user-facing description of the same behavior.
+Pick the bump for what changed — only a major version gates the fleet behind a
+manual opt-in; patch and minor both upgrade without intervention. See
+README.md around lines 90-104 for the user-facing description of the same
+behavior.
 
 ## 3. Tag and push
 

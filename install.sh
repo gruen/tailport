@@ -12,10 +12,10 @@
 #
 # Version-aware upgrades: if a tailport is already installed at $dest, its
 # version and the freshly-downloaded target's version are both read via
-# `--version` and compared (semver, 0.x convention -- see is_breaking below).
-# A same-version re-run is a no-op. A "breaking" transition (major version
-# change, or a 0.x minor change, in EITHER direction) is refused unless
-# TAILPORT_ALLOW_BREAKING=1 is set in the environment. Any replace is
+# `--version` and compared (semver -- see is_breaking below). A same-version
+# re-run is a no-op. A "breaking" transition (a MAJOR version change, in EITHER
+# direction) is refused unless TAILPORT_ALLOW_BREAKING=1 is set in the
+# environment; a 0.x minor change auto-upgrades like any other. Any replace is
 # preceded by a single rolling backup at $dest.bak.
 set -eu
 
@@ -137,16 +137,17 @@ read_version() {
 # is_breaking INSTALLED TARGET
 # Exit 0 if the semver transition INSTALLED -> TARGET is breaking, exit 1
 # otherwise. Both arguments are plain "X.Y.Z" strings. Breaking (applies in
-# either direction) iff the major version differs, or both sides are pre-1.0
-# (major 0) and the minor version differs -- the 0.x convention, matching
-# internal/selfupdate's semver semantics for `tailport update`.
+# either direction) iff the MAJOR version differs -- and only that. A 0.x minor
+# change (e.g. 0.1.x -> 0.2.0) is a normal, auto-upgrading transition, not a
+# breaking one (mmgv). Version parsing matches internal/selfupdate's semver
+# semantics for `tailport update`; the breaking classification is install.sh's
+# own (selfupdate has no breaking gate).
 is_breaking() {
 	awk -v inst="$1" -v tgt="$2" '
 		BEGIN {
 			split(inst, i, ".")
 			split(tgt, t, ".")
 			if (i[1] != t[1]) exit 0
-			if (i[1] == 0 && t[1] == 0 && i[2] != t[2]) exit 0
 			exit 1
 		}
 	'
@@ -205,7 +206,7 @@ fi
 
 if [ "$breaking" -eq 1 ] && [ "${TAILPORT_ALLOW_BREAKING:-}" != "1" ]; then
 	echo "tailport: refusing breaking upgrade v$installed_ver -> v$target_ver" >&2
-	echo "tailport: this is a breaking change (major version, or a 0.x minor change) -- review the release notes before upgrading:" >&2
+	echo "tailport: this is a breaking change (major version change) -- review the release notes before upgrading:" >&2
 	echo "tailport:   https://github.com/${repo}/releases" >&2
 	echo "tailport: re-run with TAILPORT_ALLOW_BREAKING=1 to install anyway." >&2
 	exit 1
