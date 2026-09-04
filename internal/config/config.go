@@ -72,6 +72,27 @@ type CaddyConfig struct {
 	SilentRepublish bool `yaml:"silent_republish"`
 }
 
+// CloudflaredConfig holds the settings for exposing a local port to the
+// public internet through a Cloudflare Tunnel run by the `cloudflared` CLI
+// (the `t` key, kata nc1j). Like CaddyConfig -- and unlike PortMeta entries --
+// this block is ALWAYS present in the saved config (see Save and
+// applyCloudflaredComments) so the knobs are discoverable without reading
+// docs. Both fields are optional: a quick (unauthenticated) tunnel needs no
+// configuration at all, and the whole feature stays dormant unless the
+// `cloudflared` binary is actually installed.
+type CloudflaredConfig struct {
+	// Binary is an optional path to the cloudflared executable. Blank (the
+	// default) means tailport looks up `cloudflared` on $PATH.
+	Binary string `yaml:"binary"`
+	// Domain is an optional public base domain used only to PREFILL the
+	// hostname prompt when starting a NAMED (authenticated) tunnel. Blank by
+	// default. It is a convenience only: quick (unauthenticated) tunnels
+	// ignore it entirely, and the named path still lets you type any hostname
+	// you have already routed to a pre-provisioned tunnel via
+	// `cloudflared tunnel route dns`.
+	Domain string `yaml:"domain"`
+}
+
 // applyDefaults fills any zero-value field that has a sensible default,
 // leaving Domain blank (see the Domain doc comment -- no safe universal
 // value exists for it) and AuthUser/AuthHash blank (no auth by default).
@@ -94,6 +115,10 @@ type Config struct {
 	// present in the saved file with defaults + explanatory comments --
 	// see CaddyConfig and applyCaddyComments.
 	Caddy CaddyConfig `yaml:"caddy"`
+	// Cloudflared holds the publish-via-Cloudflare-Tunnel settings (kata
+	// nc1j). Always present in the saved file with defaults + explanatory
+	// comments -- see CloudflaredConfig and applyCloudflaredComments.
+	Cloudflared CloudflaredConfig `yaml:"cloudflared"`
 	// Markers selects the EXPOSURE-marker glyph style (qwcw): the port-state
 	// moon-phase ramp 🌕 localhost/🌔 local network/🌒 on tailnet (served or
 	// bound wide)/🌑 funnelled to the internet (plus the off-ramp 🌫️ stale/
@@ -255,6 +280,7 @@ func (c Config) Save() error {
 		return err
 	}
 	applyCaddyComments(&root)
+	applyCloudflaredComments(&root)
 	data, err := yaml.Marshal(&root)
 	if err != nil {
 		return err
@@ -697,6 +723,24 @@ func applyCaddyComments(root *yaml.Node) {
 		"\nSkip the y/n confirm when re-publishing a port already published\n"+
 			"earlier this session (remembered hostname + auth). First publish\n"+
 			"always confirms. Default false (confirm shown).")
+}
+
+// applyCloudflaredComments sets the explanatory head comments on the
+// cloudflared: block's keys. Like applyCaddyComments, these strings are
+// constants tailport owns (not user data), so Save re-applies them on every
+// write, which is what makes them durable across saves that touch fields
+// outside the cloudflared block.
+func applyCloudflaredComments(root *yaml.Node) {
+	cf := mappingValueNode(root, "cloudflared")
+	if cf == nil {
+		return
+	}
+	setKeyHeadComment(cf, "binary",
+		"Optional path to the cloudflared executable. Blank means tailport\nlooks up `cloudflared` on $PATH.")
+	setKeyHeadComment(cf, "domain",
+		"\nOptional public base domain used to prefill the hostname prompt when\n"+
+			"starting a named (authenticated) tunnel. Blank by default; quick\n"+
+			"(unauthenticated) tunnels ignore it.")
 }
 
 // mappingValueNode returns the value node for key within mapping node m, or
