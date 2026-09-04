@@ -143,6 +143,9 @@ is actually reachable — localhost only, already on your tailnet, or served
 | --- | --- |
 | `space` | Toggle `tailscale serve` (tailnet-only) on/off for the selected port — only offered for a loopback-bound port; an already-reachable (tailnet/LAN) port shows an info toast instead |
 | `P` | Funnel the selected port to the **public internet** via `tailscale funnel`, behind a strong y/n confirm (`:22` refused). Press again to drop it back to tailnet-served |
+| `p` | Publish the selected port to the **public internet** via a Caddy edge (a custom `https://` hostname, no port in the URL), behind a strong y/n confirm (`:22` refused). Press again to unpublish |
+| `e` | Change a published port's hostname or auth without unpublishing it first — runs the same setup flow as `p`, ending in the same confirm |
+| `t` | Tunnel the selected port to the **public internet** via a Cloudflare Tunnel (`cloudflared`), quick (random `*.trycloudflare.com`) or named (your routed hostname). Press again to tear it down. Only offered when `cloudflared` is installed; `:22` refused |
 | `c` | Copy the selected port's URL to the clipboard (via OSC 52, so it works over SSH). It copies the URL for the port's current exposure — a **published** port's public `https://…`, a LAN bind's LAN address, a localhost-only/offline port's `http://localhost:…`, otherwise the tailnet URL (served/tailnet/funnel). The copy is confirmed inline with a ✓, or by a toast naming the exact URL copied |
 | `C` | Tear down stale forwards — ports still served with nothing listening locally. Offered only when some exist |
 | `x` | Lock / unlock the selected port. A locked port can't be served until unlocked; `:22` is locked by default and unlocking it requires typing `ssh` |
@@ -247,13 +250,14 @@ markers: "" # "" / mono (default) | auto | emoji | ascii
 ```
 
 - unset (`""`, the default) — mono: ○ localhost · ◔ local network ·
-  ◑ on tailnet · ◉ served · ● public (funnel) · ▲ stale (dangling forward) ·
-  ✕ offline.
+  ◑ on tailnet · ◉ served · ● public (funnel) · ◆ public (published) ·
+  ◈ public (cloudflare tunnel) · ▲ stale (dangling forward) · ✕ offline.
 - `auto` — opts into detecting a UTF-8-capable terminal (locale is UTF-8 and
   `TERM` isn't the bare Linux console or `dumb`) and switches to the
   moon-phase emoji ramp there, otherwise falls back to mono: 🌕 localhost ·
   🌔 local network · 🌓 on tailnet · 🌒 served · 🌑 public (funnel) ·
-  🌫️ stale · ✕ offline.
+  🌐 public (published) · ☁️ public (cloudflare tunnel) · 🌫️ stale ·
+  ✕ offline.
 - `emoji` — always the moon-phase ramp above, regardless of terminal.
 - `ascii` — always mono, regardless of terminal (same glyphs as unset).
 
@@ -353,6 +357,53 @@ None of this configures the edge itself — it only tells tailport where an
 you run — Tailscale ACL and auth key, DNS) is a separate one-time operator
 task; see [`docs/caddy-edge.md`](docs/caddy-edge.md).
 
+### Tunnel (Cloudflare)
+
+A `cloudflared` block configures the optional tunnel-to-the-internet path
+(see [Tunnelling to the public internet](#tunnelling-to-the-public-internet-cloudflare-tunnel)
+below). Like the `caddy` block, tailport writes this block in full — with
+visible defaults and explanatory comments — the first time it saves the
+config once the feature is present, so both knobs are discoverable without
+reading docs.
+
+> **Upgraded from an older tailport?** A `config.yaml` written before this
+> feature landed has **no `cloudflared:` block yet** — that's expected. It
+> appears on the next save — any change that writes the file, e.g.
+> favouriting or labelling a port — or just paste the block below in by hand.
+> Unlike `caddy.domain`, `cloudflared.domain` gates nothing: it's a pure
+> convenience prefill, so there's no equivalent of publish's "captures it
+> inline on first use" behavior here.
+
+```yaml
+cloudflared:
+    # Optional path to the cloudflared executable. Blank means tailport
+    # looks up `cloudflared` on $PATH.
+    binary: ""
+
+    # Optional public base domain used to prefill the hostname prompt when
+    # starting a named (authenticated) tunnel. Blank by default; quick
+    # (unauthenticated) tunnels ignore it.
+    domain: ""
+```
+
+- **`binary`** (default `""`, blank) — path to the cloudflared executable.
+  Blank means tailport looks up `cloudflared` on `$PATH`; the whole `t`
+  feature (key, discovery, polling) stays dormant unless it's found there
+  (or at this path).
+- **`domain`** (default `""`, blank) — a public base domain used only to
+  **prefill** the hostname prompt when starting a **named** tunnel (see
+  [The tunnel toggle](#the-tunnel-toggle-t) below). Purely a convenience:
+  leaving it blank doesn't block anything, and a **quick** tunnel ignores it
+  entirely — its hostname is assigned by Cloudflare, not built from this
+  domain.
+
+None of this configures Cloudflare itself — for a named tunnel, logging in
+(`cloudflared tunnel login`), creating the tunnel, and routing its hostname
+(`cloudflared tunnel route dns`) are a separate, one-time operator task;
+tailport only ever *runs* an already-provisioned named tunnel. See
+[Tunnelling to the public internet](#tunnelling-to-the-public-internet-cloudflare-tunnel)
+below.
+
 ## How it works
 
 - Port discovery: `ss -H -t -l -n -p` on Linux, `lsof -iTCP -sTCP:LISTEN -n
@@ -432,6 +483,90 @@ unpublishing it first: `e` always runs the full setup flow (prefilled with
 the port's current/remembered hostname when known), ending in the same y/n
 confirm `p` uses. Confirming replaces the live route with the new
 hostname/auth in place — the port is never briefly unpublished in between.
+
+## Tunnelling to the public internet (Cloudflare Tunnel)
+
+Tailnet `serve`, Funnel, and Publish aren't the only way out to the world:
+tailport can also tunnel a port to the public internet through a
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/),
+run by the `cloudflared` CLI. This is a **third** exposure path, sibling to
+Funnel and Publish rather than layered above or below either — and
+architecturally different from both: cloudflared is a **long-running local
+process** tailport supervises directly, not a remote edge tailport pokes (as
+with Publish) or a Tailscale-managed public ingress slot (as with Funnel).
+The `cloudflared` binary *is* the connector; a tunnel is up only while its
+process stays alive.
+
+The whole feature exists only when `cloudflared` is actually installed:
+tailport detects it once at startup, and when it's absent the `t` key is
+dropped from the bar entirely — no key, no discovery, no polling, zero cost.
+There are two flavors, matching Cloudflare's two account scenarios:
+
+- **Quick tunnel** — no Cloudflare account needed. tailport runs
+  `cloudflared tunnel --url http://localhost:<port>`, which hands back a
+  random `https://<name>.trycloudflare.com` hostname: unauthenticated, and
+  ephemeral — a new hostname every time you start one.
+- **Named tunnel** — for an authenticated account. You've already run
+  `cloudflared tunnel login`, created a tunnel, and routed a stable custom
+  hostname to it (`cloudflared tunnel route dns`) — a separate, one-time
+  operator task, exactly like standing up the Caddy edge, that tailport does
+  not do for you and never automates. tailport only *runs* that
+  pre-provisioned tunnel — `cloudflared tunnel run --url
+  http://localhost:<port> <name>` — bound to your stable hostname. It never
+  mutates your Cloudflare account or DNS.
+
+**Tunnels survive tailport exiting.** cloudflared is started detached, in its
+own session, so quitting the TUI doesn't drop the tunnel — it keeps running
+until you tear it down or kill it yourself. tailport never persists tunnel
+state to disk; instead it reads the OS process table live on every poll, so a
+tunnel started in a previous tailport session is re-discovered the next time
+you launch it and stays re-toggleable with `t`. Only **tailport-owned**
+tunnels — the ones carrying a sentinel `--logfile` flag tailport always
+passes — are tracked this way; a `cloudflared` process started outside
+tailport is left alone entirely, never signalled or touched.
+
+Tunnelling, Funnel, and Publish are **mutually exclusive per port**: a local
+port can carry at most one public exposure. tailport refuses to tunnel an
+already-funnelled or already-published port (and refuses to funnel or
+publish an already-tunnelled one), naming the conflicting exposure and asking
+you to remove it first. As with Funnel/Publish, there is no implicit
+precedence between any of the three — exposure created outside tailport (a
+foreign process, or a manual edit) is surfaced as explicit drift rather than
+silently picked for you: two colliding paths read e.g. "funnelled AND
+tunnelled — remove one", and three collapse to "multiple public exposures —
+remove all but one".
+
+A tunnelled port is drawn with its own distinct marker (`◈` / ☁️) — see
+[Status markers](#status-markers) above — and its description shows the
+exact public URL once known: `https://<host> · tunnelled to the internet`.
+
+### The tunnel toggle (`t`)
+
+`t` behaves differently depending on the port's state:
+
+- **Already tunnelled** — `t` tears the tunnel down immediately. No confirm:
+  reducing exposure is never gated.
+- **Tunnelled earlier this SESSION, then torn down** — tailport remembers
+  that port's mode (and, for a named tunnel, its hostname) in memory only,
+  for as long as the process runs. Pressing `t` again re-raises it, skipping
+  the setup prompts entirely — straight to the same confirm.
+- **Never tunnelled this session** — `t` runs the full setup. If you're
+  logged in to Cloudflare (a credential from `cloudflared tunnel login` is
+  present), you're asked to pick quick or named; choosing named then asks for
+  the hostname you've already routed and the tunnel's name. Without an
+  account, only the quick path exists, so setup skips straight to its
+  confirm.
+
+Every path ends in a y/n confirm before anything goes live, and `:22` (SSH)
+is hard-blocked — the same funnel/publish-grade guardrails. The **quick**
+tunnel's confirm is a deliberate exception to the "always name the exact
+public URL" rule: cloudflared assigns the `*.trycloudflare.com` hostname only
+after the tunnel actually starts, so there is no URL to name in advance. The
+confirm instead names the local port; tailport flashes `starting Cloudflare
+quick tunnel for :<port>…`, and the real `https://…` address appears in the
+row's description a few seconds later, once the next poll picks it up. A
+**named** tunnel's confirm has no such gap — it names the exact
+`https://<hostname>` up front, the same as Publish.
 
 ## Troubleshooting
 

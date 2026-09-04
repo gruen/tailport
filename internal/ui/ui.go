@@ -26,6 +26,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/gruen/tailport/internal/caddyedge"
+	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/clip"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
@@ -101,6 +102,14 @@ var (
 	// blue -- and stays high-contrast (>=4.5:1) on either background so the
 	// "reachable by anyone" signal remains unambiguous.
 	publishMarkerStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#005fd7", Dark: "39"}).Bold(true)
+	// tunnelMarkerStyle colours the TUNNELLED marker (◈) Cloudflare-orange
+	// (kata nc1j) -- a THIRD distinct public marker so funnel's magenta ●,
+	// publish's blue ◆, and a tunnel's orange ◈ are tellable apart at a glance
+	// (the safety-marker mandate). Raw Cloudflare #f38020 fails >=4.5:1 on a
+	// light background (~2:1), so Light uses a deeper orange and Dark uses
+	// xterm 208, both clearing the contrast bar. The hue sits near warnStyle's
+	// amber ▲, but the GLYPH (◈ vs ▲) carries the distinction, not the colour.
+	tunnelMarkerStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#c2410c", Dark: "208"}).Bold(true)
 
 	helpTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#006644", Dark: "42"}).Bold(true)
 	helpKeyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#004a7f", Dark: "81"}).Bold(true)
@@ -165,7 +174,13 @@ type keyMap struct {
 	// Caddy edge (the `p` key, kata v1z5; swapped from `P` under vzj4). It is a
 	// SECOND public path, sibling
 	// to Funnel and mutually exclusive with it per port -- never ranked above.
-	Publish  key.Binding
+	Publish key.Binding
+	// Tunnel exposes a port to the public internet through a Cloudflare Tunnel
+	// run by cloudflared (the `t` key, kata nc1j). A THIRD public path, sibling
+	// to Funnel and Publish and mutually exclusive with both. Only shown in the
+	// bottom bar when cloudflared is installed (barGroups gates it on
+	// cfAvailable); it stays in groups() so the "?" overlay documents it.
+	Tunnel   key.Binding
 	Filter   key.Binding
 	NewPort  key.Binding
 	Label    key.Binding
@@ -186,8 +201,12 @@ type keyMap struct {
 	Copy    key.Binding
 	Clean   key.Binding
 	Refresh key.Binding
-	Help    key.Binding
-	Quit    key.Binding
+	// Hints toggles the bottom-bar keybinding legend on/off (the `h` key). When
+	// hidden, a single right-aligned "h show/hide key bindings" footer persists
+	// so it stays discoverable; the reclaimed rows go back to the port list.
+	Hints key.Binding
+	Help  key.Binding
+	Quit  key.Binding
 }
 
 // keyGroup is one like-for-like column of the keybinding legend (kata p39s): a
@@ -200,25 +219,28 @@ type keyGroup struct {
 	bindings []key.Binding
 }
 
-// groups returns the approved like-for-like grouping: Serve Toggles, Favorites,
-// View, App -- in display order, one group per bottom-bar column and one
-// "?"-overlay section. (p39s introduced this grouping with a separate Protect
-// column; folded into Serve Toggles here -- lock/unlock and the contextual
-// clean-stale are exposure guards, so they live at the end of the group with x
-// lock/unlock always the last item. Clean is contextual: barGroups drops it
-// unless a dangling forward exists, so ordering it before Lock keeps Lock last
-// in every state. Copy moved out to sit under "n new favorite" in Favorites.
-// Edit (kata prp1) sits right after Lock -- it's a publish-flow variant, not
-// an exposure guard, but there's no later slot that reads better.)
+// groups returns the approved like-for-like grouping: Toggle Service Exposure,
+// Favorites, View, App -- in display order, one group per bottom-bar column and
+// one "?"-overlay section. (p39s introduced this grouping with a separate
+// Protect column; folded into the exposure column here -- lock/unlock and the
+// contextual clean-stale are exposure guards, so they live at the end of the
+// group with x lock/unlock always the last item. Clean is contextual: barGroups
+// drops it unless a dangling forward exists, so ordering it before Lock keeps
+// Lock last in every state. Copy moved out to sit under "n new favorite" in
+// Favorites. Edit (kata prp1) sits right after Lock -- it's a publish-flow
+// variant, not an exposure guard, but there's no later slot that reads better.)
+// The three public paths run publish (p) -> cloudflare tunnel (t) -> funnel (P):
+// funnel sits BELOW the tunnel per mg's ordering (nc1j follow-up).
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Serve Toggles", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Clean, k.Lock, k.Edit}},
+		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Publish, k.Tunnel, k.Funnel, k.Clean, k.Lock, k.Edit}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
-		// edit, including the lock changes that live in the Serve Toggles column, so
-		// filing them under Favorites would understate their reach.
-		{"App", []key.Binding{k.Undo, k.Redo, k.Help, k.Quit}},
+		// edit, including the lock changes that live in the exposure column, so
+		// filing them under Favorites would understate their reach. Hints (h)
+		// toggles the legend itself -- an app-level view control, so it lives here.
+		{"App", []key.Binding{k.Undo, k.Redo, k.Hints, k.Help, k.Quit}},
 	}
 }
 
@@ -259,6 +281,10 @@ func newKeyMap() keyMap {
 		// publish sibling to funnel, in the Serve Toggles group. p is a TOGGLE
 		// (kata prp1): unpublish/republish/first-setup, see requestPublish.
 		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "on caddy (public)")),
+		// "on cloudflare (public)": the third public path (kata nc1j), a
+		// cloudflared-tunnel sibling to funnel/publish in the Serve Toggles group.
+		// t is a TOGGLE: tear down / re-raise / first-setup, see requestTunnel.
+		Tunnel: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "on cloudflare (public)")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -286,6 +312,7 @@ func newKeyMap() keyMap {
 		// it to a shifted key is fine.
 		Clean:   key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "clean stale")),
 		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Hints:   key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "show/hide key bindings")),
 		Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
@@ -310,6 +337,17 @@ type portItem struct {
 	// way to see both is external mutation, surfaced as explicit drift (reach).
 	publishHostname string
 	publishAuth     bool
+	// tunnelActive marks that a tailport-owned cloudflared tunnel (kata nc1j)
+	// covers this port -- true even before a quick tunnel's hostname is known,
+	// so the marker/description flip the moment the process is up. tunnelHostname
+	// is the public host (a *.trycloudflare.com for quick, "" until assigned, or
+	// the operator's custom host for named); tunnelMode distinguishes the two for
+	// the "starting…" wording. Set from the live process-table poll (m.tunnels),
+	// never persisted -- the running process is the source of truth. A SIBLING of
+	// funnel/publish, mutually exclusive per port (see reach).
+	tunnelActive   bool
+	tunnelHostname string
+	tunnelMode     cftunnel.Mode
 	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
 	// Favorites view by an active "/" filter (4ye6), so real favorites still
 	// stand out among the wider search results. See portDelegate.Render.
@@ -388,6 +426,17 @@ func (i portItem) markerGlyph() string {
 			m = "🌐"
 		} else {
 			m = publishMarkerStyle.Render("◆")
+		}
+	case reachTunnel:
+		// Tunnelled to the public internet via cloudflared (kata nc1j). A THIRD
+		// distinct public marker: an ORANGE ◈ (tunnelMarkerStyle) -- Cloudflare's
+		// hue -- vs funnel's magenta ● and publish's blue ◆, all "reachable by
+		// anyone". Emoji uses ☁️ (a cloud, echoing Cloudflare), off the moon ramp
+		// like publish's 🌐.
+		if i.emoji {
+			m = "☁️"
+		} else {
+			m = tunnelMarkerStyle.Render("◈")
 		}
 	case reachServed, reachTailnet:
 		// Served AND already-tailnet-reachable-by-IP (wildcard/tailnet bind)
@@ -502,6 +551,7 @@ const (
 	reachServed                      // C: served AND something is listening
 	reachFunnel                      // D: funnelled to the public internet -- outranks everything
 	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel, not ranked (mutual exclusion means a tailport port is in exactly one)
+	reachTunnel                      // D'': tunnelled to the public internet via cloudflared (kata nc1j) -- a THIRD public sibling, likewise mutually exclusive
 	reachStale                       // E: served but nothing listening -- a dangling forward
 	reachOffline                     // F: not served, not listening (e.g. a down favorite)
 )
@@ -522,15 +572,21 @@ const (
 // simply offline.
 func (i portItem) reach() reachState {
 	published := i.publishHostname != ""
+	funnelled := i.funnelPublic != 0
+	tunnelled := i.tunnelActive
 	switch {
-	case i.funnelPublic != 0 && published:
-		// External drift: both public paths on one port. Reuse the warning/stale
-		// affordance rather than picking a winner (plainDescription names it).
+	case boolCount(funnelled, published, tunnelled) >= 2:
+		// External drift: MORE THAN ONE public path on one port (kata nc1j
+		// extends the funnel/publish drift case to three-way). Reuse the
+		// warning/stale affordance rather than picking a winner
+		// (plainDescription names which collided).
 		return reachStale
-	case i.funnelPublic != 0:
+	case funnelled:
 		return reachFunnel
 	case published:
 		return reachPublish
+	case tunnelled:
+		return reachTunnel
 	case i.active && !i.listening:
 		return reachStale
 	case i.active && i.listening:
@@ -562,6 +618,11 @@ func (i portItem) inlineCopyState() bool {
 	switch i.reach() {
 	case reachLocalhost, reachLAN, reachTailnet, reachServed, reachPublish:
 		return true
+	case reachTunnel:
+		// Like publish, `c` copies the exact https URL the row shows -- but only
+		// once the hostname is known (a still-starting quick tunnel has none, so
+		// it falls back to the toast).
+		return i.tunnelHostname != ""
 	default: // reachFunnel, reachStale, reachOffline
 		return false
 	}
@@ -587,12 +648,20 @@ func (i portItem) plainDescription() string {
 			}
 		}
 		return d
+	case reachTunnel:
+		// A quick tunnel's URL isn't known until cloudflared assigns it a few
+		// seconds after start; until then say so rather than show a blank host.
+		if i.tunnelHostname == "" {
+			return "starting Cloudflare quick tunnel…"
+		}
+		return "https://" + i.tunnelHostname + " · tunnelled to the internet"
 	case reachStale:
-		// Drift: a port carrying BOTH public paths (external mutation only) is
-		// routed here to reuse the ▲ warning affordance; name it explicitly
-		// rather than pretending it's an ordinary dangling forward.
-		if i.funnelPublic != 0 && i.publishHostname != "" {
-			return "funnelled AND published — remove one"
+		// Drift: a port carrying MORE THAN ONE public path (external mutation
+		// only) is routed here to reuse the ▲ warning affordance; name which
+		// collided rather than pretending it's an ordinary dangling forward
+		// (kata nc1j extends the two-way funnel/publish case to three-way).
+		if drift := driftDescription(i); drift != "" {
+			return drift
 		}
 		return "bound to tailnet, but stale — space to unbind"
 	case reachServed:
@@ -624,10 +693,10 @@ func (i portItem) plainDescription() string {
 // stale dangling forward. The healthy states stay unstyled.
 func (i portItem) styledDescription() string {
 	switch i.reach() {
-	case reachFunnel, reachPublish:
+	case reachFunnel, reachPublish, reachTunnel:
 		// Gray+bold, not publicStyle's magenta -- magenta reads as "selected"
-		// (e0e7 for publish, ze1z extends it to funnel). The ●/◆ marker glyphs
-		// keep the magenta safety signal.
+		// (e0e7 for publish, ze1z extends it to funnel; nc1j to tunnel). The
+		// ●/◆/◈ marker glyphs keep the public safety signal.
 		return publicDescStyle.Render(i.plainDescription())
 	case reachStale:
 		return warnStyle.Render(i.plainDescription())
@@ -969,6 +1038,18 @@ const (
 	entryConfirmPurgeOwned       // y/n: force-purge an owned conflicting route, then take over
 	entryConfirmPurgeForeign     // y/n: scary drift warning before purging a foreign route
 	entryConfirmPurgeForeignType // typed-"purge" commit gate for a foreign route
+	// The cloudflared tunnel (`t`) flow (kata nc1j), handled inline in Update
+	// (the y/n gates) and updateTunnelEntry (the text steps). A logged-in user
+	// picks quick vs named first; quick jumps straight to its generic confirm
+	// (the random URL can't be named in advance); named gathers a hostname + a
+	// pre-provisioned tunnel name, then a confirm naming the exact https URL:
+	//   entryTunnelMode -> [ quick: entryConfirmTunnelQuick
+	//                      | named: entryTunnelHost -> entryTunnelName -> entryConfirmTunnelNamed ]
+	entryTunnelMode         // y/n-style: q quick / n named / esc cancel (logged-in only)
+	entryTunnelHost         // text: the public hostname the operator already routed (named)
+	entryTunnelName         // text: the pre-provisioned cloudflared tunnel name (named)
+	entryConfirmTunnelQuick // generic y/n: expose to a random *.trycloudflare.com (URL unknown until it starts)
+	entryConfirmTunnelNamed // y/n naming the exact https://<hostname> (named)
 )
 
 type model struct {
@@ -1013,6 +1094,13 @@ type model struct {
 	// searches ALL listening ports regardless of showAllPorts (4ye6). Kept in
 	// sync with the list's own filter state as it toggles on/off.
 	filtering bool
+	// hideHints toggles the bottom-bar keybinding legend off (the `h` key). When
+	// true, renderBottom drops the multi-row legend and shows a single
+	// right-aligned "h show/hide key bindings" footer instead, and
+	// legendReservationLines shrinks to 1 so the port list reclaims the rows.
+	// Session-only; never persisted. Distinct from showHelp (the full-screen
+	// "?" overlay): this just collapses the always-on bar legend.
+	hideHints bool
 	// showHelp gates the full-screen "?" help overlay (see helpView). While
 	// it's open the overlay replaces the whole view and swallows every key
 	// except the ?/esc/q that dismiss it (and the scroll keys below).
@@ -1125,6 +1213,39 @@ type model struct {
 	// attempt so a cleared-then-returned conflict can never spin. This carry is
 	// also the seam kata 6n15's force-purge takeover resumes the publish through.
 	pendingPublish pendingPublish
+
+	// Cloudflare Tunnel state (kata nc1j); see internal/ui/cftunnel.go. The
+	// whole feature is GATED on cfAvailable -- detected once at New() -- so an
+	// uninstalled cloudflared costs nothing: the `t` key is dropped from the bar
+	// (barGroups) and pollTunnelsCmd returns a nil cmd. cfVersion is shown
+	// nowhere yet; kept for parity/debugging.
+	cfAvailable bool
+	cfVersion   string
+	// tunnels maps a local port to its LIVE cloudflared tunnel state, rebuilt
+	// each poll from the process table (Discover) -- never persisted; the
+	// running process IS the source of truth, so a tunnel from a prior session
+	// is re-found after a restart. Only tailport-owned tunnels land here.
+	tunnels map[int]tunnelInfo
+	// lastTunnel remembers, per port, what a port was last tunnelled as, so `t`
+	// can re-raise a torn-down tunnel without re-prompting. SESSION-ONLY, never
+	// persisted -- the process table stays the source of truth (mirrors
+	// lastPublish).
+	lastTunnel map[int]tunnelMemory
+	// tunnelPollGen/Applied VERSION async tunnel polls so an out-of-order
+	// completion can't clobber newer state (mirrors publishPollGen/Applied).
+	tunnelPollGen     int
+	tunnelPollApplied int
+	// cfClientOverride, when non-nil, replaces the client built from
+	// cfg.Cloudflared for tests (mirrors caddyClientOverride).
+	cfClientOverride *cftunnel.Client
+	// tunnel-setup (`t`) flow state, carried across the dialog steps and cleared
+	// by clearTunnelFlow. tunnelInput is the shared textinput for the named
+	// flow's hostname / tunnel-name steps.
+	tunnelInput     textinput.Model
+	tunnelPort      int           // local port being set up
+	tunnelSetupMode cftunnel.Mode // quick vs named for the in-flight setup
+	tunnelHostname  string        // named: the public hostname entered (held into the confirm)
+	tunnelName      string        // named: the pre-provisioned cloudflared tunnel name
 
 	mode       entryMode
 	portInput  textinput.Model
@@ -1450,6 +1571,20 @@ func New(cfg config.Config, markersOverride ...string) model {
 	pui.CharLimit = 8
 	pui.Width = 10
 
+	// The cloudflared-tunnel setup input (kata nc1j), reused for the named flow's
+	// hostname and tunnel-name steps.
+	tui := textinput.New()
+	tui.CharLimit = 253 // max DNS name length
+	tui.Width = 40
+
+	// Detect cloudflared ONCE, synchronously, at construction: cheap (a LookPath
+	// that fast-fails when absent, else one short `version` probe bounded by
+	// detectTimeout), and knowing availability up front lets barGroups decide
+	// whether to show the `t` key with no startup pop-in. When absent the whole
+	// feature stays dormant -- no key, no poll (kata nc1j).
+	cfVersion, cfErr := (&cftunnel.Client{Binary: cfg.Cloudflared.Binary}).Detect()
+	cfAvailable := cfErr == nil
+
 	if cfg.Ports == nil {
 		cfg.Ports = map[int]config.PortMeta{}
 	}
@@ -1488,6 +1623,13 @@ func New(cfg config.Config, markersOverride ...string) model {
 		// empty here regardless of what cfg carries (cfg never carries it --
 		// see the field doc).
 		lastPublish: map[int]publishInfo{},
+		// Cloudflare Tunnel state (kata nc1j): availability decided above; the
+		// live/memory maps start empty (the process-table poll fills tunnels).
+		cfAvailable: cfAvailable,
+		cfVersion:   cfVersion,
+		tunnels:     map[int]tunnelInfo{},
+		lastTunnel:  map[int]tunnelMemory{},
+		tunnelInput: tui,
 		portInput:   ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
 		// Optimistic until the first edge poll actually fails (see the field
 		// doc), so a configured-but-not-yet-polled edge doesn't flash
@@ -1542,7 +1684,10 @@ func (m model) Init() tea.Cmd {
 	// its own slower 15s cadence and is a no-op (nil cmd) when unconfigured. The
 	// Init poll races fqdn resolution -- it may not yet know our short label --
 	// so fqdnMsg re-polls once the label is known.
-	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), tea.SetWindowTitle(title))
+	// The cloudflared-tunnel poll (kata nc1j) is its OWN faster ticker (a cheap
+	// local process-table scan, unlike the remote edge poll): nil when
+	// cloudflared is unavailable, so an uninstalled host pays only for the timer.
+	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.pollTunnelsCmd(), tunnelTick(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -2215,6 +2360,14 @@ func (m *model) copyTargetURL(sel portItem) string {
 		return fmt.Sprintf("http://localhost:%d", sel.port.Number)
 	case reachPublish:
 		return "https://" + sel.publishHostname
+	case reachTunnel:
+		// Copy the exact public tunnel URL the row shows, when known; a
+		// still-starting quick tunnel has none, so fall back to the tailnet form
+		// (it never reaches the inline-✓ path -- inlineCopyState gates on the host).
+		if sel.tunnelHostname != "" {
+			return "https://" + sel.tunnelHostname
+		}
+		return tailnetURL
 	default: // reachTailnet, reachServed, reachFunnel, reachStale
 		return tailnetURL
 	}
@@ -2620,6 +2773,11 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 	if info, ok := m.published[port]; ok {
 		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (p) before funnelling", port, info.hostname))
 	}
+	// Mutual-exclusion mirror guard (kata nc1j): funnel refuses a port carrying
+	// a cloudflared tunnel -- a third independent public path, never layered.
+	if _, ok := m.tunnels[port]; ok {
+		return m.setErr(fmt.Sprintf("port :%d is tunnelled to the internet via Cloudflare — remove the tunnel first (t) before funnelling", port))
+	}
 	if port == 22 {
 		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
 	}
@@ -2725,6 +2883,11 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	// ranking -- publish does not outrank funnel; they're independent paths).
 	if pub, on := m.funnel[port]; on {
 		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (P) before publishing", port, pub))
+	}
+	// 4b. mutual exclusion: a cloudflared tunnel is a third independent public
+	// path (kata nc1j); a tunnelled port must lose the tunnel first.
+	if _, ok := m.tunnels[port]; ok {
+		return m.setErr(fmt.Sprintf("port :%d is tunnelled to the internet via Cloudflare — remove the tunnel first (t) before publishing", port))
 	}
 	// 5. already published by tailport on THIS exact port -> de-escalation:
 	// unpublish immediately, no confirm (reducing exposure is never gated).
@@ -4041,6 +4204,77 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.pollPublishedCmd(), publishTick())
 
+	case tunnelDoneMsg:
+		// A supervise op (start/tear-down) finished (kata nc1j). Mirror
+		// publishDoneMsg: clear pending, then re-poll rather than trusting an
+		// optimistic outcome -- but also apply the outcome immediately so the
+		// marker flips without waiting a poll cycle.
+		m.pending = 0
+		if msg.err != nil {
+			return m, tea.Batch(m.setErr(tunnelErrText(msg.err)), m.pollTunnelsCmd(), m.rebuildItems())
+		}
+		if msg.torndown {
+			// Optimistically drop it now so the marker clears immediately. We do
+			// NOT re-poll here: cloudflared can take a moment to drain after
+			// SIGTERM, so an immediate Discover might still see the dying process
+			// and flicker the tunnel back. The 4s tick reconciles reliably (and
+			// re-adds it if the Stop somehow failed).
+			delete(m.tunnels, msg.port)
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("tunnel on :%d torn down", msg.port), flashInfo), m.rebuildItems())
+		}
+		// Start success: record the running process so the row flips now. A quick
+		// tunnel's hostname isn't known yet (the poll surfaces it via
+		// /quicktunnel), so the flash says "starting…"; a named tunnel's host is
+		// known up front, so name it and teach the `t` de-escalation.
+		if msg.running != nil {
+			m.tunnels[msg.port] = tunnelInfo{
+				mode:        msg.running.Mode,
+				pid:         msg.running.PID,
+				metricsPort: msg.running.MetricsPort,
+				hostname:    msg.running.Hostname, // "" for quick until assigned
+			}
+		}
+		save := m.remember(msg.port) // keep a tunnelled port visible in the registry
+		var flash tea.Cmd
+		if msg.running != nil && msg.running.Hostname != "" {
+			flash = m.setFlash(fmt.Sprintf("tunnelled https://%s — press t to unpublish", msg.running.Hostname), flashInfo)
+		}
+		return m, tea.Batch(save, flash, m.pollTunnelsCmd(), m.rebuildItems())
+
+	case tunnelPollMsg:
+		// Drop a stale result (mirrors publishPollMsg's out-of-order guard).
+		if msg.gen < m.tunnelPollApplied {
+			return m, nil
+		}
+		m.tunnelPollApplied = msg.gen
+		if msg.err != nil {
+			// Quiet degrade: keep the last-known tunnels map. A Discover error is
+			// a transient /proc-scan hiccup, not a reason to blank exposure.
+			return m, nil
+		}
+		m.tunnels = msg.tunnels
+		// Every tunnel the poll reports is, by definition, re-raiseable -- so
+		// remember it (mirrors lastPublish), letting a tunnel from BEFORE this
+		// process started (across a restart) be re-toggled from memory too. A
+		// quick tunnel's ephemeral hostname isn't worth remembering (a re-raise
+		// gets a fresh URL), so only named tunnels seed a hostname/name.
+		for port, info := range m.tunnels {
+			if info.mode == cftunnel.ModeNamed {
+				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: info.hostname})
+			} else if _, ok := m.lastTunnel[port]; !ok {
+				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
+			}
+		}
+		return m, m.rebuildItems()
+
+	case tunnelTickMsg:
+		// The tunnel ticker never stops: reschedule unconditionally. Poll only
+		// when idle and available (pollTunnelsCmd is nil when unavailable).
+		if m.pending != 0 || m.cleaning != 0 {
+			return m, tunnelTick()
+		}
+		return m, tea.Batch(m.pollTunnelsCmd(), tunnelTick())
+
 	case cleanupDoneMsg:
 		m.cleaning = 0
 		if msg.err != nil {
@@ -4202,6 +4436,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
+			// The cloudflared tunnel (`t`) flow (kata nc1j): the mode select and
+			// the two confirms are y/n-style gates handled here like funnel; the
+			// text steps go through updateTunnelEntry via the switch below. The
+			// quick confirm names no URL (a *.trycloudflare.com host doesn't exist
+			// until cloudflared starts) -- the only public-path confirm that can't,
+			// by cloudflared's design.
+			if m.mode == entryTunnelMode {
+				switch msg.String() {
+				case "q", "Q":
+					m.tunnelSetupMode = cftunnel.ModeQuick
+					m.mode = entryConfirmTunnelQuick
+					return m, nil
+				case "n", "N":
+					return m, m.enterTunnelNamedHost()
+				default:
+					m.clearTunnelFlow()
+					return m, nil
+				}
+			}
+			if m.mode == entryConfirmTunnelQuick {
+				if msg.String() == "y" || msg.String() == "Y" {
+					if m.pending != 0 {
+						m.clearTunnelFlow()
+						return m, nil
+					}
+					return m, m.confirmTunnelQuick()
+				}
+				m.clearTunnelFlow()
+				return m, nil
+			}
+			if m.mode == entryConfirmTunnelNamed {
+				if msg.String() == "y" || msg.String() == "Y" {
+					if m.pending != 0 {
+						m.clearTunnelFlow()
+						return m, nil
+					}
+					return m, m.confirmTunnelNamed()
+				}
+				m.clearTunnelFlow()
+				return m, nil
+			}
 			// The publish (`p`) flow (kata v1z5; swapped from `P` under vzj4) is
 			// a self-contained state
 			// machine handled here, BEFORE the generic esc/enter switch and the
@@ -4211,6 +4486,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case entryPublishHostname, entryPublishDomain, entryPublishHost, entryPublishAuth,
 				entryPublishCredUser, entryPublishCredPass, entryConfirmPublish:
 				return m, m.updatePublishEntry(msg)
+			case entryTunnelHost, entryTunnelName:
+				// The named-tunnel text steps (kata nc1j): keystrokes reach
+				// tunnelInput, never labelInput.
+				return m, m.updateTunnelEntry(msg)
 			case entryConfirmPurgeOwned, entryConfirmPurgeForeign, entryConfirmPurgeForeignType:
 				// The force-purge / take-over ladders (kata 6n15) are their own
 				// self-contained state machine, dispatched here for the same reason
@@ -4434,6 +4713,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectPort(cur)
 			}
 			return m, cmd
+		case "h":
+			// Toggle the bottom-bar legend. resizeList recomputes the list body
+			// height against the new legend reservation (1 line when hidden), so
+			// the port list grows into the reclaimed rows immediately.
+			m.hideHints = !m.hideHints
+			m.resizeList()
+			return m, nil
 		case "r":
 			// Also re-run the proactive operator check (kata tapv): pressing r
 			// after fixing it (`sudo tailscale set --operator=...`) clears the
@@ -4632,6 +4918,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// unpublishes -- it always runs the full setup flow so a
 			// published port's hostname/auth can be changed in place.
 			return m, m.requestEditPublish(sel.port.Number)
+		case "t": // cloudflared tunnel (kata nc1j)
+			if m.pending != 0 {
+				return m, nil // a toggle/funnel/publish/tunnel is already in flight
+			}
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			// requestTunnel runs the tunnel guards in order (busy, availability,
+			// de-escalation, :22, funnel/publish mutual-exclusion, lock) and
+			// otherwise opens the tunnel dialog. t is a TOGGLE: tear down /
+			// same-session re-raise / first-setup.
+			return m, m.requestTunnel(sel.port.Number)
 		}
 	}
 
@@ -4704,7 +5003,8 @@ func (m *model) rebuildItems() tea.Cmd {
 			}
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+			tun := m.tunnels[n]
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 		}
 		return m.setItems(items)
 	}
@@ -4728,7 +5028,8 @@ func (m *model) rebuildItems() tea.Cmd {
 		// ok is exactly the listening bool: the port is present in
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+		tun := m.tunnels[n]
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
 	}
 	return m.setItems(items)
 }
@@ -4839,6 +5140,10 @@ func (m model) barGroups(cleanEnabled bool) []keyGroup {
 	keys := m.keys
 	keys.ShowAll.SetHelp("a", "switch view")
 	keys.Clean.SetEnabled(cleanEnabled)
+	// The `t` tunnel key (kata nc1j) is dropped from the bottom bar unless
+	// cloudflared is installed -- no control for a feature the host can't use.
+	// It stays in groups() so the "?" overlay still documents it (like Redo).
+	keys.Tunnel.SetEnabled(m.cfAvailable)
 	// Redo is supported but stays OFF the bottom bar (3cwx, owner's call): it's
 	// the rarer half of the pair and the bar is already dense. It remains in
 	// groups(), so the "?" overlay and `tailport quickstart` still document it
@@ -6402,14 +6707,17 @@ type KeyLegendGroup struct {
 // not egg/fireworks).
 func keyLegendDescs(emoji bool) map[string]string {
 	served, funneled, published, dangling := "◉", "●", "◆", "▲"
+	tunnelled := "◈"
 	if emoji {
 		served, funneled, published, dangling = "🌒", "🌑", "🌐", "🌫️"
+		tunnelled = "☁️"
 	}
 	return map[string]string{
 		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
 		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of and\nmutually exclusive with funnel — a port can carry one or the other,\nnever both. Press e to change hostname/auth without unpublishing.",
+		"t":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. t is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, mutually exclusive with funnel and publish — a port carries one\npublic exposure, never several.",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, funnel conflict, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
@@ -6423,6 +6731,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
 		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
 		"r":      "Refresh the port list and serve status.",
+		"h":      "Show or hide the keyboard-shortcuts legend at the bottom of the\nscreen. When hidden, a single \"h show/hide key bindings\" reminder\nstays bottom-right and the reclaimed rows go back to the port list.\n(This just collapses the bar; ? opens the full help overlay.)",
 		"?":      "Toggle this help. esc or q also close it.",
 		"q":      "Quit.",
 	}
@@ -7061,6 +7370,11 @@ func (m model) bannerReservationLines() int {
 // assuming cleanEnabled=true is worst-case) is robust to 04rb's non-monotonic
 // fold, where one more binding can shrink a group.
 func (m model) legendReservationLines() int {
+	// Legend collapsed (the `h` key): only the single-line renderHintFooter
+	// shows, so reserve exactly one row.
+	if m.hideHints {
+		return 1
+	}
 	lines := 1
 	for _, cleanEnabled := range []bool{true, false} {
 		if legend := m.renderLegendWith(cleanEnabled); legend != "" {
@@ -7394,6 +7708,33 @@ func (m model) renderBottom() string {
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
+	case entryTunnelMode:
+		return helpStyle.Render(fmt.Sprintf("cloudflare tunnel :%d — ", m.tunnelPort)) +
+			helpStyle.Render("(q: quick random url / n: named hostname / esc: cancel)")
+	case entryTunnelHost:
+		return m.promptLine(fmt.Sprintf("tunnel :%d — public hostname: ", m.tunnelPort),
+			m.fitField(m.tunnelInput, ""), "  (enter: next, esc: cancel)")
+	case entryTunnelName:
+		return m.promptLine(fmt.Sprintf("tunnel :%d — cloudflared tunnel name: ", m.tunnelPort),
+			m.fitField(m.tunnelInput, ""), "  (enter: confirm, esc: cancel)")
+	case entryConfirmTunnelQuick:
+		// The one public confirm that can't name its URL: a quick tunnel's
+		// *.trycloudflare.com host doesn't exist until cloudflared assigns it.
+		lines := []string{
+			warnStyle.Render(fmt.Sprintf("⚠ Expose :%d to the PUBLIC INTERNET via a Cloudflare quick tunnel?", m.tunnelPort)),
+			helpStyle.Render("   → a random https://<name>.trycloudflare.com URL appears once it starts"),
+			warnStyle.Render("   no auth — anyone with the URL can reach it"),
+			helpStyle.Render("   (y: confirm, any other key: cancel)"),
+		}
+		return strings.Join(lines, "\n")
+	case entryConfirmTunnelNamed:
+		url := "https://" + m.tunnelHostname
+		lines := []string{
+			warnStyle.Render(fmt.Sprintf("⚠ Publish :%d to the PUBLIC INTERNET via Cloudflare Tunnel?", m.tunnelPort)),
+			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
+			helpStyle.Render("   (y: confirm, any other key: cancel)"),
+		}
+		return strings.Join(lines, "\n")
 	case entryConfirmPurgeOwned:
 		// Normal y/n force-purge of an owned route. Name the backend; for a
 		// cross-machine owned route (backend label != this machine's short label),
@@ -7456,10 +7797,31 @@ func (m model) renderBottom() string {
 	if banner := m.renderBanner(m.operatorHintText()); banner != "" {
 		bar = banner + "\n" + bar
 	}
-	if legend := m.renderLegend(); legend != "" {
+	if m.hideHints {
+		// Legend collapsed (the `h` key): show only the persistent bottom-right
+		// reminder of how to bring it back. legendReservationLines shrinks to 1
+		// to match, so the list already reclaimed the freed rows.
+		bar += "\n" + m.renderHintFooter()
+	} else if legend := m.renderLegend(); legend != "" {
 		bar += "\n" + legend
 	}
 	return bar
+}
+
+// renderHintFooter is the single-line, right-aligned "h show/hide key bindings"
+// reminder shown in place of the legend when it's collapsed (m.hideHints). It's
+// right-justified to m.width so it sits bottom-right; on an unknown/zero width
+// it renders left-aligned (pre-first-resize only).
+func (m model) renderHintFooter() string {
+	hint := helpKeyStyle.Render("h") + barDescStyle.Render(" show/hide key bindings")
+	if m.width <= 0 {
+		return hint
+	}
+	pad := m.width - lipgloss.Width(hint)
+	if pad <= 0 {
+		return hint
+	}
+	return strings.Repeat(" ", pad) + hint
 }
 
 // renderGrid lays out the current page of the port list in gridDims' cols

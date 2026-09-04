@@ -3972,18 +3972,20 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	k := newKeyMap()
 	groups := k.groups()
 
-	wantNames := []string{"Serve Toggles", "Favorites", "View", "App"}
+	wantNames := []string{"Toggle Service Exposure", "Favorites", "View", "App"}
 	if len(groups) != len(wantNames) {
 		t.Fatalf("groups() = %d columns, want %d", len(groups), len(wantNames))
 	}
 	// 3cwx: Favorites carries F (forget, the old "u"); u is undo and lives in
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
-	// documents it even though barGroups hides it from the bottom bar.
+	// documents it even though barGroups hides it from the bottom bar. h (hints)
+	// also lives in App. nc1j: exposure column runs space/p/t/P (funnel below the
+	// cloudflare tunnel) then C/x/e.
 	wantKeys := [][]string{
-		{"space", "P", "p", "C", "x", "e"}, // Funnel=P, Publish=p (swapped, vzj4); Edit=e (kata prp1)
+		{"space", "p", "t", "P", "C", "x", "e"}, // Publish=p, Tunnel=t (nc1j), Funnel=P below it; Edit=e (kata prp1)
 		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
-		{"u", "ctrl+r", "?", "q"},
+		{"u", "ctrl+r", "h", "?", "q"},
 	}
 	full := k.FullHelp()
 	if len(full) != len(groups) {
@@ -4013,20 +4015,21 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	}
 }
 
-// TestBottomBarGridAligned drives the real model at a width just below the
-// 04rb fold threshold (~80, the width Serve Toggles' fold needs to fit -- see
-// TestBottomBarGridFolds) and asserts the bar renders the four grouped
-// columns UNFOLDED, at their exact packed floor width, with a header row and
-// aligned gutters: descriptions line up within a column and columns line up
-// across rows. With no dangling, Serve Toggles is space/P/p/x/e (edit last,
-// kata prp1; clean dropped) and Favorites is f/F/n/c/l -- now TIED for
-// tallest column at 5 rows each -- so the grid is a header + 5 rows.
-// (Previously this used width=100, which now has enough surplus to fold
-// Serve Toggles/Favorites/View -- see TestBottomBarGridFolds for that
-// behavior instead.)
+// TestBottomBarGridAligned drives the real model at a packed-floor width
+// (below the 04rb fold threshold -- see TestBottomBarGridFolds) and asserts
+// the bar renders the four grouped columns UNFOLDED, at their exact packed
+// floor width, with a header row and aligned gutters: descriptions line up
+// within a column and columns line up across rows. With no dangling, Toggle
+// Service Exposure is space/p/P/x/e (edit last, kata prp1; clean dropped;
+// `t` cloudflare tunnel is pinned off, see cfAvailable below) and Favorites
+// is f/F/n/c/l -- TIED for tallest column at 5 rows each -- so the grid is a
+// header + 5 rows. (nc1j lengthened the header to "Toggle Service Exposure"
+// and added the App-group `h` hints key, pushing the packed floor from 64 to
+// 82 wide -- see TestBottomBarGridFolds for the fold thresholds.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
-	const width = 65 // packed floor is 64 wide; Serve Toggles' fold needs >=86
+	m.cfAvailable = false // pin: this exercises grid mechanics with the classic key set (no `t`), independent of whether the test host has cloudflared (kata nc1j)
+	const width = 90      // packed floor is 82 wide; Toggle Service Exposure's fold needs >=104
 	m.help.Width = width
 	m.width = width
 
@@ -4051,7 +4054,7 @@ func TestBottomBarGridAligned(t *testing.T) {
 
 	// Header row carries all four section names, in order, on one line.
 	prev := -1
-	for _, name := range []string{"Serve Toggles", "Favorites", "View", "App"} {
+	for _, name := range []string{"Toggle Service Exposure", "Favorites", "View", "App"} {
 		i := strings.Index(hdr, name)
 		if i < 0 {
 			t.Fatalf("header row missing %q; got %q", name, hdr)
@@ -4063,18 +4066,18 @@ func TestBottomBarGridAligned(t *testing.T) {
 	}
 
 	// Columns line up: each header's start == the start of every cell in its
-	// column, wherever that cell falls (Serve Toggles' lock is on the 3rd data row,
-	// Favorites' label on the 5th).
+	// column, wherever that cell falls (Toggle Service Exposure's lock is on the 4th
+	// data row, Favorites' label on the 5th).
 	col := func(label string, header, needle string) {
 		_, c := at(needle)
 		if h := strings.Index(hdr, header); c != h {
 			t.Errorf("%s misaligned: %q header at %d, cell %q at %d", label, header, h, needle, c)
 		}
 	}
-	// Serve Toggles' key gutter is 5 wide (from "space"), so its cells render like
-	// "x     lock/unlock"; anchor its column on "space on tailscale" (which starts flush
-	// at the column) rather than a padded cell.
-	col("Serve Toggles/on tailscale", "Serve Toggles", "space on tailscale")
+	// Toggle Service Exposure's key gutter is 5 wide (from "space"), so its cells render
+	// like "x     lock/unlock"; anchor its column on "space on tailscale" (which starts
+	// flush at the column) rather than a padded cell.
+	col("Toggle Service Exposure/on tailscale", "Toggle Service Exposure", "space on tailscale")
 	col("Favorites/favorite", "Favorites", "f favorite")
 	col("Favorites/label", "Favorites", "l label")
 	col("View/filter", "View", "/ filter")
@@ -4088,34 +4091,34 @@ func TestBottomBarGridAligned(t *testing.T) {
 		t.Errorf("c copy URL should be the row directly under n new favorite; n at (%d,%d), c at (%d,%d)", nRow, nCol, cRow, cCol)
 	}
 
-	// Edit (e, kata prp1) is now the LAST Serve Toggles row -- added right
-	// after Lock -- and its key sits flush at the Serve Toggles column start;
-	// Lock sits directly above it. (Match the desc "edit publish config" since
-	// the padded "e     edit publish config" cell isn't a single-space
-	// substring; editRow/lockRow index lines[1:].)
+	// Edit (e, kata prp1) is now the LAST Toggle Service Exposure row -- added
+	// right after Lock -- and its key sits flush at the Toggle Service Exposure
+	// column start; Lock sits directly above it. (Match the desc "edit publish
+	// config" since the padded "e     edit publish config" cell isn't a
+	// single-space substring; editRow/lockRow index lines[1:].)
 	editRow, _ := at("edit publish config")
 	editLine := lines[editRow+1]
-	exposeCol := strings.Index(hdr, "Serve Toggles")
+	exposeCol := strings.Index(hdr, "Toggle Service Exposure")
 	if exposeCol >= len(editLine) || editLine[exposeCol] != 'e' {
-		t.Errorf("edit's key should sit flush at the Serve Toggles column start (col %d); line: %q", exposeCol, editLine)
+		t.Errorf("edit's key should sit flush at the Toggle Service Exposure column start (col %d); line: %q", exposeCol, editLine)
 	}
 	lockRow, _ := at("lock/unlock")
 	if lockRow != editRow-1 {
-		t.Errorf("lock (x) should sit directly ABOVE edit (e) in Serve Toggles; lock row %d, edit row %d", lockRow, editRow)
+		t.Errorf("lock (x) should sit directly ABOVE edit (e) in Toggle Service Exposure; lock row %d, edit row %d", lockRow, editRow)
 	}
 	for li := editRow + 2; li < len(lines); li++ {
 		if ln := lines[li]; len(ln) > exposeCol && ln[exposeCol] != ' ' {
-			t.Errorf("Serve Toggles column has content below edit (line %d): %q", li, ln)
+			t.Errorf("Toggle Service Exposure column has content below edit (line %d): %q", li, ln)
 		}
 	}
 
-	// Within the Serve Toggles column the key gutter aligns the descriptions:
-	// "on tailscale" (after "space ") and "on ts.net (public)" (after "P     ")
-	// start at the same offset.
+	// Within the Toggle Service Exposure column the key gutter aligns the
+	// descriptions: "on tailscale" (after "space ") and "on ts.net (public)"
+	// (after "P     ") start at the same offset.
 	_, serveCol := at("on tailscale")
 	_, funnelCol := at("on ts.net (public)")
 	if serveCol != funnelCol {
-		t.Errorf("Serve Toggles gutter misaligned: on tailscale at %d, on ts.net (public) at %d", serveCol, funnelCol)
+		t.Errorf("Toggle Service Exposure gutter misaligned: on tailscale at %d, on ts.net (public) at %d", serveCol, funnelCol)
 	}
 }
 
@@ -4137,55 +4140,62 @@ func TestBottomBarGridFolds(t *testing.T) {
 	}
 
 	m := New(config.Config{})
+	m.cfAvailable = false // pin the classic key set (no `t`) for deterministic grid mechanics (kata nc1j)
 
-	// Floor: below the fold threshold (the first fold -- Serve Toggles, see
-	// below -- needs total width >=86; see the 64-wide packed floor in
-	// TestBottomBarNarrowFallback), the grid is the exact packed layout --
-	// header + 5 rows. Serve Toggles (space/P/p/x/e, kata prp1 added e) and
-	// Favorites (f/F/n/c/l) are now TIED for tallest at 5 rows each.
-	m.help.Width, m.width = 65, 65
+	// Floor: below the fold threshold (the first fold -- Toggle Service
+	// Exposure, see below -- needs total width >=104; see the 82-wide packed
+	// floor in TestBottomBarNarrowFallback), the grid is the exact packed
+	// layout -- header + 5 rows. Toggle Service Exposure (space/p/P/x/e, kata
+	// prp1 added e) and Favorites (f/F/n/c/l) are TIED for tallest at 5 rows
+	// each. (nc1j lengthened the header and added App's `h` hints key, which
+	// pushed the packed floor from 64 to 82 -- see TestBottomBarGridAligned.)
+	m.help.Width, m.width = 90, 90
 	floor := stripANSI(m.renderLegend())
 	floorLines := strings.Split(floor, "\n")
 	if len(floorLines) != 6 {
-		t.Fatalf("floor (width 65) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
+		t.Fatalf("floor (width 90) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
 	}
 
-	// Wide: 100 cols is enough surplus to fold Serve Toggles and Favorites
-	// (kata prp1: Serve Toggles is now tied with Favorites at 5 rows, and --
-	// since the fold candidates are sorted STABLE by row count and Serve
-	// Toggles comes first in groups() -- it is now tried FIRST on a tie, so
-	// the fold ORDER flipped from before prp1) but NOT View (3 rows; folding
-	// it needs >=109, checked below) or App (tried last). Folding SHORTENS
-	// the bar: after both folds, the tallest group is ceil(5/2) = 3 rows, so
-	// header+3 = 4 lines, fewer than the floor's 6 -- not just wider-gapped.
-	m.help.Width, m.width = 100, 100
+	// Wide: 120 cols is enough surplus to fold Toggle Service Exposure and
+	// Favorites (kata prp1: Toggle Service Exposure is tied with Favorites at
+	// 5 rows, and -- since the fold candidates are sorted STABLE by row count
+	// and Toggle Service Exposure comes first in groups() -- it is tried
+	// FIRST on the tie) but NOT View (3 rows) or App (nc1j: now 4 rows, since
+	// `h` hints joined u/?/q -- which makes App OUT-RANK View in the
+	// tallest-first order, so App is tried before View; App still doesn't fit
+	// the fold at 120, checked below, and View -- tried LAST -- never even
+	// gets attempted until App's fold fits, see below). Folding SHORTENS the
+	// bar: after both folds, the tallest UNFOLDED group (App, 4 rows) sets the
+	// height, so header+4 = 5 lines, fewer than the floor's 6.
+	m.help.Width, m.width = 120, 120
 	wide := stripANSI(m.renderLegend())
 	wideLines := strings.Split(wide, "\n")
 	if len(wideLines) >= len(floorLines) {
-		t.Errorf("wide (100) grid (%d lines) should be shorter than the floor grid (%d lines) once tall groups fold:\nfloor:\n%s\nwide:\n%s",
+		t.Errorf("wide (120) grid (%d lines) should be shorter than the floor grid (%d lines) once tall groups fold:\nfloor:\n%s\nwide:\n%s",
 			len(wideLines), len(floorLines), floor, wide)
 	}
 
-	// Serve Toggles folded (kata prp1 -- now tried FIRST, see above): top-heavy
-	// column-major split -- space/P/p down the first sub-column, x/e down the
-	// second (never a dangling item left stranded atop an empty second
-	// sub-column). "x lock/unlock" sits beside "space on tailscale" on the
-	// SAME row, and "e edit publish config" beside "P on ts.net (public)";
-	// "p on caddy (public)" is left alone on the third row (top-heavy 3/2
-	// split of 5 items). (p/P swapped, vzj4: Funnel is now P, Publish is now p.)
+	// Toggle Service Exposure folded: top-heavy column-major split --
+	// space/p/P down the first sub-column, x/e down the second (never a
+	// dangling item left stranded atop an empty second sub-column). "x
+	// lock/unlock" sits beside "space on tailscale" on the SAME row, and "e
+	// edit publish config" beside "p on caddy (public)"; "P on ts.net
+	// (public)" is left alone on the third row (top-heavy 3/2 split of 5
+	// items). (nc1j: the exposure order is now space/p/P -- Publish before
+	// Funnel -- so p, not P, now pairs with edit; P sits alone.)
 	if r1, r2 := lineOf(wideLines, "space on tailscale"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
-		t.Errorf("Serve Toggles should fold space on tailscale/x lock/unlock onto the same row; space on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+		t.Errorf("Toggle Service Exposure should fold space on tailscale/x lock/unlock onto the same row; space on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
-	if r1, r2 := lineOf(wideLines, "on ts.net (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
-		t.Errorf("Serve Toggles should fold P on ts.net (public)/e edit publish config onto the same row; P on ts.net (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
+	if r1, r2 := lineOf(wideLines, "on caddy (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
+		t.Errorf("Toggle Service Exposure should fold p on caddy (public)/e edit publish config onto the same row; p on caddy (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
 	}
-	// "on caddy (public)" (desc only, not "p on caddy (public)" -- the folded
-	// left sub-col's key gutter is 5 wide (from "space"), so the rendered key
-	// is padded: "p     on caddy (public)").
-	if r := lineOf(wideLines, "on caddy (public)"); r < 0 {
-		t.Errorf("p on caddy (public) missing from wide grid:\n%s", wide)
+	// "on ts.net (public)" (desc only, not "P on ts.net (public)" -- the
+	// folded left sub-col's key gutter is 5 wide (from "space"), so the
+	// rendered key is padded: "P     on ts.net (public)").
+	if r := lineOf(wideLines, "on ts.net (public)"); r < 0 {
+		t.Errorf("P on ts.net (public) missing from wide grid:\n%s", wide)
 	} else if strings.Contains(wideLines[r], "edit publish config") {
-		t.Errorf("p on caddy (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+		t.Errorf("P on ts.net (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
 	// Favorites folded too: top-heavy column-major split -- f/F/n down the
@@ -4204,22 +4214,41 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
-	// App (3 bar bindings since 3cwx -- u undo, ? help, q quit; ctrl+r redo is
-	// hidden from the bar) is tried last and doesn't fit the fold at width 100,
-	// so it stays a single unfolded column: help and quit on SEPARATE rows.
+	// App (4 bar bindings since nc1j added `h` hints -- u undo, h hints, ?
+	// help, q quit; ctrl+r redo is hidden from the bar) doesn't fit the fold
+	// at width 120 (no surplus left after the other 2 folds), so it stays a
+	// single unfolded column: help and quit on SEPARATE rows. View (tried
+	// after App) never even gets a chance yet.
 	if r1, r2 := lineOf(wideLines, "? help"), lineOf(wideLines, "q quit"); r1 < 0 || r2 < 0 || r1 == r2 {
-		t.Errorf("App should NOT fold at width 100 (no surplus left after the other 3 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
+		t.Errorf("App should NOT fold at width 120 (no surplus left after the other 2 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
 	}
 
-	// View folds only once there's room for it (kata prp1's longer Serve
-	// Toggles column pushed its threshold to >=109, past the 100 above). At
-	// 110 its 3 items split column-major: "/ filter" beside "r refresh" on
-	// one row, "a switch view" below. (roborev 95j1: 100 no longer exercised
-	// this.)
-	m.help.Width, m.width = 110, 110
-	w110 := strings.Split(stripANSI(m.renderLegend()), "\n")
-	if r1, r2 := lineOf(w110, "/ filter"), lineOf(w110, "r refresh"); r1 < 0 || r1 != r2 {
-		t.Errorf("View should fold / filter and r refresh onto the same row at width 110; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w110, "\n"))
+	// App folds once there's room for it (nc1j: it now out-ranks View at 4
+	// rows, so it's tried before View -- and the algorithm never backtracks to
+	// a later, smaller candidate once one doesn't fit, so View can't fold
+	// before App does). At 130 App's 4 items split column-major: "u undo"
+	// beside "? help" on one row, "h show/hide key bindings" beside "q quit"
+	// on the next -- but View still doesn't fit (its own fold needs >=135, past
+	// 130), so "/ filter"/"a switch view"/"r refresh" stay on SEPARATE rows.
+	m.help.Width, m.width = 130, 130
+	w130 := strings.Split(stripANSI(m.renderLegend()), "\n")
+	if r1, r2 := lineOf(w130, "u undo"), lineOf(w130, "? help"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold u undo/? help onto the same row at width 130; u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	}
+	if r1, r2 := lineOf(w130, "show/hide key bindings"), lineOf(w130, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold h show/hide key bindings/q quit onto the same row at width 130; h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	}
+	if r1, r2 := lineOf(w130, "/ filter"), lineOf(w130, "r refresh"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("View should NOT fold at width 130 (needs >=135); / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	}
+
+	// View folds last, once there's room for it (its own fold needs >=135,
+	// past App's 130 above). At 135 its 3 items split column-major: "/ filter"
+	// beside "r refresh" on one row, "a switch view" below.
+	m.help.Width, m.width = 135, 135
+	w135 := strings.Split(stripANSI(m.renderLegend()), "\n")
+	if r1, r2 := lineOf(w135, "/ filter"), lineOf(w135, "r refresh"); r1 < 0 || r1 != r2 {
+		t.Errorf("View should fold / filter and r refresh onto the same row at width 135; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w135, "\n"))
 	}
 
 	// Ceiling: a very wide terminal folds ALL FOUR groups, App included,
@@ -4233,28 +4262,29 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("grid should stop changing once every group is folded; width=200 and width=400 rendered differently:\n200:\n%s\n400:\n%s", ceiling, pastCeiling)
 	}
 	ceilingLines := strings.Split(ceiling, "\n")
-	// App's 3 bar bindings fold top-heavy 2/1: "u undo" and "? help" down the
-	// first sub-column, "q quit" alone in the second -- so the fold shows up as
-	// q quit rising to share u undo's row (before 3cwx, App was 2 bindings and
-	// this read "? help | q quit").
-	if r1, r2 := lineOf(ceilingLines, "u undo"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold at the ceiling width (u undo | q quit on one row); u undo row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	// App's 4 bar bindings (nc1j added `h`) fold EVEN column-major: u/h down
+	// the first sub-column, ?/q down the second -- so "u undo" pairs with "?
+	// help" on one row, and "h show/hide key bindings" pairs with "q quit" on
+	// the next (before nc1j, App was 3 bindings and folded top-heavy 2/1,
+	// reading "u undo | q quit" / "? help" alone).
+	if r1, r2 := lineOf(ceilingLines, "u undo"), lineOf(ceilingLines, "? help"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold at the ceiling width (u undo | ? help on one row); u undo row %d, ? help row %d:\n%s", r1, r2, ceiling)
 	}
-	if r1, r2 := lineOf(ceilingLines, "? help"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 == r2 {
-		t.Errorf("App's folded second sub-col holds only q quit; ? help should be on its own row, not beside q quit; ? help row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	if r1, r2 := lineOf(ceilingLines, "show/hide key bindings"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App's folded second sub-col pairs h show/hide key bindings with q quit; h row %d, q quit row %d:\n%s", r1, r2, ceiling)
 	}
 
 	// Still no truncation/ellipsis at the ceiling: every hint present. ("P
 	// on ts.net (public)" isn't checked as a single-space literal here: unlike
 	// the wrapped fallback, the grid pads keys to their sub-column's gutter --
-	// Serve Toggles' folded left sub-col gutter is 5 (from "space"), so "P" renders
-	// padded ("P     on ts.net (public)") -- checking the description alone
-	// sidesteps that padding.)
+	// Toggle Service Exposure's folded left sub-col gutter is 5 (from
+	// "space"), so "P" renders padded ("P     on ts.net (public)") --
+	// checking the description alone sidesteps that padding.)
 	for _, want := range []string{
 		"space on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
 		"f favorite", "F forget", "n new favorite", "c copy URL", "l label",
 		"/ filter", "a switch view", "r refresh",
-		"u undo", "? help", "q quit",
+		"u undo", "show/hide key bindings", "? help", "q quit",
 	} {
 		if !strings.Contains(ceiling, want) {
 			t.Errorf("ceiling grid dropped %q; got:\n%s", want, ceiling)
@@ -4271,7 +4301,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 // TestBottomBarGridFoldedSubColAligned covers kata xqdk: a folded group's
 // SECOND sub-column must begin at the same display column on every row, not
 // hug the previous row's (possibly shorter) sub-col-1 content. Favorites
-// folds at width 100 (see TestBottomBarGridFolds) into a top-heavy 3/2 split:
+// folds at width 120 (see TestBottomBarGridFolds) into a top-heavy 3/2 split:
 // f/u/n down sub-col 1, c/l down sub-col 2. Sub-col 1's rendered content width
 // varies by row -- "f favorite" is 10 wide, "u unfavorite" is 12, "n add
 // favorite" is 14 (the widest, setting subWidth[0]) -- which is exactly the
@@ -4282,7 +4312,8 @@ func TestBottomBarGridFolds(t *testing.T) {
 // column.
 func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 	m := New(config.Config{})
-	m.help.Width, m.width = 100, 100
+	m.cfAvailable = false // pin the classic key set (no `t`) for deterministic grid mechanics (kata nc1j)
+	m.help.Width, m.width = 120, 120
 
 	grid := stripANSI(m.renderLegend())
 	lines := strings.Split(grid, "\n")
@@ -4320,7 +4351,9 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	// The 4-column grid is 64 cells wide; 50 forces the wrapped fallback.
+	// The 4-column grid's packed floor is 82 cells wide (84 when the `t`
+	// cloudflare-tunnel key is also shown, kata nc1j -- see m.cfAvailable
+	// below); 50 forces the wrapped fallback either way.
 	const width = 50
 	m := New(config.Config{})
 	m.help.Width = width
@@ -4330,7 +4363,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	lines := strings.Split(bar, "\n")
 
 	// Not the grid: the four headers are no longer all on the first line.
-	if all := strings.Contains(lines[0], "Serve Toggles") && strings.Contains(lines[0], "App"); all {
+	if all := strings.Contains(lines[0], "Toggle Service Exposure") && strings.Contains(lines[0], "App"); all {
 		t.Errorf("narrow width should fall back, not render the single-row grid header; got %q", lines[0])
 	}
 
@@ -4342,16 +4375,22 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	}
 
 	// Every hint is still present -- no truncation, no elision. (C is contextual
-	// and absent with no dangling.)
-	for _, want := range []string{
-		"Serve Toggles", "Favorites", "View", "App",
+	// and absent with no dangling. This test doesn't pin m.cfAvailable, so `t`
+	// on cloudflare only belongs in the want-list when this host actually has
+	// cloudflared, kata nc1j.)
+	want := []string{
+		"Toggle Service Exposure", "Favorites", "View", "App",
 		"space on tailscale", "P on ts.net (public)", "c copy URL",
 		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
-		"u undo", "? help", "q quit",
-	} {
-		if !strings.Contains(bar, want) {
-			t.Errorf("narrow fallback dropped %q; got:\n%s", want, bar)
+		"u undo", "h show/hide key bindings", "? help", "q quit",
+	}
+	if m.cfAvailable {
+		want = append(want, "t on cloudflare (public)")
+	}
+	for _, hint := range want {
+		if !strings.Contains(bar, hint) {
+			t.Errorf("narrow fallback dropped %q; got:\n%s", hint, bar)
 		}
 	}
 	if strings.Contains(bar, "clean") {
@@ -4360,26 +4399,30 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 }
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
-// Protect is folded into Serve Toggles: with no dangling the Serve Toggles
-// column ends at "e edit publish config" (space/P/p/x/e, no clean, no
+// Protect is folded into Toggle Service Exposure: with no dangling the
+// column ends at "e edit publish config" (space/p/P/x/e, no clean, no
 // reserved blank slot); when a dangling forward exists it gains "C clean
 // stale" -- inserted just ABOVE lock so "x lock/unlock" then "e edit publish
 // config" stay the last two items, in that order, in either state. (kata
-// v1z5 added publish edge to Serve Toggles, after funnel; p/P swapped under
-// vzj4 so it's now P funnel, p publish; kata prp1 added e edit right after
-// lock, so edit -- not lock -- is now the column's last item.)
+// v1z5 added publish edge to the exposure column, after funnel; p/P swapped
+// under vzj4 so it's now P funnel, p publish; kata prp1 added e edit right
+// after lock, so edit -- not lock -- is now the column's last item. nc1j
+// renamed the column "Toggle Service Exposure" and reordered it to
+// space/p/t/P; `t` (cloudflare tunnel) is pinned off here via cfAvailable,
+// so the column stays space/p/P/x/e -- see the pinned tests' comments.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
+	m.cfAvailable = false // pin the classic key set (no `t`); this tests contextual-Clean, not the tunnel key (kata nc1j)
 	m.help.Width = 100
 	m.width = 100
 
 	expose := func(groups []keyGroup) keyGroup {
 		for _, g := range groups {
-			if g.name == "Serve Toggles" {
+			if g.name == "Toggle Service Exposure" {
 				return g
 			}
 		}
-		t.Fatal("no Serve Toggles group")
+		t.Fatal("no Toggle Service Exposure group")
 		return keyGroup{}
 	}
 	lastKey := func(g keyGroup) string {
@@ -4389,31 +4432,31 @@ func TestExposeContextualClean(t *testing.T) {
 		return g.bindings[len(g.bindings)-1].Help().Key
 	}
 
-	// No dangling -> Serve Toggles is space/P/p/x/e (clean dropped), edit
-	// last, and the rendered bar omits "clean".
+	// No dangling -> Toggle Service Exposure is space/p/P/x/e (clean
+	// dropped), edit last, and the rendered bar omits "clean".
 	noClean := expose(m.barGroups(false))
 	if got := len(noClean.bindings); got != 5 {
-		t.Errorf("Serve Toggles should be 5 bindings (space/P/p/x/e) with no dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 5 bindings (space/p/P/x/e) with no dangling; got %d", got)
 	}
 	if k := lastKey(noClean); k != "e" {
-		t.Errorf("edit (e) should be the last Serve Toggles binding with no dangling; got %q", k)
+		t.Errorf("edit (e) should be the last Toggle Service Exposure binding with no dangling; got %q", k)
 	}
 	if noDangle := stripANSI(m.renderLegend()); strings.Contains(noDangle, "clean") {
 		t.Errorf("bar should not show 'clean' with no dangling:\n%s", noDangle)
 	}
 
-	// A served-but-not-listening port is dangling -> Serve Toggles gains "C clean",
-	// still with edit (e) last (and lock directly above it).
+	// A served-but-not-listening port is dangling -> Toggle Service Exposure
+	// gains "C clean", still with edit (e) last (and lock directly above it).
 	m.active = map[int]bool{9999: true}
 	if !m.hasDangling() {
 		t.Fatal("setup: expected a dangling forward")
 	}
 	withClean := expose(m.barGroups(true))
 	if got := len(withClean.bindings); got != 6 {
-		t.Errorf("Serve Toggles should be 6 bindings (space/P/p/C/x/e) with a dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 6 bindings (space/p/P/C/x/e) with a dangling; got %d", got)
 	}
 	if k := lastKey(withClean); k != "e" {
-		t.Errorf("edit (e) should STILL be the last Serve Toggles binding with a dangling; got %q", k)
+		t.Errorf("edit (e) should STILL be the last Toggle Service Exposure binding with a dangling; got %q", k)
 	}
 	if dangle := stripANSI(m.renderLegend()); !strings.Contains(dangle, "clean stale") {
 		t.Errorf("bar should show 'C clean stale' with a dangling:\n%s", dangle)
@@ -4781,7 +4824,7 @@ func TestHelpOverlayGroupedSections(t *testing.T) {
 
 	// Sections appear in the approved order.
 	prev := -1
-	for _, name := range []string{"Serve Toggles", "Favorites", "View", "App"} {
+	for _, name := range []string{"Toggle Service Exposure", "Favorites", "View", "App"} {
 		at := strings.Index(help, name)
 		if at < 0 {
 			t.Fatalf("overlay missing section %q", name)
@@ -4830,8 +4873,8 @@ func TestHelpOverlaySetupPrerequisites(t *testing.T) {
 	}
 	// It lands ahead of the keybinding groups, near Markers -- not appended
 	// after everything else, and not inside the grouped keybinding legend.
-	if at, expose := strings.Index(help, "Setup / prerequisites"), strings.Index(help, "Serve Toggles"); at < 0 || expose < 0 || at > expose {
-		t.Errorf("'Setup / prerequisites' (at %d) should appear before the 'Serve Toggles' keybinding group (at %d)", at, expose)
+	if at, expose := strings.Index(help, "Setup / prerequisites"), strings.Index(help, "Toggle Service Exposure"); at < 0 || expose < 0 || at > expose {
+		t.Errorf("'Setup / prerequisites' (at %d) should appear before the 'Toggle Service Exposure' keybinding group (at %d)", at, expose)
 	}
 }
 

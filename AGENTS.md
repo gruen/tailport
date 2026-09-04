@@ -68,6 +68,43 @@ contract. The short version:
   published-state poll in `internal/ui`. The `p` toggle, the `e` edit key, the
   session-only `lastPublish` memory, and `caddy.silent_republish` were added
   under kata prp1.)
+- Cloudflare Tunnel is a THIRD public path (the `t` key, kata nc1j),
+  **mutually exclusive with BOTH Funnel and Publish — never layered or
+  ranked above either**. A local port can carry at most one public
+  exposure: `t` refuses an already-funnelled or already-published port, and
+  `P`/`p` each refuse an already-tunnelled one, each instructing the user to
+  remove the other exposure first. Exposure created outside tailport is
+  surfaced as explicit drift (a "funnelled AND tunnelled — remove one"
+  description, extending to "multiple public exposures — remove all but
+  one" when all three collide), never silently collapsed to one marker.
+  `:22` is hard-blocked, same as Funnel/Publish. Two flavours, matching
+  Cloudflare's two account scenarios: a QUICK tunnel needs no account and
+  gets a random, ephemeral `*.trycloudflare.com` hostname assigned only
+  after cloudflared actually starts — so its confirm CANNOT name the exact
+  public URL in advance, a DOCUMENTED, DELIBERATE deviation from the
+  always-name-the-URL rule the other public paths follow, forced by
+  cloudflared's own design (there is no way to reserve or predict the
+  hostname before starting); a NAMED tunnel requires the operator to have
+  already run `cloudflared tunnel login`, created the tunnel, and routed its
+  hostname (`cloudflared tunnel route dns`) — a separate, one-time operator
+  task, exactly like standing up the Caddy edge. tailport only ever RUNS a
+  named tunnel (`cloudflared tunnel run --url http://localhost:PORT
+  <name>`); it never mutates the user's Cloudflare account or DNS. Unlike
+  Publish (a stateless client of a remote edge) or Funnel (a
+  Tailscale-managed ingress slot), cloudflared is a LONG-RUNNING LOCAL
+  PROCESS tailport supervises directly — and by design TUNNELS SURVIVE
+  TAILPORT EXITING: cloudflared is spawned DETACHED (its own session), and
+  the OS process table is the live source of truth, polled fresh every
+  cycle and NEVER persisted, so a tunnel from a prior session is
+  re-discovered and re-toggleable on the next launch. Only tailport-OWNED
+  tunnels (carrying a sentinel `--logfile` flag tailport always passes) are
+  tracked this way; a foreign `cloudflared` process is surfaced as drift,
+  never signalled or touched. The whole feature is gated on `cloudflared`
+  being installed — detected once at startup — so an absent binary drops
+  the `t` key from the bar entirely: no key, no discovery, no polling.
+  (Implemented under kata nc1j: `internal/cftunnel`, the `cloudflared:`
+  config block, and the `t` key / `requestTunnel` gate / tunnel-state poll
+  in `internal/ui`.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel
   already encrypts peer-to-peer traffic, so app-layer TLS added no real
@@ -102,6 +139,16 @@ contract. The short version:
   `c` copy-URL action, but it is never required to build or run — the
   primary clipboard path is OSC 52 (pure Go, no external binary), and a
   missing helper is silently skipped.
+  Carve-out (nc1j): `cloudflared` is a SECOND optional, opt-in third-party
+  binary, required only if you use the `t` Cloudflare Tunnel feature (see
+  the Cloudflare Tunnel design-constraints bullet above and
+  `internal/cftunnel`). Unlike the clipboard helper's fire-and-forget
+  shell-out, cloudflared is a **supervised local daemon** — the first
+  long-running process tailport itself spawns and supervises, distinct
+  from the remote Caddy edge tailport only ever talks to over HTTP. Like
+  the clipboard carve-out, it is never required to build or run tailport:
+  absence just disables the `t` key (no key, no discovery, no polling) and
+  costs nothing.
 
 ### Verification bar
 
