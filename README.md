@@ -46,7 +46,7 @@ Two deliberate constraints on the tailnet-`serve` path:
   `http://<hostname>:<port>` resolves for your other tailnet devices).
 - Run this once so tailport can call `tailscale serve` without root:
   ```sh
-  sudo tailscale set --operator=$USER
+  sudo tailscale set --operator=$(whoami)
   ```
 - Linux (uses `ss` for port discovery) or macOS (uses `lsof`). Other
   platforms aren't supported.

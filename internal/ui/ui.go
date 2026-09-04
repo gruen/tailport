@@ -1091,11 +1091,6 @@ type model struct {
 	// published-state poll or a successful publish. See domainSetupHintText and
 	// the publishPollMsg/publishDoneMsg handlers.
 	domainSetupPending bool
-	// operatorUser is the OS username used to build the sticky hint's exact,
-	// copy-pasteable fix command ($USER EXPANDED, via tsserve.CurrentUsername
-	// resolved once in New) -- falls back to a "<you>" placeholder at render
-	// time if it couldn't be determined.
-	operatorUser string
 	// configPath is the resolved absolute path where preferences (the port
 	// registry: favorites, labels, locks) are persisted, captured once at
 	// New() from config.Path(cfg.ResolvedPath()) so the help overlay can
@@ -1379,8 +1374,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 		emoji: emojiCapable(),
 		// markerEmoji (exposure markers) obeys --markers/cfg.Markers, defaulting
 		// to mono when unset (qwcw).
-		markerEmoji:  resolveMarkerEmoji(markersMode),
-		operatorUser: tsserve.CurrentUsername(),
+		markerEmoji: resolveMarkerEmoji(markersMode),
 	}
 }
 
@@ -6349,27 +6343,24 @@ func (m model) markerLegend() string {
 // "Setup / prerequisites" section (see helpView) and `tailport quickstart`
 // (kata tapv), so the two can't drift apart -- mirroring how
 // KeyLegendGroups/RenderKeyLegendGroups already share the keybinding legend
-// between them. operatorUser is expected $USER EXPANDED (see
-// tsserve.CurrentUsername) so the fix command is directly copy-pasteable; a
-// "<you>" placeholder is substituted if it's empty (couldn't be determined).
-func OperatorSetupText(operatorUser string) string {
-	you := operatorUser
-	if you == "" {
-		you = "<you>"
-	}
+// between them. The fix command uses $(whoami) rather than a resolved username
+// so it's correct for ANY reader (a copy of this text -- in the quickstart
+// output, a screenshot, docs -- must never carry one machine's operator name),
+// while staying directly copy-pasteable: the shell expands $(whoami) to the
+// invoking (non-root) user before sudo runs.
+func OperatorSetupText() string {
 	return "tailscale itself requires an operator to be set before a non-root\n" +
 		"user can run `tailscale serve`/`funnel` -- without it you'll see\n" +
 		"\"Access denied\" the first time you press space. Run this once:\n" +
-		"  sudo tailscale set --operator=" + you + "\n" +
+		"  sudo tailscale set --operator=$(whoami)\n" +
 		"(or run tailport itself with sudo). If it's not set yet, pressing\n" +
 		"space shows a persistent on-screen reminder with this exact command;\n" +
 		"press r afterward to re-check and clear it."
 }
 
-// operatorSetupText binds OperatorSetupText to this model's resolved
-// operator username, for helpView.
+// operatorSetupText is the model-side alias of OperatorSetupText, for helpView.
 func (m model) operatorSetupText() string {
-	return OperatorSetupText(m.operatorUser)
+	return OperatorSetupText()
 }
 
 // helpContent builds the FULL "?" overlay text (title, intro, markers, setup,
@@ -6764,11 +6755,9 @@ func (m model) statusText() string {
 
 // operatorHintText returns the STICKY banner guiding the user through
 // tailscale's operator requirement (kata tapv), or "" when the hint isn't
-// active (see m.operatorNotSet). The fix command has $USER EXPANDED --
-// m.operatorUser, resolved once at New() via tsserve.CurrentUsername -- so
-// it's directly copy-pasteable, no manual substitution needed. Falls back
-// to a "<you>" placeholder in the unlikely case the OS username couldn't be
-// determined at all, so the line still reads sensibly.
+// active (see m.operatorNotSet). The fix command uses $(whoami) so it's both
+// directly copy-pasteable (the shell expands it) and correct for any user --
+// no per-machine operator name is baked into a banner a screenshot might share.
 func (m model) operatorHintText() string {
 	if !m.operatorNotSet {
 		return ""
@@ -6783,11 +6772,7 @@ func (m model) operatorHintText() string {
 // can appear async with no intervening WindowSizeMsg). The two must build the
 // SAME text or the reservation would measure a different string than the render.
 func (m model) operatorHintTextRaw() string {
-	you := m.operatorUser
-	if you == "" {
-		you = "<you>"
-	}
-	return fmt.Sprintf("⚠ tailscale operator not set — run once: sudo tailscale set --operator=%s  (then press r)  — or run tailport with sudo", you)
+	return "⚠ tailscale operator not set — run once: sudo tailscale set --operator=$(whoami)  (then press r)  — or run tailport with sudo"
 }
 
 // domainSetupHintText returns the STICKY setup-reminder banner raised after the

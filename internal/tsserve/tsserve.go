@@ -209,12 +209,12 @@ func portSuffix(s string) int {
 // command because the invoking OS user isn't tailscale's configured
 // operator. This is tailscale's OWN permission model (not a tailport bug):
 // controlling `tailscale serve` as a non-root user requires `sudo tailscale
-// set --operator=$USER` once (or running the command with sudo every time).
+// set --operator=$(whoami)` once (or running the command with sudo every time).
 // classifyServeErr recognizes tailscale's own remedy text in the CLI's
 // output and maps it to this sentinel, so callers (the UI) can react to a
 // TYPED error instead of string-matching tailscale's stderr themselves
 // (kata tapv).
-var ErrOperatorNotSet = errors.New("tailscale operator is not set for this user -- run 'sudo tailscale set --operator=$USER' once, or run tailport with sudo")
+var ErrOperatorNotSet = errors.New("tailscale operator is not set for this user -- run 'sudo tailscale set --operator=$(whoami)' once, or run tailport with sudo")
 
 // isOperatorNotSet reports whether out (a failed `tailscale serve`/`funnel`
 // invocation's combined output) is tailscale's Access-denied/operator

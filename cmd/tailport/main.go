@@ -18,7 +18,6 @@ import (
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/selfupdate"
 	"github.com/gruen/tailport/internal/statusreport"
-	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -331,7 +330,7 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 	// should see the same legible colors --theme light gives the TUI.
 	ui.ApplyTheme(resolveThemeMode(cf.theme, cfg.Theme))
 
-	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveMarkerEmoji(markersMode), tsserve.CurrentUsername()))
+	fmt.Fprint(stdout, quickstartText(cfg.ResolvedPath(), ui.ResolveMarkerEmoji(markersMode)))
 	return 0
 }
 
@@ -355,10 +354,10 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 //
 // Kept as a pure string builder (like versionLine) rather than writing
 // straight to an io.Writer, so it's testable without stdout/exit-code
-// plumbing. operatorUser is passed in (rather than resolved here via
-// tsserve.CurrentUsername) so a test can pin it to a fixed value instead of
-// depending on whichever OS user happens to run the test.
-func quickstartText(configPath string, emoji bool, operatorUser string) string {
+// plumbing. The operator fix command is a fixed $(whoami) form (see
+// ui.OperatorSetupText), so the output no longer depends on whichever OS user
+// runs it -- deterministic without a pinned username.
+func quickstartText(configPath string, emoji bool) string {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, "tailport exposes your machine's locally listening TCP ports across your")
@@ -367,7 +366,7 @@ func quickstartText(configPath string, emoji bool, operatorUser string) string {
 	fmt.Fprintln(&b, "list (run `tailport` with no arguments) or headlessly via its subcommands.")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Prerequisites:")
-	for _, line := range strings.Split(ui.OperatorSetupText(operatorUser), "\n") {
+	for _, line := range strings.Split(ui.OperatorSetupText(), "\n") {
 		fmt.Fprintln(&b, "  "+line)
 	}
 	fmt.Fprintln(&b)

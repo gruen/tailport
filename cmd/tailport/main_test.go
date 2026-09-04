@@ -15,7 +15,6 @@ import (
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/statusreport"
-	"github.com/gruen/tailport/internal/tsserve"
 	"github.com/gruen/tailport/internal/ui"
 )
 
@@ -263,9 +262,8 @@ func TestRunQuickstartLegendMatchesOverlay(t *testing.T) {
 // `tailport quickstart`'s printed prerequisites section is (line-for-line,
 // modulo quickstart's two-space indent) the exact same
 // ui.OperatorSetupText the in-TUI "?" overlay's "Setup / prerequisites"
-// section renders, so the two can never drift apart. tsserve.CurrentUsername
-// is called from the test itself (not hardcoded) since both quickstart and
-// the test resolve it the same way on whatever machine runs this.
+// section renders, so the two can never drift apart. OperatorSetupText emits
+// a fixed $(whoami) form, so it needs no machine-specific resolution here.
 func TestRunQuickstartPrerequisitesMatchesOverlay(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -275,7 +273,7 @@ func TestRunQuickstartPrerequisitesMatchesOverlay(t *testing.T) {
 		t.Fatalf("run([quickstart]) code = %d, want 0; stderr:\n%s", code, errOut.String())
 	}
 
-	want := ui.OperatorSetupText(tsserve.CurrentUsername())
+	want := ui.OperatorSetupText()
 	got := out.String()
 	for _, line := range strings.Split(want, "\n") {
 		if !strings.Contains(got, "  "+line) {

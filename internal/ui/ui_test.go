@@ -4427,11 +4427,10 @@ func TestHelpOverlayGroupedSections(t *testing.T) {
 // requirement, added near Markers -- INTO the same grouped structure
 // (p39s) but not folded into KeyLegendGroups (that source is shared
 // verbatim with the bottom-bar grid and quickstart's legend, and this isn't
-// a keybinding). The fix command is $USER expanded.
+// a keybinding). The fix command is the portable $(whoami) form.
 func TestHelpOverlaySetupPrerequisites(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{})
-	m.operatorUser = "alice"
 
 	// Assert on helpContent (the full overlay text); helpView windows it to the
 	// terminal height (v10j).
@@ -4439,8 +4438,8 @@ func TestHelpOverlaySetupPrerequisites(t *testing.T) {
 	if !strings.Contains(help, "Setup / prerequisites") {
 		t.Fatalf("help overlay missing 'Setup / prerequisites' section:\n%s", help)
 	}
-	if !strings.Contains(help, "sudo tailscale set --operator=alice") {
-		t.Errorf("helpView's prerequisites section should show the $USER-expanded fix command; got:\n%s", help)
+	if !strings.Contains(help, "sudo tailscale set --operator=$(whoami)") {
+		t.Errorf("helpView's prerequisites section should show the $(whoami) fix command; got:\n%s", help)
 	}
 	// It lands ahead of the keybinding groups, near Markers -- not appended
 	// after everything else, and not inside the grouped keybinding legend.
@@ -4548,15 +4547,14 @@ func TestHelpOverlayScrolls(t *testing.T) {
 // serve/funnel failure classified as tsserve.ErrOperatorNotSet raises the
 // STICKY banner -- a deliberate exception to the auto-dismissing toast (see
 // TestErrorToasts case 6 for the ordinary-error contrast) -- carrying the
-// $USER-expanded fix command, and it survives a keypress and a flash-expiry
-// tick that would clear an ordinary toast. It clears only on genuine
-// resolution: a subsequent successful toggle, or a re-check
+// portable $(whoami) fix command, and it survives a keypress and a
+// flash-expiry tick that would clear an ordinary toast. It clears only on
+// genuine resolution: a subsequent successful toggle, or a re-check
 // (detectOperatorMsg, as triggered by "r") confirming the operator is now
 // set; an INCONCLUSIVE re-check must leave it standing.
 func TestOperatorHintBanner(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	base := New(config.Config{})
-	base.operatorUser = "alice"
 	base.width, base.height = 100, 24
 
 	// (1) A serve failure classified as ErrOperatorNotSet raises the sticky
@@ -4568,10 +4566,10 @@ func TestOperatorHintBanner(t *testing.T) {
 	if m.flash != "" {
 		t.Errorf("ErrOperatorNotSet should NOT raise the transient toast; flash = %q", m.flash)
 	}
-	const wantCmd = "sudo tailscale set --operator=alice"
+	const wantCmd = "sudo tailscale set --operator=$(whoami)"
 	view := stripANSI(m.View())
 	if !strings.Contains(view, wantCmd) {
-		t.Errorf("View() missing the $USER-expanded fix command %q; got:\n%s", wantCmd, view)
+		t.Errorf("View() missing the $(whoami) fix command %q; got:\n%s", wantCmd, view)
 	}
 	if !strings.Contains(view, "press r") {
 		t.Errorf("View() should mention pressing r to re-check; got:\n%s", view)
@@ -6137,7 +6135,6 @@ func TestPublishSuccessTeachesUnpublish(t *testing.T) {
 func TestTwoConcurrentBanners(t *testing.T) {
 	m := New(config.Config{Ports: map[int]config.PortMeta{}})
 	m.cfg.Caddy.Domain = "apps.example.com"
-	m.operatorUser = "alice"
 	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"}}
 	m.showAllPorts = true
 	m.rebuildItems()
@@ -6178,7 +6175,6 @@ func TestBannerReservationDominatesBothLive(t *testing.T) {
 	build := func(w, h int, domain string, opAtRender, domAtRender bool) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{}})
 		m.cfg.Caddy.Domain = domain
-		m.operatorUser = "alice"
 		m.allPorts = []portscan.Port{
 			{Number: 3000, Process: "node"}, {Number: 8080, Process: "srv"},
 			{Number: 9000, Process: "api"}, {Number: 5173, Process: "vite"},
