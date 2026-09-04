@@ -1222,50 +1222,45 @@ func TestCopyKeymap(t *testing.T) {
 	}
 }
 
-// TestCopyURL covers vnq7's copy action, updated for py5b and vqa3: state C
-// (served + listening, not funnelled) goes INLINE -- the row's own
-// "✓ copied" annotation, no toast -- since the row already shows the copied
-// URL. Since vqa3, the "not served" case below is ALSO inline: with no
-// explicit bind scope the port resolves to reachLocalhost, one of the four
-// healthy states whose row text ("localhost only") already states what was
-// copied.
+// TestCopyURL covers vnq7's copy action migrated to route-scoped copy (kata
+// th05 P5): `c` copies the SELECTED route sub-row's exact URL, flags the inline
+// "✓ copied" on THAT route line (copiedPort + copiedRouteIdx), and never toasts
+// for a non-empty URL. A served wildcard port carries two routes (localhost +
+// tailnet); copying each copies its own address, so the annotation is truly
+// per-route now, not per-service.
 func TestCopyURL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	newModel := func(active bool) model {
+	newModel := func() model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
 		m.host = "host"
-		m.width = 80 // wide enough that inlineCopyFits always succeeds here
-		m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
-		if active {
-			m.active = map[int]bool{8080: true}
-		} else {
-			m.active = map[int]bool{}
-		}
+		m.width = 80
+		// A served wildcard bind -> routes[0]=localhost, routes[1]=tailnet.
+		m.allPorts = []portscan.Port{{Number: 8080, Process: "web", BindScope: portscan.ScopeWildcard}}
+		m.active = map[int]bool{8080: true}
 		m.showAllPorts = true
 		m.rebuildItems()
 		return m
 	}
 
-	// State C: inline "✓ copied" on the row, copiedPort set, NO toast.
-	m := newModel(true)
+	// routeIdx 0 = localhost: inline ✓, copiedRouteIdx 0, NO toast, and the
+	// localhost URL (not the tailnet one) is what carries the suffix.
+	m := newModel()
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
 	if cmd == nil {
 		t.Error("c should return a copy/rebuild/expire cmd")
 	}
 	if m.flash != "" {
-		t.Errorf("state-C copy should NOT toast; flash = %q", m.flash)
+		t.Errorf("route copy should NOT toast a non-empty URL; flash = %q", m.flash)
 	}
-	if m.copiedPort != 8080 {
-		t.Errorf("copiedPort = %d, want 8080", m.copiedPort)
+	if m.copiedPort != 8080 || m.copiedRouteIdx != 0 {
+		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/0", m.copiedPort, m.copiedRouteIdx)
 	}
-	sel, ok := m.list.SelectedItem().(portItem)
-	if !ok || !sel.justCopied {
-		t.Errorf("selected item justCopied = %v, want true", ok && sel.justCopied)
+	body, _ := m.bodyLines()
+	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://localhost:8080") {
+		t.Errorf("body = %q, want the localhost URL plus the ✓ copied suffix on the selected route", got)
 	}
-	if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://host:8080") {
-		t.Errorf("Description() = %q, want the tailnet URL plus the ✓ copied suffix", got)
-	}
+
 	// Unlike the toast, the inline annotation is NOT cleared by the next
 	// keypress -- it fades only via copiedExpireMsg's id-guarded timer.
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
@@ -1273,33 +1268,22 @@ func TestCopyURL(t *testing.T) {
 		t.Errorf("copiedPort should survive an unrelated keypress; got %d", got.copiedPort)
 	}
 
-	// Not served (reachLocalhost: listening, unclassified/loopback bind,
-	// nothing active): since vqa3 this is ALSO inline -- the row's own
-	// "localhost only" text already says what got copied, so no toast.
-	m = newModel(false)
+	// Move the route cursor down to the tailnet route and copy again: the
+	// annotation migrates to routeIdx 1 and copies the tailnet URL.
+	m = newModel()
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}}) // down -> tailnet route
+	m = m2.(model)
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
 	if m.flash != "" {
-		t.Errorf("not-served (reachLocalhost) copy should not toast; flash = %q", m.flash)
+		t.Errorf("tailnet route copy should not toast; flash = %q", m.flash)
 	}
-	if m.copiedPort != 8080 {
-		t.Errorf("not-served (reachLocalhost) copy should set copiedPort; got %d", m.copiedPort)
+	if m.copiedPort != 8080 || m.copiedRouteIdx != 1 {
+		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/1 (annotation should move to the tailnet route)", m.copiedPort, m.copiedRouteIdx)
 	}
-}
-
-// TestInlineCopyFits covers py5b's width-fit boundary: the "✓ copied"
-// annotation fits exactly at its required width, and is one cell too wide
-// just below it -- the rule that keeps a narrow terminal from silently
-// dropping the confirmation off the end-truncated row.
-func TestInlineCopyFits(t *testing.T) {
-	suffixWidth := lipgloss.Width(copiedSuffix)
-	const descWidth = 30
-	avail := descWidth + suffixWidth
-	if !inlineCopyFits(descWidth, avail) {
-		t.Errorf("inlineCopyFits(%d, %d) = false, want true (exact fit)", descWidth, avail)
-	}
-	if inlineCopyFits(descWidth, avail-1) {
-		t.Errorf("inlineCopyFits(%d, %d) = true, want false (one cell too narrow)", descWidth, avail-1)
+	body, _ = m.bodyLines()
+	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://host:8080") {
+		t.Errorf("body = %q, want the tailnet URL plus the ✓ copied suffix", got)
 	}
 }
 
@@ -1333,191 +1317,12 @@ func TestCopiedExpire(t *testing.T) {
 	}
 }
 
-// TestCopyURLInlineVsToast covers py5b's precise inline-vs-toast boundary:
-// only state C (served + listening + not funnelled), and only when the
-// annotation actually fits, goes inline. Funnelled, dangling, and a state-C
-// copy too wide for the terminal all keep the toast with copiedPort staying
-// 0 -- see AGENTS.md's "When to go inline vs toast".
-func TestCopyURLInlineVsToast(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	base := func() model {
-		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
-		m.host = "host"
-		m.width = 80
-		m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
-		m.active = map[int]bool{8080: true}
-		m.showAllPorts = true
-		return m
-	}
-
-	// Funnelled: the row shows the PUBLIC url but "c" copies the TAILNET
-	// url -- a mismatch, so the toast (which names what was copied) stays,
-	// no inline.
-	m := base()
-	m.funnel = map[int]int{8080: 443}
-	m.rebuildItems()
-	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	m = res.(model)
-	if m.copiedPort != 0 || m.flash == "" {
-		t.Errorf("funnelled copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast", m.copiedPort, m.flash)
-	}
-
-	// Dangling (active, but nothing listening): the row shows the stale
-	// warning, no URL at all -- toast, no inline.
-	m = base()
-	m.allPorts = nil // nothing listening locally -> the active favorite is dangling
-	m.rebuildItems()
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	m = res.(model)
-	if m.copiedPort != 0 || m.flash == "" {
-		t.Errorf("dangling copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast", m.copiedPort, m.flash)
-	}
-
-	// State C, but the terminal is too narrow for the suffix to fit: falls
-	// back to the toast rather than silently truncating the confirmation
-	// off the row.
-	m = base()
-	m.width = 5
-	m.rebuildItems()
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	m = res.(model)
-	if m.copiedPort != 0 || m.flash == "" {
-		t.Errorf("narrow state-C copy: copiedPort=%d flash=%q, want copiedPort 0 and a toast fallback", m.copiedPort, m.flash)
-	}
-}
-
-// TestCopyURLReachAware covers 83wv/vqa3: copyURL's confirmation must be
-// reach()-aware (parallel to Description()/markerGlyph()), not the pre-79xb
-// binary sel.active, so it can never contradict the space guard
-// (TestSpaceGuardForReachablePorts) for the same state. Since vqa3, the
-// healthy states -- A (reachLocalhost), B (reachTailnet), B' (reachLAN),
-// C (reachServed), and (since d80p) G (reachPublish) -- all go inline
-// (copiedPort set, no toast) at a wide width; the two remaining principled
-// exceptions -- D (reachFunnel) and E (reachStale) -- plus F (reachOffline)
-// keep the toast.
-func TestCopyURLReachAware(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	newModel := func(port int, scope portscan.BindScope, active, listening bool, bindHost string) model {
-		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
-		m.host = "host"
-		m.width = 80 // wide enough that every inline state actually goes inline
-		if listening {
-			m.allPorts = []portscan.Port{{Number: port, Process: "srv", BindScope: scope, BindHost: bindHost}}
-		}
-		if active {
-			m.active = map[int]bool{port: true}
-		} else {
-			m.active = map[int]bool{}
-		}
-		m.showAllPorts = true
-		m.rebuildItems()
-		return m
-	}
-
-	press := func(m model) model {
-		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-		return res.(model)
-	}
-
-	// B: reachTailnet (wildcard bind, listening, unserved). The copied URL
-	// already resolves across the tailnet, so the row's own "on tailnet"
-	// description is enough -- no toast needed, and (crucially) nothing here
-	// can say "localhost only" or "press space", which would contradict the
-	// "already on tailnet — nothing to serve" no-op asserted by
-	// TestSpaceGuardForReachablePorts.
-	m := press(newModel(8080, portscan.ScopeWildcard, false, true, ""))
-	if m.copiedPort != 8080 || m.flash != "" {
-		t.Errorf("reachTailnet copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
-	}
-
-	// B': reachLAN (specific LAN IP, listening, unserved). The row already
-	// says "local network only", so the inline ✓ is sufficient.
-	m = press(newModel(3000, portscan.ScopeLAN, false, true, "192.168.1.50"))
-	if m.copiedPort != 3000 || m.flash != "" {
-		t.Errorf("reachLAN copy: copiedPort=%d flash=%q, want inline (copiedPort 3000, no toast)", m.copiedPort, m.flash)
-	}
-
-	// A: reachLocalhost (loopback bind, listening, unserved). The row already
-	// says "localhost only", so the inline ✓ is sufficient -- no separate
-	// "press space" toast is needed to convey that.
-	m = press(newModel(9000, portscan.ScopeLoopback, false, true, ""))
-	if m.copiedPort != 9000 || m.flash != "" {
-		t.Errorf("reachLocalhost copy: copiedPort=%d flash=%q, want inline (copiedPort 9000, no toast)", m.copiedPort, m.flash)
-	}
-
-	// C: reachServed (served AND listening). Unchanged behavior from py5b --
-	// still goes inline.
-	m = press(newModel(8080, portscan.ScopeLoopback, true, true, ""))
-	if m.copiedPort != 8080 || m.flash != "" {
-		t.Errorf("reachServed copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
-	}
-
-	// F: reachOffline (down favorite, unserved). STILL a toast: nothing live
-	// to copy, so "press space to serve it" is the actionable guidance.
-	m = press(newModel(8025, portscan.ScopeLoopback, false, false, ""))
-	if m.copiedPort != 0 {
-		t.Errorf("reachOffline copy should not go inline; copiedPort = %d", m.copiedPort)
-	}
-	if m.flashLevel != flashWarn || !strings.Contains(m.flash, "localhost only; press space to serve it") || !strings.Contains(m.flash, "http://localhost:8025") {
-		t.Errorf("reachOffline copy flash = %q (level=%v), want the localhost-only press-space toast naming http://localhost:8025", m.flash, m.flashLevel)
-	}
-
-	// E: reachStale (served, but nothing listening). STILL a toast: the
-	// copied URL is dangling and resolves to nothing.
-	m = press(newModel(8025, portscan.ScopeLoopback, true, false, ""))
-	if m.copiedPort != 0 {
-		t.Errorf("reachStale copy should not go inline; copiedPort = %d", m.copiedPort)
-	}
-	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
-		t.Errorf("reachStale copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
-	}
-
-	// D: reachFunnel. STILL a toast: the row shows the PUBLIC url but c
-	// copies the TAILNET url, so a bare inline ✓ would misstate what got
-	// copied -- the toast names it explicitly.
-	fm := newModel(8080, portscan.ScopeWildcard, true, true, "")
-	fm.funnel = map[int]int{8080: 443}
-	fm.rebuildItems()
-	m = press(fm)
-	if m.copiedPort != 0 {
-		t.Errorf("reachFunnel copy should not go inline; copiedPort = %d", m.copiedPort)
-	}
-	if m.flashLevel != flashInfo || !strings.Contains(m.flash, "the tailnet url") {
-		t.Errorf("reachFunnel copy flash = %q (level=%v), want a toast naming 'the tailnet url'", m.flash, m.flashLevel)
-	}
-
-	// G: reachPublish (d80p). Unlike funnel, the row's public https URL and
-	// what `c` copies are now the SAME string (shown==copied), so it joins the
-	// inline group -- no more "tailnet url" toast.
-	pm := newModel(8080, portscan.ScopeWildcard, true, true, "")
-	pm.published = map[int]publishInfo{8080: {hostname: "app.example.com"}}
-	pm.rebuildItems()
-	m = press(pm)
-	if m.copiedPort != 8080 || m.flash != "" {
-		t.Errorf("reachPublish copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
-	}
-
-	// C, but too narrow to inline: falls back to the toast rather than
-	// silently truncating the confirmation off the row.
-	nm := newModel(8080, portscan.ScopeWildcard, true, true, "")
-	nm.width = 5
-	nm.rebuildItems()
-	m = press(nm)
-	if m.copiedPort != 0 {
-		t.Errorf("narrow reachServed copy should not go inline; copiedPort = %d", m.copiedPort)
-	}
-	if m.flashLevel != flashInfo || !strings.HasPrefix(m.flash, "copied ✓") {
-		t.Errorf("narrow reachServed copy flash = %q (level=%v), want the plain copied-checkmark toast", m.flash, m.flashLevel)
-	}
-}
-
-// TestInlineCopyUniversal covers vqa3's core change: the inline "✓ copied"
-// confirmation is no longer state-C-only. It fires for every healthy
-// copyable state (localhost/LAN/tailnet/served, and -- since d80p --
-// published) when the annotation fits, gracefully falls back to the toast
-// when the row is too narrow, and the annotation correctly migrates when the
-// selection moves between two eligible rows.
+// TestInlineCopyUniversal, migrated for route-scoped copy (kata th05 P5): the
+// inline "✓ copied" confirmation fires for every route that has a URL --
+// copiedPort/copiedRouteIdx set, no toast, and the suffix on THAT route line.
+// Only an empty-URL route (the offline pseudo-route, or a still-starting quick
+// tunnel) toasts "nothing to copy yet" and copies nothing. The annotation
+// migrates when the selection moves to another service.
 func TestInlineCopyUniversal(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -1543,8 +1348,8 @@ func TestInlineCopyUniversal(t *testing.T) {
 		return res.(model)
 	}
 
-	// The four inline-eligible states, at a wide width: c goes inline (no
-	// toast), and the annotated row's Description carries the suffix.
+	// Copying the selected route (routeIdx 0) goes inline for any non-empty
+	// URL, and the rendered body carries the ✓ suffix beside that route's URL.
 	inlineCases := []struct {
 		name      string
 		port      int
@@ -1552,11 +1357,12 @@ func TestInlineCopyUniversal(t *testing.T) {
 		active    bool
 		listening bool
 		bindHost  string
+		wantURL   string
 	}{
-		{"localhost", 9000, portscan.ScopeLoopback, false, true, ""},
-		{"LAN", 3000, portscan.ScopeLAN, false, true, "10.0.0.9"},
-		{"tailnet", 8080, portscan.ScopeWildcard, false, true, ""},
-		{"served", 8080, portscan.ScopeLoopback, true, true, ""},
+		{"localhost", 9000, portscan.ScopeLoopback, false, true, "", "http://localhost:9000"},
+		{"LAN", 3000, portscan.ScopeLAN, false, true, "10.0.0.9", "http://10.0.0.9:3000"},
+		{"wildcard -> localhost route", 8080, portscan.ScopeWildcard, false, true, "", "http://localhost:8080"},
+		{"served -> localhost route", 8080, portscan.ScopeLoopback, true, true, "", "http://localhost:8080"},
 	}
 	for _, tc := range inlineCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1564,73 +1370,57 @@ func TestInlineCopyUniversal(t *testing.T) {
 			if m.copiedPort != tc.port || m.flash != "" {
 				t.Fatalf("%s copy: copiedPort=%d flash=%q, want inline (copiedPort %d, no toast)", tc.name, m.copiedPort, m.flash, tc.port)
 			}
-			sel, ok := m.list.SelectedItem().(portItem)
-			if !ok || !sel.justCopied {
-				t.Fatalf("%s: selected item justCopied = %v, want true", tc.name, ok && sel.justCopied)
-			}
-			if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") {
-				t.Errorf("%s Description() = %q, want it to carry the ✓ copied suffix", tc.name, got)
+			body, _ := m.bodyLines()
+			plain := stripANSI(strings.Join(body, "\n"))
+			if !strings.Contains(plain, "✓ copied") || !strings.Contains(plain, tc.wantURL) {
+				t.Errorf("%s body = %q, want the ✓ copied suffix beside %q", tc.name, plain, tc.wantURL)
 			}
 		})
 	}
 
-	// reachPublish (d80p) joins the inline group too: the row's public https
-	// URL and what `c` copies are now the same string, so it goes inline like
-	// the four states above, and the row's own justCopied suffix confirms it.
-	t.Run("published", func(t *testing.T) {
+	// A PUBLIC route copies inline too: navigate to the publish route and copy
+	// its exact https URL (the same string the route line shows).
+	t.Run("published route", func(t *testing.T) {
 		pm := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
 		pm.host = "host"
 		pm.width = 80
-		pm.allPorts = []portscan.Port{{Number: 8080, Process: "srv"}}
+		// wildcard + served + published -> routes: localhost, tailnet, caddy.
+		pm.allPorts = []portscan.Port{{Number: 8080, Process: "srv", BindScope: portscan.ScopeWildcard}}
 		pm.active = map[int]bool{8080: true}
 		pm.published = map[int]publishInfo{8080: {hostname: "app.example.com"}}
 		pm.showAllPorts = true
 		pm.rebuildItems()
-		m := press(pm)
-		if m.copiedPort != 8080 || m.flash != "" {
-			t.Fatalf("published copy: copiedPort=%d flash=%q, want inline (copiedPort 8080, no toast)", m.copiedPort, m.flash)
+		// down twice: localhost(0) -> tailnet(1) -> caddy(2)
+		r1, _ := pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		r2, _ := r1.(model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m := press(r2.(model))
+		if m.copiedPort != 8080 || m.copiedRouteIdx != 2 || m.flash != "" {
+			t.Fatalf("published route copy: copiedPort=%d routeIdx=%d flash=%q, want 8080/2 inline", m.copiedPort, m.copiedRouteIdx, m.flash)
 		}
-		sel, ok := m.list.SelectedItem().(portItem)
-		if !ok || !sel.justCopied {
-			t.Fatalf("published: selected item justCopied = %v, want true", ok && sel.justCopied)
-		}
-		if got := stripANSI(sel.Description()); !strings.Contains(got, "✓ copied") {
-			t.Errorf("published Description() = %q, want it to carry the ✓ copied suffix", got)
+		body, _ := m.bodyLines()
+		if plain := stripANSI(strings.Join(body, "\n")); !strings.Contains(plain, "✓ copied") || !strings.Contains(plain, "https://app.example.com") {
+			t.Errorf("published body = %q, want the ✓ copied suffix beside the public https URL", plain)
 		}
 	})
 
-	// inlineCopyState() itself: true for the healthy states -- including (since
-	// d80p) reachPublish -- false for the two remaining toast exceptions
-	// (funnel/stale) plus offline.
-	elig := []struct {
-		name string
-		item portItem
-		want bool
-	}{
-		{"reachLocalhost", portItem{port: portscan.Port{Number: 9000, BindScope: portscan.ScopeLoopback}, listening: true}, true},
-		{"reachLAN", portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "10.0.0.9"}, listening: true}, true},
-		{"reachTailnet", portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true}, true},
-		{"reachServed", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true}, true},
-		{"reachPublish", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true, publishHostname: "app.example.com"}, true},
-		{"reachFunnel", portItem{port: portscan.Port{Number: 8080}, listening: true, active: true, funnelPublic: 443}, false},
-		{"reachStale", portItem{port: portscan.Port{Number: 8025}, active: true}, false},
-		{"reachOffline", portItem{port: portscan.Port{Number: 8025}}, false},
-	}
-	for _, tc := range elig {
-		if got := tc.item.inlineCopyState(); got != tc.want {
-			t.Errorf("%s.inlineCopyState() = %v, want %v", tc.name, got, tc.want)
+	// An empty-URL route (a down favorite's offline pseudo-route) has nothing to
+	// copy: it toasts "nothing to copy yet" and leaves copiedPort at 0.
+	t.Run("offline route toasts", func(t *testing.T) {
+		om := New(config.Config{Ports: map[int]config.PortMeta{6379: {Favorite: true}}})
+		om.host = "host"
+		om.width = 80
+		om.allPorts = nil // down favorite: nothing listening
+		om.active = map[int]bool{}
+		om.showAllPorts = true
+		om.rebuildItems()
+		m := press(om)
+		if m.copiedPort != 0 || m.flash == "" || m.flashLevel != flashWarn {
+			t.Errorf("offline route copy: copiedPort=%d flash=%q level=%v, want copiedPort 0 and a warn toast", m.copiedPort, m.flash, m.flashLevel)
 		}
-	}
-
-	// NARROW fallback: an inline-eligible state whose annotation wouldn't
-	// fit the row falls back to the toast, exactly like state C always has.
-	nm := newModel(9000, portscan.ScopeLoopback, false, true, "")
-	nm.width = 5
-	nm.rebuildItems()
-	m := press(nm)
-	if m.copiedPort != 0 || m.flash == "" {
-		t.Errorf("narrow localhost copy: copiedPort=%d flash=%q, want a toast fallback (copiedPort 0, non-empty flash)", m.copiedPort, m.flash)
-	}
+		if !strings.Contains(m.flash, "nothing to copy") {
+			t.Errorf("offline route flash = %q, want it to name 'nothing to copy'", m.flash)
+		}
+	})
 
 	// Rapid A -> B: copying port A (inline), then moving the selection to a
 	// second eligible port B and copying again, must move the annotation --
@@ -1667,88 +1457,24 @@ func TestInlineCopyUniversal(t *testing.T) {
 	}
 }
 
-// TestCopyTargetURL is the direct check on copyTargetURL, the single source
-// of truth for what "c" writes to the clipboard (83wv): it asserts the exact
-// URL string per reach state, independent of the toast wording covered by
-// TestCopyURLReachAware.
-func TestCopyTargetURL(t *testing.T) {
-	m := model{host: "host"}
-
-	for _, tc := range []struct {
-		name string
-		item portItem
-		want string
-	}{
-		{
-			name: "reachLocalhost",
-			item: portItem{port: portscan.Port{Number: 9000, BindScope: portscan.ScopeLoopback}, listening: true},
-			want: "http://localhost:9000",
-		},
-		{
-			name: "reachOffline",
-			item: portItem{port: portscan.Port{Number: 8025, BindScope: portscan.ScopeLoopback}},
-			want: "http://localhost:8025",
-		},
-		{
-			name: "reachLAN/v4",
-			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "192.168.1.50"}, listening: true},
-			want: "http://192.168.1.50:3000",
-		},
-		{
-			name: "reachLAN/ipv6",
-			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: "fe80::1"}, listening: true},
-			want: "http://[fe80::1]:3000",
-		},
-		{
-			name: "reachLAN/emptyBindHost",
-			item: portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: ""}, listening: true},
-			want: "http://host:3000",
-		},
-		{
-			name: "reachTailnet",
-			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true},
-			want: "http://host:8080",
-		},
-		{
-			name: "reachServed",
-			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true},
-			want: "http://host:8080",
-		},
-		{
-			name: "reachFunnel",
-			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true, funnelPublic: 443},
-			want: "http://host:8080",
-		},
-		{
-			// d80p: unlike funnel, a published port copies its exact PUBLIC
-			// "https://<publishHostname>" -- the same URL the row shows -- not
-			// the tailnet form.
-			name: "reachPublish",
-			item: portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeLoopback}, active: true, listening: true, publishHostname: "app.example.com"},
-			want: "https://app.example.com",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := m.copyTargetURL(tc.item); got != tc.want {
-				t.Errorf("copyTargetURL(%+v) = %q, want %q", tc.item, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestFlashExpire covers the toast's timed clear: a matching flashExpireMsg
-// clears it, a stale one (older id, from a superseded toast) does not.
+// clears it, a stale one (older id, from a superseded toast) does not. Post-th05
+// a route copy only toasts when there's nothing to copy, so a down favorite's
+// offline route is used to raise the toast under test.
 func TestFlashExpire(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	m := New(config.Config{})
+	m := New(config.Config{Ports: map[int]config.PortMeta{6379: {Favorite: true}}})
 	m.host = "host"
-	m.allPorts = []portscan.Port{{Number: 8080}}
-	m.active = map[int]bool{8080: true}
+	m.allPorts = nil // down favorite -> offline route, nothing to copy
+	m.active = map[int]bool{}
 	m.showAllPorts = true
 	m.rebuildItems()
 
 	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
+	if m.flash == "" {
+		t.Fatalf("copying an offline (empty-URL) route should raise a toast")
+	}
 	id := m.flashID
 
 	res, _ = m.Update(flashExpireMsg{id: id - 1})
@@ -2047,22 +1773,64 @@ func TestFunnelItemRender(t *testing.T) {
 		fqdn:         "host.example.ts.net",
 		funnelPublic: 8443, // ... but funnel outranks it
 	}
-	got := it.Title()
-	if !strings.Contains(got, "●") {
-		t.Errorf("funnelled Title should carry the public ● marker; got %q", got)
-	}
-	if strings.Contains(got, "◉") {
-		t.Errorf("funnelled Title should not show the tailnet ◉ marker; got %q", got)
-	}
+	// reach() still resolves funnel as the widest public path (it now backs only
+	// the space serve-guard).
 	if got := it.reach(); got != reachFunnel {
 		t.Errorf("reach() = %v, want reachFunnel", got)
 	}
-	desc := it.Description()
-	if !strings.Contains(desc, "https://host.example.ts.net:8443 · on the internet") {
-		t.Errorf("funnelled Description should show the honest 'on the internet' prefix and public URL; got %q", desc)
+	// Post-th05 the funnel is its OWN route rather than an aggregate marker: a
+	// routeFunnel line carrying the public ● marker and the https ts.net URL,
+	// kept DISTINCT from (no longer collapsing) the tailnet route it coexists
+	// with.
+	routes := it.routes()
+	var fun, tail *route
+	for i := range routes {
+		switch routes[i].kind {
+		case routeFunnel:
+			fun = &routes[i]
+		case routeTailnet:
+			tail = &routes[i]
+		}
 	}
-	if strings.Contains(desc, "http://host:3000") {
-		t.Errorf("funnelled Description should not show the tailnet URL; got %q", desc)
+	if fun == nil {
+		t.Fatalf("funnelled service must carry a routeFunnel; got %+v", routes)
+	}
+	if m := stripANSI(fun.marker(false)); !strings.Contains(m, "●") {
+		t.Errorf("funnel marker = %q, want the public ● glyph", m)
+	}
+	if !strings.HasPrefix(fun.url, "https://") || !strings.Contains(fun.url, "host.example.ts.net") {
+		t.Errorf("funnel route url = %q, want the public https ts.net URL", fun.url)
+	}
+	// The served tailnet route still coexists (relaxed mutual exclusion), with
+	// its own ◉ served marker and the tailnet URL -- not swallowed by the funnel.
+	if tail == nil || tail.url != "http://host:3000" {
+		t.Errorf("tailnet route = %+v, want a coexisting http://host:3000 route", tail)
+	}
+	if m := stripANSI(tail.marker(false)); !strings.Contains(m, "◉") {
+		t.Errorf("tailnet marker = %q, want the served ◉ glyph", m)
+	}
+}
+
+// TestRouteURLFormatting pins the per-route copyable URL formatting that the
+// retired aggregate copyTargetURL used to own -- most notably httpURL's IPv6
+// bracketing on a LAN route, which routesFor's own table test doesn't exercise.
+func TestRouteURLFormatting(t *testing.T) {
+	lanRouteURL := func(bindHost string) string {
+		it := portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, BindHost: bindHost}, listening: true}
+		rs := it.routes()
+		return rs[0].url
+	}
+	if got := lanRouteURL("192.168.1.50"); got != "http://192.168.1.50:3000" {
+		t.Errorf("LAN IPv4 route url = %q, want http://192.168.1.50:3000", got)
+	}
+	if got := lanRouteURL("fe80::1"); got != "http://[fe80::1]:3000" {
+		t.Errorf("LAN IPv6 route url = %q, want the bracketed http://[fe80::1]:3000", got)
+	}
+	// A published route carries its exact public https URL.
+	pub := portItem{port: portscan.Port{Number: 8080}, publishHostname: "app.example.com"}
+	pr := pub.routes()
+	if got := pr[len(pr)-1].url; got != "https://app.example.com" {
+		t.Errorf("publish route url = %q, want https://app.example.com", got)
 	}
 }
 
@@ -2528,94 +2296,6 @@ func TestConfigSaveLines(t *testing.T) {
 	}
 }
 
-// TestMarkerGlyph covers 1exs: the exposure-state marker resolves to the
-// moon-phase reach ramp in emoji mode and the styled ASCII fallback
-// otherwise, one case per reachState (79xb), with the SAME field
-// combinations TestReachStateDescriptions/TestFunnelItemRender use to reach
-// each state -- so a glyph and its state can never quietly drift apart.
-// Every emoji case pads to a stable 2-cell column, including the naturally
-// 1-cell ✕ (reachOffline) and the VS16-bearing 🌫️ (reachStale).
-func TestMarkerGlyph(t *testing.T) {
-	cases := []struct {
-		name                 string
-		item                 portItem
-		wantState            reachState
-		wantEmoji, wantASCII string
-	}{
-		{
-			name:      "A reachLocalhost",
-			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLoopback}, listening: true},
-			wantState: reachLocalhost,
-			wantEmoji: "🌕", wantASCII: "○",
-		},
-		{
-			name:      "B' reachLAN",
-			item:      portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN}, listening: true},
-			wantState: reachLAN,
-			wantEmoji: "🌔", wantASCII: "◔",
-		},
-		{
-			name:      "B reachTailnet",
-			item:      portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true},
-			wantState: reachTailnet,
-			wantEmoji: "🌒", wantASCII: "◉",
-		},
-		{
-			name:      "C reachServed",
-			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true},
-			wantState: reachServed,
-			wantEmoji: "🌒", wantASCII: "◉",
-		},
-		{
-			name:      "D reachFunnel",
-			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, funnelPublic: 443},
-			wantState: reachFunnel,
-			wantEmoji: "🌑", wantASCII: "●",
-		},
-		{
-			name:      "D reachFunnel outranks a dangling forward",
-			item:      portItem{port: portscan.Port{Number: 8080}, active: true, listening: false, funnelPublic: 443},
-			wantState: reachFunnel,
-			wantEmoji: "🌑", wantASCII: "●",
-		},
-		{
-			name:      "E reachStale",
-			item:      portItem{port: portscan.Port{Number: 8025}, active: true, listening: false},
-			wantState: reachStale,
-			wantEmoji: "🌫️", wantASCII: "▲",
-		},
-		{
-			name:      "F reachOffline",
-			item:      portItem{port: portscan.Port{Number: 8025}, active: false, listening: false, meta: config.PortMeta{Favorite: true, LastProcess: "mailpit"}},
-			wantState: reachOffline,
-			wantEmoji: "✕", wantASCII: "✕",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := c.item.reach(); got != c.wantState {
-				t.Fatalf("reach() = %v, want %v (fix the test fixture, not the glyph mapping)", got, c.wantState)
-			}
-
-			em := c.item
-			em.emoji = true
-			got := em.markerGlyph()
-			if !strings.Contains(got, c.wantEmoji) {
-				t.Errorf("emoji marker = %q, want to contain %q", got, c.wantEmoji)
-			}
-			if lipgloss.Width(got) < 2 {
-				t.Errorf("emoji marker %q should pad to a 2-cell column, width=%d", got, lipgloss.Width(got))
-			}
-
-			as := c.item
-			as.emoji = false
-			if got := stripANSI(as.markerGlyph()); got != c.wantASCII {
-				t.Errorf("ascii marker = %q, want %q", got, c.wantASCII)
-			}
-		})
-	}
-}
-
 // TestFilterNoHighlight covers ykxh: the custom filter ranks exactly like the
 // default (so filtering still works) but returns no matched indices, so the
 // delegate's ANSI-unaware highlighter never mangles our styled titles.
@@ -2671,93 +2351,58 @@ func TestFilterValue(t *testing.T) {
 	}
 }
 
-// TestDanglingDescription covers km8x (as retargeted by 79xb): a
-// served-but-not-listening row explains itself -- names the stale state and
-// the unbind key -- while a healthy served row and an offline row keep their
-// plain descriptions.
-func TestDanglingDescription(t *testing.T) {
-	dangling := portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"}
-	got := stripANSI(dangling.Description())
-	// Names why it looks served-yet-empty (tailscale still holds the port) and
-	// the key to unbind it. The loopback fix lives in ? help / README.
-	for _, want := range []string{"bound to tailnet", "stale", "space", "unbind"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("dangling description %q should mention %q", got, want)
-		}
-	}
-
-	// Healthy serve: the tailnet URL, no scary hint.
-	healthy := portItem{port: portscan.Port{Number: 8025}, active: true, listening: true, host: "host"}
-	if got := stripANSI(healthy.Description()); got != "http://host:8025 · on tailnet" {
-		t.Errorf("healthy description = %q, want the tailnet URL", got)
-	}
-
-	// Offline: not served, not listening -- distinct from the reachable states.
-	idle := portItem{port: portscan.Port{Number: 8025}}
-	if got := idle.Description(); got != "offline" {
-		t.Errorf("idle description = %q, want %q", got, "offline")
-	}
-}
-
-// TestReachStateDescriptions covers 79xb pt2's honest 7-state lexicon end to
-// end: reach() resolves the right state from a portItem's fields, and
-// Description() renders the exact row text for each, per the truth table in
-// the issue. D (funnel) is covered separately by TestFunnelItemRender since
-// it needs fqdn/PublicURL wiring.
+// TestReachStateDescriptions covers 79xb's honest 7-state lexicon: reach()
+// resolves the right state from a portItem's fields. Post-th05 reach() no
+// longer renders row text (that's per-route via routesFor -- see
+// routerender_test.go); its ONE remaining consumer is the space serve-guard,
+// so this pins the resolver's truth table directly. D (funnel/publish/tunnel)
+// coexistence is covered by TestFunnelItemRender, TestPublishReachDriftSurfaced
+// and cftunnel_test's TestReachTunnel.
 func TestReachStateDescriptions(t *testing.T) {
 	cases := []struct {
 		name  string
 		item  portItem
 		state reachState
-		desc  string
 	}{
 		{
-			name:  "A loopback unserved -> localhost only",
+			name:  "A loopback unserved -> localhost",
 			item:  portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLoopback}, listening: true, host: "host"},
 			state: reachLocalhost,
-			desc:  "localhost only",
 		},
 		{
-			name:  "A unknown bind scope also reads localhost only (conservative default)",
+			name:  "A unknown bind scope also reads localhost (conservative default)",
 			item:  portItem{port: portscan.Port{Number: 3000}, listening: true, host: "host"},
 			state: reachLocalhost,
-			desc:  "localhost only",
 		},
 		{
 			name:  "B wildcard unserved -> on tailnet",
 			item:  portItem{port: portscan.Port{Number: 8080, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
 			state: reachTailnet,
-			desc:  "http://host:8080 · on tailnet",
 		},
 		{
-			name:  "B :22 on a wildcard bind -> on tailnet, reachable via SSH",
+			name:  "B :22 on a wildcard bind -> on tailnet",
 			item:  portItem{port: portscan.Port{Number: 22, BindScope: portscan.ScopeWildcard}, listening: true, host: "host"},
 			state: reachTailnet,
-			desc:  "on tailnet · reachable via SSH",
 		},
 		{
-			name:  "B' LAN-bound unserved -> local network only",
+			name:  "B' LAN-bound unserved -> LAN",
 			item:  portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN}, listening: true, host: "host"},
 			state: reachLAN,
-			desc:  "local network only",
 		},
 		{
-			name:  "C served and listening -> on tailnet URL",
+			name:  "C served and listening -> served",
 			item:  portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, host: "host"},
 			state: reachServed,
-			desc:  "http://host:8080 · on tailnet",
 		},
 		{
 			name:  "E served but nothing listening -> stale",
 			item:  portItem{port: portscan.Port{Number: 8025}, active: true, listening: false, host: "host"},
 			state: reachStale,
-			desc:  "bound to tailnet, but stale — space to unbind",
 		},
 		{
 			name:  "F down favorite -> offline",
 			item:  portItem{port: portscan.Port{Number: 8025}, active: false, listening: false, meta: config.PortMeta{Favorite: true, LastProcess: "mailpit"}},
 			state: reachOffline,
-			desc:  "offline",
 		},
 	}
 	for _, c := range cases {
@@ -2765,93 +2410,13 @@ func TestReachStateDescriptions(t *testing.T) {
 			if got := c.item.reach(); got != c.state {
 				t.Errorf("reach() = %v, want %v", got, c.state)
 			}
-			if got := stripANSI(c.item.Description()); got != c.desc {
-				t.Errorf("Description() = %q, want %q", got, c.desc)
-			}
 		})
 	}
 }
 
-// TestBindPrefix covers qptn: the netstat-style host prefix shown left of
-// ":PORT" on the row title is now the ONLY channel that distinguishes a
-// bound-wide-on-tailnet port from a served one, since both share the green
-// ◉ glyph and an identical description (Change 1/2). Wildcard -> "*", a
-// specific LAN bind -> its bare host, everything else (loopback, served,
-// unclassified) -> "" (quiet).
-func TestBindPrefix(t *testing.T) {
-	cases := []struct {
-		name  string
-		scope portscan.BindScope
-		host  string
-		want  string
-	}{
-		{"wildcard -> *", portscan.ScopeWildcard, "0.0.0.0", "*"},
-		{"LAN -> bare host", portscan.ScopeLAN, "192.168.1.5", "192.168.1.5"},
-		{"loopback -> quiet", portscan.ScopeLoopback, "127.0.0.1", ""},
-		{"unknown/unclassified -> quiet", portscan.ScopeUnknown, "", ""},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			it := portItem{port: portscan.Port{Number: 3000, BindScope: c.scope, BindHost: c.host}}
-			if got := it.bindPrefix(); got != c.want {
-				t.Errorf("bindPrefix() = %q, want %q", got, c.want)
-			}
-		})
-	}
-}
-
-// TestTitleBindPrefix covers the other half of qptn: Title() actually
-// renders bindPrefix() left of ":PORT" -- "*:3000" for a wildcard-bound
-// (bound-wide) port, ":3000" (no host, unchanged) for a loopback/served
-// port, and "192.168.1.5:3000" for a LAN-bound port. A wildcard FAVORITE row
-// must show BOTH the "*" prefix and the "★" favorite marker without
-// collision, since the star sits to the right of the port, not the left.
-func TestTitleBindPrefix(t *testing.T) {
-	t.Run("wildcard bound-wide shows * prefix", func(t *testing.T) {
-		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard}, listening: true}
-		got := stripANSI(it.Title())
-		if !strings.Contains(got, "*:3000") {
-			t.Errorf("Title() = %q, want to contain %q", got, "*:3000")
-		}
-	})
-
-	t.Run("loopback/served shows no host prefix", func(t *testing.T) {
-		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeLoopback}, listening: true}
-		got := stripANSI(it.Title())
-		if !strings.Contains(got, " :3000") {
-			t.Errorf("Title() = %q, want to contain %q", got, " :3000")
-		}
-		if strings.Contains(got, "*:3000") {
-			t.Errorf("Title() = %q, should not contain the wildcard prefix", got)
-		}
-	})
-
-	t.Run("LAN bind shows the bare LAN IP prefix", func(t *testing.T) {
-		it := portItem{port: portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeLAN, BindHost: "192.168.1.5"}, listening: true}
-		got := stripANSI(it.Title())
-		if !strings.Contains(got, "192.168.1.5:3000") {
-			t.Errorf("Title() = %q, want to contain %q", got, "192.168.1.5:3000")
-		}
-	})
-
-	t.Run("wildcard favorite shows both * prefix and star without collision", func(t *testing.T) {
-		it := portItem{
-			port:      portscan.Port{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard},
-			listening: true,
-			meta:      config.PortMeta{Favorite: true},
-		}
-		got := stripANSI(it.Title())
-		if !strings.Contains(got, "*:3000") {
-			t.Errorf("Title() = %q, want to contain %q", got, "*:3000")
-		}
-		if !strings.Contains(got, "★") {
-			t.Errorf("Title() = %q, want to contain the favorite star %q", got, "★")
-		}
-	})
-}
-
-// TestWasName covers znrg: the Title name precedence -- label > live process >
-// remembered "was <name>" (italic) > "?".
+// TestWasName covers znrg, migrated to displayName() (kata th05): the header
+// name precedence -- label > live process > remembered "was <name>" (muted) >
+// "?" -- with the muted-"was" form flagged by displayName's second return.
 func TestWasName(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -2861,12 +2426,13 @@ func TestWasName(t *testing.T) {
 		last      string // meta.LastProcess
 		wantSub   string
 		wantNoSub string
+		wantWas   bool // displayName's muted "was <proc>" flag
 	}{
-		{"label wins", "My Mail", "mailpit", true, "mailpit", "My Mail", "was"},
-		{"live process", "", "mailpit", true, "postfix", "mailpit", "was"},
-		{"down remembers", "", "", false, "mailpit", "was mailpit", ""},
-		{"down, nothing known", "", "", false, "", "?", "was"},
-		{"label beats remembered when down", "My Mail", "", false, "mailpit", "My Mail", "was"},
+		{"label wins", "My Mail", "mailpit", true, "mailpit", "My Mail", "was", false},
+		{"live process", "", "mailpit", true, "postfix", "mailpit", "was", false},
+		{"down remembers", "", "", false, "mailpit", "was mailpit", "", true},
+		{"down, nothing known", "", "", false, "", "?", "was", false},
+		{"label beats remembered when down", "My Mail", "", false, "mailpit", "My Mail", "was", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2875,12 +2441,17 @@ func TestWasName(t *testing.T) {
 				listening: c.listening,
 				meta:      config.PortMeta{Label: c.label, Favorite: true, LastProcess: c.last},
 			}
-			got := stripANSI(it.Title())
+			// displayName() carries the retired Title()'s name precedence
+			// (kata th05): label > live process > remembered "was <proc>" > "?".
+			got, was := it.displayName()
 			if !strings.Contains(got, c.wantSub) {
-				t.Errorf("Title = %q, want to contain %q", got, c.wantSub)
+				t.Errorf("displayName = %q, want to contain %q", got, c.wantSub)
 			}
 			if c.wantNoSub != "" && strings.Contains(got, c.wantNoSub) {
-				t.Errorf("Title = %q, should not contain %q", got, c.wantNoSub)
+				t.Errorf("displayName = %q, should not contain %q", got, c.wantNoSub)
+			}
+			if was != c.wantWas {
+				t.Errorf("displayName was-flag = %v, want %v (name=%q)", was, c.wantWas, got)
 			}
 		})
 	}
@@ -5104,225 +4675,168 @@ func TestOperatorHintSizingNoClip(t *testing.T) {
 	}
 }
 
-// --- 9gys: multi-column grid layout ---------------------------------------
+// --- th05: single-column two-level (service, route) navigation -------------
 
-// TestGridCols pins gridCols' width->column-count table: roughly one column
-// per minColWidth cells, clamped to maxCols, never less than 1. See gridCols'
-// own doc comment for the boundary caveat TestGridColWidth below covers.
-func TestGridCols(t *testing.T) {
-	cases := []struct{ width, want int }{
-		{60, 1}, {99, 1}, {100, 2}, {149, 2}, {150, 3}, {300, 3}, {10, 1},
-	}
-	for _, tc := range cases {
-		if got := gridCols(tc.width); got != tc.want {
-			t.Errorf("gridCols(%d) = %d, want %d", tc.width, got, tc.want)
-		}
-	}
-}
-
-// TestGridColWidth pins the exact per-column-width formula, and separately
-// checks the minColWidth floor holds once a width is comfortably inside a
-// column tier (not immediately at the tier's own transition point -- see
-// gridCols' doc comment: gridCols(100)==2 and gridCols(150)==3 are pinned
-// exact test values that put the resulting cell 1-2 cells UNDER minColWidth
-// right at those two boundaries, which a stricter gridCols could avoid only
-// by changing those two pinned outputs).
-func TestGridColWidth(t *testing.T) {
-	if got := gridColWidth(150, 3); got != 48 {
-		t.Errorf("gridColWidth(150, 3) = %d, want 48 ((150-2*2)/3)", got)
-	}
-	if got := gridColWidth(80, 1); got != 80 {
-		t.Errorf("gridColWidth(80, 1) = %d, want 80 (single column, no gutter)", got)
-	}
-	// Right at the tier boundary, the naive split can undershoot -- accepted,
-	// see gridCols' doc comment.
-	if got := gridColWidth(100, gridCols(100)); got != 49 {
-		t.Errorf("gridColWidth(100, %d) = %d, want 49 (documented under minColWidth at this exact boundary)", gridCols(100), got)
-	}
-	// A few columns past the boundary, the floor holds again.
-	for _, w := range []int{102, 154, 200, 300} {
-		cols := gridCols(w)
-		if cw := gridColWidth(w, cols); cols >= 2 && cw < minColWidth {
-			t.Errorf("gridColWidth(%d, %d) = %d, want >= minColWidth (%d)", w, cols, cw, minColWidth)
-		}
-	}
-}
-
-// TestGridRows pins gridRows' body-height -> row-count formula: r rows of
-// itemHeight with (r-1) spacing gaps fit in h.
-func TestGridRows(t *testing.T) {
-	cases := []struct{ h, itemHeight, spacing, want int }{
-		{30, 2, 1, 10},
-		{2, 2, 1, 1},
-		{5, 2, 1, 2},
-	}
-	for _, tc := range cases {
-		if got := gridRows(tc.h, tc.itemHeight, tc.spacing); got != tc.want {
-			t.Errorf("gridRows(%d, %d, %d) = %d, want %d", tc.h, tc.itemHeight, tc.spacing, got, tc.want)
-		}
-	}
-}
-
-// TestGridColumnMajorPlacement covers gridPlacement, the pure helper
-// renderGrid uses to fan a page's items out column-major: a column fills
-// top-to-bottom before the next one starts.
-func TestGridColumnMajorPlacement(t *testing.T) {
-	const rows = 4
-	cases := []struct{ k, wantCol, wantRow int }{
-		{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3},
-		{4, 1, 0}, {7, 1, 3},
-		{8, 2, 0}, {11, 2, 3},
-	}
-	for _, tc := range cases {
-		col, row := gridPlacement(tc.k, rows)
-		if col != tc.wantCol || row != tc.wantRow {
-			t.Errorf("gridPlacement(%d, %d) = (%d, %d), want (%d, %d)", tc.k, rows, col, row, tc.wantCol, tc.wantRow)
-		}
-	}
-}
-
-// TestAvailableDescriptionWidthPerColumn covers the fix availableDescriptionWidth
-// needed for 9gys: the inline "✓ copied" fit check must budget against the
-// per-column width in a multi-column layout, not the full terminal width, or
-// copyURL would think a suffix fits when the column it actually renders into
-// is much narrower. At a width that stays single-column it's unchanged from
-// before 9gys (colWidth == width).
-func TestAvailableDescriptionWidthPerColumn(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	pad := descTruncateStyle.GetPaddingLeft() + descTruncateStyle.GetPaddingRight()
-
-	narrow := New(config.Config{})
-	narrow.width = 80
-	if cols, _, _ := narrow.gridDims(); cols != 1 {
-		t.Fatalf("width 80 should stay single-column, got %d cols", cols)
-	}
-	if got, want := narrow.availableDescriptionWidth(), 80-pad; got != want {
-		t.Errorf("width 80 (1 col) availableDescriptionWidth = %d, want %d (== width-pad)", got, want)
-	}
-
-	wide := New(config.Config{})
-	wide.width = 150
-	cols, _, colWidth := wide.gridDims()
-	if cols != 3 {
-		t.Fatalf("width 150 should choose 3 columns, got %d", cols)
-	}
-	if got, want := wide.availableDescriptionWidth(), colWidth-pad; got != want {
-		t.Errorf("width 150 (3 cols) availableDescriptionWidth = %d, want %d (== colWidth-pad)", got, want)
-	}
-	if got, narrowGot := wide.availableDescriptionWidth(), narrow.availableDescriptionWidth(); got >= narrowGot {
-		t.Errorf("3-column availableDescriptionWidth (%d) should be MUCH less than 1-column (%d)", got, narrowGot)
-	}
-}
-
-// TestGridNavLeftRight covers the ONE genuinely new nav move the grid needs:
-// Left/Right jump exactly one column over (±rows), same row -- intercepted
-// before m.list.Update so bubbles/list's own left/right-bound
-// PrevPage/NextPage default keys don't also fire. Down still flows through
-// to m.list.Update unmodified and must still advance Index() by exactly 1
-// (column-major fill means a linear +1 already walks down a column and
-// wraps to the next column's top, so Down needs no special-casing -- see
-// gridDims' doc comment on why Index()/Select() stay accurate regardless of
-// the list's own internal PerPage).
-func TestGridNavLeftRight(t *testing.T) {
+// navModel builds a 3-service list whose flattened route layout is:
+//
+//	svc0 :3000  [0]localhost [1]tailnet   (wildcard bind)
+//	svc1 :5173  [0]localhost              (loopback bind)
+//	svc2 :8080  [0]localhost [1]tailnet   (wildcard bind)
+//
+// so the tests can walk the route cursor across service boundaries and jump
+// whole services.
+func navModel(t *testing.T) model {
+	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{})
-	var ports []portscan.Port
-	for i := 0; i < 12; i++ {
-		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("p%d", i)})
+	m.host = "host"
+	m.allPorts = []portscan.Port{
+		{Number: 3000, Process: "a", BindScope: portscan.ScopeWildcard},
+		{Number: 5173, Process: "b", BindScope: portscan.ScopeLoopback},
+		{Number: 8080, Process: "c", BindScope: portscan.ScopeWildcard},
 	}
-	m.allPorts = ports
 	m.showAllPorts = true
 	m.rebuildItems()
-
-	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = res.(model)
-
-	cols, rows, _ := m.gridDims()
-	if cols != 2 {
-		t.Fatalf("width 120 should choose 2 columns, got %d", cols)
-	}
-	if rows < 2 {
-		t.Fatalf("need at least 2 rows per column for this test to be meaningful, got %d rows", rows)
-	}
-
 	m.list.Select(0)
-
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
-	m = res.(model)
-	if got := m.list.Index(); got != rows {
-		t.Errorf("after Right from index 0, Index() = %d, want %d (rows)", got, rows)
-	}
-
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
-	m = res.(model)
-	if got := m.list.Index(); got != 0 {
-		t.Errorf("after Left back, Index() = %d, want 0", got)
-	}
-
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = res.(model)
-	if got := m.list.Index(); got != 1 {
-		t.Errorf("after Down from index 0, Index() = %d, want 1 (native list handling, untouched by 9gys)", got)
-	}
+	m.routeIdx = 0
+	return m
 }
 
-// TestRenderGridNoOverflow covers the width-containment requirement: no
-// rendered grid line ever exceeds the terminal width, at a width wide enough
-// to pick the max column count.
-func TestRenderGridNoOverflow(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	m := New(config.Config{})
-	var ports []portscan.Port
-	for i := 0; i < 20; i++ {
-		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i)})
+// TestTwoLevelNav covers kata th05 P4's two-level navigation, replacing the
+// retired grid's Left/Right column jump: j/k (and ↑/↓) walk the FLATTENED
+// route list, crossing into the adjacent service at a service's first/last
+// route and clamping at the very top/bottom; J/K and ←/→ jump whole SERVICES,
+// landing on route 0.
+func TestTwoLevelNav(t *testing.T) {
+	press := func(m model, msg tea.Msg) model {
+		res, _ := m.Update(msg)
+		return res.(model)
 	}
-	m.allPorts = ports
-	m.showAllPorts = true
-	m.rebuildItems()
+	rune_ := func(r rune) tea.Msg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+	at := func(t *testing.T, m model, wantSvc, wantRoute int, label string) {
+		t.Helper()
+		if got := m.list.Index(); got != wantSvc {
+			t.Errorf("%s: service index = %d, want %d", label, got, wantSvc)
+		}
+		if m.routeIdx != wantRoute {
+			t.Errorf("%s: routeIdx = %d, want %d", label, m.routeIdx, wantRoute)
+		}
+	}
 
-	res, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 24})
-	m = res.(model)
+	m := navModel(t)
+	at(t, m, 0, 0, "start")
 
-	for _, ln := range strings.Split(m.renderGrid(), "\n") {
-		if w := lipgloss.Width(ln); w > m.width {
-			t.Errorf("renderGrid line exceeds terminal width %d (got %d): %q", m.width, w, stripANSI(ln))
+	// j walks the flattened list, crossing service boundaries.
+	m = press(m, rune_('j'))
+	at(t, m, 0, 1, "down into svc0 route1")
+	m = press(m, rune_('j'))
+	at(t, m, 1, 0, "down crosses into svc1 route0")
+	m = press(m, rune_('j'))
+	at(t, m, 2, 0, "down crosses into svc2 route0")
+	m = press(m, rune_('j'))
+	at(t, m, 2, 1, "down into svc2 route1")
+	m = press(m, rune_('j'))
+	at(t, m, 2, 1, "down at the very bottom clamps")
+
+	// k walks back up, crossing boundaries and landing on the prev service's
+	// LAST route.
+	m = press(m, rune_('k'))
+	at(t, m, 2, 0, "up to svc2 route0")
+	m = press(m, rune_('k'))
+	at(t, m, 1, 0, "up crosses into svc1 route0")
+	m = press(m, rune_('k'))
+	at(t, m, 0, 1, "up crosses into svc0's LAST route")
+
+	// J jumps a whole service, landing on route 0.
+	m = press(m, rune_('J'))
+	at(t, m, 1, 0, "J jumps to svc1 route0")
+	// arrow-key aliases: → jumps a service forward, ← back.
+	m = press(m, tea.KeyMsg{Type: tea.KeyRight})
+	at(t, m, 2, 0, "right jumps to svc2 route0")
+	m = press(m, tea.KeyMsg{Type: tea.KeyLeft})
+	at(t, m, 1, 0, "left jumps back to svc1 route0")
+	m = press(m, rune_('K'))
+	at(t, m, 0, 0, "K jumps back to svc0 route0")
+
+	// Clamp at the top: k and K at the very top stay put.
+	m = press(m, rune_('k'))
+	at(t, m, 0, 0, "up at the very top clamps")
+	m = press(m, rune_('K'))
+	at(t, m, 0, 0, "K at the top clamps")
+}
+
+// TestRenderListNoOverflow carries the retired grid's width-containment
+// invariant onto the single-column renderer: no rendered renderList line ever
+// exceeds the terminal width -- route URLs truncate with "…" to fit.
+func TestRenderListNoOverflow(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	build := func(w int) model {
+		m := New(config.Config{})
+		m.host = "host"
+		var ports []portscan.Port
+		for i := 0; i < 20; i++ {
+			ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+		}
+		m.allPorts = ports
+		m.showAllPorts = true
+		m.rebuildItems()
+		res, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
+		return res.(model)
+	}
+	// Wide (no truncation needed) and narrow (URLs must truncate).
+	for _, w := range []int{160, 40} {
+		m := build(w)
+		for _, ln := range strings.Split(m.renderList(), "\n") {
+			if got := lipgloss.Width(ln); got > m.width {
+				t.Errorf("width %d: renderList line exceeds terminal width (got %d): %q", m.width, got, stripANSI(ln))
+			}
 		}
 	}
 }
 
-// TestRenderGridPageIndicator covers the "more below/next page" affordance
-// renderGrid restores now that it no longer uses bubbles/list's own
-// paginator: a compact "page N/M" line appears exactly when there's more
-// than one page, and moving selection to a later page changes it.
-func TestRenderGridPageIndicator(t *testing.T) {
+// TestRenderListScrollIndicator covers renderList's scroll affordance (the
+// single-column replacement for the retired grid's "page N/M"): a body taller
+// than the list viewport shows a compact "off+1–end of total" indicator, and
+// scrolling to the bottom moves the visible range off the top.
+func TestRenderListScrollIndicator(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{})
+	m.host = "host"
 	var ports []portscan.Port
 	for i := 0; i < 40; i++ {
-		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i)})
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
 	}
 	m.allPorts = ports
 	m.showAllPorts = true
 	m.rebuildItems()
-
 	res, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 24})
 	m = res.(model)
 
-	cols, rows, _ := m.gridDims()
-	perPage := cols * rows
-	if perPage >= 40 {
-		t.Skip("terminal fits all 40 ports on one page; nothing to page through here")
+	lastLine := func(s string) string {
+		lines := strings.Split(s, "\n")
+		return stripANSI(lines[len(lines)-1])
 	}
 
-	grid := stripANSI(m.renderGrid())
-	if !strings.Contains(grid, "page 1/") {
-		t.Errorf("expected a page indicator on a multi-page grid, got:\n%s", grid)
+	// At the top: the indicator names a range starting at 1.
+	top := lastLine(m.renderList())
+	if !strings.Contains(top, " of ") {
+		t.Fatalf("expected a scroll indicator on an overflowing list, got last line %q", top)
+	}
+	if !strings.HasPrefix(top, "1–") {
+		t.Errorf("at the top the indicator should start at 1; got %q", top)
 	}
 
-	m.list.Select(len(m.list.VisibleItems()) - 1)
-	grid = stripANSI(m.renderGrid())
-	if strings.Contains(grid, "page 1/") {
-		t.Errorf("selecting the last item should move off page 1, got:\n%s", grid)
+	// Jump to the last service: the range scrolls off the top.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+	bottom := lastLine(m.renderList())
+	if !strings.Contains(bottom, " of ") {
+		t.Errorf("the indicator should remain while scrolled; got %q", bottom)
+	}
+	if strings.HasPrefix(bottom, "1–") {
+		t.Errorf("after scrolling to the end the range should no longer start at 1; got %q", bottom)
 	}
 }
 
@@ -5774,13 +5288,16 @@ func TestRequestPublishGuards(t *testing.T) {
 		}
 	})
 
-	// mutual exclusion: a funnelled port is refused, message names the funnel.
-	t.Run("funnelled port refused", func(t *testing.T) {
+	// th05 RELAXED the funnel/publish/tunnel mutual exclusion: a funnelled port
+	// may ALSO be published now (each public path is its own route), so publish
+	// proceeds to its setup dialog instead of refusing. The port's own
+	// public-internet confirm still fires later in the flow.
+	t.Run("funnelled port coexists (proceeds to setup)", func(t *testing.T) {
 		m := base()
 		m.funnel = map[int]int{8080: 443}
 		m.requestPublish(8080)
-		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "funnel") {
-			t.Errorf("funnelled: mode=%v flash=%q (want refuse naming the funnel)", m.mode, m.flash)
+		if m.mode != entryPublishHost || m.publishPort != 8080 {
+			t.Errorf("funnelled+publish: mode=%v publishPort=%d, want the host dialog (entryPublishHost) on :8080", m.mode, m.publishPort)
 		}
 	})
 
@@ -6429,33 +5946,6 @@ func TestMarkerLegendDocumentsAuthGlyph(t *testing.T) {
 	}
 }
 
-// TestPublicRowDescriptionGrayBold: a PUBLIC row's description -- funnelled or
-// published -- uses the gray+bold publicDescStyle, not publicStyle's
-// selection-magenta (e0e7 published, ze1z funnel). Style getters are checked
-// directly so the assertion doesn't depend on the test's (colorless) profile.
-func TestPublicRowDescriptionGrayBold(t *testing.T) {
-	if !publicDescStyle.GetBold() {
-		t.Error("publicDescStyle should keep bold (\"bold is great\")")
-	}
-	if publicDescStyle.GetForeground() == publicStyle.GetForeground() {
-		t.Error("publicDescStyle must not reuse publicStyle's selection-magenta foreground")
-	}
-	pub := portItem{publishHostname: "web.example.com"}
-	if pub.reach() != reachPublish {
-		t.Fatalf("reach=%v, want reachPublish", pub.reach())
-	}
-	if got, want := pub.styledDescription(), publicDescStyle.Render(pub.plainDescription()); got != want {
-		t.Errorf("published row must render its description via publicDescStyle;\n got=%q\nwant=%q", got, want)
-	}
-	fun := portItem{funnelPublic: 443, fqdn: "dev-box.tailnet.ts.net"}
-	if fun.reach() != reachFunnel {
-		t.Fatalf("reach=%v, want reachFunnel", fun.reach())
-	}
-	if got, want := fun.styledDescription(), publicDescStyle.Render(fun.plainDescription()); got != want {
-		t.Errorf("funnel row must render its description via publicDescStyle;\n got=%q\nwant=%q", got, want)
-	}
-}
-
 // TestPublishMarkerIsBlueNotMagenta: the published marker (◆) is blue
 // (publishMarkerStyle), not publicStyle's magenta, so the two public paths are
 // tellable apart -- funnel's ● stays magenta.
@@ -6463,9 +5953,14 @@ func TestPublishMarkerIsBlueNotMagenta(t *testing.T) {
 	if publishMarkerStyle.GetForeground() == publicStyle.GetForeground() {
 		t.Error("publishMarkerStyle must not reuse publicStyle's magenta foreground")
 	}
-	pub := portItem{publishHostname: "web.example.com"} // reachPublish, mono
-	if got, want := pub.markerGlyph(), publishMarkerStyle.Render("◆"); got != want {
-		t.Errorf("published marker must render via publishMarkerStyle; got %q, want %q", got, want)
+	// Per-route now (kata th05): the caddy/publish route's ◆ marker renders via
+	// publishMarkerStyle, funnel's ● via publicStyle -- so the two public paths
+	// stay tellable apart.
+	if got, want := (route{kind: routePublish}).marker(false), publishMarkerStyle.Render("◆")+" "; got != want {
+		t.Errorf("publish route marker must render via publishMarkerStyle; got %q, want %q", got, want)
+	}
+	if got := stripANSI((route{kind: routeFunnel}).marker(false)); !strings.Contains(got, "●") {
+		t.Errorf("funnel route marker = %q, want the magenta ● glyph", got)
 	}
 }
 
@@ -7044,9 +6539,9 @@ func TestLastPublishNeverClearedOnUnpublish(t *testing.T) {
 }
 
 // TestRequestEditPublishGuards (kata prp1) mirrors p's non-de-escalation
-// refuse-guards: busy, :22, funnel-conflict, and locked all refuse `e` exactly
-// like `p` -- edit must not be a backdoor around any of them (AGENTS.md: a
-// port can carry funnel OR publish, never both).
+// refuse-guards that STILL hold after th05: busy, :22, and locked all refuse
+// `e` exactly like `p`. The funnel cross-path refusal is GONE (th05 relaxed the
+// mutual exclusion); a funnelled port now coexists and proceeds to setup.
 func TestRequestEditPublishGuards(t *testing.T) {
 	t.Run("refuses :22", func(t *testing.T) {
 		m := newPublishModel(t, nil)
@@ -7067,12 +6562,15 @@ func TestRequestEditPublishGuards(t *testing.T) {
 		_ = cmd
 	})
 
-	t.Run("refuses a funnelled port", func(t *testing.T) {
+	// th05 RELAXED mutual exclusion: editing a funnelled port's publish config is
+	// fine now -- the paths coexist as separate routes -- so `e` proceeds to the
+	// host dialog instead of refusing.
+	t.Run("funnelled port coexists (proceeds to host dialog)", func(t *testing.T) {
 		m := newPublishModel(t, nil)
 		m.funnel = map[int]int{8080: 443}
 		cmd := m.requestEditPublish(8080)
-		if m.mode != entryNone || m.flashLevel != flashError || !strings.Contains(m.flash, "funnelled") {
-			t.Errorf("edit on a funnelled port should refuse (funnel/publish mutual exclusion); mode=%v flash=%q", m.mode, m.flash)
+		if m.mode != entryPublishHost || m.publishPort != 8080 {
+			t.Errorf("edit on a funnelled port should proceed to the host dialog; mode=%v publishPort=%d", m.mode, m.publishPort)
 		}
 		_ = cmd
 	})
@@ -7140,81 +6638,91 @@ func TestEditKeyDispatch(t *testing.T) {
 	}
 }
 
-// TestFunnelRefusesPublished is the OTHER mutual-exclusion direction: the P
-// funnel key (swapped from p, vzj4) refuses a port that is currently
-// Caddy-published.
-func TestFunnelRefusesPublished(t *testing.T) {
+// TestFunnelCoexistsWithPublished is the inverted OTHER direction: th05 relaxed
+// the mutual exclusion, so the funnel key no longer refuses a currently
+// Caddy-published port -- it proceeds to the public-internet confirm, and the
+// two public paths coexist as separate routes.
+func TestFunnelCoexistsWithPublished(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
 	cmd := m.requestFunnel(8080)
-	if m.mode != entryNone {
-		t.Errorf("funnel on a published port must not open a confirm; mode=%v", m.mode)
+	if m.mode != entryConfirmFunnel || m.funnelPort != 8080 {
+		t.Errorf("funnel on a published port should proceed to the confirm; mode=%v funnelPort=%d", m.mode, m.funnelPort)
 	}
-	if m.flashLevel != flashError || !strings.Contains(m.flash, "published") || !strings.Contains(m.flash, "unpublish") {
-		t.Errorf("funnel-on-published flash=%q level=%v, want a refusal naming publish", m.flash, m.flashLevel)
+	if strings.Contains(m.flash, "unpublish") {
+		t.Errorf("funnel-on-published must not refuse naming publish; flash=%q", m.flash)
 	}
 	_ = cmd
 }
 
-// TestPublishReachDriftSurfaced covers step 4's reach() rules: a published-only
-// port shows the ◆ marker and its https description; a port carrying BOTH
-// public paths (external drift) is NOT silently collapsed to one marker -- it
-// reuses the ▲ warning affordance and a distinct "funnelled AND published"
-// description, with no bespoke drift state.
+// TestPublishReachDriftSurfaced, migrated for th05: reach() still resolves the
+// widest public path (it now backs only the space serve-guard), and coexisting
+// public paths are SURFACED as separate route sub-rows -- the retired "drift"
+// collapse is gone (multi-public coexistence is legitimate now).
 func TestPublishReachDriftSurfaced(t *testing.T) {
-	// Published only -> reachPublish, ◆, https description with an auth note.
+	// Published only -> reachPublish, carrying a ◆ publish route with its https
+	// URL and the auth flag.
 	pub := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com", publishAuth: true}
 	if got := pub.reach(); got != reachPublish {
 		t.Errorf("published-only reach() = %v, want reachPublish", got)
 	}
-	if got := stripANSI(pub.markerGlyph()); got != "◆" {
-		t.Errorf("published marker = %q, want ◆", got)
+	pubRoutes := pub.routes()
+	r := pubRoutes[len(pubRoutes)-1]
+	if r.kind != routePublish || r.url != "https://web.example.com" || !r.auth {
+		t.Fatalf("publish route = %+v, want routePublish with the https URL and auth=true", r)
 	}
-	if d := pub.plainDescription(); !strings.Contains(d, "https://web.example.com · published to the internet") || !strings.Contains(d, authGlyphMono) {
-		t.Errorf("published description = %q (want url + auth glyph)", d)
+	if m := stripANSI(r.marker(false)); !strings.Contains(m, "◆") {
+		t.Errorf("publish marker = %q, want ◆", m)
 	}
 
-	// Drift: both funnel AND publish (external mutation) -> reachStale (warning
-	// affordance), distinct description, NOT reachPublish/reachFunnel.
-	drift := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", fqdn: "dev-box.tailnet.ts.net", active: true, listening: true, funnelPublic: 443, publishHostname: "web.example.com"}
-	if got := drift.reach(); got != reachStale {
-		t.Errorf("drift reach() = %v, want reachStale (warning affordance, not a silent collapse)", got)
+	// Coexistence (the retired "drift"): funnel AND publish. th05 relaxed the
+	// mutual exclusion, so reach() returns the WIDEST public path (funnel), NOT a
+	// bespoke reachStale collapse -- and BOTH public routes still surface.
+	both := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", fqdn: "dev-box.tailnet.ts.net", active: true, listening: true, funnelPublic: 443, publishHostname: "web.example.com"}
+	if got := both.reach(); got != reachFunnel {
+		t.Errorf("funnel+publish reach() = %v, want reachFunnel (widest public path, no drift collapse)", got)
 	}
-	if got := stripANSI(drift.markerGlyph()); got != "▲" {
-		t.Errorf("drift marker = %q, want ▲ (the existing warn affordance)", got)
+	var haveFunnel, havePublish bool
+	for _, rr := range both.routes() {
+		haveFunnel = haveFunnel || rr.kind == routeFunnel
+		havePublish = havePublish || rr.kind == routePublish
 	}
-	if d := drift.plainDescription(); !strings.Contains(d, "funnelled AND published") {
-		t.Errorf("drift description = %q, want it to name the dual exposure", d)
+	if !haveFunnel || !havePublish {
+		t.Errorf("coexisting public paths must BOTH surface as routes; routes=%+v", both.routes())
 	}
 }
 
-// TestPublishRowAuthGlyph covers the published row's auth indicator: no glyph
-// (and no leftover "basic auth"/"p to unpublish" text) without auth, a person
-// glyph with auth in emoji mode, and a mono fallback in no-emoji mode.
+// TestPublishRowAuthGlyph, migrated for th05: the auth indicator is now a
+// trailing adornment on the caddy/publish ROUTE line (renderServiceBlock) --
+// absent without auth, the 👤 person glyph in emoji mode, the @ mono fallback
+// otherwise (never the emoji in mono mode).
 func TestPublishRowAuthGlyph(t *testing.T) {
-	base := portItem{port: portscan.Port{Number: 8080}, host: "dev-box", publishHostname: "web.example.com"}
-	baseDesc := "https://web.example.com · published to the internet"
-
-	// No auth: bare description, and none of the retired text.
-	if got := base.plainDescription(); got != baseDesc {
-		t.Errorf("no-auth published row = %q, want the bare %q", got, baseDesc)
+	routeLine := func(auth, emoji bool) string {
+		b := blockInput{
+			port:          8080,
+			name:          "web",
+			routes:        []route{{kind: routePublish, url: "https://web.example.com", auth: auth}},
+			selectedRoute: -1,
+			copiedRoute:   -1,
+			emoji:         emoji,
+		}
+		lines := renderServiceBlock(b)
+		return stripANSI(lines[1]) // header is lines[0], the single route is lines[1]
 	}
 
-	// Auth + emoji: person glyph appended, no "basic auth" spelled out.
-	e := base
-	e.publishAuth, e.emoji = true, true
-	if got := e.plainDescription(); got != baseDesc+" "+authGlyphEmoji {
-		t.Errorf("authed (emoji) row = %q, want %q", got, baseDesc+" "+authGlyphEmoji)
+	// No auth: no auth glyph at all.
+	if got := routeLine(false, false); strings.Contains(got, authGlyphMono) || strings.Contains(got, authGlyphEmoji) {
+		t.Errorf("no-auth publish route = %q, want no auth glyph", got)
+	}
+
+	// Auth + emoji: the person glyph.
+	if got := routeLine(true, true); !strings.Contains(got, authGlyphEmoji) {
+		t.Errorf("authed (emoji) publish route = %q, want the emoji auth glyph %q", got, authGlyphEmoji)
 	}
 
 	// Auth + mono: the mono fallback, never the emoji.
-	mo := base
-	mo.publishAuth, mo.emoji = true, false
-	if got := mo.plainDescription(); got != baseDesc+" "+authGlyphMono {
-		t.Errorf("authed (mono) row = %q, want %q", got, baseDesc+" "+authGlyphMono)
-	}
-	if strings.Contains(mo.plainDescription(), authGlyphEmoji) {
-		t.Errorf("mono row must not contain the emoji glyph; got %q", mo.plainDescription())
+	if got := routeLine(true, false); !strings.Contains(got, authGlyphMono) || strings.Contains(got, authGlyphEmoji) {
+		t.Errorf("authed (mono) publish route = %q, want the mono glyph %q and never the emoji", got, authGlyphMono)
 	}
 }
 

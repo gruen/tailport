@@ -11,70 +11,51 @@ import (
 	"github.com/gruen/tailport/internal/portscan"
 )
 
-// TestReachTunnel: an owned tunnel drives reachTunnel, and it collides with
-// funnel/publish into the drift (reachStale) state -- the three-way extension of
-// the funnel/publish mutual-exclusion drift case (kata nc1j).
+// TestReachTunnel: an owned tunnel drives reachTunnel. th05 RELAXED the
+// funnel/publish/tunnel mutual exclusion, so a coexisting funnel/publish no
+// longer collapses to the retired drift (reachStale) state -- reach() now
+// returns the WIDEST present public path (funnel > publish > tunnel).
 func TestReachTunnel(t *testing.T) {
 	tun := portItem{listening: true, tunnelActive: true, tunnelHostname: "app.example.com"}
 	if got := tun.reach(); got != reachTunnel {
 		t.Errorf("tunnel-only reach = %v, want reachTunnel", got)
 	}
-	// tunnel + funnel => drift
-	if got := (portItem{tunnelActive: true, funnelPublic: 443}).reach(); got != reachStale {
-		t.Errorf("tunnel+funnel reach = %v, want reachStale (drift)", got)
+	// tunnel + funnel => funnel wins (widest public path)
+	if got := (portItem{tunnelActive: true, funnelPublic: 443}).reach(); got != reachFunnel {
+		t.Errorf("tunnel+funnel reach = %v, want reachFunnel", got)
 	}
-	// tunnel + publish => drift
-	if got := (portItem{tunnelActive: true, publishHostname: "x.example.com"}).reach(); got != reachStale {
-		t.Errorf("tunnel+publish reach = %v, want reachStale (drift)", got)
-	}
-}
-
-func TestTunnelDriftDescription(t *testing.T) {
-	cases := []struct {
-		it   portItem
-		want string
-	}{
-		{portItem{funnelPublic: 443, tunnelActive: true}, "funnelled AND tunnelled — remove one"},
-		{portItem{publishHostname: "h", tunnelActive: true}, "published AND tunnelled — remove one"},
-		{portItem{funnelPublic: 443, publishHostname: "h"}, "funnelled AND published — remove one"},
-		{portItem{funnelPublic: 443, publishHostname: "h", tunnelActive: true}, "multiple public exposures — remove all but one"},
-	}
-	for _, c := range cases {
-		if got := c.it.plainDescription(); got != c.want {
-			t.Errorf("drift desc = %q, want %q", got, c.want)
-		}
+	// tunnel + publish => publish wins over tunnel
+	if got := (portItem{tunnelActive: true, publishHostname: "x.example.com"}).reach(); got != reachPublish {
+		t.Errorf("tunnel+publish reach = %v, want reachPublish", got)
 	}
 }
 
-func TestTunnelDescriptionAndMarker(t *testing.T) {
-	// quick tunnel still starting (no host yet)
-	starting := portItem{tunnelActive: true}
-	if got := starting.plainDescription(); got != "starting Cloudflare quick tunnel…" {
-		t.Errorf("starting desc = %q", got)
+// TestTunnelRoute pins the tunnel down at the ROUTE level (route-scoped copy,
+// kata th05 P5 -- replaces the retired aggregate plainDescription()/markerGlyph()
+// and copyTargetURL tailnet-fallback): a tunnelled service's tunnel route carries
+// the exact https URL and the orange ◈ marker once the host is known, and an
+// empty URL (nothing to copy) while the quick tunnel is still starting.
+func TestTunnelRoute(t *testing.T) {
+	// host known -> the tunnel route carries the exact https URL and ◈ marker
+	up := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com", port: portscan.Port{Number: 3000}}
+	upRoutes := up.routes()
+	r := upRoutes[len(upRoutes)-1]
+	if r.kind != routeTunnel {
+		t.Fatalf("last route kind = %v, want routeTunnel", r.kind)
 	}
-	// host known
-	up := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com"}
-	if got := up.plainDescription(); got != "https://foo.trycloudflare.com · tunnelled to the internet" {
-		t.Errorf("up desc = %q", got)
+	if r.url != "https://foo.trycloudflare.com" {
+		t.Errorf("tunnel route url (host known) = %q, want https://foo.trycloudflare.com", r.url)
 	}
-	// mono marker is the orange ◈ (strip styling by checking the glyph is present)
-	if m := stripANSI(up.markerGlyph()); !strings.Contains(m, "◈") {
+	if m := stripANSI(r.marker(false)); !strings.Contains(m, "◈") {
 		t.Errorf("tunnel mono marker = %q, want to contain ◈", m)
 	}
-}
-
-func TestCopyTargetURLTunnel(t *testing.T) {
-	m := New(config.Config{})
-	m.host = "myhost"
-	// host known -> copies the exact https URL
-	up := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com", port: portscan.Port{Number: 3000}}
-	if got := m.copyTargetURL(up); got != "https://foo.trycloudflare.com" {
-		t.Errorf("copy (host known) = %q", got)
-	}
-	// still starting -> falls back to the tailnet URL (never a blank https://)
+	// still starting -> empty url; route-scoped copy toasts "nothing to copy"
+	// rather than the retired aggregate tailnet fallback.
 	starting := portItem{tunnelActive: true, port: portscan.Port{Number: 3000}}
-	if got := m.copyTargetURL(starting); got != "http://myhost:3000" {
-		t.Errorf("copy (starting) = %q", got)
+	sRoutes := starting.routes()
+	sr := sRoutes[len(sRoutes)-1]
+	if sr.kind != routeTunnel || sr.url != "" {
+		t.Errorf("starting tunnel route = %+v, want routeTunnel with empty url", sr)
 	}
 }
 
@@ -107,23 +88,30 @@ func TestRequestTunnelGuards(t *testing.T) {
 		}
 	})
 
-	// funnelled port refused
-	t.Run("funnel exclusion", func(t *testing.T) {
+	// th05 RELAXED mutual exclusion: a funnelled port may ALSO be tunnelled now,
+	// so requestTunnel proceeds to its own setup/confirm instead of refusing.
+	// Pin the login state (not logged in -> quick confirm) so the branch is
+	// deterministic regardless of the host's ~/.cloudflared.
+	t.Run("funnel coexistence proceeds", func(t *testing.T) {
+		t.Setenv("TUNNEL_ORIGIN_CERT", "")
+		t.Setenv("HOME", t.TempDir())
 		m := base()
 		m.funnel = map[int]int{3000: 443}
 		m.requestTunnel(3000)
-		if m.mode != entryNone {
-			t.Errorf("funnel exclusion should refuse; mode=%v", m.mode)
+		if m.mode != entryConfirmTunnelQuick {
+			t.Errorf("funnel coexistence should proceed to tunnel setup, not refuse; mode=%v", m.mode)
 		}
 	})
 
-	// published port refused
-	t.Run("publish exclusion", func(t *testing.T) {
+	// Likewise a published port may ALSO be tunnelled now.
+	t.Run("publish coexistence proceeds", func(t *testing.T) {
+		t.Setenv("TUNNEL_ORIGIN_CERT", "")
+		t.Setenv("HOME", t.TempDir())
 		m := base()
 		m.published = map[int]publishInfo{3000: {hostname: "x.example.com"}}
 		m.requestTunnel(3000)
-		if m.mode != entryNone {
-			t.Errorf("publish exclusion should refuse; mode=%v", m.mode)
+		if m.mode != entryConfirmTunnelQuick {
+			t.Errorf("publish coexistence should proceed to tunnel setup, not refuse; mode=%v", m.mode)
 		}
 	})
 

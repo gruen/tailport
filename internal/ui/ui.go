@@ -3,7 +3,6 @@
 package ui
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,10 +53,12 @@ import (
 // lower bar is documented intent, not a color that's actually that close to
 // the line.
 //
-// lockStyle, errStyle, helpStyle, and viewActiveStyle are deliberately left
+// errStyle, helpStyle, and viewActiveStyle are deliberately left
 // as plain lipgloss.Color: the audit (kata n7gc) found their existing
 // contrast already fine on both backgrounds (viewActiveStyle paints its own
-// Background(), so it never depends on the terminal's at all). The bubbles
+// Background(), so it never depends on the terminal's at all). lockStyle WAS in
+// that set but th05 found its fixed Color("208") only ~2.4:1 on white and made
+// it adaptive (see its own comment below). The bubbles
 // list.DefaultDelegate and help.Model widgets already use AdaptiveColor
 // internally and are untouched here.
 var (
@@ -71,8 +72,13 @@ var (
 	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8a4500", Dark: "214"}).Bold(true)
 	// favStyle marks the ★ favorite indicator -- decorative/accent, >=3:1
 	// bar would suffice, but the chosen Light value clears >=4.5:1.
-	favStyle  = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8b6500", Dark: "220"}).Bold(true)
-	lockStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	favStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#8b6500", Dark: "220"}).Bold(true)
+	// lockStyle colours the 🔒 lock indicator. Made adaptive in th05: the old
+	// fixed Color("208") = #ff8700 clears the bar on a dark terminal but is only
+	// ~2.4:1 on white; the Light variant is the same deep orange the tunnel
+	// marker uses, and Dark keeps the original xterm 208 (byte-identical output
+	// for existing dark-terminal users -- TestNoDarkRegression).
+	lockStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#c2410c", Dark: "208"}).Bold(true)
 	errStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	// wasStyle renders a remembered-but-gone process name ("was mailpit") as a
@@ -172,12 +178,13 @@ type keyMap struct {
 	Funnel key.Binding
 	// Publish exposes a port to the public internet through a user-controlled
 	// Caddy edge (the `p` key, kata v1z5; swapped from `P` under vzj4). It is a
-	// SECOND public path, sibling
-	// to Funnel and mutually exclusive with it per port -- never ranked above.
+	// SECOND public path, sibling to Funnel -- never ranked above. Since kata
+	// th05 it may COEXIST with funnel/tunnel on one port (each its own route).
 	Publish key.Binding
 	// Tunnel exposes a port to the public internet through a Cloudflare Tunnel
 	// run by cloudflared (the `t` key, kata nc1j). A THIRD public path, sibling
-	// to Funnel and Publish and mutually exclusive with both. Only shown in the
+	// to Funnel and Publish, and since kata th05 freely coexisting with both.
+	// Only shown in the
 	// bottom bar when cloudflared is installed (barGroups gates it on
 	// cfAvailable); it stays in groups() so the "?" overlay documents it.
 	Tunnel   key.Binding
@@ -306,7 +313,7 @@ func newKeyMap() keyMap {
 		Undo:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "undo")),
 		Redo:    key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "redo")),
 		ShowAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
-		Copy:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
+		Copy:    key.NewBinding(key.WithKeys("c", "y"), key.WithHelp("c", "copy URL")),
 		// Clean moved to shift-C when "c" was reassigned to copy (vnq7); it's
 		// contextual (only enabled when dangling forwards exist), so demoting
 		// it to a shifted key is fine.
@@ -332,9 +339,8 @@ type portItem struct {
 	// through the Caddy edge (kata v1z5), or "" if it isn't published. Set from
 	// the live edge poll (m.published), never persisted per-port. publishAuth
 	// records whether that route carries basic auth. Publish is a SIBLING of
-	// funnel, not ranked against it: tailport enforces mutual exclusion, so a
-	// tailport-driven port is funnelled XOR published, never both -- the only
-	// way to see both is external mutation, surfaced as explicit drift (reach).
+	// funnel, not ranked against it; since kata th05 the two (and tunnel) may
+	// coexist on one port, each rendered as its own route sub-row (routesFor).
 	publishHostname string
 	publishAuth     bool
 	// tunnelActive marks that a tailport-owned cloudflared tunnel (kata nc1j)
@@ -344,7 +350,7 @@ type portItem struct {
 	// the operator's custom host for named); tunnelMode distinguishes the two for
 	// the "starting…" wording. Set from the live process-table poll (m.tunnels),
 	// never persisted -- the running process is the source of truth. A SIBLING of
-	// funnel/publish, mutually exclusive per port (see reach).
+	// funnel/publish, and since kata th05 freely coexisting with them (own route).
 	tunnelActive   bool
 	tunnelHostname string
 	tunnelMode     cftunnel.Mode
@@ -358,13 +364,6 @@ type portItem struct {
 	// and served share 🌒/◉ (qptn). Resolved once for the model and copied
 	// onto each item.
 	emoji bool
-	// justCopied marks the port most recently copied via "c" while its
-	// description was the bare tailnet URL (state C: reachServed), set in
-	// rebuildItems from m.copiedPort (py5b). Description() appends the
-	// styled "✓ copied" suffix when it's set; it fades on its own via
-	// copiedExpireMsg/copiedID (mirroring flashExpireMsg/flashID) rather
-	// than being cleared by selection changes.
-	justCopied bool
 }
 
 // portDelegate is the list's item renderer: the stock DefaultDelegate, except
@@ -392,156 +391,14 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 	d.DefaultDelegate.Render(w, m, index, item)
 }
 
-// markerGlyph is the port's reachability marker: a moon-phase "fill ramp"
-// (1exs, direction fixed by e1wv) tracking i.reach()'s 7-state classification
-// (79xb) from least exposed to most -- both channels go open/light at
-// localhost and filled/dark at the public internet, so the emoji ramp reads
-// consistently with the mono ramp: 🌕/○ localhost only, 🌔/◔ local network
-// only, 🌒/◉ on tailnet (served or bound wide), 🌑/● funnelled to the public
-// internet. The two BROKEN states sit OFF the ramp as plain glyphs, not
-// moons: 🌫️/▲ a stale dangling forward, ✕/✕ a favorite whose process is
-// down. It switches on the SAME i.reach() resolver Description() uses, so
-// the glyph and the row's text can never disagree about a port's state.
-// Emoji markers are padded to a stable 2-cell width so the :port column
-// stays aligned even if a terminal renders a given emoji (or the naturally
-// 1-cell ✕) narrow.
-func (i portItem) markerGlyph() string {
-	var m string
-	switch i.reach() {
-	case reachFunnel:
-		// Reachable from the open internet -- outranks every other state.
-		// Public is safety-critical (AGENTS.md): keep the hot-magenta ●.
-		if i.emoji {
-			m = "🌑"
-		} else {
-			m = publicStyle.Render("●")
-		}
-	case reachPublish:
-		// Published to the public internet via the Caddy edge (kata v1z5). A
-		// DISTINCT public marker from funnel's ●/🌑 per the safety-marker
-		// mandate (the two public paths must be tellable apart at a glance) --
-		// a BLUE ◆ (publishMarkerStyle, mg) vs funnel's magenta ●, both still
-		// meaning "reachable by anyone".
-		if i.emoji {
-			m = "🌐"
-		} else {
-			m = publishMarkerStyle.Render("◆")
-		}
-	case reachTunnel:
-		// Tunnelled to the public internet via cloudflared (kata nc1j). A THIRD
-		// distinct public marker: an ORANGE ◈ (tunnelMarkerStyle) -- Cloudflare's
-		// hue -- vs funnel's magenta ● and publish's blue ◆, all "reachable by
-		// anyone". Emoji uses ☁️ (a cloud, echoing Cloudflare), off the moon ramp
-		// like publish's 🌐.
-		if i.emoji {
-			m = "☁️"
-		} else {
-			m = tunnelMarkerStyle.Render("◈")
-		}
-	case reachServed, reachTailnet:
-		// Served AND already-tailnet-reachable-by-IP (wildcard/tailnet bind)
-		// share this glyph (qptn): both answer at the SAME http://host:port,
-		// so they're the same reachability tier from a peer's perspective.
-		// The bind-scope distinction (served vs. bound wide) now lives on
-		// the title's bindPrefix() instead of a separate marker tier.
-		if i.emoji {
-			m = "🌒"
-		} else {
-			m = activeStyle.Render("◉")
-		}
-	case reachStale:
-		// Dangling forward: served, but nothing is bound locally, so a tailnet
-		// peer hitting the URL gets connection refused. Off the moon ramp --
-		// this reads as "something's wrong", not just "less reachable".
-		if i.emoji {
-			m = "🌫️"
-		} else {
-			m = warnStyle.Render("▲")
-		}
-	case reachLAN:
-		if i.emoji {
-			m = "🌔"
-		} else {
-			m = "◔"
-		}
-	case reachOffline:
-		// A favorite whose process is down -- off the moon ramp, same as
-		// reachStale, but styled distinctly so the two broken states don't
-		// read as the same problem: wasStyle is the exact "remembered but
-		// gone" muted treatment the row's own "was mailpit" label already
-		// uses for this precise situation (a down favorite).
-		if i.emoji {
-			m = "✕"
-		} else {
-			m = wasStyle.Render("✕")
-		}
-	default: // reachLocalhost
-		if i.emoji {
-			m = "🌕"
-		} else {
-			m = "○"
-		}
-	}
-	if i.emoji {
-		for lipgloss.Width(m) < 2 {
-			m += " "
-		}
-	}
-	return m
-}
-
-// bindPrefix is the netstat-style host prefix shown left of ":PORT" on the row
-// title, the differentiator now that a bound-wide tailnet port and a served
-// port share the green ◉ glyph and the same URL (qptn): "*" for a wildcard
-// bind (0.0.0.0/::), the LAN IP for a specific LAN bind, and "" (quiet) for a
-// loopback/served port. So "*:3000" (bound wide) vs ":3000" (served) read alike
-// but stay distinguishable, and a LAN row's "<ip>:3000" self-explains why it is
-// NOT on the tailnet.
-func (i portItem) bindPrefix() string {
-	switch i.port.BindScope {
-	case portscan.ScopeWildcard:
-		return "*"
-	case portscan.ScopeLAN:
-		return i.port.BindHost // e.g. "192.168.1.5"; may be "" in the odd unclassified case
-	default: // loopback / tailnet-ip / unknown -> quiet
-		return ""
-	}
-}
-
-func (i portItem) Title() string {
-	marker := i.markerGlyph()
-	lock := ""
-	if i.meta.Locked {
-		lock = " " + lockStyle.Render("🔒")
-	}
-	star := ""
-	if i.meta.Favorite {
-		star = favStyle.Render("★") + " "
-	}
-	// Name precedence: an explicit user label wins; else the live process name
-	// while something's listening; else the remembered last process ("was
-	// mailpit", italic) so a down favorite still says what used to run there;
-	// else "?".
-	name := i.meta.Label
-	switch {
-	case name != "":
-	case i.port.Process != "":
-		name = i.port.Process
-	case i.meta.LastProcess != "":
-		name = wasStyle.Render("was " + i.meta.LastProcess)
-	default:
-		name = "?"
-	}
-	return fmt.Sprintf("%s%s %s:%d  %s%s", marker, lock, i.bindPrefix(), i.port.Number, star, name)
-}
-
 // reachState is the honest 7-state reachability lexicon (79xb): who can
 // ACTUALLY reach this port, as distinct from whether tailport has served it.
 // `tailscale serve` is a separate app-layer reverse proxy that only matters
 // for a loopback-bound app -- a wildcard/tailnet-IP bind (e.g. sshd on :22)
-// is already tailnet-reachable at the IP layer with or without serve. This
-// single resolver backs both Description (the row text) and the Part-3
-// serve-guard, so the two can never disagree about a port's state.
+// is already tailnet-reachable at the IP layer with or without serve. Post-th05
+// this resolver backs only the space serve-guard (the row text is now per-route
+// via routesFor); several of the states below are still produced but only
+// reachTailnet/reachLAN/reachLocalhost are consumed by that guard.
 type reachState int
 
 const (
@@ -550,37 +407,29 @@ const (
 	reachLAN                         // B': specific LAN-IP bind, unserved -- LAN only, NOT tailnet
 	reachServed                      // C: served AND something is listening
 	reachFunnel                      // D: funnelled to the public internet -- outranks everything
-	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel, not ranked (mutual exclusion means a tailport port is in exactly one)
-	reachTunnel                      // D'': tunnelled to the public internet via cloudflared (kata nc1j) -- a THIRD public sibling, likewise mutually exclusive
+	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel; th05 lets them coexist, so reach() returns funnel > publish when both are present (it now only feeds the space serve-guard)
+	reachTunnel                      // D'': tunnelled to the public internet via cloudflared (kata nc1j) -- a THIRD public sibling; likewise coexists post-th05, ranked last of the three by reach()
 	reachStale                       // E: served but nothing listening -- a dangling forward
 	reachOffline                     // F: not served, not listening (e.g. a down favorite)
 )
 
-// reach resolves a portItem's reachState. Precedence (top to bottom): the two
-// public paths (funnel D and publish D') come first -- either makes the port
-// public regardless of its tailnet serve status. They are SIBLINGS, not a
-// ranked pair (kata v1z5): tailport enforces funnel/publish mutual exclusion,
-// so a tailport-driven port is in exactly one and reach() never has to pick a
-// winner. The one case where BOTH are observed on a port is external mutation
-// (a foreign Funnel or Caddy edit); rather than silently collapse to one
-// marker, reach() surfaces it with the existing warning/stale affordance (▲)
-// and a distinct "funnelled AND published" description (see plainDescription)
-// -- no bespoke drift state, glyph, or field. Below the public tier: a served
-// port is either healthy (C, listening) or a stale dangling forward (E, not
-// listening); an unserved port's reachability comes straight from its widest
-// bind scope (portscan.BindScope); anything neither served nor listening is
-// simply offline.
+// reach resolves a portItem's reachState. Since th05 replaced the single
+// aggregate row with per-route sub-rows (routesFor), reach() is no longer the
+// row renderer; its ONE remaining caller is the space serve-guard, which needs
+// to tell a loopback-only port (serve applies) from an already-tailnet /
+// LAN-only bind (serve is a no-op or broken). Multiple public paths coexisting
+// on one port is NORMAL now (th05 relaxed the funnel/publish/tunnel mutual
+// exclusion), so reach() no longer collapses that to a drift/▲ state: it simply
+// returns the widest present public path (funnel, else publish, else tunnel).
+// Below the public tier: a served port is either healthy (C, listening) or a
+// stale dangling forward (E, not listening); an unserved port's reachability
+// comes straight from its widest bind scope (portscan.BindScope); anything
+// neither served nor listening is simply offline.
 func (i portItem) reach() reachState {
 	published := i.publishHostname != ""
 	funnelled := i.funnelPublic != 0
 	tunnelled := i.tunnelActive
 	switch {
-	case boolCount(funnelled, published, tunnelled) >= 2:
-		// External drift: MORE THAN ONE public path on one port (kata nc1j
-		// extends the funnel/publish drift case to three-way). Reuse the
-		// warning/stale affordance rather than picking a winner
-		// (plainDescription names which collided).
-		return reachStale
 	case funnelled:
 		return reachFunnel
 	case published:
@@ -603,129 +452,6 @@ func (i portItem) reach() reachState {
 	default: // !active && !listening
 		return reachOffline
 	}
-}
-
-// inlineCopyState reports whether a `c` copy on this row confirms INLINE
-// (append a transient "✓ copied" to the row's description) rather than via the
-// bottom-bar toast (vqa3). True for the healthy copyable states whose row
-// text already states what was copied -- including reachPublish (d80p): `c`
-// now copies the exact "https://<publishHostname>" the row shows, so
-// shown==copied and it joins the inline group. False for funnel (shown
-// PUBLIC funnel URL ≠ copied TAILNET URL — a genuine shown≠copied mismatch),
-// stale (dangling — the copied URL resolves to nothing), and offline (nothing
-// live to copy), which keep the one disambiguating toast.
-func (i portItem) inlineCopyState() bool {
-	switch i.reach() {
-	case reachLocalhost, reachLAN, reachTailnet, reachServed, reachPublish:
-		return true
-	case reachTunnel:
-		// Like publish, `c` copies the exact https URL the row shows -- but only
-		// once the hostname is known (a still-starting quick tunnel has none, so
-		// it falls back to the toast).
-		return i.tunnelHostname != ""
-	default: // reachFunnel, reachStale, reachOffline
-		return false
-	}
-}
-
-// plainDescription is the UNSTYLED row text for the current reach state -- what
-// inlineCopyFits measures before choosing inline-✓ vs toast, and the base that
-// styledDescription() and the inline "✓ copied" suffix build on (vqa3). Kept in
-// lockstep with the states in reach().
-func (i portItem) plainDescription() string {
-	switch i.reach() {
-	case reachFunnel:
-		return tsserve.PublicURL(i.fqdn, i.funnelPublic) + " · on the internet"
-	case reachPublish:
-		d := "https://" + i.publishHostname + " · published to the internet"
-		if i.publishAuth {
-			// A glyph marks a basic-auth-protected route rather than spelling out
-			// "basic auth"; emoji-gated like the exposure markers (markerGlyph).
-			if i.emoji {
-				d += " " + authGlyphEmoji
-			} else {
-				d += " " + authGlyphMono
-			}
-		}
-		return d
-	case reachTunnel:
-		// A quick tunnel's URL isn't known until cloudflared assigns it a few
-		// seconds after start; until then say so rather than show a blank host.
-		if i.tunnelHostname == "" {
-			return "starting Cloudflare quick tunnel…"
-		}
-		return "https://" + i.tunnelHostname + " · tunnelled to the internet"
-	case reachStale:
-		// Drift: a port carrying MORE THAN ONE public path (external mutation
-		// only) is routed here to reuse the ▲ warning affordance; name which
-		// collided rather than pretending it's an ordinary dangling forward
-		// (kata nc1j extends the two-way funnel/publish case to three-way).
-		if drift := driftDescription(i); drift != "" {
-			return drift
-		}
-		return "bound to tailnet, but stale — space to unbind"
-	case reachServed:
-		return i.servedDescPlain()
-	case reachTailnet:
-		// :22 (SSH) isn't HTTP, so it keeps its own line rather than a
-		// served-style URL. A leading guard like this makes room for future
-		// non-HTTP special-cases without disturbing the common path below.
-		if i.port.Number == 22 {
-			return "on tailnet · reachable via SSH"
-		}
-		// qptn: a wildcard-bound port is already reachable at the SAME
-		// http://host:port a served port answers at (post-83wv, `c` copies
-		// this exact URL for both) -- so its description now reads
-		// IDENTICALLY to reachServed's. The bind-scope distinction moves to
-		// the title's bindPrefix() instead (netstat-style "*:port").
-		return i.servedDescPlain()
-	case reachLAN:
-		return "local network only"
-	case reachOffline:
-		return "offline"
-	default: // reachLocalhost
-		return "localhost only"
-	}
-}
-
-// styledDescription wraps plainDescription with the per-state emphasis the row
-// carries today: publicStyle for a funnelled (public) row, warnStyle for a
-// stale dangling forward. The healthy states stay unstyled.
-func (i portItem) styledDescription() string {
-	switch i.reach() {
-	case reachFunnel, reachPublish, reachTunnel:
-		// Gray+bold, not publicStyle's magenta -- magenta reads as "selected"
-		// (e0e7 for publish, ze1z extends it to funnel; nc1j to tunnel). The
-		// ●/◆/◈ marker glyphs keep the public safety signal.
-		return publicDescStyle.Render(i.plainDescription())
-	case reachStale:
-		return warnStyle.Render(i.plainDescription())
-	default:
-		return i.plainDescription()
-	}
-}
-
-func (i portItem) Description() string {
-	desc := i.styledDescription()
-	if i.justCopied {
-		// Pre-styled bold-green suffix (py5b), now on EVERY inline-copy state
-		// (vqa3), not just served. justCopied is set by copyURL ONLY for
-		// inlineCopyState() rows, so funnel/stale/offline never reach here with
-		// it set. The delegate's rune highlighter is ANSI-unaware, but
-		// filterNoHighlight (see New) strips the per-char match highlight from
-		// every row, so embedding raw ANSI here is safe.
-		desc += activeStyle.Render(copiedSuffix)
-	}
-	return desc
-}
-
-// servedDescPlain returns the UNSTYLED state-C description text
-// ("http://host:port · on tailnet") -- the row text Description() renders for
-// reachServed, and the exact string whose URL copyURL copies. Shared by
-// Description() and copyURL's inlineCopyFits width check (py5b) so the two
-// can never drift out of sync about what the row actually shows.
-func (i portItem) servedDescPlain() string {
-	return fmt.Sprintf("http://%s:%d · on tailnet", i.host, i.port.Number)
 }
 
 func (i portItem) FilterValue() string {
@@ -1317,15 +1043,29 @@ type model struct {
 	flash      string
 	flashLevel flashLevel
 	flashID    int
-	// copiedPort is the port number showing the inline "✓ copied" row
-	// annotation (py5b), or 0 for none -- set by copyURL's state-C fast path
-	// instead of the toast, and read back in rebuildItems to flag that one
-	// port's item justCopied. copiedID is copiedPort's flashID-style guard:
-	// bumped on every inline copy so a matching copiedExpireMsg clears it,
-	// while a stale one (superseded by a newer copy) is ignored -- see
+	// copiedPort is the port number of the service showing the inline "✓ copied"
+	// annotation (py5b), or 0 for none -- set by copyRoute (kata th05), together
+	// with copiedRouteIdx which route within it. copiedID is copiedPort's
+	// flashID-style guard: bumped on every copy so a matching copiedExpireMsg
+	// clears it, while a stale one (superseded by a newer copy) is ignored -- see
 	// copiedExpireMsg.
 	copiedPort int
 	copiedID   int
+	// copiedRouteIdx pins WHICH route sub-row of m.copiedPort's service shows
+	// the inline "✓ copied" annotation (kata th05: copy is route-scoped now, not
+	// per-port). Meaningful only while copiedPort != 0; cleared alongside it.
+	copiedRouteIdx int
+	// routeIdx is the ROUTE-level cursor (kata th05): the index of the selected
+	// route sub-row WITHIN the current service (m.list.Index() selects the
+	// service). Kept in [0, len(routes)-1] by clampRouteIdx on every rebuild.
+	// ↑↓/jk move it (crossing into adjacent services at the ends); Shift+↑↓/JK
+	// jump whole services, landing on route 0.
+	routeIdx int
+	// scrollOff is the single-column body's top line offset (kata th05). Because
+	// service blocks are variable-height, the body can't page by a fixed row
+	// count like the retired grid did; instead ensureRouteVisible nudges this so
+	// the selected route stays on screen, and renderList slices bodyLines to it.
+	scrollOff int
 	// operatorNotSet is the STICKY counterpart to flash (kata tapv): a
 	// deliberate exception to the auto-dismiss toast, because tailscale's
 	// operator requirement is required-setup guidance, not a fleeting
@@ -2190,144 +1930,19 @@ func publishErrText(err error) string {
 }
 
 // copiedSuffix is the plain (unstyled) text of the inline copy confirmation
-// (py5b), appended -- pre-styled bold-green via activeStyle -- to a state-C
-// row's description when its portItem.justCopied is set. Kept as one
-// constant so the width-fit check (inlineCopyFits) and the styled render
-// (portItem.Description) can never drift out of sync about its width.
+// (py5b), appended -- pre-styled bold-green via activeStyle -- to the route
+// sub-row that was just copied (kata th05: routeAdornments in routerender.go
+// renders it when copiedRoute matches). Kept as one constant so the width math
+// and the styled render can never drift out of sync about its width.
 const copiedSuffix = "  ✓ copied"
 
-// authGlyph{Emoji,Mono} mark a basic-auth-protected published row in place of
-// the words "basic auth". Emoji-gated like the exposure markers (markerGlyph):
-// a person for emoji terminals, a plain "@" (login-ish) for the mono fallback.
+// authGlyph{Emoji,Mono} mark a basic-auth-protected published route in place of
+// the words "basic auth". Emoji-gated like the exposure markers: a person for
+// emoji terminals, a plain "@" (login-ish) for the mono fallback.
 const (
 	authGlyphEmoji = "👤"
 	authGlyphMono  = "@"
 )
-
-// descTruncateStyle mirrors the style bubbles/list's DefaultDelegate.Render
-// uses to compute its available text width (vendored
-// github.com/charmbracelet/bubbles/list@v1.0.0, defaultitem.go: textwidth =
-// list width - NormalTitle's left+right padding, applied to BOTH title and
-// description). portDelegate never overrides Styles.NormalTitle (only swaps
-// NormalTitle/NormalDesc for a dimmed row on a throwaway copy inside
-// Render), so a freshly resolved list.NewDefaultDelegate()'s style is always
-// the one actually in effect -- resolved once here rather than reconstructed
-// on every call.
-var descTruncateStyle = list.NewDefaultDelegate().Styles.NormalTitle
-
-// Grid layout constants (9gys): minColWidth is the narrowest a single
-// column's cell is ever allowed to be, maxCols caps how many side-by-side
-// columns a very wide terminal ever grows to, and colGutter is the blank gap
-// between adjacent columns. See gridCols/gridColWidth/gridRows.
-const (
-	minColWidth = 50
-	maxCols     = 3
-	colGutter   = 2
-)
-
-// gridCols returns how many side-by-side columns fit a terminal of the given
-// width: roughly one per minColWidth cells, clamped to maxCols and never
-// less than 1 (so a very narrow terminal still gets a single, ordinary
-// column). Below minColWidth it's always 1.
-//
-// NOTE (boundary caveat): this is the naive width/minColWidth floor-division
-// split the kata spec pins exact test values against (gridCols(100)==2,
-// gridCols(150)==3, ...). Right AT those transition widths the resulting
-// gridColWidth dips a couple of cells below minColWidth (e.g.
-// gridColWidth(100, 2) == 49, gridColWidth(150, 3) == 48) before recovering
-// a few columns later (>=102 and >=154 respectively) -- see
-// TestGridColWidth. A stricter gridCols that floors on colWidth>=minColWidth
-// at every width would change gridCols(100) to 1 and gridCols(150) to 2,
-// contradicting the pinned test table, so this deliberately keeps the exact
-// formula given rather than "fixing" it unilaterally; the undershoot is at
-// most 2 cells and self-heals a few columns later.
-func gridCols(width int) int {
-	if width < minColWidth {
-		return 1
-	}
-	c := width / minColWidth
-	if c > maxCols {
-		c = maxCols
-	}
-	if c < 1 {
-		c = 1
-	}
-	return c
-}
-
-// gridColWidth is the per-column cell width given the terminal width and
-// column count (colGutter-wide gutters between columns, none at the outer
-// edges).
-func gridColWidth(width, cols int) int {
-	if cols < 1 {
-		cols = 1
-	}
-	return (width - colGutter*(cols-1)) / cols
-}
-
-// gridRows is how many item rows fit a body of height h, given the
-// delegate's per-item height and the spacing between items: r rows of
-// itemHeight with (r-1) spacing gaps between them fit in h.
-func gridRows(h, itemHeight, spacing int) int {
-	unit := itemHeight + spacing
-	if unit < 1 {
-		unit = 1
-	}
-	r := (h + spacing) / unit
-	if r < 1 {
-		r = 1
-	}
-	return r
-}
-
-// gridPlacement maps a window-relative item index k (0-based) to its
-// column-major (col, row) position in a grid with the given row count: a
-// column fills top-to-bottom before the next column starts (like a
-// newspaper), so the k-th item lands at column k/rows, row k%rows.
-func gridPlacement(k, rows int) (col, row int) {
-	if rows < 1 {
-		rows = 1
-	}
-	return k / rows, k % rows
-}
-
-// gridDims computes the current grid layout from the model's terminal width
-// and available body height: cols (gridCols), rows (gridRows, from the same
-// body height resizeList gives m.list -- see listBodyHeight), and colWidth
-// (gridColWidth). renderGrid, availableDescriptionWidth, and the Left/Right
-// grid-nav keys all derive from this single computation so they can never
-// disagree about the current layout.
-func (m model) gridDims() (cols, rows, colWidth int) {
-	cols = gridCols(m.width)
-	colWidth = gridColWidth(m.width, cols)
-	rows = gridRows(m.listBodyHeight(), m.delegate.Height(), m.delegate.Spacing())
-	return cols, rows, colWidth
-}
-
-// availableDescriptionWidth returns the width (in cells) the list delegate
-// truncates a row's title/description to, given the model's current PER-
-// COLUMN width (9gys: multi-column layouts render each cell at colWidth, not
-// the full terminal width) -- the same budget bubbles/list enforces at
-// render time, so inlineCopyFits can decide whether the "✓ copied" suffix
-// will actually be visible before copyURL appends it. At a single-column
-// width this is identical to the pre-9gys width-based budget, since
-// gridColWidth(width, 1) == width.
-func (m *model) availableDescriptionWidth() int {
-	_, _, colWidth := m.gridDims()
-	return colWidth - descTruncateStyle.GetPaddingLeft() - descTruncateStyle.GetPaddingRight()
-}
-
-// inlineCopyFits reports whether appending copiedSuffix to a description of
-// descWidth (its PLAIN, unstyled rendered width) would still fit within
-// availWidth, the delegate's available title/description budget
-// (availableDescriptionWidth). Pure and side-effect free so it's directly
-// unit-testable: bubbles/list truncates descriptions END-first, so on a
-// narrow terminal / long URL the appended suffix would be the FIRST thing
-// clipped -- silently dropping the confirmation -- unless copyURL checks
-// this first and falls back to the toast.
-func inlineCopyFits(descWidth, availWidth int) bool {
-	return descWidth+lipgloss.Width(copiedSuffix) <= availWidth
-}
 
 // httpURL builds an http:// URL for host:port, bracketing an IPv6 literal host
 // (a bare "fe80::1" would otherwise make the trailing :port ambiguous).
@@ -2336,115 +1951,6 @@ func httpURL(host string, port int) string {
 		return fmt.Sprintf("http://[%s]:%d", host, port)
 	}
 	return fmt.Sprintf("http://%s:%d", host, port)
-}
-
-// copyTargetURL returns the clipboard URL for sel, chosen to actually resolve
-// for the port's reach state: a tailnet-reachable port (reachTailnet) and every
-// served/funnelled/stale (active) port copy the tailnet host URL; a LAN-only
-// bind copies its real http://<lan-ip>:PORT; a localhost-only port or an
-// offline favorite copies http://localhost:PORT instead of a dead tailnet URL.
-// (Funnelled ports deliberately keep the tailnet form -- the toast names the
-// public-vs-tailnet mismatch.) reachPublish is the one exception (d80p): it
-// copies the exact public "https://<publishHostname>" the row shows, not the
-// tailnet form, since that's the URL the port is actually reachable at from
-// the public internet.
-func (m *model) copyTargetURL(sel portItem) string {
-	tailnetURL := fmt.Sprintf("http://%s:%d", m.host, sel.port.Number)
-	switch sel.reach() {
-	case reachLAN:
-		if sel.port.BindHost == "" { // no real LAN address to offer; stay honest
-			return tailnetURL
-		}
-		return httpURL(sel.port.BindHost, sel.port.Number)
-	case reachLocalhost, reachOffline:
-		return fmt.Sprintf("http://localhost:%d", sel.port.Number)
-	case reachPublish:
-		return "https://" + sel.publishHostname
-	case reachTunnel:
-		// Copy the exact public tunnel URL the row shows, when known; a
-		// still-starting quick tunnel has none, so fall back to the tailnet form
-		// (it never reaches the inline-✓ path -- inlineCopyState gates on the host).
-		if sel.tunnelHostname != "" {
-			return "https://" + sel.tunnelHostname
-		}
-		return tailnetURL
-	default: // reachTailnet, reachServed, reachFunnel, reachStale
-		return tailnetURL
-	}
-}
-
-// copyURL copies the selected port's URL to the clipboard and confirms the
-// copy. The copied URL is reach-aware (copyTargetURL): the tailnet host form
-// (http://<host>:<port>) for a tailnet-reachable, served, funnelled, or stale
-// port; the real http://<lan-ip>:<port> for a LAN-only bind; and
-// http://localhost:<port> for a localhost-only port or an offline favorite --
-// never a dead tailnet URL for a port that can't actually be reached that way.
-// A funnelled port still copies the tailnet form on purpose (the toast names
-// the public-vs-tailnet mismatch). A published port copies its exact public
-// "https://<publishHostname>" (d80p) -- shown==copied, unlike funnel. The
-// inline "✓ copied" confirmation is now UNIVERSAL (vqa3) across every
-// inlineCopyState() row -- reachLocalhost, reachLAN, reachTailnet,
-// reachServed, reachPublish -- because each row's description already states
-// exactly what got copied, so -- provided the annotation fits the terminal
-// width (inlineCopyFits) -- the confirmation goes inline as a transient
-// "✓ copied" on the row instead of the bottom-bar toast (py5b). The two
-// remaining principled exceptions keep the toast: funnel (row shows the
-// PUBLIC url but c copies the TAILNET url -- shown≠copied) and stale
-// (dangling -- the copied URL resolves to nothing); offline has nothing live
-// to copy either. A too-narrow row for an inline state also falls back to
-// the toast.
-func (m *model) copyURL(sel portItem) tea.Cmd {
-	url := m.copyTargetURL(sel)
-
-	if sel.inlineCopyState() && inlineCopyFits(lipgloss.Width(sel.plainDescription()), m.availableDescriptionWidth()) {
-		m.copiedID++
-		id := m.copiedID
-		m.copiedPort = sel.port.Number
-		// Clear any lingering toast so the two confirmation channels never
-		// show at once (the KeyMsg handler already does this on every
-		// keypress before dispatch, but copyURL is the one place that
-		// decides inline-vs-toast, so it's made explicit here too).
-		m.flash = ""
-		m.flashLevel = flashInfo
-		m.resizeList() // the toast may have been wrapped multi-line; give the list its rows back
-		return tea.Batch(
-			copyCmd(url),
-			m.rebuildItems(), // immediate render of the new annotation
-			tea.Tick(3*time.Second, func(time.Time) tea.Msg { return copiedExpireMsg{id: id} }),
-		)
-	}
-
-	var flash tea.Cmd
-	switch sel.reach() {
-	case reachTailnet:
-		// Wildcard/tailnet-IP bind: the copied http://<host>:<port> ALREADY
-		// resolves across the tailnet (the app is bound 0.0.0.0:PORT), so this
-		// is honest -- NOT "localhost only", and NOT "press space" (serving is
-		// a no-op here, matching the space guard's "already on tailnet").
-		flash = m.setFlash(fmt.Sprintf("copied — :%d is reachable on your tailnet at this URL", sel.port.Number), flashInfo)
-	case reachLAN:
-		// Bound to a specific LAN IP, not the tailnet: mirrors the space guard's
-		// reachLAN message (ui.go ~2019) so c and space agree. Name the copied
-		// URL so it's clear it's the real LAN address, not a dead tailnet one.
-		flash = m.setFlash(fmt.Sprintf("copied %s — LAN only; serve can't reach this bind", url), flashWarn)
-	case reachFunnel:
-		// The row shows the PUBLIC funnel URL but c copies the TAILNET URL by
-		// design; a bare inline ✓ would imply the public URL was copied. Funnel
-		// is the one principled exception to universal inline (vqa3): a toast
-		// that names what was actually copied.
-		flash = m.setFlash(fmt.Sprintf("copied %s — the tailnet url (row shows the public funnel url)", url), flashInfo)
-	default:
-		// reachLocalhost / reachOffline: genuinely localhost-only (or a down
-		// favorite) -- "press space to serve it" is TRUE here. reachServed /
-		// reachPublish (the inline path didn't fit) / reachFunnel / reachStale
-		// are all `active`, so keep the plain "copied ✓ url" confirmation.
-		if sel.active {
-			flash = m.setFlash("copied ✓  "+url, flashInfo)
-		} else {
-			flash = m.setFlash(fmt.Sprintf("copied %s — localhost only; press space to serve it", url), flashWarn)
-		}
-	}
-	return tea.Batch(copyCmd(url), flash)
 }
 
 // copyCmd performs the clipboard write off the render path (it may shell out to
@@ -2765,19 +2271,11 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 		// reduces exposure.
 		return m.beginFunnel(port, pub, false)
 	}
-	// Mutual-exclusion mirror guard (kata v1z5): funnel refuses a port that is
-	// currently Caddy-published. Funnel and publish are two INDEPENDENT public
-	// paths, never layered or ranked -- so escalating a published port to also
-	// carry a funnel is refused, with the same no-ranking treatment publish
-	// gives a funnelled port. The user removes the other exposure first.
-	if info, ok := m.published[port]; ok {
-		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (p) before funnelling", port, info.hostname))
-	}
-	// Mutual-exclusion mirror guard (kata nc1j): funnel refuses a port carrying
-	// a cloudflared tunnel -- a third independent public path, never layered.
-	if _, ok := m.tunnels[port]; ok {
-		return m.setErr(fmt.Sprintf("port :%d is tunnelled to the internet via Cloudflare — remove the tunnel first (t) before funnelling", port))
-	}
+	// th05 RELAXED the funnel/publish/tunnel mutual exclusion: multiple public
+	// routes on one port are legitimate now (each shows as its own sub-row), so
+	// funnel no longer refuses an already-published or already-tunnelled port.
+	// The funnel escalation still gets its own y/n public-internet confirm below
+	// (entryConfirmFunnel), and :22 stays hard-blocked from every public path.
 	if port == 22 {
 		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
 	}
@@ -2879,16 +2377,9 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if m.fqdn == "" {
 		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
 	}
-	// 4. mutual exclusion: a funnelled port must lose the funnel first (no
-	// ranking -- publish does not outrank funnel; they're independent paths).
-	if pub, on := m.funnel[port]; on {
-		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (P) before publishing", port, pub))
-	}
-	// 4b. mutual exclusion: a cloudflared tunnel is a third independent public
-	// path (kata nc1j); a tunnelled port must lose the tunnel first.
-	if _, ok := m.tunnels[port]; ok {
-		return m.setErr(fmt.Sprintf("port :%d is tunnelled to the internet via Cloudflare — remove the tunnel first (t) before publishing", port))
-	}
+	// 4. th05 RELAXED mutual exclusion: a funnelled or tunnelled port may ALSO be
+	// published now (each public route is its own sub-row). No cross-path refusal
+	// here; the publish setup flow still runs its own confirm before going live.
 	// 5. already published by tailport on THIS exact port -> de-escalation:
 	// unpublish immediately, no confirm (reducing exposure is never gated).
 	if info, ok := m.published[port]; ok {
@@ -3033,11 +2524,8 @@ func (m *model) requestEditPublish(port int) tea.Cmd {
 	if m.fqdn == "" {
 		return m.setErr("cannot determine this machine's tailnet name — is tailscale up?")
 	}
-	// 4. mutual exclusion: a funnelled port must lose the funnel first, same
-	// as requestPublish -- editing must not be a backdoor around it.
-	if pub, on := m.funnel[port]; on {
-		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (P) before publishing", port, pub))
-	}
+	// 4. th05 RELAXED mutual exclusion: editing a funnelled/tunnelled port's
+	// publish config is fine now -- the paths coexist as separate routes.
 	// 5. locked port -- editing a locked port's publish config still bypasses
 	// the `x` guard otherwise.
 	if m.cfg.Ports[port].Locked {
@@ -4297,6 +3785,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fresh copiedID, so this stale timer is a no-op.
 		if msg.id == m.copiedID {
 			m.copiedPort = 0
+			m.copiedRouteIdx = 0
 			return m, m.rebuildItems()
 		}
 		return m, nil
@@ -4623,55 +4112,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "left", "right":
-			// Grid column jump (9gys): the one genuinely NEW nav move the
-			// column-major grid needs -- move one column over, same row --
-			// intercepted here, BEFORE the fallthrough to m.list.Update,
-			// so bubbles/list's own left/right-bound PrevPage/NextPage
-			// default keys never also fire and double-move the selection.
-			// Deliberately ARROW KEYS ONLY: "h"/"l" are left bound to the
-			// list's native PrevPage/NextPage (h) and this app's own "l"
-			// label shortcut (l, handled below) respectively, so hijacking
-			// either would either collide with "l" or need a second
-			// carve-out -- not worth it for a key with an arrow equivalent.
-			// Up/Down/PgUp/PgDn/Home/End/j/k deliberately are NOT
-			// intercepted: they already fall through to m.list.Update below
-			// and land on the right Index() there -- CursorUp/CursorDown
-			// move it by exactly ±1 and GoToStart/GoToEnd snap to 0/len-1
-			// regardless of the list's own internal PerPage, because
-			// Index()/Select() are self-consistent by construction
-			// (Page*PerPage+cursor round-trips any index); see gridDims'
-			// doc comment. PgUp/PgDn still jump by the list's own
-			// single-column PerPage rather than the grid's cols*rows page
-			// size -- a known, accepted imprecision (not a correctness bug:
-			// it's still a monotonic, in-bounds jump) rather than fight
-			// bubbles/list's paginator to make it exact.
-			//
-			// This case returns EARLY (below), before the end-of-Update
-			// navigation clear, so clear the restore affordance here too
-			// (kata 7jy2 FIX 4) — horizontal nav is selection-changing
-			// navigation intent like the vertical keys that fall through.
+		case "up", "k":
+			// ROUTE-level move (kata th05 P4): walk the flattened route list one
+			// sub-row up, crossing into the previous service's LAST route at a
+			// service's first route. These return EARLY (before the end-of-Update
+			// nav clear), so clear the restore affordance here like the old
+			// grid-nav case did (kata 7jy2 FIX 4).
 			m.clearRestoreOnNav()
-			items := m.list.VisibleItems()
-			if len(items) == 0 {
-				return m, nil
+			m.moveRoute(-1)
+			m.ensureRouteVisible()
+			return m, nil
+		case "down", "j":
+			m.clearRestoreOnNav()
+			m.moveRoute(1)
+			m.ensureRouteVisible()
+			return m, nil
+		case "shift+up", "K", "left":
+			// RECORD-level jump (kata th05 P4): Shift+↑ / K (and ← as a plain
+			// alias) move to the PREVIOUS service, landing on its first route.
+			m.clearRestoreOnNav()
+			m.jumpService(-1)
+			m.ensureRouteVisible()
+			return m, nil
+		case "shift+down", "J", "right":
+			m.clearRestoreOnNav()
+			m.jumpService(1)
+			m.ensureRouteVisible()
+			return m, nil
+		case "home":
+			m.clearRestoreOnNav()
+			m.list.Select(0)
+			m.routeIdx = 0
+			m.ensureRouteVisible()
+			return m, nil
+		case "end":
+			m.clearRestoreOnNav()
+			if n := len(m.list.VisibleItems()); n > 0 {
+				m.list.Select(n - 1)
 			}
-			_, rows, _ := m.gridDims()
-			if rows < 1 {
-				rows = 1
-			}
-			sel := m.list.Index()
-			target := sel - rows
-			if msg.String() == "right" {
-				target = sel + rows
-			}
-			if target < 0 {
-				target = 0
-			}
-			if last := len(items) - 1; target > last {
-				target = last
-			}
-			m.list.Select(target)
+			m.routeIdx = 0
+			m.ensureRouteVisible()
+			return m, nil
+		case "pgup":
+			m.clearRestoreOnNav()
+			m.jumpService(-5)
+			m.ensureRouteVisible()
+			return m, nil
+		case "pgdown":
+			m.clearRestoreOnNav()
+			m.jumpService(5)
+			m.ensureRouteVisible()
 			return m, nil
 		case "/":
 			// Widen scope to ALL listening ports BEFORE handing "/" to the list
@@ -4725,15 +4215,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// after fixing it (`sudo tailscale set --operator=...`) clears the
 			// sticky banner even without another serve attempt.
 			return m, tea.Batch(refresh, detectOperator)
-		case "c":
-			// Copy the selected port's TAILNET URL (http://<host>:<port>) to the
-			// clipboard, even when it isn't currently exposed -- the toast then
-			// says so. Always the tailnet URL, never the public/funnel one.
+		case "c", "y":
+			// Route-scoped copy (kata th05 P5): copy the SELECTED route sub-row's
+			// exact URL (m.routeIdx into the current service's routes) -- so
+			// copying the ts.net route copies the public funnel URL, the localhost
+			// route copies http://localhost:PORT, and so on. `y` is the yank alias.
+			// The inline "✓ copied" confirmation lands on that route line
+			// (copyRoute); an empty-URL route (offline, or a still-starting quick
+			// tunnel) has nothing to copy, so it toasts instead.
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
 				return m, nil
 			}
-			return m, m.copyURL(sel)
+			routes := sel.routes()
+			ri := clampInt(m.routeIdx, 0, len(routes)-1)
+			r := routes[ri]
+			if r.url == "" {
+				return m, m.setFlash(fmt.Sprintf(":%d %s — nothing to copy yet", sel.port.Number, r.label()), flashWarn)
+			}
+			return m, m.copyRoute(sel.port.Number, ri, r.url)
 		case "C":
 			// Batch-tear-down of dangling forwards, behind a y/n confirm (moved
 			// from "c" to shift-C when "c" became copy; see vnq7). No-op while a
@@ -5004,7 +4504,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
 			tun := m.tunnels[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
 		return m.setItems(items)
 	}
@@ -5029,7 +4529,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
 		tun := m.tunnels[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji, justCopied: m.copiedPort == n})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
 	return m.setItems(items)
 }
@@ -5046,6 +4546,10 @@ func (m *model) setItems(items []list.Item) tea.Cmd {
 	if idx := m.list.Index(); len(items) > 0 && (idx < 0 || idx >= len(items)) {
 		m.list.Select(len(items) - 1)
 	}
+	// The route cursor (kata th05) must also survive a rebuild: a service whose
+	// route list shrank (an exposure torn down between polls) could otherwise
+	// leave m.routeIdx dangling past the end.
+	m.clampRouteIdx()
 	return cmd
 }
 
@@ -6716,9 +6220,9 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
-		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of and\nmutually exclusive with funnel — a port can carry one or the other,\nnever both. Press e to change hostname/auth without unpublishing.",
-		"t":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. t is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, mutually exclusive with funnel and publish — a port carries one\npublic exposure, never several.",
-		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, funnel conflict, locked); e never de-escalates.",
+		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
+		"t":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. t is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
+		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
@@ -7824,95 +7328,6 @@ func (m model) renderHintFooter() string {
 	return strings.Repeat(" ", pad) + hint
 }
 
-// renderGrid lays out the current page of the port list in gridDims' cols
-// side-by-side columns (1 on an ordinary terminal, up to maxCols on a wide
-// one), taking over LAYOUT and paging from bubbles/list while list.Model
-// stays the single source of truth for STATE -- Items/VisibleItems, Index,
-// Select, FilterState (9gys). It pages off m.list.Index() directly rather
-// than the list's own internal paginator (which bubbles/list sizes for a
-// single column and which this code never touches): perPage = cols*rows,
-// and the window is VisibleItems()[page*perPage : ...].
-//
-// Each cell in the window is rendered by REUSING m.delegate -- the exact
-// same delegate list.New(nil, del, ...) was built with -- on a scratch copy
-// of m.list (sl) whose width is narrowed to the column width. m is already a
-// value copy (View/renderGrid have value receivers), so mutating sl is safe
-// and never leaks back to the real m.list. Because sl.Index() == m.list.Index()
-// == sel unchanged, the delegate still selects/highlights the right cell,
-// and dimmed/ANSI styling is byte-identical to the old single-column
-// list.View() path -- only the surrounding layout differs.
-//
-// Items fill COLUMN-MAJOR (gridPlacement): the k-th window item lands at
-// column k/rows, row k%rows, so a column reads top-to-bottom before
-// wrapping to the next, like a newspaper.
-func (m model) renderGrid() string {
-	cols, rows, colWidth := m.gridDims()
-	items := m.list.VisibleItems()
-	perPage := cols * rows
-	if perPage < 1 {
-		perPage = 1
-	}
-	sel := m.list.Index()
-	page := sel / perPage
-	start := page * perPage
-	end := start + perPage
-	if end > len(items) {
-		end = len(items)
-	}
-	window := items[start:end]
-
-	sl := m.list
-	sl.SetWidth(colWidth)
-	spacing := m.delegate.Spacing()
-
-	columns := make([][]string, cols)
-	for k, it := range window {
-		var buf bytes.Buffer
-		m.delegate.Render(&buf, sl, start+k, it)
-		c, _ := gridPlacement(k, rows)
-		columns[c] = append(columns[c], buf.String())
-	}
-
-	// Join each column's cells vertically with `spacing` blank line(s)
-	// between them (matching the delegate's own inter-item gap), then pad
-	// every column to the tallest one's line count so JoinHorizontal aligns
-	// them on a common baseline, with a colGutter-wide blank gutter between
-	// columns.
-	colStrs := make([]string, cols)
-	tallest := 0
-	for c := 0; c < cols; c++ {
-		colStrs[c] = strings.Join(columns[c], strings.Repeat("\n", spacing+1))
-		if hgt := lipgloss.Height(colStrs[c]); hgt > tallest {
-			tallest = hgt
-		}
-	}
-	gutter := lipgloss.NewStyle().Width(colGutter).Height(tallest).Render("")
-	parts := make([]string, 0, cols*2-1)
-	for c := 0; c < cols; c++ {
-		block := colStrs[c]
-		if pad := tallest - lipgloss.Height(block); pad > 0 {
-			block += strings.Repeat("\n", pad)
-		}
-		parts = append(parts, lipgloss.NewStyle().Width(colWidth).Render(block))
-		if c < cols-1 {
-			parts = append(parts, gutter)
-		}
-	}
-	grid := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
-
-	// A compact "page N/M" indicator when there's more than one page, so the
-	// more-below/next-page affordance bubbles/list's own paginator used to
-	// give isn't lost. Always emitted as exactly one line -- blank when
-	// there's only one page -- so listBodyHeight's pageIndicatorLines
-	// reservation never has to change between single- and multi-page states.
-	indicator := ""
-	if len(items) > perPage {
-		totalPages := (len(items) + perPage - 1) / perPage
-		indicator = helpStyle.Render(fmt.Sprintf("page %d/%d", page+1, totalPages))
-	}
-	return grid + "\n" + indicator
-}
-
 func (m model) View() string {
 	if m.showEgg {
 		return m.eggView()
@@ -7944,7 +7359,7 @@ func (m model) View() string {
 	case len(m.list.Items()) == 0 && !filtering:
 		body += m.renderEmptyState()
 	default:
-		body += m.renderGrid()
+		body += m.renderList()
 	}
 
 	// Pin the bottom bar (shortcuts, status -- or a modal prompt) to the last

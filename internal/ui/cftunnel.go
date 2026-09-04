@@ -176,13 +176,9 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 	if port == 22 {
 		return m.setErr("refusing to tunnel :22 (SSH) to the public internet")
 	}
-	// 5. mutual exclusion: one public path per port, never layered or ranked.
-	if pub, on := m.funnel[port]; on {
-		return m.setErr(fmt.Sprintf("port :%d is funnelled (public %d) — remove the funnel first (P) before tunnelling", port, pub))
-	}
-	if info, ok := m.published[port]; ok {
-		return m.setErr(fmt.Sprintf("port :%d is published to the internet (https://%s) — unpublish it first (p) before tunnelling", port, info.hostname))
-	}
+	// 5. th05 RELAXED mutual exclusion: a funnelled or published port may ALSO be
+	// tunnelled now -- each public path is its own route sub-row. The tunnel
+	// setup still runs its own public-internet confirm before going live.
 	// 6. locked port: a tunnel must not bypass the `x` lock any more than serve/
 	// funnel/publish do.
 	if m.cfg.Ports[port].Locked {
@@ -319,31 +315,6 @@ func (m *model) clearTunnelFlow() {
 	m.tunnelInput.Reset()
 }
 
-// driftDescription names the public paths colliding on one port (external
-// mutation only -- tailport enforces one-at-a-time), or "" when fewer than two
-// are present. Two collided paths read "<a> AND <b> — remove one"; all three
-// collapse to a compact "multiple public exposures — remove all but one".
-func driftDescription(i portItem) string {
-	var present []string
-	if i.funnelPublic != 0 {
-		present = append(present, "funnelled")
-	}
-	if i.publishHostname != "" {
-		present = append(present, "published")
-	}
-	if i.tunnelActive {
-		present = append(present, "tunnelled")
-	}
-	switch len(present) {
-	case 0, 1:
-		return ""
-	case 2:
-		return present[0] + " AND " + present[1] + " — remove one"
-	default:
-		return "multiple public exposures — remove all but one"
-	}
-}
-
 // tunnelErrText maps a cftunnel op error to a user-facing toast, giving the
 // two actionable sentinels a clear remedy and otherwise surfacing the raw error.
 func tunnelErrText(err error) string {
@@ -355,18 +326,6 @@ func tunnelErrText(err error) string {
 	default:
 		return "cloudflared: " + err.Error()
 	}
-}
-
-// boolCount returns how many of its arguments are true -- used by reach() to
-// detect drift when more than one public exposure lands on a single port.
-func boolCount(bs ...bool) int {
-	n := 0
-	for _, b := range bs {
-		if b {
-			n++
-		}
-	}
-	return n
 }
 
 // validTunnelHostname is a light sanity check on a named-tunnel hostname: a
