@@ -12,6 +12,7 @@ import (
 )
 
 var procNameRe = regexp.MustCompile(`\(\("([^"]+)"`)
+var procPidRe = regexp.MustCompile(`pid=(\d+)`)
 
 // List enumerates locally listening TCP ports via `ss`. Process names are
 // best-effort: ss can only attribute a socket to a process when it's owned
@@ -70,15 +71,22 @@ func parseSS(out []byte) ([]Port, error) {
 		scope := classifyBindScope(host)
 
 		proc := ""
+		pid := 0
 		if len(fields) > 5 {
-			if m := procNameRe.FindStringSubmatch(strings.Join(fields[5:], " ")); m != nil {
+			joined := strings.Join(fields[5:], " ")
+			if m := procNameRe.FindStringSubmatch(joined); m != nil {
 				proc = m[1]
+			}
+			if m := procPidRe.FindStringSubmatch(joined); m != nil {
+				if v, err := strconv.Atoi(m[1]); err == nil {
+					pid = v
+				}
 			}
 		}
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, BindScope: scope, BindHost: host}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host}
 			order = append(order, port)
 			continue
 		}
@@ -86,8 +94,9 @@ func parseSS(out []byte) ([]Port, error) {
 			p.BindScope = scope
 			p.BindHost = host
 		}
-		if p.Process == "" { // keep the first non-empty process name
+		if p.Process == "" { // keep the first non-empty process name, paired with its pid
 			p.Process = proc
+			p.Pid = pid
 		}
 	}
 	if err := scanner.Err(); err != nil {

@@ -331,6 +331,9 @@ type portItem struct {
 	listening bool
 	host      string
 	fqdn      string
+	// pid is the listening process's PID (portscan.Port.Pid), threaded through
+	// to the header renderer; 0 when unknown (renders nothing).
+	pid int
 	// funnelPublic is the public ingress port (443/8443/10000) this port is
 	// funnelled on, or 0 if it isn't funnelled. A funnelled port is exposed to
 	// the public internet, which outranks its tailnet-serve state in the UI.
@@ -4498,7 +4501,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
 			tun := m.tunnels[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
 		return m.setItems(items)
 	}
@@ -4523,7 +4526,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
 		tun := m.tunnels[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
 	return m.setItems(items)
 }

@@ -49,6 +49,7 @@ type blockInput struct {
 	port    int
 	name    string // already-resolved display name (label | process | "was <proc>" | "?"); caller resolves
 	nameWas bool   // true when name is a muted "was <proc>" form -> render with wasStyle
+	pid     int    // listening process's PID; 0 means unknown -> renders nothing
 
 	favorite bool
 	locked   bool
@@ -104,6 +105,9 @@ func renderServiceHeader(b blockInput) string {
 	header := bar + badge + " " + portField + "  " + name
 	if b.locked {
 		header += " " + lockStyle.Render("🔒")
+	}
+	if b.pid > 0 {
+		header += "    " + routeMutedStyle.Render(fmt.Sprintf("pid:%d", b.pid))
 	}
 	return header
 }

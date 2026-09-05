@@ -56,7 +56,8 @@ func parseLsof(out []byte) ([]Port, error) {
 			continue
 		}
 		proc := fields[0]
-		name := fields[8] // e.g. "*:3000", "127.0.0.1:5173", "[fd7a:...]:port"
+		pid, _ := strconv.Atoi(fields[1]) // best-effort; 0 if unparseable
+		name := fields[8]                 // e.g. "*:3000", "127.0.0.1:5173", "[fd7a:...]:port"
 		idx := strings.LastIndex(name, ":")
 		if idx == -1 {
 			continue
@@ -85,7 +86,7 @@ func parseLsof(out []byte) ([]Port, error) {
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, BindScope: scope, BindHost: host}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host}
 			order = append(order, port)
 			continue
 		}
@@ -93,8 +94,9 @@ func parseLsof(out []byte) ([]Port, error) {
 			p.BindScope = scope
 			p.BindHost = host
 		}
-		if p.Process == "" { // keep the first non-empty process name
+		if p.Process == "" { // keep the first non-empty process name, paired with its pid
 			p.Process = proc
+			p.Pid = pid
 		}
 	}
 	if err := scanner.Err(); err != nil {

@@ -41,14 +41,15 @@ func TestParseLsof(t *testing.T) {
 	for _, tc := range []struct {
 		port  int
 		proc  string
+		pid   int
 		scope BindScope
 		host  string
 	}{
-		{3000, "launchd", ScopeWildcard, "*"},          // *:3000 -> Wildcard
-		{5173, "node", ScopeLoopback, "127.0.0.1"},     // 127.0.0.1 + [::1] collapse; loopback-only stays Loopback; tie keeps first-seen host
-		{17600, "Dropbox", ScopeLoopback, "127.0.0.1"}, // loopback
-		{8080, "nginx", ScopeLAN, "192.168.1.5"},       // a specific LAN IP -> LAN
-		{4000, "vite", ScopeWildcard, "*"},             // 127.0.0.1 + * aggregates UP to Wildcard; host follows the wider bind
+		{3000, "launchd", 1, ScopeWildcard, "*"},            // *:3000 -> Wildcard
+		{5173, "node", 501, ScopeLoopback, "127.0.0.1"},     // 127.0.0.1 + [::1] collapse; loopback-only stays Loopback; tie keeps first-seen host
+		{17600, "Dropbox", 720, ScopeLoopback, "127.0.0.1"}, // loopback
+		{8080, "nginx", 800, ScopeLAN, "192.168.1.5"},       // a specific LAN IP -> LAN
+		{4000, "vite", 900, ScopeWildcard, "*"},             // 127.0.0.1 + * aggregates UP to Wildcard; host follows the wider bind
 	} {
 		p, ok := got[tc.port]
 		if !ok {
@@ -57,6 +58,9 @@ func TestParseLsof(t *testing.T) {
 		}
 		if p.Process != tc.proc {
 			t.Errorf("port %d process = %q, want %q", tc.port, p.Process, tc.proc)
+		}
+		if p.Pid != tc.pid {
+			t.Errorf("port %d pid = %d, want %d", tc.port, p.Pid, tc.pid)
 		}
 		if p.BindScope != tc.scope {
 			t.Errorf("port %d scope = %v, want %v", tc.port, p.BindScope, tc.scope)

@@ -182,6 +182,7 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 			port:          pi.port.Number,
 			name:          name,
 			nameWas:       was,
+			pid:           pi.pid,
 			favorite:      pi.meta.Favorite,
 			locked:        pi.meta.Locked,
 			routes:        routes,

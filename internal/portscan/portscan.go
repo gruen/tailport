@@ -7,6 +7,9 @@ import "net"
 type Port struct {
 	Number  int
 	Process string // best-effort; empty if not resolvable (e.g. owned by another user)
+	// Pid is the listening process's PID, paired with Process (same source
+	// row). Best-effort; 0 if not resolvable, mirroring Process.
+	Pid int
 	// BindScope is the WIDEST (most tailnet-reachable) scope across all of
 	// this port's non-filtered bind rows -- see classifyBindScope and the
 	// per-port aggregation in the scanners. It answers "who can actually

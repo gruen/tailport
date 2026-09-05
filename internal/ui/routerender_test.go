@@ -284,3 +284,32 @@ func TestRenderServiceBlockNonEmptyAndMarkerColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderServiceHeaderPid covers the PID display (kata 6x92): a known PID
+// renders as a muted "pid:<N>" after the name, while an unknown PID (0, the
+// zero value -- e.g. a process owned by another user, or a down favorite)
+// renders nothing at all.
+func TestRenderServiceHeaderPid(t *testing.T) {
+	base := blockInput{
+		port:          8888,
+		name:          "labelname",
+		routes:        []route{{kind: routeLocalhost, url: "http://localhost:8888"}},
+		selectedRoute: -1,
+		copiedRoute:   -1,
+	}
+
+	withPid := base
+	withPid.pid = 9999
+	lines := blockLines(t, withPid)
+	header := lines[0]
+	if !strings.Contains(header, "pid:9999") {
+		t.Errorf("header = %q, want it to contain %q", header, "pid:9999")
+	}
+
+	noPid := base
+	lines = blockLines(t, noPid)
+	header = lines[0]
+	if strings.Contains(header, "pid:") {
+		t.Errorf("header = %q, pid == 0 -> should not contain %q", header, "pid:")
+	}
+}
