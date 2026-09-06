@@ -103,19 +103,65 @@ func TestParseSS(t *testing.T) {
 }
 
 func TestList(t *testing.T) {
-	// Smoke test against the real `ss` binary: sshd should always be
-	// listening on port 22 in this environment.
+	// Smoke test of the REAL `ss` invocation + parsing. It MUST be
+	// environment-independent: the package's check() (go test ./...) runs in
+	// clean build sandboxes and on machines that don't run sshd, so it must not
+	// assume any particular service is listening. A previous hard "sshd on :22"
+	// assertion here broke a real install on a machine without SSH (kata gxt5).
+	// Parsing correctness is covered exhaustively by TestParseSS (and the
+	// :22-less TestParseSSNoSSH); here we only assert the live call succeeds and
+	// returns well-formed ports.
 	ports, err := List()
 	if err != nil {
-		t.Fatalf("List() error: %v", err)
+		// `ss` (iproute2) can be absent in a minimal build sandbox; that is not
+		// a tailport failure, so skip rather than fail the package's check().
+		t.Skipf("List() unavailable in this environment (ss missing?): %v", err)
 	}
-	found := false
 	for _, p := range ports {
-		if p.Number == 22 {
-			found = true
+		if p.Number < 1 || p.Number > 65535 {
+			t.Errorf("List() returned an out-of-range port: %+v", p)
 		}
 	}
-	if !found {
-		t.Errorf("expected port 22 (sshd) in %+v", ports)
+}
+
+// TestParseSSNoSSH guards the case that broke a real install (kata gxt5): a
+// machine with NO sshd / nothing on :22. parseSS must handle it cleanly and
+// never require a particular port -- here a box whose only listeners are
+// systemd-resolved (:53) and cups (:631), mirroring the failing environment.
+func TestParseSSNoSSH(t *testing.T) {
+	const fixture = `LISTEN 0      4096       127.0.0.53%lo:53            0.0.0.0:*    users:(("systemd-resolve",pid=700,fd=13))
+LISTEN 0      128            127.0.0.1:631           0.0.0.0:*    users:(("cupsd",pid=800,fd=7))
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseSS error: %v", err)
+	}
+	if len(ports) != 2 {
+		t.Fatalf("parsed %d ports, want 2 (:53, :631): %+v", len(ports), ports)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		if p.Number == 22 {
+			t.Errorf(":22 must never appear when nothing binds it: %+v", ports)
+		}
+		byPort[p.Number] = p
+	}
+	if p := byPort[53]; p.Process != "systemd-resolve" || p.Pid != 700 {
+		t.Errorf(":53 = %+v, want process systemd-resolve pid 700", p)
+	}
+	if p := byPort[631]; p.Process != "cupsd" || p.Pid != 800 {
+		t.Errorf(":631 = %+v, want process cupsd pid 800", p)
+	}
+}
+
+// TestParseSSEmpty: no listeners at all (a fresh/clean sandbox) -> no ports, no
+// error. The scanner (and everything downstream) must tolerate an empty world.
+func TestParseSSEmpty(t *testing.T) {
+	ports, err := parseSS([]byte(""))
+	if err != nil {
+		t.Fatalf("parseSS error: %v", err)
+	}
+	if len(ports) != 0 {
+		t.Errorf("empty ss output should yield no ports; got %+v", ports)
 	}
 }
