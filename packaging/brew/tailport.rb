@@ -7,10 +7,18 @@ class Tailport < Formula
   head "https://github.com/gruen/tailport.git", branch: "main"
 
   depends_on "go" => :build
-  # tailport shells out to the tailscale CLI for serve/funnel. Port discovery
-  # uses lsof on macOS (ships with the OS) and ss on Linux (iproute2, present on
-  # any Linuxbrew host) -- neither is a formula dependency.
-  depends_on "tailscale"
+  # tailport shells out to the tailscale CLI for serve/funnel, but that's a
+  # RUNTIME tool found on PATH, not a build/install dependency (xzgh): tailport
+  # runs and discovers ports without it (lsof on macOS, which ships with the OS;
+  # ss on Linux), degrading only the serve/funnel actions -- every tailscale
+  # call captures its own not-found error rather than crashing. Deliberately NOT
+  # `depends_on "tailscale"`: on macOS most people run the Tailscale app (App
+  # Store / standalone), whose bundled CLI a hard formula dep would duplicate
+  # and whose daemon the formula's `tailscaled` would fight; and the `tailscale`
+  # bottle isn't published for every macOS tier, which broke `brew install
+  # tailport` outright on a Tier-3 runner. The caveat below points users at
+  # Tailscale instead. (Linux packaging keeps the dep -- `tailscale` is a real,
+  # always-available package there.)
 
   def install
     # -X main.version is required, not cosmetic: this builds from a release
@@ -18,6 +26,16 @@ class Tailport < Formula
     # cmd/tailport/main.go resolves to "(devel)" and the binary would otherwise
     # report "dev". std_go_args supplies -trimpath and -o bin/"tailport".
     system "go", "build", *std_go_args(ldflags: "-s -w -X main.version=#{version}"), "./cmd/tailport"
+  end
+
+  def caveats
+    <<~EOS
+      tailport needs the `tailscale` CLI on your PATH to expose ports
+      (`tailscale serve` / `tailscale funnel`). Install Tailscale from
+      https://tailscale.com/download -- the macOS app bundles the CLI -- or
+      run `brew install tailscale`. Without it, tailport still discovers and
+      lists your local ports; only the serve/funnel actions are unavailable.
+    EOS
   end
 
   test do
