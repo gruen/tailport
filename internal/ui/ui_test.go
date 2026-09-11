@@ -6422,6 +6422,53 @@ func TestBannerActivationKeepsSelectionVisible(t *testing.T) {
 	}
 }
 
+// TestForeignTunnelVisibleOnDeadPort guards roborev 2196 finding 2: a FOREIGN
+// cloudflared tunnel on a port with NO local listener that isn't favorited must
+// still surface as drift in the All-ports view. rebuildItems' row set was
+// (listening UNION favorites) only, so such a port vanished entirely --
+// defeating the drift-visibility guarantee the feature exists for (AGENTS.md: a
+// foreign tunnel is never silently hidden).
+func TestForeignTunnelVisibleOnDeadPort(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	// One ordinary listening port; :7777 is NOT listening and NOT a favorite --
+	// it exists ONLY as a foreign cloudflared tunnel.
+	m.allPorts = []portscan.Port{{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard}}
+	m.tunnelForeign = map[int]bool{7777: true}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	var found *portItem
+	for _, it := range m.list.Items() {
+		if pi := it.(portItem); pi.port.Number == 7777 {
+			p := pi
+			found = &p
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("foreign-tunnel port :7777 is absent from the All-ports view -- the drift is invisible")
+	}
+	if found.listening {
+		t.Errorf(":7777 should be a synthetic non-listening entry; got listening=true")
+	}
+	if !found.tunnelForeign {
+		t.Errorf(":7777 should carry tunnelForeign=true")
+	}
+	// It must render exactly one route: the foreign tunnel drift row.
+	routes := found.routes()
+	hasForeign := false
+	for _, r := range routes {
+		if r.kind == routeTunnel && r.foreign {
+			hasForeign = true
+		}
+	}
+	if !hasForeign {
+		t.Errorf(":7777 routes lack a foreign tunnel drift route: %+v", routes)
+	}
+}
+
 // TestDeEscalationImmediateUnpublish: P on a port THIS machine already publishes
 // unpublishes immediately -- no confirm, no dialog -- and the edge round-trip
 // actually deletes the route (re-verifying ownership first).

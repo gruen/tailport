@@ -139,18 +139,22 @@ func routesFor(s serviceState) []route {
 	// there's nothing misleading to correct -- the empty url already reads as
 	// "still starting" -- so staleness isn't judged until there's a URL to
 	// judge it against.
-	switch {
-	case s.tunnelActive:
+	if s.tunnelActive {
 		url := ""
 		if s.tunnelHost != "" {
 			url = "https://" + s.tunnelHost
 		}
 		routes = append(routes, route{kind: routeTunnel, url: url, stale: s.tunnelHost != "" && !s.tunnelReady})
-	case s.tunnelForeign:
-		// A cloudflared tailport doesn't own covers this port (AGENTS.md:
-		// surfaced as drift, never signalled or touched) -- no URL to offer
-		// (its hostname is never probed; a foreign process's metrics endpoint
-		// is left alone like the process itself).
+	}
+	// A foreign cloudflared can cover this port AT THE SAME TIME as a
+	// tailport-owned one -- two separate processes both targeting :PORT -- so
+	// this is an INDEPENDENT check, never an else on tunnelActive. Collapsing
+	// the two into a switch hid the foreign tunnel behind an owned one, exactly
+	// the drift this feature exists to surface (AGENTS.md: a foreign tunnel
+	// must never be invisible; roborev 2196). No URL to offer: its hostname is
+	// never probed and a foreign process's metrics endpoint is left alone, like
+	// the process itself.
+	if s.tunnelForeign {
 		routes = append(routes, route{kind: routeTunnel, foreign: true})
 	}
 

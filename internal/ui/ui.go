@@ -4536,6 +4536,18 @@ func (m *model) rebuildItems() tea.Cmd {
 				seen[n] = true
 			}
 		}
+		// A FOREIGN cloudflared tunnel must surface as drift even when nothing
+		// listens locally on its port AND it isn't favorited -- otherwise the
+		// exact unowned public exposure the All-ports view exists to reveal is
+		// invisible (AGENTS.md: a foreign tunnel is never silently hidden;
+		// roborev 2196). Pull those ports into the union too; each renders as a
+		// synthetic not-listening entry carrying only its foreign drift route.
+		for n := range m.tunnelForeign {
+			if !seen[n] {
+				numbers = append(numbers, n)
+				seen[n] = true
+			}
+		}
 		sort.Ints(numbers)
 		items := make([]list.Item, 0, len(numbers))
 		for _, n := range numbers {

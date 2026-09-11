@@ -123,6 +123,25 @@ func TestRoutesFor(t *testing.T) {
 			},
 		},
 		{
+			// roborev 2196: a tailport-owned tunnel and a FOREIGN one can cover
+			// the same port at once (two separate cloudflared processes). Both
+			// must show -- the owned route AND the foreign drift route -- never
+			// collapsed to one (the foreign exposure must never hide behind the
+			// owned tunnel).
+			name: "owned + foreign tunnel on the same port -> BOTH routes",
+			in: serviceState{
+				port:          8000,
+				tunnelActive:  true,
+				tunnelHost:    "witty-fox-42.trycloudflare.com",
+				tunnelReady:   true,
+				tunnelForeign: true,
+			},
+			want: []route{
+				{kind: routeTunnel, url: "https://witty-fox-42.trycloudflare.com"},
+				{kind: routeTunnel, foreign: true},
+			},
+		},
+		{
 			name: "LAN-only bind -> just LAN, no localhost",
 			in: serviceState{
 				port:      5432,
