@@ -160,6 +160,7 @@ is actually reachable — localhost only, already on your tailnet, or served
 | `a` | Toggle between the default view and showing every listening port |
 | `/` | Filter by port number, process, or label (fuzzy) |
 | `r` | Refresh the port list and serve status |
+| `h` | Show or hide the bottom-bar keybinding legend (the shortcuts strip) |
 | `?` | Toggle the full help overlay |
 | `q` / `ctrl+c` | Quit |
 

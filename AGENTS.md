@@ -152,6 +152,41 @@ contract. The short version:
   absence just disables the `t` key (no key, no discovery, no polling) and
   costs nothing.
 
+### Docs stay honest (a claim is a test)
+
+A user-facing behavioral claim is only as trustworthy as the test that pins it.
+This applies to every prose surface that promises behavior: `README.md`, the
+Homebrew caveats (`packaging/brew/tailport.rb`), `docs/*`, and the in-app help
+overlay / `tailport quickstart`. A claim with no test is drift waiting to
+happen — roborev has caught the same class repeatedly (a README that said "all
+routes shown" while the scanner kept only the widest bind, `2f14`/`t12m`; a
+design doc that said `host:port` while the code forced `http://`; brew caveats
+that promised "still lists ports without tailscale" when `refresh()` blanks the
+list, `xzgh`/`yn46`). Treat doc-drift as a first-class concern **at every phase**:
+
+- **Designing** a feature: enumerate which docs/claims it creates or changes —
+  a new key, a changed guarantee, a caveat. That list is part of the design.
+- **Implementing** it: update those docs in the SAME change, and add or adjust a
+  test that pins each behavioral claim, so the claim fails loudly if the
+  behavior later diverges. Reference the claim in the test (or vice versa).
+- **Checking / reviewing**: verify the docs match the built behavior. A claim
+  with no pinning test, or prose that has outrun the code, is a finding — fix
+  the doc or add the test; don't ship the gap. roborev is the post-hoc net
+  (it caught `yn46` only after it shipped to the tap), never a substitute for
+  pinning the claim before merge.
+
+Automate the STRUCTURED, deterministic surfaces so drift fails in CI, not review:
+the README keybinding table is checked against the app's canonical key registry
+(`keyMap.groups()`) by `TestReadmeKeybindingsMatchKeymap` in the push/PR suite
+(`.github/workflows/ci.yml`), so a key added, renamed, or removed without
+updating the README fails before merge. Extend that pattern to any other
+structured doc↔code surface, but do NOT try to regex-verify prose behavioral
+claims — a brittle prose-parser becomes its own drift. Prose claims are covered
+by the per-claim pinning test above plus review; keep the drift surface small by
+single-sourcing where possible (the help overlay and `quickstart` already share
+one source — don't restate the same behavior in README + design doc + help
+unless one is generated from the other).
+
 ### Verification bar
 
 - A kata issue does not close on "it compiles." Run `go build ./...`,
