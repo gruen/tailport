@@ -490,7 +490,19 @@ type refreshMsg struct {
 	// auto marks a periodic-poll refresh (e40f), whose errors fade silently
 	// instead of raising a red toast every interval.
 	auto bool
-	err  error
+	// err is a FATAL discovery failure (portscan.List() itself errored) --
+	// there is nothing to show, so the handler keeps the old list and toasts
+	// (unless auto). Deliberately distinct from statusErr below (yn46).
+	err error
+	// statusErr carries a tsserve.Status() failure -- e.g. the `tailscale` CLI
+	// isn't on PATH -- WITHOUT discarding a successful ports scan (yn46:
+	// refresh() used to fold both failures into err, which made the handler
+	// blank the whole list whenever tailscale was merely absent or hiccuped).
+	// A statusErr refreshMsg still carries ports (with active/funnel left
+	// empty) and is never treated as fatal: the handler still populates
+	// m.allPorts and surfaces this as a quiet, persistent status-line note
+	// (m.tailnetUnavailable / statusText's suffix), never a blanking toast.
+	statusErr error
 }
 
 // fqdnMsg carries the node's MagicDNS name, fetched once at startup and cached
@@ -934,6 +946,13 @@ type model struct {
 	// degrade) and a small persistent " · edge unreachable" fragment is shown --
 	// never a toast (kata v1z5 step 5).
 	publishReachable bool
+	// tailnetUnavailable tracks the LAST refresh's tsserve.Status() health
+	// (yn46): false until a refresh's statusErr is set, so it starts
+	// optimistic (no note before the first refresh completes) and mirrors
+	// publishReachable's quiet-degrade pattern -- it never blanks m.allPorts,
+	// never toasts, and clears itself the moment a later refresh succeeds.
+	// See the refreshMsg handler and statusText's suffix.
+	tailnetUnavailable bool
 	// publishPollGen / publishPollApplied VERSION the async edge polls (roborev
 	// 0k12 #1): pollPublishedCmd stamps each issued poll with an incrementing
 	// publishPollGen, and the publishPollMsg handler DROPS any result whose gen
@@ -1560,12 +1579,20 @@ func fwLagNext(ewma, obs float64) float64 {
 func refresh() tea.Msg {
 	ports, err := portscan.List()
 	if err != nil {
+		// Discovery itself failed -- there's nothing to show, so this alone
+		// stays fatal to the refresh (unlike a tsserve.Status() failure below).
 		return refreshMsg{err: err}
 	}
 	// One serve-status fetch reconciles both serve and funnel (e40f dedupe).
-	activeList, funnel, err := tsserve.Status()
-	if err != nil {
-		return refreshMsg{err: err}
+	activeList, funnel, statusErr := tsserve.Status()
+	if statusErr != nil {
+		// tailnet exposure is unknown (commonly: `tailscale` isn't on PATH),
+		// but discovery still succeeded -- decouple the two (yn46) rather than
+		// discarding the scan. active/funnel come back empty, which degrades
+		// sensibly: routesFor already omits tailnet/funnel routes whenever
+		// m.fqdn is empty (also unresolved without tailscale), so ports just
+		// fall back to showing their localhost/LAN routes instead of vanishing.
+		return refreshMsg{ports: ports, statusErr: statusErr}
 	}
 	active := make(map[int]bool, len(activeList))
 	for _, p := range activeList {
@@ -3195,6 +3222,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allPorts = msg.ports
 		m.active = msg.active
 		m.funnel = msg.funnel
+		// A tsserve.Status() failure (yn46) never blanks the list above and
+		// never toasts (auto or not) -- it only flips this quiet, persistent
+		// flag, which statusText() surfaces as a small trailing note. A
+		// following successful refresh clears it again, same as
+		// publishReachable does for the edge-unreachable note.
+		m.tailnetUnavailable = msg.statusErr != nil
 		// Remember the live process names of favorites BEFORE rebuilding, so a
 		// favorite that later goes down can show "was <name>". Persist only when
 		// something actually changed, so a steady state never re-writes config.
@@ -6747,20 +6780,35 @@ func (m model) statusText() string {
 	if m.host != "" {
 		withHost = fmt.Sprintf("%d listening on %s · %d on tailnet · %d public (funnel)", listening, m.host, tailnet, public)
 	}
-	// Persistent quiet-degrade fragment (kata v1z5 step 5): only when publishing
-	// is configured (a blank caddy.domain suppresses the poll entirely) and the
-	// last edge poll failed. Never a toast -- a small trailing status fragment.
-	// It MUST be sized into the width fit below (roborev 0k12 #4): ordinary
-	// status text isn't wrapped (unlike toasts), so a suffix appended after the
-	// variant is chosen would overflow m.width and get truncated -- silently
-	// dropping the health warning on narrow terminals. On a very narrow line we
-	// shorten "edge unreachable" to "edge down" before sacrificing any of it.
-	suffix := ""
+	// Persistent quiet-degrade fragment(s) (kata v1z5 step 5, extended by
+	// yn46): never a toast, just a small trailing status fragment. tailnetPart
+	// covers the LAST refresh's tsserve.Status() failing (commonly: no
+	// `tailscale` on PATH) -- unlike the edge fragment it has no narrow-width
+	// short form, since it's already short and, per yn46, more fundamental
+	// (exposure state itself is unknown, not just the publish edge). edgePart
+	// applies only when publishing is configured (a blank caddy.domain
+	// suppresses the poll entirely) and the last edge poll failed. Both can be
+	// live at once -- they're independent degrade signals -- so they're
+	// composed into one suffix and run through the SAME width fit below
+	// (roborev 0k12 #4): ordinary status text isn't wrapped (unlike toasts),
+	// so a suffix appended after the variant is chosen would overflow m.width
+	// and get truncated -- silently dropping the health warning on narrow
+	// terminals. On a very narrow line we shorten "edge unreachable" to "edge
+	// down" before sacrificing any of it.
+	tailnetPart := ""
+	if m.tailnetUnavailable {
+		tailnetPart = " · tailscale unavailable"
+	}
+	edgePart := ""
 	if m.cfg.Caddy.Domain != "" && !m.publishReachable {
-		suffix = " · edge unreachable"
+		edgePart = " · edge unreachable"
+	}
+	suffix := tailnetPart + edgePart
+	if edgePart != "" {
 		initials := fmt.Sprintf("%dL · %dT · %dP", listening, tailnet, public)
 		if m.width > 0 && lipgloss.Width(initials)+lipgloss.Width(suffix) > m.width {
-			suffix = " · edge down"
+			edgePart = " · edge down"
+			suffix = tailnetPart + edgePart
 		}
 	}
 	// avail is the width the base variant must fit within, after reserving room

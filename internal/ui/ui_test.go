@@ -814,6 +814,57 @@ func TestAutoRefresh(t *testing.T) {
 		t.Errorf("a non-auto refresh error should toast; flash=%q level=%v", m.flash, m.flashLevel)
 	}
 
+	// yn46: a FAILING tsserve.Status() (surfaced as refreshMsg.statusErr, kept
+	// distinct from a fatal refreshMsg.err) must NOT discard a successful
+	// portscan -- refresh() used to fold both into one err and the handler
+	// only ever set m.allPorts on the non-error path, so an absent `tailscale`
+	// CLI blanked the whole list. The initial (first-ever) refresh case:
+	scanned := []portscan.Port{{Number: 3000, Process: "web"}, {Number: 8080, Process: "api"}}
+	m = New(config.Config{})
+	m = mustUpdate(t, m, refreshMsg{ports: scanned, statusErr: fmt.Errorf("tailscale: executable file not found in $PATH")})
+	if len(m.allPorts) != 2 {
+		t.Errorf("a tsserve.Status() failure must not discard the scanned ports; m.allPorts = %v", m.allPorts)
+	}
+	if len(m.active) != 0 || len(m.funnel) != 0 {
+		t.Errorf("a statusErr refresh should report empty active/funnel, not stale/guessed state; active=%v funnel=%v", m.active, m.funnel)
+	}
+	if m.flash != "" {
+		t.Errorf("a statusErr refresh must not toast (soft indicator only); flash=%q", m.flash)
+	}
+	if !m.tailnetUnavailable {
+		t.Error("a statusErr refresh should set m.tailnetUnavailable so statusText can show the quiet note")
+	}
+	// auto (periodic-poll) statusErr behaves identically -- silent, no toast,
+	// same soft flag; it never gets the heavier "auto err fades silently"
+	// special-case because a statusErr never toasted in the first place.
+	mAuto := New(config.Config{})
+	mAuto = mustUpdate(t, mAuto, refreshMsg{auto: true, ports: scanned, statusErr: fmt.Errorf("boom")})
+	if len(mAuto.allPorts) != 2 || mAuto.flash != "" || !mAuto.tailnetUnavailable {
+		t.Errorf("an auto statusErr refresh should populate ports silently; allPorts=%v flash=%q tailnetUnavailable=%v",
+			mAuto.allPorts, mAuto.flash, mAuto.tailnetUnavailable)
+	}
+
+	// A TRANSIENT mid-session status failure -- tailscale was fine, then this
+	// one poll's Status() call failed -- must likewise keep the list rather
+	// than wiping it back to empty.
+	m = New(config.Config{})
+	m = mustUpdate(t, m, refreshMsg{ports: scanned, active: map[int]bool{8080: true}, funnel: map[int]int{}})
+	if len(m.allPorts) != 2 || m.tailnetUnavailable {
+		t.Fatalf("setup: expected a healthy populated refresh; allPorts=%v tailnetUnavailable=%v", m.allPorts, m.tailnetUnavailable)
+	}
+	m = mustUpdate(t, m, refreshMsg{ports: scanned, statusErr: fmt.Errorf("transient: tailscaled busy")})
+	if len(m.allPorts) != 2 {
+		t.Errorf("a transient mid-session status failure must not blank the list; m.allPorts = %v", m.allPorts)
+	}
+	if !m.tailnetUnavailable {
+		t.Error("the transient failure should still raise the quiet indicator")
+	}
+	// A subsequent successful refresh clears the indicator again.
+	m = mustUpdate(t, m, refreshMsg{ports: scanned, active: map[int]bool{8080: true}, funnel: map[int]int{}})
+	if m.tailnetUnavailable {
+		t.Error("a following successful refresh should clear m.tailnetUnavailable")
+	}
+
 	// FQDN arrives via its own message and is cached.
 	m = New(config.Config{})
 	m = mustUpdate(t, m, fqdnMsg{fqdn: "host.example.ts.net"})
@@ -1653,6 +1704,58 @@ func TestStatusLineWarningSurvivesVeryNarrowWidth(t *testing.T) {
 	// is truncated from the right rather than dropped entirely.
 	if got := mk(6); lipgloss.Width(got) > 6 {
 		t.Errorf("width 6: status %q width %d overflows", got, lipgloss.Width(got))
+	}
+}
+
+// TestStatusTextTailnetUnavailable covers yn46's quiet degrade indicator: a
+// tsserve.Status() failure never blanks statusText's counts, it only adds a
+// small trailing note (mirroring the "edge unreachable" fragment above), and
+// that note clears the moment m.tailnetUnavailable does. It also checks the
+// note composes correctly alongside a live "edge unreachable" fragment,
+// since the two are independent degrade signals that can both be true.
+func TestStatusTextTailnetUnavailable(t *testing.T) {
+	base := model{
+		host:     "host",
+		width:    120,
+		allPorts: []portscan.Port{{Number: 3000}, {Number: 8080}},
+		active:   map[int]bool{8080: true},
+	}
+
+	// Off by default: no note, and the ordinary breakdown is untouched.
+	if got := base.statusText(); strings.Contains(got, "tailscale unavailable") {
+		t.Errorf("statusText should carry no note by default; got %q", got)
+	}
+
+	// On: a quiet trailing note, counts still intact -- never a blanked line.
+	unavailable := base
+	unavailable.tailnetUnavailable = true
+	got := unavailable.statusText()
+	if !strings.Contains(got, "tailscale unavailable") {
+		t.Errorf("statusText should carry the tailnet-unavailable note; got %q", got)
+	}
+	for _, want := range []string{"2 listening", "1 on tailnet"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("statusText = %q, the degrade note must not crowd out the counts (%q)", got, want)
+		}
+	}
+	if lipgloss.Width(got) > unavailable.width {
+		t.Errorf("statusText %q width %d exceeds %d", got, lipgloss.Width(got), unavailable.width)
+	}
+
+	// Both fragments live at once: independent signals, both shown.
+	cfg := config.Config{}
+	cfg.Caddy.Domain = "example.com"
+	cfg.Caddy.Hostname = "caddy"
+	both := New(cfg)
+	both.width = 120
+	both.tailnetUnavailable = true
+	both.publishReachable = false
+	gotBoth := both.statusText()
+	if !strings.Contains(gotBoth, "tailscale unavailable") || !strings.Contains(gotBoth, "edge unreachable") {
+		t.Errorf("both degrade notes should compose; got %q", gotBoth)
+	}
+	if lipgloss.Width(gotBoth) > both.width {
+		t.Errorf("combined statusText %q width %d exceeds %d", gotBoth, lipgloss.Width(gotBoth), both.width)
 	}
 }
 
