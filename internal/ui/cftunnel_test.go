@@ -36,8 +36,11 @@ func TestReachTunnel(t *testing.T) {
 // the exact https URL and the orange ◈ marker once the host is known, and an
 // empty URL (nothing to copy) while the quick tunnel is still starting.
 func TestTunnelRoute(t *testing.T) {
-	// host known -> the tunnel route carries the exact https URL and ◈ marker
-	up := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com", port: portscan.Port{Number: 3000}}
+	// host known AND ready -> the tunnel route carries the exact https URL and
+	// ◈ marker. tunnelReady must be set: kata aprt marks a known-host tunnel
+	// stale (▲) once it has zero ready edge connections, so a healthy tunnel
+	// has to say so explicitly (see TestTunnelRouteNotReady for the other case).
+	up := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com", tunnelReady: true, port: portscan.Port{Number: 3000}}
 	upRoutes := up.routes()
 	r := upRoutes[len(upRoutes)-1]
 	if r.kind != routeTunnel {
@@ -56,6 +59,47 @@ func TestTunnelRoute(t *testing.T) {
 	sr := sRoutes[len(sRoutes)-1]
 	if sr.kind != routeTunnel || sr.url != "" {
 		t.Errorf("starting tunnel route = %+v, want routeTunnel with empty url", sr)
+	}
+}
+
+// TestTunnelRouteNotReady is the regression test for the MEDIUM roborev
+// carryover (kata aprt): reachability used to key off nonzero PID alone, so a
+// tunnel with a known hostname but zero ready edge connections showed as
+// unconditionally, permanently reachable. It must now render stale (▲),
+// mirroring a dangling tailnet forward, rather than a plain ◈.
+func TestTunnelRouteNotReady(t *testing.T) {
+	notReady := portItem{tunnelActive: true, tunnelHostname: "foo.trycloudflare.com", tunnelReady: false, port: portscan.Port{Number: 3000}}
+	routes := notReady.routes()
+	r := routes[len(routes)-1]
+	if r.kind != routeTunnel || !r.stale {
+		t.Fatalf("not-ready tunnel route = %+v, want routeTunnel with stale=true", r)
+	}
+	if r.url != "https://foo.trycloudflare.com" {
+		t.Errorf("not-ready tunnel route url = %q, want the hostname preserved", r.url)
+	}
+	if m := stripANSI(r.marker(false)); !strings.Contains(m, "▲") {
+		t.Errorf("not-ready tunnel mono marker = %q, want it to contain ▲", m)
+	}
+}
+
+// TestTunnelRouteForeign is the regression test for the HIGH roborev
+// carryover (kata aprt): a foreign cloudflared (no tailport --logfile
+// sentinel) covering a port used to be discarded outright -- invisible, no
+// drift warning. It must now surface as its own tunnel route: no URL (never
+// probed), the same attention-grabbing marker as stale, and a "· foreign"
+// adornment distinguishing it from an owned-but-not-ready tunnel.
+func TestTunnelRouteForeign(t *testing.T) {
+	foreign := portItem{tunnelForeign: true, port: portscan.Port{Number: 3000}}
+	routes := foreign.routes()
+	r := routes[len(routes)-1]
+	if r.kind != routeTunnel || !r.foreign {
+		t.Fatalf("foreign tunnel route = %+v, want routeTunnel with foreign=true", r)
+	}
+	if r.url != "" {
+		t.Errorf("foreign tunnel route url = %q, want empty (never probed)", r.url)
+	}
+	if m := stripANSI(r.marker(false)); !strings.Contains(m, "▲") {
+		t.Errorf("foreign tunnel mono marker = %q, want it to contain ▲", m)
 	}
 }
 
@@ -137,6 +181,19 @@ func TestRequestTunnelGuards(t *testing.T) {
 		}
 		if m.mode != entryNone {
 			t.Errorf("de-escalation should not open a modal; mode=%v", m.mode)
+		}
+	})
+
+	// a FOREIGN cloudflared on this port is refused (kata aprt, HIGH roborev
+	// carryover): AGENTS.md requires it surface as drift and block a second
+	// exposure, not stay invisible and let tailport pile a competing tunnel on
+	// top of it.
+	t.Run("foreign tunnel on this port refused", func(t *testing.T) {
+		m := base()
+		m.tunnelForeign = map[int]bool{3000: true}
+		m.requestTunnel(3000)
+		if m.mode != entryNone || m.pending != 0 {
+			t.Errorf("foreign tunnel should refuse without opening a modal or starting an op: mode=%v pending=%d", m.mode, m.pending)
 		}
 	})
 }
@@ -230,6 +287,74 @@ func TestValidTunnelHostname(t *testing.T) {
 		if validTunnelHostname(s) {
 			t.Errorf("validTunnelHostname(%q) = true, want false", s)
 		}
+	}
+}
+
+// TestTunnelDoneInvalidatesInFlightPoll is the regression test for the MEDIUM
+// roborev carryover (kata aprt): a start/stop op used to mutate m.tunnels
+// directly without invalidating any poll already in flight when it landed. A
+// stale poll (snapshotted before the op) landing AFTER could erase a
+// just-started tunnel or resurrect a just-torn-down one. Mirrors
+// TestPublishPollOutOfOrderDropsStale's gen-based technique.
+func TestTunnelDoneInvalidatesInFlightPoll(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+
+	// Simulate a poll already in flight (gen 1) when the start lands.
+	m.tunnelPollGen = 1
+
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
+	if _, ok := m.tunnels[3000]; !ok {
+		t.Fatalf("start success should record the tunnel immediately")
+	}
+
+	// The STALE poll (gen 1, issued before the start) arrives late with an
+	// empty map -- it must not erase what the start just applied.
+	m = mustUpdate(t, m, tunnelPollMsg{gen: 1, tunnels: map[int]tunnelInfo{}})
+	if _, ok := m.tunnels[3000]; !ok {
+		t.Errorf("a stale in-flight poll must not erase a just-started tunnel; got %#v", m.tunnels)
+	}
+
+	// Tear it down; a poll issued before the STOP (but after the start, so its
+	// gen is "fresh" relative to the start) must not resurrect it once the
+	// stop lands.
+	preStopGen := m.tunnelPollGen
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, torndown: true})
+	if _, ok := m.tunnels[3000]; ok {
+		t.Fatalf("torn-down tunnel should be removed immediately")
+	}
+	m = mustUpdate(t, m, tunnelPollMsg{gen: preStopGen, tunnels: map[int]tunnelInfo{3000: {pid: 111}}})
+	if _, ok := m.tunnels[3000]; ok {
+		t.Errorf("a stale in-flight poll must not resurrect a just-torn-down tunnel; got %#v", m.tunnels)
+	}
+}
+
+// TestTunnelStartupCmdGatedOnAvailability is the regression test for the LOW
+// roborev carryover (kata aprt): the tunnel ticker used to reschedule itself
+// forever even when cloudflared is unavailable, contradicting the "zero cost
+// when absent" gate. tunnelStartupCmd (Init's entry point) must be a true nil
+// -- no poll, no ticker -- in that case, and a real batch otherwise.
+func TestTunnelStartupCmdGatedOnAvailability(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = false
+	if cmd := m.tunnelStartupCmd(); cmd != nil {
+		t.Error("tunnelStartupCmd should be nil (no poll, no ticker) when cloudflared is unavailable")
+	}
+	m.cfAvailable = true
+	if cmd := m.tunnelStartupCmd(); cmd == nil {
+		t.Error("tunnelStartupCmd should batch the poll + ticker when cloudflared is available")
+	}
+}
+
+// TestTunnelTickStopsWhenUnavailable is the defensive-check half of the same
+// fix: even if something reached tunnelTickMsg while unavailable, it must not
+// reschedule (return a nil cmd) rather than perpetuating the ticker.
+func TestTunnelTickStopsWhenUnavailable(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = false
+	_, cmd := m.Update(tunnelTickMsg{})
+	if cmd != nil {
+		t.Error("tunnelTickMsg should not reschedule when cloudflared is unavailable")
 	}
 }
 

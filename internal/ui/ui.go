@@ -357,6 +357,18 @@ type portItem struct {
 	tunnelActive   bool
 	tunnelHostname string
 	tunnelMode     cftunnel.Mode
+	// tunnelReady mirrors the tunnel's polled /ready edge-connection state
+	// (tunnelInfo.ready): a tunnel can be tunnelActive (its process is up) yet
+	// have zero ready connections, which routesFor marks stale rather than
+	// showing it as unconditionally reachable forever (kata aprt).
+	tunnelReady bool
+	// tunnelForeign marks that a cloudflared tailport does NOT own covers this
+	// port (AGENTS.md: surfaced as drift, never signalled). Mutually exclusive
+	// with tunnelActive in practice -- Discover reports at most one sentinel
+	// match per port -- but kept as its own bool rather than folded into
+	// tunnelActive's semantics, since "ours and up" and "someone else's" drive
+	// different UI treatment (kata aprt).
+	tunnelForeign bool
 	// dimmed de-emphasises this row: set on non-favorite ports pulled into the
 	// Favorites view by an active "/" filter (4ye6), so real favorites still
 	// stand out among the wider search results. See portDelegate.Render.
@@ -962,6 +974,12 @@ type model struct {
 	// running process IS the source of truth, so a tunnel from a prior session
 	// is re-found after a restart. Only tailport-owned tunnels land here.
 	tunnels map[int]tunnelInfo
+	// tunnelForeign is the set of local ports covered by a cloudflared tailport
+	// does NOT own (no --logfile sentinel), rebuilt each poll alongside tunnels.
+	// AGENTS.md requires a foreign tunnel to surface as drift -- visible, never
+	// signalled -- so unlike tunnels this is populated (not discarded) and
+	// requestTunnel refuses to layer a second exposure on top of it (kata aprt).
+	tunnelForeign map[int]bool
 	// lastTunnel remembers, per port, what a port was last tunnelled as, so `t`
 	// can re-raise a torn-down tunnel without re-prompting. SESSION-ONLY, never
 	// persisted -- the process table stays the source of truth (mirrors
@@ -1370,12 +1388,13 @@ func New(cfg config.Config, markersOverride ...string) model {
 		lastPublish: map[int]publishInfo{},
 		// Cloudflare Tunnel state (kata nc1j): availability decided above; the
 		// live/memory maps start empty (the process-table poll fills tunnels).
-		cfAvailable: cfAvailable,
-		cfVersion:   cfVersion,
-		tunnels:     map[int]tunnelInfo{},
-		lastTunnel:  map[int]tunnelMemory{},
-		tunnelInput: tui,
-		portInput:   ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
+		cfAvailable:   cfAvailable,
+		cfVersion:     cfVersion,
+		tunnels:       map[int]tunnelInfo{},
+		tunnelForeign: map[int]bool{},
+		lastTunnel:    map[int]tunnelMemory{},
+		tunnelInput:   tui,
+		portInput:     ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
 		// Optimistic until the first edge poll actually fails (see the field
 		// doc), so a configured-but-not-yet-polled edge doesn't flash
 		// "unreachable" on startup.
@@ -1429,9 +1448,10 @@ func (m model) Init() tea.Cmd {
 	// Init poll races fqdn resolution -- it may not yet know our short label --
 	// so fqdnMsg re-polls once the label is known.
 	// The cloudflared-tunnel poll (kata nc1j) is its OWN faster ticker (a cheap
-	// local process-table scan, unlike the remote edge poll): nil when
-	// cloudflared is unavailable, so an uninstalled host pays only for the timer.
-	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.pollTunnelsCmd(), tunnelTick(), tea.SetWindowTitle(title))
+	// local process-table scan, unlike the remote edge poll): tunnelStartupCmd
+	// is nil entirely -- not even the ticker -- when cloudflared is unavailable,
+	// so an uninstalled host pays nothing at all (kata aprt).
+	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.tunnelStartupCmd(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -3709,19 +3729,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.setErr(tunnelErrText(msg.err)), m.pollTunnelsCmd(), m.rebuildItems())
 		}
 		if msg.torndown {
-			// Optimistically drop it now so the marker clears immediately. We do
-			// NOT re-poll here: cloudflared can take a moment to drain after
-			// SIGTERM, so an immediate Discover might still see the dying process
-			// and flicker the tunnel back. The 4s tick reconciles reliably (and
-			// re-adds it if the Stop somehow failed).
+			// Invalidate any poll issued BEFORE this op landed (kata aprt): a
+			// poll already in flight at that point snapshotted the process table
+			// before the teardown took effect and would otherwise resurrect this
+			// entry when it lands late. Then optimistically drop it now so the
+			// marker clears immediately. We do NOT re-poll here: cloudflared can
+			// take a moment to drain after SIGTERM, so an immediate Discover
+			// might still see the dying process and flicker the tunnel back. The
+			// 4s tick reconciles reliably (and re-adds it if the Stop somehow
+			// failed).
+			m.invalidateTunnelPolls()
 			delete(m.tunnels, msg.port)
 			return m, tea.Batch(m.setFlash(fmt.Sprintf("tunnel on :%d torn down", msg.port), flashInfo), m.rebuildItems())
 		}
-		// Start success: record the running process so the row flips now. A quick
-		// tunnel's hostname isn't known yet (the poll surfaces it via
-		// /quicktunnel), so the flash says "starting…"; a named tunnel's host is
-		// known up front, so name it and teach the `t` de-escalation.
+		// Start success: invalidate any in-flight pre-start poll (kata aprt --
+		// same rationale as the teardown branch, mirrored: a stale poll landing
+		// here would otherwise erase the entry set below) and record the running
+		// process so the row flips now. A quick tunnel's hostname isn't known yet
+		// (the poll surfaces it via /quicktunnel), so the flash says "starting…";
+		// a named tunnel's host is known up front, so name it and teach the `t`
+		// de-escalation.
 		if msg.running != nil {
+			m.invalidateTunnelPolls()
 			m.tunnels[msg.port] = tunnelInfo{
 				mode:        msg.running.Mode,
 				pid:         msg.running.PID,
@@ -3748,6 +3777,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.tunnels = msg.tunnels
+		m.tunnelForeign = msg.foreign
 		// Every tunnel the poll reports is, by definition, re-raiseable -- so
 		// remember it (mirrors lastPublish), letting a tunnel from BEFORE this
 		// process started (across a restart) be re-toggled from memory too. A
@@ -3763,8 +3793,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.rebuildItems()
 
 	case tunnelTickMsg:
-		// The tunnel ticker never stops: reschedule unconditionally. Poll only
-		// when idle and available (pollTunnelsCmd is nil when unavailable).
+		// cfAvailable is decided once at New() and never changes; once false the
+		// ticker must not reschedule itself at all (kata aprt -- defensive:
+		// tunnelStartupCmd already refuses to start the chain in the first
+		// place, so this is normally unreachable, but it keeps the invariant
+		// self-evident here too rather than relying solely on that call site).
+		if !m.cfAvailable {
+			return m, nil
+		}
+		// Poll only when idle (pollTunnelsCmd is never nil once we're here).
 		if m.pending != 0 || m.cleaning != 0 {
 			return m, tunnelTick()
 		}
@@ -4511,7 +4548,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
 			tun := m.tunnels[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
 		return m.setItems(items)
 	}
@@ -4536,7 +4573,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
 		tun := m.tunnels[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, meta: m.cfg.Ports[n], emoji: m.markerEmoji})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
 	return m.setItems(items)
 }

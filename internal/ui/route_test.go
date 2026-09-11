@@ -82,6 +82,7 @@ func TestRoutesFor(t *testing.T) {
 				publish:      &publishInfo{hostname: "app.example.com", auth: false},
 				tunnelActive: true,
 				tunnelHost:   "witty-fox-42.trycloudflare.com",
+				tunnelReady:  true,
 			},
 			want: []route{
 				{kind: routeLocalhost, url: "http://localhost:3000"},
@@ -89,6 +90,36 @@ func TestRoutesFor(t *testing.T) {
 				{kind: routeFunnel, url: "https://myhost.tail1234.ts.net"},
 				{kind: routePublish, url: "https://app.example.com", auth: false},
 				{kind: routeTunnel, url: "https://witty-fox-42.trycloudflare.com"},
+			},
+		},
+		{
+			// kata aprt (MEDIUM roborev carryover): a tunnel with a known
+			// hostname but zero ready edge connections must not read as
+			// unconditionally reachable -- it's marked stale, same treatment as
+			// a dangling tailnet forward.
+			name: "tunnel with known host but NOT ready -> stale tunnel route",
+			in: serviceState{
+				port:         8000,
+				tunnelActive: true,
+				tunnelHost:   "witty-fox-42.trycloudflare.com",
+				tunnelReady:  false,
+			},
+			want: []route{
+				{kind: routeTunnel, stale: true, url: "https://witty-fox-42.trycloudflare.com"},
+			},
+		},
+		{
+			// kata aprt (HIGH roborev carryover): a FOREIGN cloudflared (no
+			// tailport sentinel) covering this port must surface as drift --
+			// visible, with no URL (never probed), never confused with an
+			// owned tunnel.
+			name: "foreign cloudflared on this port -> foreign tunnel route, no url",
+			in: serviceState{
+				port:          9000,
+				tunnelForeign: true,
+			},
+			want: []route{
+				{kind: routeTunnel, foreign: true},
 			},
 		},
 		{

@@ -142,9 +142,10 @@ func renderRouteLine(b blockInput, r route, i int) string {
 	prefix := bar + "  " + pointer + " " + marker + " " + label + "  "
 
 	urlText := r.url
-	if r.kind == routeOffline {
-		// Offline is a pseudo-route with no address; the design's em-dash
-		// placeholder stands in for it.
+	if r.kind == routeOffline || r.foreign {
+		// Offline (no address at all) and a foreign tunnel (an address we
+		// deliberately never probe) both stand in for a URL with the design's
+		// em-dash placeholder.
 		urlText = "—"
 	}
 
@@ -189,6 +190,9 @@ func routeAdornments(b blockInput, r route, i int) string {
 	}
 	if r.stale {
 		out.WriteString("  " + warnStyle.Render("· stale"))
+	}
+	if r.foreign {
+		out.WriteString("  " + warnStyle.Render("· foreign"))
 	}
 	if i == b.copiedRoute {
 		out.WriteString(activeStyle.Render(copiedSuffix))

@@ -43,18 +43,20 @@ func (i portItem) serviceState() serviceState {
 		pub = &publishInfo{hostname: i.publishHostname, auth: i.publishAuth}
 	}
 	return serviceState{
-		port:         i.port.Number,
-		bindScope:    i.port.BindScope,
-		bindHost:     i.port.BindHost,
-		bindLoopback: i.port.Loopback,
-		listening:    i.listening,
-		served:       i.active,
-		funnelPub:    i.funnelPublic,
-		publish:      pub,
-		tunnelHost:   i.tunnelHostname,
-		tunnelActive: i.tunnelActive,
-		host:         i.host,
-		fqdn:         i.fqdn,
+		port:          i.port.Number,
+		bindScope:     i.port.BindScope,
+		bindHost:      i.port.BindHost,
+		bindLoopback:  i.port.Loopback,
+		listening:     i.listening,
+		served:        i.active,
+		funnelPub:     i.funnelPublic,
+		publish:       pub,
+		tunnelHost:    i.tunnelHostname,
+		tunnelActive:  i.tunnelActive,
+		tunnelReady:   i.tunnelReady,
+		tunnelForeign: i.tunnelForeign,
+		host:          i.host,
+		fqdn:          i.fqdn,
 	}
 }
 

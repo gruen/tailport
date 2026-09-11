@@ -28,16 +28,21 @@ var (
 // (e.g. ✕, ☁️, 🌫️) can themselves render narrower than 2 cells on some
 // terminals, so the same trailing-pad loop applies there too.
 //
-// r.stale is checked FIRST: it overrides the kind-based glyph/color with the
-// stale-dangling-forward marker (▲/🌫️, amber) regardless of kind -- stale is
-// only ever set on a tailnet route, but the override lives ahead of the
-// switch so that invariant doesn't have to be re-verified here.
+// r.stale or r.foreign is checked FIRST: either overrides the kind-based
+// glyph/color with the same amber marker (▲/🌫️) regardless of kind -- stale is
+// only ever set on a tailnet or tunnel route, foreign only on a tunnel route,
+// but the override lives ahead of the switch so those invariants don't have
+// to be re-verified here. The palette doesn't otherwise distinguish "ours but
+// not functionally live" from "not ours at all" by glyph -- both read as
+// "something here needs your attention" -- the adornment text
+// (routeAdornments) carries the distinction (kata aprt).
 func (r route) marker(emoji bool) string {
 	var m string
 	switch {
-	case r.stale:
-		// Dangling forward: served, but nothing listening locally. Off the
-		// moon ramp, same treatment as ui.go's reachStale.
+	case r.stale || r.foreign:
+		// Dangling forward (served but nothing listening) or a drifted
+		// foreign tunnel. Off the moon ramp, same treatment as ui.go's
+		// reachStale.
 		if emoji {
 			m = "🌫️"
 		} else {

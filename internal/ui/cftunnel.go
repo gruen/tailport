@@ -64,9 +64,14 @@ type tunnelDoneMsg struct {
 // tunnelPollMsg carries a completed tunnel poll (process-table scan + health).
 // gen versions it so an out-of-order completion can't clobber newer state
 // (mirrors publishPollMsg). A scan failure sets err and the handler keeps the
-// last-known map (quiet degrade).
+// last-known map (quiet degrade). foreign is the set of ports covered by a
+// cloudflared tailport does NOT own (no --logfile sentinel): per AGENTS.md a
+// foreign tunnel must surface as drift rather than stay invisible, so unlike
+// owned tunnels it's kept (not discarded) for the UI to show and for
+// requestTunnel to refuse layering a second exposure on top of (kata aprt).
 type tunnelPollMsg struct {
 	tunnels map[int]tunnelInfo
+	foreign map[int]bool
 	gen     int
 	err     error
 }
@@ -83,6 +88,30 @@ const tunnelPollInterval = 4 * time.Second
 
 func tunnelTick() tea.Cmd {
 	return tea.Tick(tunnelPollInterval, func(time.Time) tea.Msg { return tunnelTickMsg{} })
+}
+
+// tunnelStartupCmd is Init's tunnel entry point: the first poll plus the
+// recurring ticker, or a true nil -- not even a timer -- when cloudflared is
+// unavailable. cfAvailable is decided once at New() and never changes, so an
+// uninstalled host pays nothing at all this way, not even a 4s wakeup (LOW,
+// kata aprt: the ticker used to reschedule itself forever regardless of
+// availability, contradicting the "zero cost when absent" gate).
+func (m *model) tunnelStartupCmd() tea.Cmd {
+	if !m.cfAvailable {
+		return nil
+	}
+	return tea.Batch(m.pollTunnelsCmd(), tunnelTick())
+}
+
+// invalidateTunnelPolls bumps the tunnel poll generation and marks it
+// already-applied, so a poll issued BEFORE this call -- one already in flight
+// when a start/stop op lands -- is dropped on arrival instead of clobbering
+// the optimistic state the op just applied (kata aprt: a delayed poll erasing
+// a just-started tunnel, or resurrecting a just-torn-down one). Call it
+// immediately before tunnelDoneMsg's handler mutates m.tunnels directly.
+func (m *model) invalidateTunnelPolls() {
+	m.tunnelPollGen++
+	m.tunnelPollApplied = m.tunnelPollGen
 }
 
 // cfClient builds the cloudflared client from cfg.Cloudflared (binary path
@@ -113,10 +142,15 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		tunnels := make(map[int]tunnelInfo, len(running))
+		foreign := make(map[int]bool)
 		for _, r := range running {
-			// Only OWNED tunnels are tracked (like the Caddy owned-only filter):
-			// a foreign cloudflared is out of tailport's view.
 			if !r.Owned {
+				// A cloudflared tailport didn't start (no --logfile sentinel).
+				// AGENTS.md: surface it as drift -- never signalled, but never
+				// invisible either -- so record the port rather than discarding
+				// it outright (kata aprt; unlike Caddy's DELIBERATE v1
+				// foreign-route punt in pollPublishedCmd, this one IS in scope).
+				foreign[r.Port] = true
 				continue
 			}
 			h := client.Health(ctx, r.MetricsPort)
@@ -132,7 +166,7 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 				ready:       h.Ready,
 			}
 		}
-		return tunnelPollMsg{tunnels: tunnels, gen: gen}
+		return tunnelPollMsg{tunnels: tunnels, foreign: foreign, gen: gen}
 	}
 }
 
@@ -144,10 +178,12 @@ func tunnelStartCmd(client *cftunnel.Client, spec cftunnel.Spec) tea.Cmd {
 	}
 }
 
-// tunnelStopCmd tears a tunnel down (SIGTERM its cloudflared) off the render path.
-func tunnelStopCmd(pid, port int) tea.Cmd {
+// tunnelStopCmd tears a tunnel down (SIGTERM its cloudflared) off the render
+// path. client.Stop re-validates ownership from the live process table
+// immediately before signalling (kata aprt) -- it never trusts pid on faith.
+func tunnelStopCmd(client *cftunnel.Client, pid, port int) tea.Cmd {
 	return func() tea.Msg {
-		err := cftunnel.Stop(pid)
+		err := client.Stop(pid, port)
 		return tunnelDoneMsg{port: port, err: err, torndown: true}
 	}
 }
@@ -170,7 +206,14 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 	// confirm (reducing exposure is never gated).
 	if info, ok := m.tunnels[port]; ok {
 		m.pending = port
-		return tunnelStopCmd(info.pid, port)
+		return tunnelStopCmd(m.cfClient(), info.pid, port)
+	}
+	// 3.5. a FOREIGN cloudflared already covers this port (AGENTS.md: surfaced
+	// as drift, never signalled). It must not be invisible, and layering a
+	// second tunnel on the same local port would just be confusing -- which one
+	// is "the" tunnel? -- so refuse rather than pile on (kata aprt).
+	if m.tunnelForeign[port] {
+		return m.setErr(fmt.Sprintf("port :%d already has a cloudflared tunnel tailport doesn't own — resolve it outside tailport first", port))
 	}
 	// 4. :22 (SSH) is hard-blocked from the public internet, same as funnel/publish.
 	if port == 22 {

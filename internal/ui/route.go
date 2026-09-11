@@ -38,11 +38,12 @@ const (
 
 // route is one reachable (or degraded) path to a service.
 type route struct {
-	kind   routeKind
-	url    string // copyable address; "" for offline and for a still-starting tunnel
-	auth   bool   // publish (caddy) route behind shared basic-auth
-	served bool   // tailnet route provenance: true = via `tailscale serve`, false = via a wide/tailnet-IP bind
-	stale  bool   // tailnet route: served but nothing listening (a dangling forward)
+	kind    routeKind
+	url     string // copyable address; "" for offline, a still-starting tunnel, or a foreign one
+	auth    bool   // publish (caddy) route behind shared basic-auth
+	served  bool   // tailnet route provenance: true = via `tailscale serve`, false = via a wide/tailnet-IP bind
+	stale   bool   // administratively present but not functionally live: tailnet served-but-nothing-listening (a dangling forward), OR a tunnel with zero ready edge connections (kata aprt)
+	foreign bool   // tunnel only (kata aprt): a cloudflared tailport does NOT own covers this port -- surfaced as drift, never signalled or touched
 }
 
 // serviceState is the derivation input -- deliberately a plain struct (not the
@@ -57,15 +58,17 @@ type serviceState struct {
 	// otherwise discard, so a loopback+LAN service still gets its localhost
 	// route (and its serve-route health still reflects the loopback proxy
 	// target `tailscale serve` actually dials).
-	bindLoopback bool
-	listening    bool         // a local process is bound
-	served       bool         // tailscale serve active for this port
-	funnelPub    int          // funnel public ingress port; 0 = not funnelled
-	publish      *publishInfo // caddy publish state; nil = not published
-	tunnelHost   string       // cloudflare tunnel hostname; only meaningful if tunnelActive
-	tunnelActive bool         // a cloudflared tunnel covers this port
-	host         string       // this node's tailnet short host (m.host) for tailnet URLs; "" if tailscale down
-	fqdn         string       // this node's FQDN (m.fqdn) for the funnel PublicURL
+	bindLoopback  bool
+	listening     bool         // a local process is bound
+	served        bool         // tailscale serve active for this port
+	funnelPub     int          // funnel public ingress port; 0 = not funnelled
+	publish       *publishInfo // caddy publish state; nil = not published
+	tunnelHost    string       // cloudflare tunnel hostname; only meaningful if tunnelActive
+	tunnelActive  bool         // a cloudflared tunnel covers this port
+	tunnelReady   bool         // the tunnel's polled edge-connection state; only meaningful if tunnelActive
+	tunnelForeign bool         // a cloudflared tailport does NOT own covers this port (AGENTS.md: surfaced as drift)
+	host          string       // this node's tailnet short host (m.host) for tailnet URLs; "" if tailscale down
+	fqdn          string       // this node's FQDN (m.fqdn) for the funnel PublicURL
 }
 
 // routesFor derives the ordered route list for one service from its live
@@ -128,13 +131,27 @@ func routesFor(s serviceState) []route {
 
 	// 6. tunnel: public ingress via a cloudflared tunnel. The URL is empty
 	// while a quick tunnel is still starting (its *.trycloudflare.com
-	// hostname isn't assigned until cloudflared actually starts).
-	if s.tunnelActive {
+	// hostname isn't assigned until cloudflared actually starts). Once a
+	// hostname IS known but the tunnel still reports zero ready edge
+	// connections, mark it stale (kata aprt): otherwise a tunnel whose edge
+	// connection never came up, or dropped, would show as reachable forever
+	// off nothing but its process being alive. Before a hostname is known
+	// there's nothing misleading to correct -- the empty url already reads as
+	// "still starting" -- so staleness isn't judged until there's a URL to
+	// judge it against.
+	switch {
+	case s.tunnelActive:
 		url := ""
 		if s.tunnelHost != "" {
 			url = "https://" + s.tunnelHost
 		}
-		routes = append(routes, route{kind: routeTunnel, url: url})
+		routes = append(routes, route{kind: routeTunnel, url: url, stale: s.tunnelHost != "" && !s.tunnelReady})
+	case s.tunnelForeign:
+		// A cloudflared tailport doesn't own covers this port (AGENTS.md:
+		// surfaced as drift, never signalled or touched) -- no URL to offer
+		// (its hostname is never probed; a foreign process's metrics endpoint
+		// is left alone like the process itself).
+		routes = append(routes, route{kind: routeTunnel, foreign: true})
 	}
 
 	// 7. offline fallback: nothing above qualified -- a down favorite or a
