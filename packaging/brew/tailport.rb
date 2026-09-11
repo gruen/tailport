@@ -30,11 +30,10 @@ class Tailport < Formula
 
   def caveats
     <<~EOS
-      tailport needs the `tailscale` CLI on your PATH to expose ports
-      (`tailscale serve` / `tailscale funnel`). Install Tailscale from
-      https://tailscale.com/download -- the macOS app bundles the CLI -- or
-      run `brew install tailscale`. Without it, tailport still discovers and
-      lists your local ports; only the serve/funnel actions are unavailable.
+      tailport exposes your local ports over your tailnet using the `tailscale`
+      CLI (`tailscale serve` / `tailscale funnel`), so install Tailscale to use
+      it: https://tailscale.com/download (the macOS app bundles the CLI), or
+      `brew install tailscale`.
     EOS
   end
 
