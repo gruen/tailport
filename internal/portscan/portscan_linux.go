@@ -11,8 +11,14 @@ import (
 	"strings"
 )
 
-var procNameRe = regexp.MustCompile(`\(\("([^"]+)"`)
-var procPidRe = regexp.MustCompile(`pid=(\d+)`)
+// procRe binds a process's name and pid together atomically (kata 9094):
+// name and pid are captured from the SAME `(("name",pid=N` match, rather than
+// two independent regexes scanning the whole users:(...) field separately.
+// The independent-scan form was correct for every real `ss` output (a
+// process name can't literally contain "pid=<digits>") but mis-paired on
+// paper if it ever did; one combined regex makes that impossible by
+// construction.
+var procRe = regexp.MustCompile(`\(\("([^"]+)",pid=(\d+)`)
 
 // List enumerates locally listening TCP ports via `ss`. Process names are
 // best-effort: ss can only attribute a socket to a process when it's owned
@@ -77,11 +83,9 @@ func parseSS(out []byte) ([]Port, error) {
 		pid := 0
 		if len(fields) > 5 {
 			joined := strings.Join(fields[5:], " ")
-			if m := procNameRe.FindStringSubmatch(joined); m != nil {
+			if m := procRe.FindStringSubmatch(joined); m != nil {
 				proc = m[1]
-			}
-			if m := procPidRe.FindStringSubmatch(joined); m != nil {
-				if v, err := strconv.Atoi(m[1]); err == nil {
+				if v, err := strconv.Atoi(m[2]); err == nil {
 					pid = v
 				}
 			}
