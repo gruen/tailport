@@ -227,7 +227,13 @@ LISTEN 0      128            0.0.0.0:5000          0.0.0.0:*
 	if p := byPort[4000]; p.Process != "app" || p.Pid != 555 {
 		t.Errorf(":4000 = %+v, want process=app pid=555 (paired from the later, non-empty row)", p)
 	}
-	if p := byPort[5000]; p.Process != "" || p.Pid != 0 {
+	// Assert the socket is actually PRESENT before checking it's zero-valued
+	// (2236): a missing map entry also returns a zero Port, so a regression that
+	// dropped every process-less row would satisfy the field checks alone. The
+	// unattributed socket must be listed, just with no process/pid attributed.
+	if p, ok := byPort[5000]; !ok {
+		t.Error(":5000 (foreign/unattributed) must still be listed, not dropped for lacking a process")
+	} else if p.Process != "" || p.Pid != 0 {
 		t.Errorf(":5000 (foreign/unattributed) = %+v, want Process=\"\" Pid=0", p)
 	}
 }
