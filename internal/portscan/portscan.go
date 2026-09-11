@@ -24,6 +24,16 @@ type Port struct {
 	// the UI substitutes "localhost"/the tailnet host instead, so BindHost
 	// matters chiefly for the LAN case. Empty if unset.
 	BindHost string
+	// Loopback records whether a loopback-scope bind row was seen for this port
+	// AT ALL, independent of BindScope/BindHost (t12m). BindScope only ever
+	// keeps the single WIDEST scope, so a port bound on BOTH loopback and
+	// something wider (LAN, wildcard) aggregates BindScope to the wider one and
+	// would otherwise lose the loopback bind entirely -- silently dropping the
+	// localhost route for a service that is, in fact, also reachable via
+	// localhost. This flag preserves that one bit of the narrower bind without
+	// widening Port's shape into a full multi-bind list (see the aggregation
+	// comment in the scanners for why a fuller refactor wasn't taken).
+	Loopback bool
 }
 
 // BindScope classifies how far a listening socket's bind address reaches. It

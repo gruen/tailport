@@ -39,7 +39,10 @@ func List() ([]Port, error) {
 // port to the WIDEST scope across its non-filtered binds -- a port bound on
 // both 127.0.0.1 and 0.0.0.0 IS tailnet-reachable and must read Wildcard, not
 // Loopback. First-seen output order is preserved (tests may assert it) by
-// tracking port numbers in the order first encountered.
+// tracking port numbers in the order first encountered. A loopback bind row
+// also sets Loopback=true regardless of what wins BindScope (t12m), so a port
+// bound on BOTH loopback and something wider (e.g. a specific LAN IP) doesn't
+// silently lose its localhost reachability.
 func parseSS(out []byte) ([]Port, error) {
 	agg := map[int]*Port{}
 	var order []int
@@ -86,13 +89,16 @@ func parseSS(out []byte) ([]Port, error) {
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host, Loopback: scope == ScopeLoopback}
 			order = append(order, port)
 			continue
 		}
 		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
 			p.BindScope = scope
 			p.BindHost = host
+		}
+		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
+			p.Loopback = true
 		}
 		if p.Process == "" { // keep the first non-empty process name, paired with its pid
 			p.Process = proc

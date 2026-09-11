@@ -82,6 +82,39 @@ func TestParseLsof(t *testing.T) {
 	}
 }
 
+// TestParseLsofPreservesLoopbackAcrossWiderBind guards t12m: a port bound on
+// BOTH loopback and a specific LAN address must aggregate BindScope to the
+// wider LAN scope (widerScope's existing behavior, unchanged) but ALSO keep
+// Loopback=true, so downstream route derivation doesn't lose the localhost
+// route just because a wider bind coexists. Ports bound on only one scope pin
+// the flag's other states: LAN-only stays false, loopback-only is true.
+func TestParseLsofPreservesLoopbackAcrossWiderBind(t *testing.T) {
+	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+mixed       900   mg   10u  IPv4 0xaaaaaaaaaaaaaaaa      0t0  TCP 127.0.0.1:9090 (LISTEN)
+mixed       900   mg   11u  IPv4 0xbbbbbbbbbbbbbbbb      0t0  TCP 192.168.1.20:9090 (LISTEN)
+lanonly     901   mg   12u  IPv4 0xcccccccccccccccc      0t0  TCP 192.168.1.21:9091 (LISTEN)
+looponly    902   mg   13u  IPv4 0xdddddddddddddddd      0t0  TCP 127.0.0.1:9092 (LISTEN)
+`
+	ports, err := parseLsof([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseLsof error: %v", err)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		byPort[p.Number] = p
+	}
+
+	if p := byPort[9090]; p.BindScope != ScopeLAN || p.BindHost != "192.168.1.20" || !p.Loopback {
+		t.Errorf(":9090 (loopback+LAN) = %+v, want BindScope=LAN BindHost=192.168.1.20 Loopback=true", p)
+	}
+	if p := byPort[9091]; p.BindScope != ScopeLAN || p.Loopback {
+		t.Errorf(":9091 (LAN-only) = %+v, want BindScope=LAN Loopback=false", p)
+	}
+	if p := byPort[9092]; p.BindScope != ScopeLoopback || !p.Loopback {
+		t.Errorf(":9092 (loopback-only) = %+v, want BindScope=Loopback Loopback=true", p)
+	}
+}
+
 // TestListDarwin is the native smoke test: it runs the real `lsof` binary on
 // the macOS runner (only reachable via the opt-in `[ci darwin]` job) and
 // confirms List() executes and parses without error. It deliberately does not
