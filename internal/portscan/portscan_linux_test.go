@@ -197,3 +197,37 @@ func TestParseSSEmpty(t *testing.T) {
 		t.Errorf("empty ss output should yield no ports; got %+v", ports)
 	}
 }
+
+// TestParseSSFirstNonEmptyProcessAcrossDifferingRows guards 9094 item 3: every
+// existing multi-row fixture above repeats the SAME proc+pid on every row for
+// a given port, which never actually exercises "the first non-empty process
+// wins, with the pid paired from that SAME row" across rows that DIFFER --
+// the aggregation could coincidentally look right while secretly reusing a
+// stale value. Row order for :4000: the FIRST-seen row is foreign/unattributed
+// (ss omits the whole users:(...) field when it can't attribute a socket, e.g.
+// one owned by another user) and a LATER row for the SAME port carries the
+// real process+pid, which the aggregate must adopt -- paired together, not
+// mixed with anything from the first row. :5000 is a lone foreign/unattributed
+// socket, covering the other half of 9094 item 3: Process/Pid must stay their
+// zero values, never a stray pid picked up from an unrelated row.
+func TestParseSSFirstNonEmptyProcessAcrossDifferingRows(t *testing.T) {
+	const fixture = `LISTEN 0      128          127.0.0.1:4000          0.0.0.0:*
+LISTEN 0      128            0.0.0.0:4000          0.0.0.0:*    users:(("app",pid=555,fd=11))
+LISTEN 0      128            0.0.0.0:5000          0.0.0.0:*
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseSS error: %v", err)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		byPort[p.Number] = p
+	}
+
+	if p := byPort[4000]; p.Process != "app" || p.Pid != 555 {
+		t.Errorf(":4000 = %+v, want process=app pid=555 (paired from the later, non-empty row)", p)
+	}
+	if p := byPort[5000]; p.Process != "" || p.Pid != 0 {
+		t.Errorf(":5000 (foreign/unattributed) = %+v, want Process=\"\" Pid=0", p)
+	}
+}
