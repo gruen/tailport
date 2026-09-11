@@ -1581,15 +1581,24 @@ func fwLagNext(ewma, obs float64) float64 {
 	return ewma + fwLagAlpha*(obs-ewma)
 }
 
+// Seams so tests can drive refresh()'s decouple-on-status-failure path (yn46
+// 2233#2) deterministically -- discovery succeeds, tailscale status fails --
+// rather than only exercising the handler with a hand-built refreshMsg (which
+// would still pass if refresh() itself regressed to discarding the scan).
+var (
+	scanListeners = portscan.List
+	serveStatus   = tsserve.Status
+)
+
 func refresh() tea.Msg {
-	ports, err := portscan.List()
+	ports, err := scanListeners()
 	if err != nil {
 		// Discovery itself failed -- there's nothing to show, so this alone
 		// stays fatal to the refresh (unlike a tsserve.Status() failure below).
 		return refreshMsg{err: err}
 	}
 	// One serve-status fetch reconciles both serve and funnel (e40f dedupe).
-	activeList, funnel, statusErr := tsserve.Status()
+	activeList, funnel, statusErr := serveStatus()
 	if statusErr != nil {
 		// tailnet exposure is unknown (commonly: `tailscale` isn't on PATH),
 		// but discovery still succeeded -- decouple the two (yn46) rather than
@@ -3235,8 +3244,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.setErr(msg.err.Error())
 		}
 		m.allPorts = msg.ports
+		// Normalize the maps to non-nil (yn46 2233#1). A statusErr refresh comes
+		// back with active/funnel unset (nil), and cancelPurgeFlow/refuseConflict
+		// WRITE into m.active[port] -- a write to a nil map panics. So a transient
+		// tailscale-status failure while a publish-conflict confirmation is open
+		// used to crash the TUI the moment the user cancelled it. Empty (not nil)
+		// carries the same "nothing known active" meaning while staying writable.
 		m.active = msg.active
+		if m.active == nil {
+			m.active = map[int]bool{}
+		}
 		m.funnel = msg.funnel
+		if m.funnel == nil {
+			m.funnel = map[int]int{}
+		}
 		// A tsserve.Status() failure (yn46) never blanks the list above and
 		// never toasts (auto or not) -- it only flips this quiet, persistent
 		// flag, which statusText() surfaces as a small trailing note. A

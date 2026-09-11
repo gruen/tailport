@@ -911,6 +911,76 @@ func TestAutoRefresh(t *testing.T) {
 	}
 }
 
+// TestStatusFailureThenPurgeCancelDoesNotPanic covers 2233#1: a statusErr
+// refresh carries no active map, so the handler set m.active = nil.
+// cancelPurgeFlow and refuseConflict then WRITE m.active[port] = true -- a write
+// to a nil map panics. So a transient tailscale-status failure while a
+// publish-conflict confirmation was open crashed the TUI the moment the user
+// cancelled it. The handler now normalizes the map to empty (non-nil).
+func TestStatusFailureThenPurgeCancelDoesNotPanic(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	scanned := []portscan.Port{{Number: 3000, Process: "web"}}
+	m := New(config.Config{})
+	m.allPorts = scanned
+	m.rebuildItems()
+
+	// The status-failure refresh that used to nil out m.active.
+	m = mustUpdate(t, m, refreshMsg{ports: scanned, statusErr: fmt.Errorf("tailscale: not found")})
+	if m.active == nil {
+		t.Fatal("a statusErr refresh must leave m.active non-nil so the conflict-cancel paths can't panic writing to it")
+	}
+
+	// Reproduce the crash path: a purge confirmation was open; cancel it. The
+	// write into m.active[port] below is what panicked on the nil map.
+	m.purgePort = 3000
+	_ = m.cancelPurgeFlow()
+	if !m.active[3000] {
+		t.Error("cancelPurgeFlow should mark serve active for the port it left on")
+	}
+}
+
+// TestRefreshDecouplesDiscoveryFromStatus covers 2233#2: exercise refresh()
+// ITSELF -- not a hand-built refreshMsg -- on the path that blanked a user's
+// list: discovery succeeds, tailscale status fails. A regression folding the
+// status failure back into a fatal err, or dropping the scanned ports, is
+// invisible to the message-level tests above but caught here, then confirmed
+// end-to-end by driving refresh()'s real result through Update.
+func TestRefreshDecouplesDiscoveryFromStatus(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	origScan, origStatus := scanListeners, serveStatus
+	t.Cleanup(func() { scanListeners, serveStatus = origScan, origStatus })
+	scanListeners = func() ([]portscan.Port, error) {
+		return []portscan.Port{{Number: 3000, Process: "web"}}, nil
+	}
+	serveStatus = func() ([]int, map[int]int, error) {
+		return nil, nil, fmt.Errorf("tailscale: executable file not found in $PATH")
+	}
+
+	msg, ok := refresh().(refreshMsg)
+	if !ok {
+		t.Fatalf("refresh() returned %T, want refreshMsg", tea.Msg(msg))
+	}
+	if msg.err != nil {
+		t.Errorf("a tailscale-status failure must NOT become a fatal refresh err: %v", msg.err)
+	}
+	if msg.statusErr == nil {
+		t.Error("refresh() should surface the status failure as statusErr")
+	}
+	if len(msg.ports) != 1 {
+		t.Errorf("refresh() must keep the scanned ports when status fails; ports = %v", msg.ports)
+	}
+
+	// The real refresh() result, driven through Update, keeps the list.
+	m := New(config.Config{})
+	m = mustUpdate(t, m, msg)
+	if len(m.allPorts) != 1 {
+		t.Errorf("Update(refresh() result) must keep ports visible when tailscale is down; allPorts = %v", m.allPorts)
+	}
+	if !m.tailnetUnavailable {
+		t.Error("the status failure should raise the quiet indicator")
+	}
+}
+
 // TestAddPortAlreadyFavorited covers 7ac3: 'n' on an already-favorited port
 // is a no-op with an info toast; 'n' on a new port favorites it silently.
 func TestAddPortAlreadyFavorited(t *testing.T) {
