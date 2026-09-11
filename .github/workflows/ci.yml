@@ -1,0 +1,62 @@
+name: ci
+
+# The push/PR gate (kata gghj #1): today the full suite (`go test ./...`, the
+# race-detector pass over internal/ui) only ran LOCALLY (AGENTS.md's
+# verification bar) or inside opt-in [ci caddy]/[ci darwin]/[ci brew] jobs --
+# build.yml's own `test` job runs the same checks, but only on a `v*` tag push
+# or a workflow_dispatch dry-run, never on an ordinary push or PR. Two roborev
+# regressions (8tnf, 6tas) surfaced only in that live/interaction gap. This
+# workflow closes it: every push and PR to main gets gofmt + build + vet +
+# test + race for free, before a human or another agent ever has to run it by
+# hand.
+#
+# Deliberately a SEPARATE workflow rather than a change to build.yml: build.yml
+# is the tag-only release pipeline (AGENTS.md says not to touch it here), and
+# giving this its own file keeps the release gate and the ordinary dev-loop
+# gate independently triggerable and readable.
+#
+# Environment note: this suite is written to be clean-runner safe -- no
+# tailscale, no caddy, no cloudflared, and possibly no ss/lsof are required.
+# The one test that shells out to a real system binary (internal/portscan's
+# TestList, against `ss`) self-skips when it's absent (kata gxt5); the real
+# `caddy`-binary integration test (internal/caddyedge) self-skips whenever
+# `caddy` isn't on PATH, which is every job here except the opt-in
+# caddy-integration.yml; and internal/cftunnel's tests fake or spawn their own
+# stand-ins ((/bin/sh, a generated fake "cloudflared" script, or /proc-based
+# discovery) rather than touching a real cloudflared. See caddy-integration.yml
+# and darwin-tests.yml for the opt-in jobs that exercise those real binaries.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          # go.mod is a floor (`go 1.26`), not the toolchain to test with
+          # (tvyh). check-latest at its default (false) would resolve the bare
+          # minor against the runner's cache first and quietly pin this to
+          # whatever 1.26.x that image ships, so a toolchain-level regression
+          # wouldn't show up here until the image moved. Matches
+          # build.yml/darwin-tests.yml/caddy-integration.yml.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt (must be clean)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs running on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go test -race ./internal/ui/
