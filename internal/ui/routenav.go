@@ -173,7 +173,16 @@ func (m *model) jumpService(delta int) {
 func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 	items := m.list.VisibleItems()
 	headerLine, selLine = -1, -1
-	cur := m.list.Index()
+	// Clamp like currentService() does (z6yf): bubbles/list's OWN cursor
+	// isn't re-clamped when VisibleItems narrows out from under it -- most
+	// notably list.FilterMatchesMsg, the async result of a "/" query, which
+	// only ever replaces m.filteredItems and returns before reaching its
+	// usual updatePagination() clamp. An unclamped cur that no longer
+	// matches any i below would make NO item "current", hiding the
+	// selection bar/pointer entirely rather than merely leaving it
+	// off-screen -- clamping keeps the last item selected instead, which
+	// ensureRouteVisible can then scroll into view.
+	cur := clampInt(m.list.Index(), 0, len(items)-1)
 	for i, it := range items {
 		pi, ok := it.(portItem)
 		if !ok {
@@ -185,9 +194,10 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 			port:          pi.port.Number,
 			name:          name,
 			nameWas:       was,
-			pid:           pi.pid,
+			pid:           pi.port.Pid,
 			favorite:      pi.meta.Favorite,
 			locked:        pi.meta.Locked,
+			dimmed:        pi.dimmed,
 			routes:        routes,
 			current:       i == cur,
 			selectedRoute: -1,
@@ -199,7 +209,21 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 			b.selectedRoute = clampInt(m.routeIdx, 0, len(routes)-1)
 		}
 		if m.copiedPort != 0 && pi.port.Number == m.copiedPort {
-			b.copiedRoute = clampInt(m.copiedRouteIdx, 0, len(routes)-1)
+			// Stable identity, not index (z6yf): find the route whose
+			// kind+url still matches what was copied, wherever it now sits.
+			// A route list reorders/grows/shrinks across rebuilds (a poll
+			// discovering a new bind, a route torn down) -- an INDEX-based
+			// lookup (the old m.copiedRouteIdx, clamped into range) could
+			// silently land the "✓ copied" annotation on a different route
+			// that happens to now occupy that slot. If the copied route is
+			// simply gone, b.copiedRoute stays -1 (its zero value set above)
+			// and the annotation just disappears, which is correct.
+			for ri, rt := range routes {
+				if rt.kind == m.copiedRouteKind && rt.url == m.copiedRouteURL {
+					b.copiedRoute = ri
+					break
+				}
+			}
 		}
 		if len(lines) > 0 {
 			lines = append(lines, "") // blank separator between records
@@ -246,16 +270,27 @@ func (m *model) ensureRouteVisible() {
 
 // reconcileViewport re-syncs the list to a changed body height: resizeList
 // re-applies listBodyHeight to the bubbles/list, and ensureRouteVisible nudges
-// scrollOff so the SELECTED route stays on screen. Call it wherever a sticky
-// setup banner is RAISED. Unlike every other height-changing site (flash, poof,
-// prompt entry, resize -- all of which already call resizeList), the banner
-// flags historically needed no reconcile: the reservation was worst-cased and
-// constant, so raising a banner never shrank the visible list. Now that the
-// reservation is LIVE (bannerReservationLines measures only active banners), an
-// appearing banner really does claim rows from the list, so -- exactly like the
-// nav keys -- it must nudge scrollOff or a selection near the bottom drops below
-// the fold (roborev job 2190). Clearing a banner only GROWS the list, which
-// can't hide the selection, so those sites don't need it.
+// scrollOff so the SELECTED route stays on screen. Originally added (roborev
+// job 2190) for wherever a sticky setup banner is RAISED: unlike every other
+// height-changing site (flash, poof, prompt entry, resize -- all of which
+// already called resizeList), the banner flags historically needed no
+// reconcile, because the reservation was worst-cased and constant, so raising
+// a banner never shrank the visible list. Once the reservation went LIVE
+// (bannerReservationLines measures only active banners), an appearing banner
+// really does claim rows from the list, so -- exactly like the nav keys -- it
+// must nudge scrollOff or a selection near the bottom drops below the fold.
+//
+// z6yf broadened this beyond banners to every OTHER viewport/visible-item
+// change that isn't already followed by its own ensureRouteVisible: a
+// WindowSizeMsg resize, and setFlash (a wrapped multi-line toast shrinks the
+// list exactly like a banner does). ensureRouteVisible alone (no resize
+// needed) is folded into setItems and selectPort instead, since those don't
+// change m.width/m.height -- see their doc comments -- and the async
+// list.FilterMatchesMsg path gets its own explicit call in Update, since that
+// message narrows/widens VisibleItems without ever going through setItems.
+//
+// Clearing a banner (or a toast) only GROWS the list, which can't hide the
+// selection, so those sites don't need it.
 func (m *model) reconcileViewport() {
 	m.resizeList()
 	m.ensureRouteVisible()
@@ -286,12 +321,17 @@ func (m model) renderList() string {
 // for the transient inline "✓ copied" annotation (route-scoped copy, kata th05
 // P5 -- retires the old per-port aggregate copyURL/copyTargetURL). An empty-URL
 // route (offline, or a still-starting quick tunnel) has nothing to copy and
-// never reaches here; the caller toasts instead.
-func (m *model) copyRoute(port, routeIdx int, url string) tea.Cmd {
+// never reaches here; the caller toasts instead. kind+url (not an index --
+// z6yf) is the route's stable identity: bodyLines re-finds it by that pair on
+// every render, so a route list that reorders/grows/shrinks underneath the
+// annotation (a poll discovering a new bind, an earlier route torn down)
+// can't move the checkmark onto a different route.
+func (m *model) copyRoute(port int, kind routeKind, url string) tea.Cmd {
 	m.copiedID++
 	id := m.copiedID
 	m.copiedPort = port
-	m.copiedRouteIdx = routeIdx
+	m.copiedRouteKind = kind
+	m.copiedRouteURL = url
 	// Clear any lingering toast so the two confirmation channels never show at
 	// once (mirrors the retired copyURL).
 	m.flash = ""

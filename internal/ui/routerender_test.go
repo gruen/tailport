@@ -3,6 +3,9 @@ package ui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // blockLines renders b and returns its lines stripped of ANSI styling, so
@@ -311,5 +314,142 @@ func TestRenderServiceHeaderPid(t *testing.T) {
 	header = lines[0]
 	if strings.Contains(header, "pid:") {
 		t.Errorf("header = %q, pid == 0 -> should not contain %q", header, "pid:")
+	}
+}
+
+// TestRenderServiceHeaderOverflowTruncates covers the z6yf bug: nothing in
+// renderServiceHeader was ever measured against b.width (only route URLs
+// were, via truncateCells), so a long user LABEL on a narrow terminal
+// produced a header wider than the terminal -- which the terminal itself
+// then soft-wraps. renderList slices by LOGICAL lines and View sizes its gap
+// from lipgloss.Height(body) (a logical-newline count), so that extra visual
+// row went uncounted and the bottom bar/scroll indicator drifted. The fix
+// must (1) never let the header exceed b.width, (2) always keep :PORT, and
+// (3) prefer dropping the trailing pid:NNNN before ever truncating the name.
+func TestRenderServiceHeaderOverflowTruncates(t *testing.T) {
+	longName := strings.Repeat("a-very-long-user-label", 3) // 66 chars
+
+	// At a moderately narrow width, dropping the pid alone frees enough room
+	// -- the name itself is left untouched.
+	b := blockInput{
+		port: 8080, name: longName, pid: 12345, width: 80,
+		routes:        []route{{kind: routeLocalhost, url: "http://localhost:8080"}},
+		selectedRoute: -1, copiedRoute: -1,
+	}
+	header := renderServiceHeader(b)
+	if w := lipgloss.Width(header); w > b.width {
+		t.Fatalf("header width %d exceeds b.width %d: %q", w, b.width, stripANSI(header))
+	}
+	plain := stripANSI(header)
+	if !strings.Contains(plain, ":8080") {
+		t.Errorf("header = %q, want it to still contain %q", plain, ":8080")
+	}
+	if !strings.Contains(plain, longName) {
+		t.Errorf("header = %q, want the full name kept once dropping the pid frees enough room", plain)
+	}
+	if strings.Contains(plain, "pid:") {
+		t.Errorf("header = %q, want the pid dropped once it no longer fits", plain)
+	}
+
+	// At a much narrower width, dropping the pid isn't enough either -- the
+	// name itself must be truncated with an ellipsis, but :PORT survives.
+	narrow := b
+	narrow.width = 40
+	header = renderServiceHeader(narrow)
+	plain = stripANSI(header)
+	if w := lipgloss.Width(header); w > narrow.width {
+		t.Fatalf("narrow header width %d exceeds width %d: %q", w, narrow.width, plain)
+	}
+	if !strings.Contains(plain, ":8080") {
+		t.Errorf("narrow header = %q, want it to still contain %q", plain, ":8080")
+	}
+	if strings.Contains(plain, "pid:") {
+		t.Errorf("narrow header = %q, want the pid dropped", plain)
+	}
+	if strings.Contains(plain, longName) {
+		t.Errorf("narrow header = %q, want the long name truncated, not kept in full", plain)
+	}
+	if !strings.Contains(plain, "…") {
+		t.Errorf("narrow header = %q, want a truncated name to end in an ellipsis", plain)
+	}
+
+	// A locked record's 🔒 badge must survive truncation too (design: never
+	// drop it, only the name/pid).
+	locked := narrow
+	locked.locked = true
+	header = renderServiceHeader(locked)
+	plain = stripANSI(header)
+	if w := lipgloss.Width(header); w > locked.width {
+		t.Errorf("locked narrow header width %d exceeds width %d: %q", w, locked.width, plain)
+	}
+	if !strings.Contains(plain, "🔒") {
+		t.Errorf("locked narrow header = %q, want the lock badge kept", plain)
+	}
+
+	// Sweep a range of realistic widths: the header must never exceed the
+	// terminal width, whatever the name length.
+	for _, w := range []int{24, 30, 40, 60, 80, 120} {
+		sweep := b
+		sweep.width = w
+		if got := lipgloss.Width(renderServiceHeader(sweep)); got > w {
+			t.Errorf("width %d: header width %d overflows", w, got)
+		}
+	}
+}
+
+// TestRenderServiceBlockDimmed covers z6yf's restored dimming: the
+// single-column renderer had no concept of portItem.dimmed at all (the field
+// was only ever read by the retired grid's list delegate, which View() no
+// longer calls), so a non-favorite match pulled into the Favorites view by an
+// active "/" filter (4ye6) rendered exactly like a real favorite. Dimming
+// must change the STYLING of the header name and any NON-quiet route (the
+// tailnet route here) without changing the VISIBLE TEXT anywhere (stripped of
+// ANSI, every line is identical). The localhost route is a "quiet" route
+// (design §6) that's ALREADY routeMutedStyle regardless of dimming, so its
+// line is expected to render byte-identical either way -- there's no lower
+// style to drop to.
+func TestRenderServiceBlockDimmed(t *testing.T) {
+	// Forced so the ANSI comparisons below are deterministic regardless of
+	// whether go test's stdout looks like a terminal at all -- routeMutedStyle
+	// sets only a Foreground color (no Bold/Italic), which degrades to plain
+	// text under the no-color/Ascii profile termenv falls back to for a
+	// non-tty, making the dimmed and plain renders look byte-identical.
+	origProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(origProfile) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	routes := []route{
+		{kind: routeLocalhost, url: "http://localhost:8080"}, // quiet -- always muted
+		{kind: routeTailnet, served: true, url: "http://host:8080"},
+	}
+	dimmed := blockInput{
+		port: 8080, name: "webapp", dimmed: true,
+		routes:        routes,
+		selectedRoute: -1, copiedRoute: -1,
+	}
+	plainInput := dimmed
+	plainInput.dimmed = false
+
+	dimmedLines := renderServiceBlock(dimmed)
+	plainLines := renderServiceBlock(plainInput)
+	if len(dimmedLines) != 3 || len(plainLines) != 3 {
+		t.Fatalf("len(dimmedLines)=%d len(plainLines)=%d, want 3 (header + 2 routes)", len(dimmedLines), len(plainLines))
+	}
+
+	// Header (name) and the tailnet route (not otherwise muted) must change
+	// styling when dimmed, but never their visible text.
+	for _, i := range []int{0, 2} {
+		if dimmedLines[i] == plainLines[i] {
+			t.Errorf("line %d identical dimmed vs not dimmed -- want dimming to change the styling: %q", i, stripANSI(dimmedLines[i]))
+		}
+		if stripANSI(dimmedLines[i]) != stripANSI(plainLines[i]) {
+			t.Errorf("line %d visible text changed by dimming: dimmed=%q plain=%q", i, stripANSI(dimmedLines[i]), stripANSI(plainLines[i]))
+		}
+	}
+
+	// The quiet localhost route is already muted regardless of dimming, so
+	// its line is unaffected either way.
+	if dimmedLines[1] != plainLines[1] {
+		t.Errorf("quiet localhost line changed by dimming, want it unaffected: dimmed=%q plain=%q", stripANSI(dimmedLines[1]), stripANSI(plainLines[1]))
 	}
 }

@@ -53,6 +53,12 @@ type blockInput struct {
 
 	favorite bool
 	locked   bool
+	// dimmed mirrors portItem.dimmed (4ye6): this record recedes -- a
+	// non-favorite match pulled into the Favorites view by an active "/"
+	// filter -- so real favorites still stand out among the wider results
+	// (z6yf: restored after the single-column renderer replaced the retired
+	// grid delegate, which was the only thing reading portItem.dimmed).
+	dimmed bool
 
 	routes []route // from routesFor; always >=1
 
@@ -76,7 +82,19 @@ func renderServiceBlock(b blockInput) []string {
 	return lines
 }
 
-// renderServiceHeader builds the HEADER line: <bar><badge><sp><:PORT:6><2sp><name>[<sp>🔒]
+// renderServiceHeader builds the HEADER line: <bar><badge><sp><:PORT:6><2sp><name>[<sp>🔒][<4sp>pid:NNNN]
+//
+// z6yf: the header is truncated to fit b.width so it can NEVER soft-wrap in
+// the terminal. Before this fix nothing here was ever measured against
+// width -- only route URLs were (via truncateCells) -- so a long user LABEL
+// on a narrow terminal (~>48 chars at 80 cols) produced a header wider than
+// the terminal, which the terminal itself soft-wraps into an extra visual
+// row. renderList slices by LOGICAL lines and View sizes its gap with
+// lipgloss.Height(body) (a logical-newline count), so that extra visual row
+// went uncounted and the bottom bar / scroll indicator drifted. :PORT and a
+// locked 🔒 are kept unconditionally (design: never drop them); the trailing
+// "pid:NNNN" is the least essential piece and is dropped FIRST when space is
+// tight, before the name itself is ever truncated.
 func renderServiceHeader(b blockInput) string {
 	bar := " "
 	if b.current {
@@ -97,19 +115,54 @@ func renderServiceHeader(b blockInput) string {
 		portField = lipgloss.NewStyle().Bold(true).Render(portField)
 	}
 
-	name := b.name
-	if b.nameWas {
-		name = wasStyle.Render(name)
+	prefix := bar + badge + " " + portField + "  "
+
+	lockSuffix := ""
+	if b.locked {
+		lockSuffix = " " + lockStyle.Render("🔒")
 	}
 
-	header := bar + badge + " " + portField + "  " + name
-	if b.locked {
-		header += " " + lockStyle.Render("🔒")
-	}
+	pidText := ""
 	if b.pid > 0 {
-		header += "    " + routeMutedStyle.Render(fmt.Sprintf("pid:%d", b.pid))
+		pidText = fmt.Sprintf("    pid:%d", b.pid)
 	}
-	return header
+
+	name := b.name
+	if b.width > 0 {
+		fixed := lipgloss.Width(prefix) + lipgloss.Width(lockSuffix)
+		if fixed+lipgloss.Width(name)+lipgloss.Width(pidText) > b.width {
+			// Overflow: drop the pid first (design's stated preference) --
+			// this is a no-op when there's no pid to drop.
+			pidText = ""
+		}
+		avail := b.width - fixed
+		if avail < 1 {
+			avail = 1
+		}
+		// A no-op (returns name unchanged) whenever it already fits avail,
+		// so the common wide-terminal case never touches the name text.
+		name = truncateCells(name, avail)
+	}
+
+	styledName := name
+	switch {
+	case b.dimmed:
+		// Non-favorite match pulled into the Favorites view by an active
+		// "/" filter (4ye6/z6yf): recede among the real favorites. Takes
+		// precedence over nameWas -- the two never co-occur in practice
+		// (dimming only applies to non-favorites, and LastProcess memory is
+		// only ever recorded for favorites).
+		styledName = routeMutedStyle.Render(name)
+	case b.nameWas:
+		styledName = wasStyle.Render(name)
+	}
+
+	var pidSuffix string
+	if pidText != "" {
+		pidSuffix = routeMutedStyle.Render(pidText)
+	}
+
+	return prefix + styledName + lockSuffix + pidSuffix
 }
 
 // renderRouteLine builds one ROUTE line for routes[i]:
@@ -131,11 +184,13 @@ func renderRouteLine(b blockInput, r route, i int) string {
 	marker := r.marker(b.emoji)
 
 	label := padCells(r.label(), 10)
-	muted := r.kind == routeLocalhost || r.kind == routeOffline
+	muted := r.kind == routeLocalhost || r.kind == routeOffline || b.dimmed
 	if muted {
 		// "Quiet" routes (design §6): localhost/offline read muted even when
 		// this is the current/selected service -- the label is exempt from
-		// the "selection only touches bar/pointer/url" rule.
+		// the "selection only touches bar/pointer/url" rule. A dimmed
+		// record (z6yf: restored dimming for portItem.dimmed) mutes every
+		// route line the same way, so the whole record recedes together.
 		label = routeMutedStyle.Render(label)
 	}
 

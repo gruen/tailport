@@ -331,9 +331,6 @@ type portItem struct {
 	listening bool
 	host      string
 	fqdn      string
-	// pid is the listening process's PID (portscan.Port.Pid), threaded through
-	// to the header renderer; 0 when unknown (renders nothing).
-	pid int
 	// funnelPublic is the public ingress port (443/8443/10000) this port is
 	// funnelled on, or 0 if it isn't funnelled. A funnelled port is exposed to
 	// the public internet, which outranks its tailnet-serve state in the UI.
@@ -1092,16 +1089,24 @@ type model struct {
 	flashID    int
 	// copiedPort is the port number of the service showing the inline "✓ copied"
 	// annotation (py5b), or 0 for none -- set by copyRoute (kata th05), together
-	// with copiedRouteIdx which route within it. copiedID is copiedPort's
-	// flashID-style guard: bumped on every copy so a matching copiedExpireMsg
-	// clears it, while a stale one (superseded by a newer copy) is ignored -- see
-	// copiedExpireMsg.
+	// with copiedRouteKind/copiedRouteURL identifying which route within it.
+	// copiedID is copiedPort's flashID-style guard: bumped on every copy so a
+	// matching copiedExpireMsg clears it, while a stale one (superseded by a
+	// newer copy) is ignored -- see copiedExpireMsg.
 	copiedPort int
 	copiedID   int
-	// copiedRouteIdx pins WHICH route sub-row of m.copiedPort's service shows
-	// the inline "✓ copied" annotation (kata th05: copy is route-scoped now, not
-	// per-port). Meaningful only while copiedPort != 0; cleared alongside it.
-	copiedRouteIdx int
+	// copiedRouteKind + copiedRouteURL together pin WHICH route sub-row of
+	// m.copiedPort's service shows the inline "✓ copied" annotation (kata
+	// th05: copy is route-scoped now, not per-port). This is a STABLE
+	// identity, not an index (z6yf: the old copiedRouteIdx was a plain int
+	// into routes(), so a route list that reordered/grew/shrank underneath
+	// it -- a poll discovering a new bind, an earlier route torn down --
+	// could silently move the checkmark onto a different route). bodyLines
+	// re-finds the matching route by kind+url on every render; if it's gone,
+	// the annotation simply disappears rather than landing on the wrong URL.
+	// Meaningful only while copiedPort != 0; cleared alongside it.
+	copiedRouteKind routeKind
+	copiedRouteURL  string
 	// routeIdx is the ROUTE-level cursor (kata th05): the index of the selected
 	// route sub-row WITHIN the current service (m.list.Index() selects the
 	// service). Kept in [0, len(routes)-1] by clampRouteIdx on every rebuild.
@@ -2032,7 +2037,12 @@ func (m *model) setFlash(text string, level flashLevel) tea.Cmd {
 	m.flashLevel = level
 	// A long toast can wrap across multiple lines at the current width
 	// (83wv pt2); re-reserve the list's height now so it never overlaps.
-	m.resizeList()
+	// reconcileViewport, not a bare resizeList (z6yf): a newly-wrapped
+	// multi-line toast shrinks the list exactly like a raised banner does, so
+	// a selection near the bottom needs the same scrollOff nudge. Clearing a
+	// toast only grows the list back, which can't hide the selection, so
+	// those sites (flashExpireMsg, the per-keypress dismiss) don't need it.
+	m.reconcileViewport()
 	id := m.flashID
 	d := 3 * time.Second
 	if level != flashInfo {
@@ -3209,7 +3219,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.Width = msg.Width
 		m.width = msg.Width
 		m.height = msg.Height
-		m.resizeList()
+		// reconcileViewport, not a bare resizeList (z6yf): a resize can shrink
+		// the list body enough to push the selected route off-screen, and
+		// unlike the nav keys nothing else nudges scrollOff for a resize.
+		m.reconcileViewport()
 		return m, nil
 
 	case refreshMsg:
@@ -3862,7 +3875,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fresh copiedID, so this stale timer is a no-op.
 		if msg.id == m.copiedID {
 			m.copiedPort = 0
-			m.copiedRouteIdx = 0
+			m.copiedRouteKind = 0
+			m.copiedRouteURL = ""
 			return m, m.rebuildItems()
 		}
 		return m, nil
@@ -4310,7 +4324,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if r.url == "" {
 				return m, m.setFlash(fmt.Sprintf(":%d %s — nothing to copy yet", sel.port.Number, r.label()), flashWarn)
 			}
-			return m, m.copyRoute(sel.port.Number, ri, r.url)
+			return m, m.copyRoute(sel.port.Number, r.kind, r.url)
 		case "C":
 			// Batch-tear-down of dangling forwards, behind a y/n confirm (moved
 			// from "c" to shift-C when "c" became copy; see vnq7). No-op while a
@@ -4520,13 +4534,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Anything not handled above goes to the list. In FilterApplied state this
 	// is where esc clears the filter (ClearFilter), so if the filter just
-	// cleared, drop the widened scope and restore the current view.
+	// cleared, drop the widened scope and restore the current view. It's also
+	// where bubbles/list's own list.FilterMatchesMsg lands -- the async result
+	// of a "/" query narrowing/widening VisibleItems as the user types (fired
+	// by a tea.Cmd, not synchronously from the keypress that started it).
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
 	if m.filtering && m.list.FilterState() == list.Unfiltered {
 		m.filtering = false
 		m.rebuildItems() // Unfiltered -> nil cmd
 	}
+	// z6yf: a filter narrowing/widening the items here goes through bubbles/
+	// list's OWN Update, never our setItems, so it needs its own reconcile --
+	// the selected route can otherwise end up off-screen (a live-narrowing
+	// filter moves the selection without any nav key firing ensureRouteVisible
+	// itself). Harmless when nothing changed (a no-op reconcile).
+	m.ensureRouteVisible()
 	return m, cmd
 }
 
@@ -4593,7 +4616,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
 			tun := m.tunnels[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
 		return m.setItems(items)
 	}
@@ -4618,7 +4641,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
 		tun := m.tunnels[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, pid: p.Pid, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
 	return m.setItems(items)
 }
@@ -4639,6 +4662,15 @@ func (m *model) setItems(items []list.Item) tea.Cmd {
 	// route list shrank (an exposure torn down between polls) could otherwise
 	// leave m.routeIdx dangling past the end.
 	m.clampRouteIdx()
+	// z6yf: every rebuildItems() caller funnels through here, so reconciling
+	// scrollOff at this single choke point covers them all (a poll dropping a
+	// route/service, a view toggle, a tunnel/publish result, ...) without
+	// scattering ensureRouteVisible calls at each of the many call sites. Just
+	// ensureRouteVisible, not the fuller reconcileViewport -- m.width/height
+	// haven't changed here, so re-applying resizeList would be a no-op. A
+	// caller that also repoints the selection afterward (selectPort) reconciles
+	// again itself once the FINAL selection is known.
+	m.ensureRouteVisible()
 	return cmd
 }
 
@@ -4657,6 +4689,10 @@ func (m *model) selectPort(number int) {
 		numbers[i] = it.(portItem).port.Number
 	}
 	m.list.Select(selectIndexForPort(numbers, number))
+	// z6yf: setItems (called just before selectPort at its one call site)
+	// already reconciled scrollOff for the PRE-repoint selection; repointing
+	// it here can leave that stale, so reconcile again for the final one.
+	m.ensureRouteVisible()
 }
 
 // selectIndexForPort returns the index in numbers (sorted ascending) to

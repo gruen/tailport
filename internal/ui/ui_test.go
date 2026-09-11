@@ -451,6 +451,44 @@ func TestFilterScope(t *testing.T) {
 	}
 }
 
+// TestFilterScopeDimsRender covers z6yf: portItem.dimmed reaching all the way
+// through bodyLines into the actual rendered header, not just being set on
+// the data (TestFilterScope above only checks the flag itself). The
+// single-column renderer had no concept of dimmed at all before this fix --
+// the retired grid's list delegate was the only thing that ever read it, and
+// View() no longer calls list.View() to invoke that delegate.
+func TestFilterScopeDimsRender(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	// Forced so the styled-substring check below is deterministic regardless
+	// of whether go test's stdout looks like a terminal (routeMutedStyle sets
+	// only a Foreground color, which degrades to plain text under the
+	// no-color/Ascii profile termenv falls back to for a non-tty).
+	origProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(origProfile) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	m := New(config.Config{Ports: map[int]config.PortMeta{8808: {Favorite: true}}})
+	m.host = "host"
+	m.width = 80
+	m.allPorts = []portscan.Port{{Number: 8808, Process: "web"}, {Number: 3000, Process: "node"}}
+	m.active = map[int]bool{}
+	m.showAllPorts = false
+	m.rebuildItems()
+
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = settle(res.(model), cmd)
+
+	body, _, _ := m.bodyLines()
+	raw := strings.Join(body, "\n")
+
+	if !strings.Contains(raw, routeMutedStyle.Render("node")) {
+		t.Errorf("body = %q, want the dimmed :3000 record's name styled with routeMutedStyle", stripANSI(raw))
+	}
+	if strings.Contains(raw, routeMutedStyle.Render("web")) {
+		t.Errorf("body = %q, the real favorite :8808 should never be dimmed", stripANSI(raw))
+	}
+}
+
 // TestFilterNoMatch covers 4ye6's no-match state: a query that matches nothing
 // yields the dedicated "no ports match" message (naming the query), not the
 // fresh-install empty-state explainer or bubbles/list's bare "No items.".
@@ -1275,10 +1313,10 @@ func TestCopyKeymap(t *testing.T) {
 
 // TestCopyURL covers vnq7's copy action migrated to route-scoped copy (kata
 // th05 P5): `c` copies the SELECTED route sub-row's exact URL, flags the inline
-// "✓ copied" on THAT route line (copiedPort + copiedRouteIdx), and never toasts
-// for a non-empty URL. A served wildcard port carries two routes (localhost +
-// tailnet); copying each copies its own address, so the annotation is truly
-// per-route now, not per-service.
+// "✓ copied" on THAT route line (copiedPort + copiedRouteKind/copiedRouteURL),
+// and never toasts for a non-empty URL. A served wildcard port carries two
+// routes (localhost + tailnet); copying each copies its own address, so the
+// annotation is truly per-route now, not per-service.
 func TestCopyURL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	newModel := func() model {
@@ -1293,8 +1331,8 @@ func TestCopyURL(t *testing.T) {
 		return m
 	}
 
-	// routeIdx 0 = localhost: inline ✓, copiedRouteIdx 0, NO toast, and the
-	// localhost URL (not the tailnet one) is what carries the suffix.
+	// routeIdx 0 = localhost: inline ✓, copiedRouteKind=routeLocalhost, NO
+	// toast, and the localhost URL (not the tailnet one) carries the suffix.
 	m := newModel()
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(model)
@@ -1304,8 +1342,8 @@ func TestCopyURL(t *testing.T) {
 	if m.flash != "" {
 		t.Errorf("route copy should NOT toast a non-empty URL; flash = %q", m.flash)
 	}
-	if m.copiedPort != 8080 || m.copiedRouteIdx != 0 {
-		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/0", m.copiedPort, m.copiedRouteIdx)
+	if m.copiedPort != 8080 || m.copiedRouteKind != routeLocalhost {
+		t.Errorf("copiedPort/copiedRouteKind = %d/%v, want 8080/routeLocalhost", m.copiedPort, m.copiedRouteKind)
 	}
 	body, _, _ := m.bodyLines()
 	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://localhost:8080") {
@@ -1329,8 +1367,8 @@ func TestCopyURL(t *testing.T) {
 	if m.flash != "" {
 		t.Errorf("tailnet route copy should not toast; flash = %q", m.flash)
 	}
-	if m.copiedPort != 8080 || m.copiedRouteIdx != 1 {
-		t.Errorf("copiedPort/copiedRouteIdx = %d/%d, want 8080/1 (annotation should move to the tailnet route)", m.copiedPort, m.copiedRouteIdx)
+	if m.copiedPort != 8080 || m.copiedRouteKind != routeTailnet {
+		t.Errorf("copiedPort/copiedRouteKind = %d/%v, want 8080/routeTailnet (annotation should move to the tailnet route)", m.copiedPort, m.copiedRouteKind)
 	}
 	body, _, _ = m.bodyLines()
 	if got := stripANSI(strings.Join(body, "\n")); !strings.Contains(got, "✓ copied") || !strings.Contains(got, "http://host:8080") {
@@ -1370,7 +1408,8 @@ func TestCopiedExpire(t *testing.T) {
 
 // TestInlineCopyUniversal, migrated for route-scoped copy (kata th05 P5): the
 // inline "✓ copied" confirmation fires for every route that has a URL --
-// copiedPort/copiedRouteIdx set, no toast, and the suffix on THAT route line.
+// copiedPort/copiedRouteKind/copiedRouteURL set, no toast, and the suffix on
+// THAT route line.
 // Only an empty-URL route (the offline pseudo-route, or a still-starting quick
 // tunnel) toasts "nothing to copy yet" and copies nothing. The annotation
 // migrates when the selection moves to another service.
@@ -1445,8 +1484,8 @@ func TestInlineCopyUniversal(t *testing.T) {
 		r1, _ := pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 		r2, _ := r1.(model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 		m := press(r2.(model))
-		if m.copiedPort != 8080 || m.copiedRouteIdx != 2 || m.flash != "" {
-			t.Fatalf("published route copy: copiedPort=%d routeIdx=%d flash=%q, want 8080/2 inline", m.copiedPort, m.copiedRouteIdx, m.flash)
+		if m.copiedPort != 8080 || m.copiedRouteKind != routePublish || m.flash != "" {
+			t.Fatalf("published route copy: copiedPort=%d kind=%v flash=%q, want 8080/routePublish inline", m.copiedPort, m.copiedRouteKind, m.flash)
 		}
 		body, _, _ := m.bodyLines()
 		if plain := stripANSI(strings.Join(body, "\n")); !strings.Contains(plain, "✓ copied") || !strings.Contains(plain, "https://app.example.com") {
@@ -1505,6 +1544,71 @@ func TestInlineCopyUniversal(t *testing.T) {
 	}
 	if m2.copiedID <= firstID {
 		t.Errorf("copiedID should increment on the second copy; first=%d second=%d", firstID, m2.copiedID)
+	}
+}
+
+// TestCopiedRouteStableIdentity covers z6yf: the inline "✓ copied" annotation
+// used to be tracked by route INDEX (m.copiedRouteIdx, clamped into range on
+// every render), so a route list that reorders underneath it -- a poll
+// discovering a new bind, in this case -- could silently move the checkmark
+// onto a different route's URL. It must instead follow the copied route's
+// STABLE identity (kind+url) wherever that route now sits.
+func TestCopiedRouteStableIdentity(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m.host = "host"
+	m.width = 80
+	// Loopback-only + served -> routes[0]=localhost, routes[1]=tailnet.
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "srv", BindScope: portscan.ScopeLoopback}}
+	m.active = map[int]bool{8080: true}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	// Move to the tailnet route (index 1) and copy it.
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = res.(model)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = res.(model)
+	if m.copiedPort != 8080 || m.copiedRouteKind != routeTailnet {
+		t.Fatalf("setup: copiedPort/copiedRouteKind = %d/%v, want 8080/routeTailnet", m.copiedPort, m.copiedRouteKind)
+	}
+	wantURL := "http://host:8080"
+	if m.copiedRouteURL != wantURL {
+		t.Fatalf("setup: copiedRouteURL = %q, want %q", m.copiedRouteURL, wantURL)
+	}
+
+	// Simulate a later poll discovering the SAME service now also bound on a
+	// LAN address: routesFor inserts LAN between localhost and tailnet, so
+	// the previously-copied tailnet route shifts from index 1 to index 2.
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "srv", BindScope: portscan.ScopeLAN, BindHost: "10.0.0.5", Loopback: true}}
+	m.rebuildItems()
+
+	sel, _, ok := m.currentService()
+	if !ok {
+		t.Fatal("no current service after rebuild")
+	}
+	routes := sel.routes()
+	if len(routes) != 3 || routes[0].kind != routeLocalhost || routes[1].kind != routeLAN || routes[2].kind != routeTailnet {
+		t.Fatalf("routes after rebuild = %+v, want [localhost, LAN, tailnet]", routes)
+	}
+	if routes[1].url == wantURL || routes[2].url != wantURL {
+		t.Fatalf("routes after rebuild = %+v, want the tailnet url %q to have moved to index 2", routes, wantURL)
+	}
+
+	body, _, _ := m.bodyLines()
+	plain := stripANSI(strings.Join(body, "\n"))
+	lines := strings.Split(plain, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("body lines = %q, want 4 (header + 3 routes)", lines)
+	}
+	// The checkmark must follow the tailnet URL to its NEW line (index 3),
+	// not stay pinned to index 2 (now the LAN route) where the old
+	// index-based tracking would have left it.
+	if strings.Contains(lines[2], "✓ copied") {
+		t.Errorf("LAN route line = %q, should NOT carry the copied annotation", lines[2])
+	}
+	if !strings.Contains(lines[3], "✓ copied") || !strings.Contains(lines[3], wantURL) {
+		t.Errorf("tailnet route line = %q, want it to carry the copied annotation beside %q", lines[3], wantURL)
 	}
 }
 
@@ -4890,15 +4994,27 @@ func TestRenderListNoOverflow(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
 		}
+		// z6yf: one port carries a long user LABEL (>48 chars) -- the record
+		// HEADER's overflow case (bar/badge/:PORT/name/lock/pid), distinct from
+		// the route-URL truncation the rest of this fixture already covers.
 		m.allPorts = ports
 		m.showAllPorts = true
+		m.cfg.Ports = map[int]config.PortMeta{3000: {Label: strings.Repeat("a-very-long-user-chosen-service-label", 2)}}
 		m.rebuildItems()
 		res, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
 		return res.(model)
 	}
-	// Wide (no truncation needed) and narrow (URLs must truncate).
-	for _, w := range []int{160, 40} {
+	// Wide (no truncation needed) and narrow (URLs must truncate; 80 is the
+	// z6yf repro width -- a long label there needs the HEADER truncated too).
+	for _, w := range []int{160, 80, 40} {
 		m := build(w)
+		// z6yf: every logical line fitting within m.width is exactly what
+		// guarantees none of them soft-wraps in the terminal -- which is, in
+		// turn, what keeps View's lipgloss.Height(body)-based gap math (a
+		// LOGICAL newline count) consistent with the terminal's actual
+		// rendered row count. Before the header was truncated, a long label
+		// at width 80 broke precisely this: the header alone exceeded 80
+		// cells, so it would have failed the check below.
 		for _, ln := range strings.Split(m.renderList(), "\n") {
 			if got := lipgloss.Width(ln); got > m.width {
 				t.Errorf("width %d: renderList line exceeds terminal width (got %d): %q", m.width, got, stripANSI(ln))
@@ -6522,6 +6638,162 @@ func TestBannerActivationKeepsSelectionVisible(t *testing.T) {
 	if !selVisible() {
 		_, _, selLine := m.bodyLines()
 		t.Errorf("selected route at line %d fell outside the viewport [%d,%d) after the banner appeared -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+m.listBodyHeight())
+	}
+}
+
+// TestWindowResizeKeepsSelectionVisible extends the roborev 2190 reconcile
+// (see TestBannerActivationKeepsSelectionVisible) to a plain terminal resize
+// (z6yf): the WindowSizeMsg handler used to call a bare resizeList, which
+// re-applies listBodyHeight but never nudges scrollOff -- unlike every nav
+// key, nothing else reconciled a resize's shrink, so a selection scrolled to
+// the bottom of a tall terminal could drop below the fold the moment the
+// terminal (and thus the list viewport) shrank.
+func TestWindowResizeKeepsSelectionVisible(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = res.(model)
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+
+	selVisible := func() bool {
+		_, _, selLine := m.bodyLines()
+		h := m.listBodyHeight()
+		return selLine >= m.scrollOff && selLine < m.scrollOff+h
+	}
+	if !selVisible() {
+		t.Fatalf("precondition: selection not visible after End (scrollOff=%d)", m.scrollOff)
+	}
+
+	before := m.listBodyHeight()
+	res, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	m = res.(model)
+	if after := m.listBodyHeight(); after >= before {
+		t.Fatalf("listBodyHeight did not shrink on resize: before=%d after=%d", before, after)
+	}
+	if !selVisible() {
+		_, _, selLine := m.bodyLines()
+		t.Errorf("selected route at line %d fell outside the viewport [%d,%d) after the resize -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+m.listBodyHeight())
+	}
+}
+
+// TestFlashWrapKeepsSelectionVisible extends the same roborev 2190 reconcile
+// to setFlash (z6yf): a wrapped multi-line toast shrinks the list's reserved
+// height exactly like a raised banner does (TestResizeListReservesWrappedFlashHeight
+// pins the height math), but setFlash used to call a bare resizeList with no
+// scrollOff nudge, so a selection near the bottom could drop below the fold
+// the instant a long toast appeared.
+func TestFlashWrapKeepsSelectionVisible(t *testing.T) {
+	const longFlash = "on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable"
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = res.(model)
+
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+
+	selVisible := func() bool {
+		_, _, selLine := m.bodyLines()
+		h := m.listBodyHeight()
+		return selLine >= m.scrollOff && selLine < m.scrollOff+h
+	}
+	if !selVisible() {
+		t.Fatalf("precondition: selection not visible after End (scrollOff=%d)", m.scrollOff)
+	}
+
+	before := m.listBodyHeight()
+	m.setFlash(longFlash, flashWarn)
+	if statusLines := lipgloss.Height(m.renderStatusLine()); statusLines < 2 {
+		t.Fatalf("expected the flash to wrap to >=2 lines at width 80, got %d", statusLines)
+	}
+	if after := m.listBodyHeight(); after >= before {
+		t.Fatalf("listBodyHeight did not shrink for the wrapped flash: before=%d after=%d", before, after)
+	}
+	if !selVisible() {
+		_, _, selLine := m.bodyLines()
+		t.Errorf("selected route at line %d fell outside the viewport [%d,%d) after the flash wrapped -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+m.listBodyHeight())
+	}
+}
+
+// TestFilterNarrowingKeepsSelectionVisible covers z6yf: bubbles/list's own
+// cursor (m.list.Index()) is NOT re-clamped when a "/" query narrows
+// VisibleItems out from under it -- list.FilterMatchesMsg (the async result
+// of typing into the filter, delivered via a tea.Cmd rather than synchronously
+// from the keypress) only ever replaces m.filteredItems and returns before
+// reaching bubbles/list's own updatePagination() clamp. bodyLines() used to
+// read that raw, unclamped index directly for its "is this the current item"
+// comparison, so a filter narrowing far below the selected row's old index
+// could make NO item "current" at all -- hiding the selection bar/pointer
+// entirely, a worse symptom than merely scrolling it off-screen. bodyLines
+// now clamps the index like currentService() already did, and the filter's
+// fallback path in Update reconciles scrollOff once the narrowed items land.
+func TestFilterNarrowingKeepsSelectionVisible(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		proc := "other" // deliberately identical across every other port
+		if i == 0 {
+			proc = "target"
+		}
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: proc, BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = res.(model)
+
+	// Select the very last item (index 39, port 3039) and scroll to the
+	// bottom -- far from :3000 ("target"), the only match below.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+	if idx := m.list.Index(); idx != 39 {
+		t.Fatalf("precondition: index = %d, want 39", idx)
+	}
+
+	// "/" then a query matching only :3000 narrows VisibleItems to a single
+	// item, resolved asynchronously via list.FilterMatchesMsg (settle applies
+	// it) -- the raw list cursor stays 39 throughout, per bubbles/list's own
+	// FilterMatchesMsg handling (it never re-clamps the cursor/pagination).
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = settle(res.(model), cmd)
+	m = typeRunes(m, "target")
+	if vis := m.list.VisibleItems(); len(vis) != 1 || vis[0].(portItem).port.Number != 3000 {
+		var nums []int
+		for _, it := range vis {
+			nums = append(nums, it.(portItem).port.Number)
+		}
+		t.Fatalf("filtered visible = %v, want just [3000]", nums)
+	}
+
+	lines, _, selLine := m.bodyLines()
+	if selLine < 0 {
+		t.Fatalf("selLine = %d, want a valid selection even though the raw list cursor (39) is out of range for the 1 filtered item", selLine)
+	}
+	h := m.listBodyHeight()
+	if selLine < m.scrollOff || selLine >= m.scrollOff+h {
+		t.Errorf("selected route at line %d outside viewport [%d,%d) of %d lines after filter narrowing -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+h, len(lines))
 	}
 }
 
