@@ -11,14 +11,12 @@ import (
 
 // enumerateCloudflared finds running cloudflared processes by walking /proc and
 // reading each PID's NUL-separated /proc/<pid>/cmdline. It matches on the
-// executable basename (argv[0] == "cloudflared"), catching both PATH-launched
-// and absolute-path launches. Unreadable entries -- permission denied for
-// another user's process, or a PID that exits mid-scan -- are silently skipped.
-//
-// Note: a cloudflared installed under a DIFFERENT binary name (config
-// Binary override) won't be enumerated here; that's an accepted v1 limitation,
-// since the common case is the stock `cloudflared` name.
-func enumerateCloudflared() ([]procInfo, error) {
+// executable basename (argv[0] against binName -- the configured Client.binary(),
+// "cloudflared" by default), catching both PATH-launched and absolute-path
+// launches, AND a configured Binary override (roborev carryover, kata aprt).
+// Unreadable entries -- permission denied for another user's process, or a PID
+// that exits mid-scan -- are silently skipped.
+func enumerateCloudflared(binName string) ([]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
@@ -34,7 +32,7 @@ func enumerateCloudflared() ([]procInfo, error) {
 			continue
 		}
 		args := splitNUL(data)
-		if len(args) == 0 || !isCloudflaredArgv0(args[0]) {
+		if len(args) == 0 || !isCloudflaredArgv0(args[0], binName) {
 			continue
 		}
 		out = append(out, procInfo{pid: pid, args: args})

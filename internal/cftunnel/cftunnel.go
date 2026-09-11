@@ -162,6 +162,14 @@ const metricsTimeout = 2 * time.Second
 // binary can't hang the TUI's construction.
 const detectTimeout = 3 * time.Second
 
+// startupGrace bounds how long Start waits after spawning cloudflared to
+// catch an IMMEDIATE exit (a bad --url/tunnel name, an already-bound metrics
+// port, etc.) so callers get a real failure reason instead of a false
+// "success" (roborev carryover, kata aprt). It is NOT a readiness check -- an
+// actual edge connection can take several more seconds and is Health's job --
+// so it stays short.
+const startupGrace = 300 * time.Millisecond
+
 func (c *Client) binary() string {
 	if c.Binary != "" {
 		return c.Binary
@@ -222,9 +230,14 @@ func LoggedIn() bool {
 // Running descriptor (PID + resolved metrics port) so the caller can begin
 // polling immediately. The process is put in its OWN session (Setsid) with its
 // stdio sent to the null device, so it survives tailport exiting and never
-// touches the TUI's terminal. A background goroutine reaps it if it dies while
-// tailport is still alive (so a crashed tunnel doesn't leave a zombie); if
-// tailport exits first, the OS reparents and keeps the tunnel running.
+// touches the TUI's terminal. It waits out startupGrace before declaring
+// success (roborev carryover, kata aprt): cmd.Start succeeding only means the
+// OS could exec the binary, not that cloudflared accepted its arguments -- a
+// bad --url or tunnel name exits moments later, and without this check the
+// caller would see a "successfully started" tunnel that's already dead. A
+// background goroutine reaps the process once it actually exits (so a crashed
+// or later-stopped tunnel doesn't leave a zombie); if tailport exits first,
+// the OS reparents and keeps the tunnel running.
 func (c *Client) Start(spec Spec) (*Running, error) {
 	if spec.Port <= 0 {
 		return nil, fmt.Errorf("cftunnel: invalid port %d", spec.Port)
@@ -265,7 +278,23 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// Reap when it exits so a tunnel that dies during this tailport session
 	// doesn't become a zombie. If tailport exits first this goroutine simply
 	// dies with it and the kernel reparents/reaps the still-running child.
-	go func() { _ = cmd.Wait() }()
+	// Buffered so the send never blocks even if nobody ends up reading it (the
+	// healthy path below doesn't).
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	// Liveness check: give cloudflared startupGrace to prove it didn't
+	// immediately exit before reporting success.
+	select {
+	case werr := <-exited:
+		if werr != nil {
+			return nil, fmt.Errorf("cftunnel: cloudflared exited immediately after starting: %w", werr)
+		}
+		return nil, errors.New("cftunnel: cloudflared exited immediately after starting")
+	case <-time.After(startupGrace):
+		// Still running past the grace window -- looks healthy. exited stays
+		// buffered for the reaper goroutine's eventual send.
+	}
 
 	return &Running{
 		Port:        spec.Port,
@@ -277,12 +306,45 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	}, nil
 }
 
-// Stop signals a tunnel's cloudflared process to shut down (SIGTERM;
-// cloudflared drains and exits cleanly). Callers must only Stop a process they
-// have confirmed Owned -- the TUI refuses to signal foreign tunnels.
-func Stop(pid int) error {
+// Stop tears down the tunnel that was running at pid on port: it
+// RE-VALIDATES ownership from the LIVE process table immediately before
+// signalling, then sends SIGTERM (cloudflared drains and exits cleanly).
+//
+// pid is a snapshot from the last poll -- up to tunnelPollInterval stale by
+// the time a user presses `t`. In that window the tailport-owned cloudflared
+// could have already exited and the OS handed pid to an unrelated process
+// (PID reuse); blindly signalling the cached pid could kill that unrelated
+// process (roborev carryover, kata aprt -- the HIGH-severity finding: a
+// cached PID must never be trusted without re-checking it's still genuinely
+// ours right before the signal). Re-Discover()ing and matching pid+port+Owned
+// here closes that window down to the tiny gap between the check and the
+// signal itself, which no check-then-act API can fully eliminate without
+// OS-level support (e.g. Linux pidfd) -- out of scope for this fix.
+func (c *Client) Stop(pid, port int) error {
 	if pid <= 0 {
 		return fmt.Errorf("cftunnel: invalid pid %d", pid)
+	}
+	running, err := c.Discover()
+	if err != nil {
+		return fmt.Errorf("cftunnel: re-validating ownership before stopping pid %d: %w", pid, err)
+	}
+	found := false
+	for _, r := range running {
+		if r.PID != pid {
+			continue
+		}
+		found = true
+		if !r.Owned || r.Port != port {
+			// pid is alive but is no longer -- or never was -- OUR tunnel for
+			// this port. Almost certainly PID reuse: refuse rather than risk
+			// signalling an unrelated process.
+			return fmt.Errorf("cftunnel: pid %d is no longer tailport's tunnel for :%d (process identity changed) -- refusing to signal it", pid, port)
+		}
+		break
+	}
+	if !found {
+		// Already gone -- the tunnel is down either way.
+		return nil
 	}
 	p, err := os.FindProcess(pid) // always non-nil on unix
 	if err != nil {

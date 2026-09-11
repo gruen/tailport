@@ -2,6 +2,7 @@ package cftunnel
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -23,8 +24,14 @@ type procInfo struct {
 // nothing persisted. Processes it cannot map to a local port (no --url, e.g. a
 // config-file ingress tunnel) are omitted -- out of scope for the per-port
 // model.
+//
+// Matching argv[0] against c.binary() (not a hardcoded "cloudflared") matters:
+// Start launches whatever binary the config points at (a custom path, or a
+// wrapper script under a different name), so Discover must look for that SAME
+// name -- otherwise a renamed binary/wrapper is undiscoverable and untoggleable
+// even though tailport itself started it (roborev carryover, kata aprt).
 func (c *Client) Discover() ([]Running, error) {
-	procs, err := enumerateCloudflared()
+	procs, err := enumerateCloudflared(c.binary())
 	if err != nil {
 		return nil, err
 	}
@@ -39,9 +46,14 @@ func (c *Client) Discover() ([]Running, error) {
 
 // parseRunning interprets one cloudflared argv into a Running, or (,false) if
 // it isn't a tunnel invocation we can map to a local port. Pure and
-// exhaustively unit-tested. Ownership is decided ONLY by the --logfile
-// sentinel, so a foreign cloudflared -- even one that happens to expose the
-// same port -- is correctly reported with Owned=false.
+// exhaustively unit-tested. Ownership is decided by the --logfile sentinel
+// basename AND its embedded port matching THIS process's own --url port
+// (roborev carryover, kata aprt) -- without that port check, a foreign
+// cloudflared whose --logfile happens to collide with our basename pattern
+// for a DIFFERENT port would be misclassified as owned. So a foreign
+// cloudflared -- even one that happens to expose the same port, or carries a
+// coincidentally-matching sentinel name for another port -- is correctly
+// reported with Owned=false.
 func parseRunning(pid int, args []string) (Running, bool) {
 	if !containsToken(args, "tunnel") {
 		return Running{}, false
@@ -63,7 +75,7 @@ func parseRunning(pid int, args []string) (Running, bool) {
 		r.MetricsPort = parseMetricsPort(m)
 	}
 	if lf, ok := flagValue(args, "--logfile"); ok {
-		if host, owned := sentinelHost(lf); owned {
+		if host, owned := sentinelHost(lf, port); owned {
 			r.Owned = true
 			// A named tunnel's hostname is unrecoverable from the cmdline
 			// alone; the sentinel logfile carries it (see logfilePath). Quick
@@ -82,13 +94,18 @@ func parseRunning(pid int, args []string) (Running, bool) {
 // basename (not the full path) keeps ownership detection robust even if
 // $XDG_STATE_HOME changed between the session that started the tunnel and the
 // one discovering it -- nobody else names a log cftunnel-<port>*.log. The
+// leading (\d+) capture is the embedded port (sentinelHost verifies it
+// matches the process's own --url port before trusting the match); the
 // trailing (.+) capture is the hostname for a named tunnel, empty for quick.
-var sentinelLogRe = regexp.MustCompile(`^cftunnel-\d+(?:-(.+))?\.log$`)
+var sentinelLogRe = regexp.MustCompile(`^cftunnel-(\d+)(?:-(.+))?\.log$`)
 
 // sentinelHost reports whether a --logfile value is tailport's ownership
-// sentinel (see logfilePath) and, when it is, returns the named-tunnel hostname
-// folded into it ("" for a quick tunnel's sentinel).
-func sentinelHost(path string) (string, bool) {
+// sentinel for wantPort (see logfilePath) and, when it is, returns the
+// named-tunnel hostname folded into it ("" for a quick tunnel's sentinel). The
+// embedded port MUST equal wantPort -- the caller's own --url port -- so a
+// foreign process whose --logfile happens to match our basename pattern for a
+// DIFFERENT port is never mistaken for ours (roborev carryover, kata aprt).
+func sentinelHost(path string, wantPort int) (string, bool) {
 	// basename without importing path/filepath's OS-specific separator quirks:
 	// cloudflared writes whatever we passed, always a forward-slash path here.
 	if i := strings.LastIndexAny(path, `/\`); i >= 0 {
@@ -98,17 +115,27 @@ func sentinelHost(path string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	return m[1], true
+	port, err := strconv.Atoi(m[1])
+	if err != nil || port != wantPort {
+		return "", false
+	}
+	return m[2], true
 }
 
-// isCloudflaredArgv0 reports whether an argv[0] is the cloudflared executable,
-// comparing its basename so both "cloudflared" and "/usr/bin/cloudflared"
-// match. Shared by the Linux (/proc) and Darwin (ps) enumerators.
-func isCloudflaredArgv0(argv0 string) bool {
+// isCloudflaredArgv0 reports whether an argv[0] is the configured cloudflared
+// executable wantBin (Client.binary(): "cloudflared" by default, or a config
+// Binary override), comparing basenames so both a bare name and an absolute
+// path to it match on either side (e.g. "cloudflared" and
+// "/usr/bin/cloudflared", or "my-wrapper" and "/opt/bin/my-wrapper"). Shared
+// by the Linux (/proc) and Darwin (ps) enumerators.
+func isCloudflaredArgv0(argv0, wantBin string) bool {
 	if i := strings.LastIndexAny(argv0, `/\`); i >= 0 {
 		argv0 = argv0[i+1:]
 	}
-	return argv0 == "cloudflared"
+	if i := strings.LastIndexAny(wantBin, `/\`); i >= 0 {
+		wantBin = wantBin[i+1:]
+	}
+	return argv0 == wantBin
 }
 
 // containsToken reports whether tok appears as a standalone argv element (a
