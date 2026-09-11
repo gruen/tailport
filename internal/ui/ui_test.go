@@ -6797,6 +6797,58 @@ func TestFilterNarrowingKeepsSelectionVisible(t *testing.T) {
 	}
 }
 
+// TestTailnetRouteSuppressedWhenTailnetUnavailable pins the yn46 honesty
+// refinement: when tailscale is unreachable (a refresh set m.tailnetUnavailable),
+// a wildcard-bound port must NOT keep advertising a "tailnet" route -- its
+// machine name resolves over MagicDNS only while the tailnet is up. The port
+// still shows (yn46's whole point) via its localhost route.
+func TestTailnetRouteSuppressedWhenTailnetUnavailable(t *testing.T) {
+	m := New(config.Config{})
+	m.host = "lysander"
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "srv", BindScope: portscan.ScopeWildcard, BindHost: "0.0.0.0"}}
+	m.showAllPorts = true
+
+	routeKinds := func() (tailnet, localhost, present bool) {
+		m.rebuildItems()
+		for _, it := range m.list.Items() {
+			pi := it.(portItem)
+			if pi.port.Number != 8080 {
+				continue
+			}
+			present = true
+			for _, r := range pi.routes() {
+				switch r.kind {
+				case routeTailnet:
+					tailnet = true
+				case routeLocalhost:
+					localhost = true
+				}
+			}
+		}
+		return
+	}
+
+	// Tailnet up: a wildcard port advertises its tailnet route.
+	m.tailnetUnavailable = false
+	if tn, _, ok := routeKinds(); !ok || !tn {
+		t.Fatalf("precondition: wildcard :8080 should have a tailnet route when tailnet is up (present=%v tailnet=%v)", ok, tn)
+	}
+
+	// Tailnet down: the tailnet route is dropped, but the port still shows with
+	// its localhost route (never blanked).
+	m.tailnetUnavailable = true
+	tn, local, ok := routeKinds()
+	if !ok {
+		t.Fatal(":8080 vanished from the list -- yn46 must keep ports visible without tailscale")
+	}
+	if tn {
+		t.Error(":8080 still advertises a tailnet route while tailscale is unavailable (yn46 honesty)")
+	}
+	if !local {
+		t.Error(":8080 lost its localhost route -- it should still be reachable locally")
+	}
+}
+
 // TestForeignTunnelVisibleOnDeadPort guards roborev 2196 finding 2: a FOREIGN
 // cloudflared tunnel on a port with NO local listener that isn't favorited must
 // still surface as drift in the All-ports view. rebuildItems' row set was

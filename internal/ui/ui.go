@@ -1593,10 +1593,12 @@ func refresh() tea.Msg {
 	if statusErr != nil {
 		// tailnet exposure is unknown (commonly: `tailscale` isn't on PATH),
 		// but discovery still succeeded -- decouple the two (yn46) rather than
-		// discarding the scan. active/funnel come back empty, which degrades
-		// sensibly: routesFor already omits tailnet/funnel routes whenever
-		// m.fqdn is empty (also unresolved without tailscale), so ports just
-		// fall back to showing their localhost/LAN routes instead of vanishing.
+		// discarding the scan. active/funnel come back empty, and the handler
+		// flips m.tailnetUnavailable, which makes rebuildItems blank each
+		// portItem's route-host so routesFor drops the (now-unreachable)
+		// tailnet route; funnel routes need m.fqdn, also empty without
+		// tailscale. So ports fall back to their localhost/LAN routes instead
+		// of vanishing, and nothing advertises a tailnet URL that isn't live.
 		return refreshMsg{ports: ports, statusErr: statusErr}
 	}
 	active := make(map[int]bool, len(activeList))
@@ -4568,6 +4570,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // request) only when rebuilding while a filter is active; callers made from
 // Update must propagate it so the filtered view doesn't blank out.
 func (m *model) rebuildItems() tea.Cmd {
+	// routeHost is the tailnet identity fed to each portItem's route
+	// derivation. It's m.host (the machine short name = its MagicDNS label)
+	// normally, but BLANK when the last refresh couldn't reach tailscale
+	// (yn46): routesFor gates the tailnet route on a non-empty host, so a
+	// blank host honestly drops the "tailnet" route while tailscale is down --
+	// otherwise a wildcard-bound port would keep advertising a tailnet URL
+	// that isn't reachable (the machine name resolves over MagicDNS only while
+	// the tailnet is up). localhost/LAN routes are unaffected (they don't use
+	// host). Pairs with the "· tailscale unavailable" status note.
+	routeHost := m.host
+	if m.tailnetUnavailable {
+		routeHost = ""
+	}
 	portsByNumber := make(map[int]portscan.Port, len(m.allPorts))
 	for _, p := range m.allPorts {
 		portsByNumber[p.Number] = p
@@ -4616,7 +4631,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			meta := m.cfg.Ports[n]
 			pub := m.published[n]
 			tun := m.tunnels[n]
-			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
+			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
 		return m.setItems(items)
 	}
@@ -4641,7 +4656,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		// portsByNumber iff a local process is bound to it.
 		pub := m.published[n]
 		tun := m.tunnels[n]
-		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: m.host, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
+		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
 	return m.setItems(items)
 }
