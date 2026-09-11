@@ -54,9 +54,9 @@ anything not listed still hits a permission prompt, and that's the point.
 
 !`git log --oneline $(git describe --tags --abbrev=0)..HEAD`
 
-## Blocker gate — open, prioritized, not the release ticket itself
+## Blocker gate — open, prioritized, not the release ticket or an auto-review
 
-!`kata list --max-priority 2 --status open --no-label release --agent`
+!`kata list --max-priority 2 --status open --no-label release --no-label review-finding --agent`
 
 ## Open release tickets
 
@@ -101,6 +101,16 @@ Two things that query won't tell you:
 
 `--no-label release` matters: the release ticket is priority 0, so without it
 the gate blocks on itself.
+
+`--no-label review-finding` matters for the same structural reason (owner call,
+2026-09): roborev auto-files a P2 `review-finding` ticket for *every* commit, so
+each release's own commits spawn fresh P2s that would re-block the gate forever —
+a treadmill no release could ever clear. These tickets are still triaged (fix
+real findings, close nitpicks) as ordinary work, and a genuine bug they surface
+is caught that way; they just no longer *gate* a cut. This exclusion is scoped to
+the auto-review label only: deliberately-filed follow-ups from a review carry
+`roborev-carryover` (not `review-finding`) and DO still gate, exactly like any
+other prioritized work.
 
 If a real blocker is open, stop and say which. Don't cut around it.
 
