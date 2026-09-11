@@ -6835,22 +6835,38 @@ func (m model) renderBanner(hint string) string {
 	return warnStyle.Width(m.width).Render(hint)
 }
 
-// bannerReservationLines is the total height the two orthogonal sticky setup
-// banners can ever occupy below the list at the current width, WORST-CASED as if
-// BOTH are live -- mirroring legendReservationLines' unconditional reservation,
-// NOT gated on the current operatorNotSet/domainSetupPending. Either banner can
-// appear asynchronously (the operator hint from a failed toggle's toggleDoneMsg
-// or the startup detectOperatorMsg; the domain reminder from the P flow
-// capturing a blank caddy.domain) with no fresh WindowSizeMsg in between, so
-// sizing must already assume both. Each banner's would-be TEXT is built
-// regardless of its active flag (the *Raw builders) and wrapped through the SAME
-// renderBanner the render uses, so a banner that wraps to more than one line at
-// a narrow width is fully reserved and the reservation can never fall short of
-// the live wrapped height. Floor is 2 (each raw line is non-empty, so each wraps
-// to at least one row), matching the pre-w131 constant.
+// bannerReservationLines is the height the two orthogonal sticky setup banners
+// actually occupy below the list at the current width, measured LIVE from the
+// currently-active banners (operatorNotSet / domainSetupPending) rather than
+// worst-cased as if both were always live. This mirrors statusLines' live
+// (non-worst-cased) reservation: it is safe because the body is drawn by the
+// custom renderList, which recomputes listBodyHeight() from these same live
+// flags on EVERY frame, so a banner appearing asynchronously (the operator hint
+// from a failed toggle's toggleDoneMsg or the startup detectOperatorMsg; the
+// domain reminder from the P flow capturing a blank caddy.domain) is reserved
+// for at the very next render with no fresh WindowSizeMsg needed -- exactly the
+// invariant TestBannerReservationDominatesBothLive pins, and TestNoPhantomGap
+// pins the other side (an INACTIVE banner reserves ZERO rows, so the list fills
+// the freed space instead of leaving dead whitespace above the bottom bar).
+// Each active banner's TEXT is wrapped through the SAME renderBanner the render
+// uses, so a banner that wraps to more than one line at a narrow width is fully
+// reserved. An inactive banner renders to "" -- and lipgloss.Height("") is 1,
+// not 0 -- so bannerRenderHeight floors an empty banner at 0 to keep it from
+// re-introducing a phantom reserved row.
 func (m model) bannerReservationLines() int {
-	return lipgloss.Height(m.renderBanner(m.operatorHintTextRaw())) +
-		lipgloss.Height(m.renderBanner(m.domainSetupTextRaw()))
+	return bannerRenderHeight(m.renderBanner(m.operatorHintText())) +
+		bannerRenderHeight(m.renderBanner(m.domainSetupHintText()))
+}
+
+// bannerRenderHeight is lipgloss.Height for a rendered banner, but 0 for an
+// inactive (empty) one. lipgloss.Height("") is 1, so measuring an inactive
+// banner directly would reserve a phantom row per banner -- the exact dead
+// whitespace TestNoPhantomGap guards against.
+func bannerRenderHeight(rendered string) int {
+	if rendered == "" {
+		return 0
+	}
+	return lipgloss.Height(rendered)
 }
 
 // legendReservationLines is the number of rows the bottom-bar legend can ever
@@ -7351,10 +7367,19 @@ func (m model) View() string {
 	}
 
 	// Pin the bottom bar (shortcuts, status -- or a modal prompt) to the last
-	// rows of the viewport by padding the gap. Before the first WindowSizeMsg
-	// (m.height == 0) this falls back to a single blank separator line.
+	// rows of the viewport by padding the gap so the whole View fills exactly
+	// m.height rows (like helpView), leaving the bar flush to the bottom. The
+	// gap is the run of blank rows between the body and the bar; the "\n"s that
+	// render it and the "\n"s that render the header spacer each cost one row
+	// more than their blank-row count, so the row budget is
+	//   m.height = header + headerSpacer(+1) + body + gap(+1) + bottom
+	// hence the trailing +1 (its omission left the bar one row above the bottom
+	// and swallowed the single separator row listBodyHeight reserves, cramming
+	// the scroll indicator against the status line). Floors at 1 so a body that
+	// (transiently, pre-resize) overfills the viewport can't drive a negative
+	// strings.Repeat; TestNoPhantomGap pins the packed case to a lone separator.
 	bottom := m.renderBottom()
-	gap := m.height - lipgloss.Height(header) - headerSpacerLines - lipgloss.Height(body) - lipgloss.Height(bottom)
+	gap := m.height - lipgloss.Height(header) - headerSpacerLines - lipgloss.Height(body) - lipgloss.Height(bottom) + 1
 	if gap < 1 {
 		gap = 1
 	}

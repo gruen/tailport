@@ -6295,6 +6295,70 @@ func TestBannerReservationDominatesBothLive(t *testing.T) {
 	}
 }
 
+// TestNoPhantomGap pins the OTHER side of TestBannerReservationDominatesBothLive:
+// with NEITHER sticky banner active (the common case), the banners must reserve
+// ZERO rows so the list fills the freed space instead of leaving dead whitespace
+// between the body and the bottom bar. The pre-fix reservation worst-cased BOTH
+// banners unconditionally, leaving ~4 blank rows above the bar on an overflowing
+// list -- the excess whitespace this guards against. It also pins the layout's
+// two intended invariants: View fills EXACTLY the terminal height (bar flush to
+// the bottom, like helpView), and an overflowing list is separated from the bar
+// by exactly ONE blank row (the separator listBodyHeight reserves), never more.
+func TestNoPhantomGap(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	const height = 24
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: height})
+	m = res.(model)
+
+	// A fresh model has neither banner active...
+	if m.operatorNotSet || m.domainSetupPending {
+		t.Fatalf("precondition: expected both banners inactive, got operatorNotSet=%v domainSetupPending=%v", m.operatorNotSet, m.domainSetupPending)
+	}
+	// ...so they must reserve nothing. lipgloss.Height("") is 1, so the 0-guard in
+	// bannerRenderHeight is load-bearing here: without it this would be 2.
+	if got := m.bannerReservationLines(); got != 0 {
+		t.Errorf("inactive banners reserved %d rows, want 0 (phantom gap)", got)
+	}
+
+	view := m.View()
+	// View fills the viewport exactly -- bar flush to the bottom (matches helpView).
+	if got := lipgloss.Height(view); got != height {
+		t.Fatalf("View height = %d, want exactly %d (bar flush to bottom):\n%s", got, height, stripANSI(view))
+	}
+
+	// Anchor the bottom bar by its measured height (robust to the status wording),
+	// then count the blank rows immediately above it.
+	lines := strings.Split(stripANSI(view), "\n")
+	bottomHeight := lipgloss.Height(m.renderBottom())
+	barStart := len(lines) - bottomHeight
+	if barStart < 1 {
+		t.Fatalf("bottom bar (%d rows) leaves no room for a body in %d lines", bottomHeight, len(lines))
+	}
+	blanks := 0
+	for i := barStart - 1; i >= 0 && strings.TrimSpace(lines[i]) == ""; i-- {
+		blanks++
+	}
+	if blanks != 1 {
+		t.Errorf("blank rows between body and bottom bar = %d, want exactly 1 (was ~4 with the phantom reservation):\n%s", blanks, strings.Join(lines, "\n"))
+	}
+	// The row just above the separator is the scroll indicator, proving the body
+	// really overflowed -- otherwise this would be the short-list layout, where a
+	// larger pinned-to-bottom gap is legitimate rather than a phantom.
+	if ind := lines[barStart-2]; !strings.Contains(ind, " of ") {
+		t.Errorf("expected the scroll indicator directly above the separator; got %q", ind)
+	}
+}
+
 // TestDeEscalationImmediateUnpublish: P on a port THIS machine already publishes
 // unpublishes immediately -- no confirm, no dialog -- and the edge round-trip
 // actually deletes the route (re-verifying ownership first).
