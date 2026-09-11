@@ -6844,8 +6844,10 @@ func TestFilterNarrowingKeepsSelectionVisible(t *testing.T) {
 
 	// "/" then a query matching only :3000 narrows VisibleItems to a single
 	// item, resolved asynchronously via list.FilterMatchesMsg (settle applies
-	// it) -- the raw list cursor stays 39 throughout, per bubbles/list's own
-	// FilterMatchesMsg handling (it never re-clamps the cursor/pagination).
+	// it). bubbles/list's OWN FilterMatchesMsg handling never re-clamps its
+	// cursor/pagination; our Update now does (2234, see the companion test),
+	// so this test's contract is the narrower one it always checked: whatever
+	// the cursor, bodyLines renders a valid, on-screen selection.
 	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 	m = settle(res.(model), cmd)
 	m = typeRunes(m, "target")
@@ -6864,6 +6866,77 @@ func TestFilterNarrowingKeepsSelectionVisible(t *testing.T) {
 	h := m.listBodyHeight()
 	if selLine < m.scrollOff || selLine >= m.scrollOff+h {
 		t.Errorf("selected route at line %d outside viewport [%d,%d) of %d lines after filter narrowing -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+h, len(lines))
+	}
+}
+
+// TestFilterNarrowingRetargetsSelection covers 2234: the REACHABLE variant of
+// the stale-cursor hazard the sibling test guards on the render side. Apply a
+// "/" filter, navigate DOWN within the matches, then let a routine background
+// poll (a 15s refresh -> rebuildItems -> SetItems re-filter) narrow the matches
+// below the cursor. bubbles/list's SetItems restores the old index and clamps
+// only the PAGE, not the cursor, and its FilterMatchesMsg handler never
+// re-clamps -- so m.list.Index() ends up past the end of the narrowed set.
+// bodyLines clamps the RENDERED highlight, but every ACTION (copy, lock,
+// favorite, publish) reads m.list.SelectedItem(), which returns nil for an
+// out-of-range index: the user sees a service highlighted, presses a key, and
+// nothing happens. Update now re-clamps the real selection after the async
+// narrowing so the highlight and the action target can't disagree.
+func TestFilterNarrowingRetargetsSelection(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	mk := func(nMatch int) []portscan.Port {
+		var ports []portscan.Port
+		for i := 0; i < 40; i++ {
+			proc := "other"
+			if i < nMatch {
+				proc = "app"
+			}
+			ports = append(ports, portscan.Port{Number: 3000 + i, Process: proc, BindScope: portscan.ScopeWildcard})
+		}
+		return ports
+	}
+	m := New(config.Config{})
+	m.host = "host"
+	m.allPorts = mk(20) // :3000-:3019 = "app"
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	m = res.(model)
+
+	// Apply "/app" (20 matches), then navigate well down into them.
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = settle(res.(model), cmd)
+	m = typeRunes(m, "app")
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // Filtering -> FilterApplied
+	m = res.(model)
+	for i := 0; i < 25; i++ {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = res.(model)
+	}
+	if m.list.Index() < 3 {
+		t.Fatalf("precondition: expected the cursor moved well down the matches; index=%d", m.list.Index())
+	}
+
+	// A routine background poll drops all but 3 matches; settle the SetItems
+	// re-filter so VisibleItems actually narrows.
+	res, cmd = m.Update(refreshMsg{ports: mk(3), active: map[int]bool{}, funnel: map[int]int{}})
+	m = settle(res.(model), cmd)
+	if vis := len(m.list.VisibleItems()); vis != 3 {
+		t.Fatalf("precondition: the filter should now match exactly 3 ports; visible=%d", vis)
+	}
+
+	// The seam every action reads must resolve to a real (highlighted) service,
+	// not nil -- this is what copy/lock/publish/favorite all key off.
+	sel, ok := m.list.SelectedItem().(portItem)
+	if !ok {
+		t.Fatal("m.list.SelectedItem() is nil after a background poll narrowed the applied filter -- copy/lock/publish/favorite would silently no-op on the highlighted row")
+	}
+
+	// End-to-end: favorite the highlighted service. Before the fix this key
+	// found no selection and did nothing.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = res.(model)
+	if !m.cfg.Ports[sel.port.Number].Favorite {
+		t.Errorf("pressing 'f' on the narrowed, highlighted :%d should favorite it", sel.port.Number)
 	}
 }
 

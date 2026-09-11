@@ -4567,11 +4567,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filtering = false
 		m.rebuildItems() // Unfiltered -> nil cmd
 	}
-	// z6yf: a filter narrowing/widening the items here goes through bubbles/
-	// list's OWN Update, never our setItems, so it needs its own reconcile --
-	// the selected route can otherwise end up off-screen (a live-narrowing
-	// filter moves the selection without any nav key firing ensureRouteVisible
-	// itself). Harmless when nothing changed (a no-op reconcile).
+	// z6yf/2234: a filter narrowing/widening the items here goes through bubbles/
+	// list's OWN Update, never our setItems, so it needs its own reconcile. Two
+	// things can drift:
+	//   1. bubbles/list's FilterMatchesMsg narrows VisibleItems WITHOUT re-clamping
+	//      its own cursor, so m.list.Index() can point past the new end. bodyLines
+	//      clamps the RENDERED highlight, but m.list.SelectedItem() (which copy,
+	//      lock, publish, and every other action read) returns nil for an
+	//      out-of-range index -- so those actions would silently no-op on the
+	//      highlighted row until a nav key repaired the cursor. Re-clamp the real
+	//      selection so the highlight and the action target always agree.
+	//   2. even in range, the selected route can end up off-screen (a live-
+	//      narrowing filter moves the selection without any nav key firing
+	//      ensureRouteVisible itself).
+	if vis := m.list.VisibleItems(); len(vis) > 0 && m.list.Index() >= len(vis) {
+		m.list.Select(len(vis) - 1)
+		m.routeIdx = 0 // landed on a different service; start at its first route
+	}
 	m.ensureRouteVisible()
 	return m, cmd
 }
