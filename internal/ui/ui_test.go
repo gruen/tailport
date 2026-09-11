@@ -7507,6 +7507,309 @@ func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
 	}
 }
 
+// --- chained in-process flow tests (kata gghj #3) ---------------------------
+//
+// Everything above drives requestPublish/confirmPublish/Update transitions
+// from MANUALLY SEEDED state (m.published, m.lastPublish set directly by the
+// test) -- excellent for pinning one transition's exact behavior, but it
+// never proves the pieces actually chain together the way a real session
+// would: press a key, run the cmd it returns, feed the result back through
+// Update, and let THAT be what populates the next step's state. The tests
+// below do exactly that for the flows named in the ticket (publish -> confirm
+// -> poll -> unpublish; p re-publish from session memory, both confirmed and
+// silent; e's refuse-then-succeed edit) -- reusing newPublishModel/newFakeCaddy
+// and the rkey/mustUpdate/stripANSI helpers above rather than adding new
+// infra. Keep this to a focused handful; the transition-level tests above
+// already cover every branch in isolation.
+
+// publishOnce drives m's currently-selected port through the full p -> host
+// (accept prefill) -> auth(n, no auth) -> confirm(y) walk (mirrors
+// TestPublishFlowWalkNoAuth), then actually EXECUTES the resulting publish cmd
+// against the fake edge and feeds its publishDoneMsg back through Update --
+// the "publish once, for real, from scratch" prefix several flow tests below
+// share.
+func publishOnce(t *testing.T, m model) model {
+	t.Helper()
+	m = mustUpdate(t, m, rkey("p"))
+	if m.mode != entryPublishHost {
+		t.Fatalf("publishOnce: after p, mode = %v, want entryPublishHost", m.mode)
+	}
+	m = mustUpdate(t, m, enterKey) // accept the prefilled label
+	if m.mode != entryPublishAuth {
+		t.Fatalf("publishOnce: after host enter, mode = %v, want entryPublishAuth", m.mode)
+	}
+	m = mustUpdate(t, m, rkey("n")) // no auth
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("publishOnce: after auth n, mode = %v, want entryConfirmPublish", m.mode)
+	}
+	res, cmd := m.Update(rkey("y"))
+	m = res.(model)
+	if cmd == nil {
+		t.Fatal("publishOnce: confirm should return a publish cmd")
+	}
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("publishOnce: publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	res, _ = m.Update(msg)
+	return res.(model)
+}
+
+// pollOnce runs a REAL poll against the fake edge (via m's caddyClientOverride)
+// and feeds the result back through Update, returning the settled model. This
+// is what actually promotes a publish into m.published -- publishDoneMsg's
+// handler always re-fetches rather than hand-setting the map (see its comment
+// in ui.go), so no flow test above is complete without one of these.
+func pollOnce(t *testing.T, m model) model {
+	t.Helper()
+	cmd := m.pollPublishedCmd()
+	if cmd == nil {
+		t.Fatal("pollOnce: expected a poll cmd (is caddy.domain/fqdn configured?)")
+	}
+	msg, ok := cmd().(publishPollMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("pollOnce: poll = %#v, want a clean publishPollMsg", msg)
+	}
+	res, _ := m.Update(msg)
+	return res.(model)
+}
+
+// unpublishOnce presses p on a currently-published port -- de-escalation, so
+// no confirm dialog -- executes the resulting unpublish cmd against the fake
+// edge, and feeds it back through Update.
+func unpublishOnce(t *testing.T, m model) model {
+	t.Helper()
+	res, cmd := m.Update(rkey("p"))
+	m = res.(model)
+	if m.mode != entryNone {
+		t.Fatalf("unpublishOnce: de-escalation must not open a dialog; mode=%v", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("unpublishOnce: expected a de-escalation unpublish cmd")
+	}
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil || !msg.unpublish {
+		t.Fatalf("unpublishOnce: unpublish cmd = %#v, want a clean unpublish publishDoneMsg", msg)
+	}
+	res, _ = m.Update(msg)
+	return res.(model)
+}
+
+// TestFlowPublishConfirmPollUnpublish chains the full publish -> confirm ->
+// poll -> unpublish -> poll session end to end (kata gghj #3): every piece of
+// state the assertions below check (m.published, m.lastPublish, the flash
+// text, the fake edge's mutation/delete counts) is produced by actually
+// running the flow, never pre-seeded.
+func TestFlowPublishConfirmPollUnpublish(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := publishOnce(t, newPublishModel(t, srv))
+	if m.pending != 0 {
+		t.Errorf("pending should be clear after publishDoneMsg; got %d", m.pending)
+	}
+	if info, ok := m.lastPublish[8080]; !ok || info.hostname != "web.example.com" {
+		t.Errorf("lastPublish[8080] = %+v (ok=%v), want hostname web.example.com", info, ok)
+	}
+	if !strings.Contains(m.flash, "press p to unpublish") {
+		t.Errorf("flash = %q, want the de-escalation teaching clause", m.flash)
+	}
+	if len(fc.mutations) != 1 {
+		t.Fatalf("expected exactly one POST to the fake edge; got %d", len(fc.mutations))
+	}
+
+	// A real poll against the fake edge is what promotes the route into
+	// m.published.
+	m = pollOnce(t, m)
+	if info, ok := m.published[8080]; !ok || info.hostname != "web.example.com" {
+		t.Fatalf("published[8080] = %+v (ok=%v) after poll, want it live at web.example.com", info, ok)
+	}
+
+	// p again on a now-published port de-escalates: immediate unpublish, no
+	// confirm dialog.
+	m = unpublishOnce(t, m)
+	if len(fc.deletes) != 1 {
+		t.Errorf("expected exactly one DELETE against the fake edge; got %d", len(fc.deletes))
+	}
+
+	// A follow-up poll drops it from m.published, but the p-toggle's session
+	// memory (lastPublish) survives the unpublish (kata prp1) -- that's what
+	// makes the remembered-republish flow below possible.
+	m = pollOnce(t, m)
+	if _, ok := m.published[8080]; ok {
+		t.Error("published[8080] should be gone after the unpublish poll")
+	}
+	if info, ok := m.lastPublish[8080]; !ok || info.hostname != "web.example.com" {
+		t.Errorf("lastPublish[8080] should survive the unpublish; got %+v (ok=%v)", info, ok)
+	}
+}
+
+// TestFlowRepublishFromMemoryConfirmThenSilent chains a real publish +
+// unpublish (kata gghj #3) into the p-toggle's remembered-republish shortcut
+// (kata prp1) TWICE: once with the default caddy.silent_republish=false (must
+// land on entryConfirmPublish, naming the exact remembered hostname, before
+// re-publishing) and once with it set true (must re-publish directly, no
+// dialog and no confirm at all) -- exercising both branches from a genuinely
+// re-derived m.lastPublish, not a manually seeded one.
+func TestFlowRepublishFromMemoryConfirmThenSilent(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := publishOnce(t, newPublishModel(t, srv))
+	m = pollOnce(t, m)
+	m = unpublishOnce(t, m)
+	m = pollOnce(t, m)
+	if len(fc.mutations) != 1 || len(fc.deletes) != 1 {
+		t.Fatalf("setup: want exactly one POST and one DELETE so far; got mutations=%d deletes=%d", len(fc.mutations), len(fc.deletes))
+	}
+
+	// silent_republish is off (the default): p on the remembered port must
+	// land on the confirm gate naming the exact remembered hostname, WITHOUT
+	// re-walking the host/auth setup prompts.
+	res, cmd := m.Update(rkey("p"))
+	m = res.(model)
+	if cmd != nil {
+		t.Error("the confirm path should not itself return a cmd yet")
+	}
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("remembered republish (silent off) should reach entryConfirmPublish; mode=%v", m.mode)
+	}
+	if m.publishHostname != "web.example.com" {
+		t.Errorf("publishHostname = %q, want the remembered web.example.com", m.publishHostname)
+	}
+	if view := stripANSI(m.renderBottom()); !strings.Contains(view, "https://web.example.com") {
+		t.Errorf("confirm should name the exact remembered URL; view:\n%s", view)
+	}
+	res, cmd = m.Update(rkey("y"))
+	m = res.(model)
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("re-publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	res, _ = m.Update(msg)
+	m = res.(model)
+	if len(fc.mutations) != 2 {
+		t.Fatalf("expected a second POST (the confirmed re-publish); got %d", len(fc.mutations))
+	}
+	m = pollOnce(t, m)
+	if _, ok := m.published[8080]; !ok {
+		t.Fatal("port should be republished after the confirm")
+	}
+
+	// Unpublish once more, flip on silent_republish, and press p a third time:
+	// it must re-publish DIRECTLY -- no dialog, no confirm.
+	m = unpublishOnce(t, m)
+	m = pollOnce(t, m)
+	m.cfg.Caddy.SilentRepublish = true
+	res, cmd = m.Update(rkey("p"))
+	m = res.(model)
+	if m.mode != entryNone {
+		t.Errorf("silent re-publish must not open a dialog or confirm; mode=%v", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("silent re-publish should return a publish cmd directly")
+	}
+	msg, ok = cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("silent re-publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	res, _ = m.Update(msg)
+	m = res.(model)
+	if len(fc.mutations) != 3 {
+		t.Fatalf("expected a third POST (the silent re-publish); got %d", len(fc.mutations))
+	}
+}
+
+// TestFlowEditRefusesLiveHostnameChangeThenEditsAuthInPlace chains a real
+// publish (kata gghj #3) into the e edit flow (kata sw2y): attempting to move
+// a STILL-LIVE published port to a new hostname is refused and leaves the
+// edge completely untouched, while accepting the SAME hostname and adding
+// auth proceeds and PATCHes the live route in place (same @id, now carrying
+// auth) -- both off the port's REAL published state, not a hand-set
+// m.published map.
+func TestFlowEditRefusesLiveHostnameChangeThenEditsAuthInPlace(t *testing.T) {
+	fc := newFakeCaddy()
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+
+	m := publishOnce(t, newPublishModel(t, srv))
+	m = pollOnce(t, m)
+	if _, ok := m.published[8080]; !ok {
+		t.Fatal("setup: port should be published")
+	}
+	if len(fc.mutations) != 1 {
+		t.Fatalf("setup: want exactly one POST; got %d", len(fc.mutations))
+	}
+
+	// e opens the host dialog prefilled with the remembered/live hostname's
+	// label.
+	m = mustUpdate(t, m, rkey("e"))
+	if m.mode != entryPublishHost {
+		t.Fatalf("after e, mode = %v, want entryPublishHost", m.mode)
+	}
+	if got := m.publishInput.Value(); got != "web" {
+		t.Errorf("edit host prefill = %q, want the remembered label \"web\"", got)
+	}
+
+	// Changing it to a new label while the port is still live must be
+	// refused -- the edge must not see any new mutation, and the port stays
+	// published.
+	m.publishInput.SetValue("new")
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryNone || !strings.Contains(m.flash, "unpublish first") {
+		t.Errorf("live hostname change should be refused; mode=%v flash=%q", m.mode, m.flash)
+	}
+	if len(fc.mutations) != 1 {
+		t.Errorf("a refused rename must not touch the edge; mutations=%d", len(fc.mutations))
+	}
+	if _, ok := m.published[8080]; !ok {
+		t.Error("the refused rename must leave the port published")
+	}
+
+	// e again, accept the SAME hostname (an auth-only edit) -> proceeds to the
+	// auth step, gathers a credential, and PATCHes the live route in place.
+	m = mustUpdate(t, m, rkey("e"))
+	m = mustUpdate(t, m, enterKey) // accept the unchanged "web" prefill
+	if m.mode != entryPublishAuth {
+		t.Fatalf("an auth-only edit (same hostname) should proceed to auth; mode=%v flash=%q", m.mode, m.flash)
+	}
+	m = mustUpdate(t, m, rkey("y")) // require auth
+	if m.mode != entryPublishCredUser {
+		t.Fatalf("after auth y (no stored credential yet), mode = %v, want entryPublishCredUser", m.mode)
+	}
+	m = mustUpdate(t, m, rkey("admin"))
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryPublishCredPass {
+		t.Fatalf("after username enter, mode = %v, want entryPublishCredPass", m.mode)
+	}
+	m = mustUpdate(t, m, rkey("hunter2"))
+	m = mustUpdate(t, m, enterKey)
+	if m.mode != entryConfirmPublish {
+		t.Fatalf("after password enter, mode = %v, want entryConfirmPublish", m.mode)
+	}
+	res, cmd := m.Update(rkey("y"))
+	m = res.(model)
+	msg, ok := cmd().(publishDoneMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("edit-auth publish cmd = %#v, want a clean publishDoneMsg", msg)
+	}
+	res, _ = m.Update(msg)
+	m = res.(model)
+
+	if len(fc.mutations) != 2 {
+		t.Fatalf("the auth-only edit should PATCH the live route (a second mutation); got %d", len(fc.mutations))
+	}
+	rt := fc.mutations[len(fc.mutations)-1]
+	if rt.ID != caddyedge.IDFor("web.example.com") {
+		t.Errorf("edited route @id = %q, want the SAME hostname's id %q (in-place edit)", rt.ID, caddyedge.IDFor("web.example.com"))
+	}
+	if !routeHasAuth(rt) {
+		t.Error("the edited route should now carry the basic-auth handler")
+	}
+}
+
 // --- force-purge / take-over confirm ladders + resume (kata 6n15) ------------
 
 // reachConflictLadder drives an attempted publish of :8080 -> host into the
