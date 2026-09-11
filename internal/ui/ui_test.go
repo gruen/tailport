@@ -6359,6 +6359,59 @@ func TestNoPhantomGap(t *testing.T) {
 	}
 }
 
+// TestBannerActivationKeepsSelectionVisible guards the regression roborev job
+// 2190 flagged in the phantom-gap fix: now that an INACTIVE banner reserves no
+// rows, a banner APPEARING genuinely shrinks the visible list, so a selection
+// near the bottom can drop below the fold unless the raise reconciles scroll
+// (reconcileViewport). Here the selection is scrolled to the very bottom, then
+// the operator banner is raised (detectOperatorMsg) -- the selected route must
+// still sit inside the (now shorter) viewport afterward.
+func TestBannerActivationKeepsSelectionVisible(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	var ports []portscan.Port
+	for i := 0; i < 40; i++ {
+		ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = res.(model)
+
+	// Scroll the selection to the very bottom of the overflowing list.
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = res.(model)
+
+	selVisible := func() bool {
+		_, _, selLine := m.bodyLines()
+		h := m.listBodyHeight()
+		return selLine >= m.scrollOff && selLine < m.scrollOff+h
+	}
+	if !selVisible() {
+		t.Fatalf("precondition: selection not visible after End (scrollOff=%d)", m.scrollOff)
+	}
+
+	before := m.listBodyHeight()
+	res, _ = m.Update(detectOperatorMsg{notSet: true, ok: true})
+	m = res.(model)
+	if !m.operatorNotSet {
+		t.Fatal("operator banner did not activate")
+	}
+	if m.bannerReservationLines() == 0 {
+		t.Fatal("active operator banner reserved 0 rows -- can't exercise the shrink")
+	}
+	if after := m.listBodyHeight(); after >= before {
+		t.Fatalf("listBodyHeight did not shrink when the banner appeared: before=%d after=%d", before, after)
+	}
+	// The reconcile must keep the selected route on screen despite the shrink.
+	if !selVisible() {
+		_, _, selLine := m.bodyLines()
+		t.Errorf("selected route at line %d fell outside the viewport [%d,%d) after the banner appeared -- scroll was not reconciled", selLine, m.scrollOff, m.scrollOff+m.listBodyHeight())
+	}
+}
+
 // TestDeEscalationImmediateUnpublish: P on a port THIS machine already publishes
 // unpublishes immediately -- no confirm, no dialog -- and the edge round-trip
 // actually deletes the route (re-verifying ownership first).

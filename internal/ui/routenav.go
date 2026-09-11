@@ -241,6 +241,23 @@ func (m *model) ensureRouteVisible() {
 	m.scrollOff = clampInt(m.scrollOff, 0, maxInt(0, len(lines)-h))
 }
 
+// reconcileViewport re-syncs the list to a changed body height: resizeList
+// re-applies listBodyHeight to the bubbles/list, and ensureRouteVisible nudges
+// scrollOff so the SELECTED route stays on screen. Call it wherever a sticky
+// setup banner is RAISED. Unlike every other height-changing site (flash, poof,
+// prompt entry, resize -- all of which already call resizeList), the banner
+// flags historically needed no reconcile: the reservation was worst-cased and
+// constant, so raising a banner never shrank the visible list. Now that the
+// reservation is LIVE (bannerReservationLines measures only active banners), an
+// appearing banner really does claim rows from the list, so -- exactly like the
+// nav keys -- it must nudge scrollOff or a selection near the bottom drops below
+// the fold (roborev job 2190). Clearing a banner only GROWS the list, which
+// can't hide the selection, so those sites don't need it.
+func (m *model) reconcileViewport() {
+	m.resizeList()
+	m.ensureRouteVisible()
+}
+
 // renderList is the single-column body: the stacked service blocks (bodyLines),
 // scrolled to m.scrollOff and sliced to the list body height, followed by a
 // one-line scroll indicator (blank when everything fits) so renderList always

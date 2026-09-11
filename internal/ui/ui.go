@@ -3199,6 +3199,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// established alone.
 		if msg.ok {
 			m.operatorNotSet = msg.notSet
+			m.reconcileViewport() // a raised banner shrinks the list (roborev 2190)
 		}
 		return m, nil
 
@@ -3287,6 +3288,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// STICKY banner (operatorHintText) instead of a transient toast
 				// that would just flash the same information and vanish.
 				m.operatorNotSet = true
+				m.reconcileViewport() // a raised banner shrinks the list (roborev 2190)
 				return m, refresh
 			}
 			// The error toast auto-dismisses (q89g); still refresh to reconcile
@@ -3367,6 +3369,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// The auto-enable-serve step hit tailscale's operator gate --
 				// same sticky guidance banner a serve toggle would raise.
 				m.operatorNotSet = true
+				m.reconcileViewport() // a raised banner shrinks the list (roborev 2190)
 				return m, tea.Batch(refresh, m.pollPublishedCmd())
 			}
 			if !msg.unpublish && errors.Is(msg.err, caddyedge.ErrHostnameConflict) {
