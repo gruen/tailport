@@ -444,6 +444,13 @@ func (i portItem) reach() reachState {
 	case i.active && i.listening:
 		return reachServed
 	case i.listening: // !active && listening
+		if i.port.Loopback {
+			// t12m: a loopback bind is ALSO present even if a wider one (LAN,
+			// wildcard) won BindScope -- serve's 127.0.0.1 proxy target is
+			// genuinely up, so the serve-ON guard above must not block it (or
+			// blame a bind that isn't the reachability problem).
+			return reachLocalhost
+		}
 		switch i.port.BindScope {
 		case portscan.ScopeWildcard, portscan.ScopeTailnet:
 			return reachTailnet

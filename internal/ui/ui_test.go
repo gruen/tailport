@@ -2390,6 +2390,16 @@ func TestReachStateDescriptions(t *testing.T) {
 			state: reachLAN,
 		},
 		{
+			// t12m: BindScope aggregates to the WIDER LAN scope, but a loopback
+			// bind is ALSO present -- serve's proxy target really is up, so the
+			// guard must read this as reachLocalhost (permit serve-ON), not
+			// reachLAN (which would wrongly block it with a "can't reach this
+			// bind" toast).
+			name:  "loopback+LAN dual bind, unserved -> localhost (not LAN)",
+			item:  portItem{port: portscan.Port{Number: 3000, BindScope: portscan.ScopeLAN, Loopback: true}, listening: true, host: "host"},
+			state: reachLocalhost,
+		},
+		{
 			name:  "C served and listening -> served",
 			item:  portItem{port: portscan.Port{Number: 8080}, active: true, listening: true, host: "host"},
 			state: reachServed,
