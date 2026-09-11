@@ -101,7 +101,9 @@ func TestRoutesFor(t *testing.T) {
 				// host == "": no tailnet identity in this scenario.
 			},
 			want: []route{
-				{kind: routeLAN, url: "http://192.168.1.5:5432"},
+				// :5432 is a known non-HTTP port (Postgres) -- bare host:port,
+				// no scheme (t12m finding #3 / design §2).
+				{kind: routeLAN, url: "192.168.1.5:5432"},
 			},
 		},
 		{
@@ -206,7 +208,99 @@ func TestRoutesFor(t *testing.T) {
 				host:      "myhost",
 			},
 			want: []route{
-				{kind: routeLAN, url: "http://192.168.1.5:5432"},
+				{kind: routeLAN, url: "192.168.1.5:5432"},
+			},
+		},
+		{
+			// t12m finding #1: a service bound on BOTH loopback AND a specific
+			// LAN address must keep BOTH its localhost and LAN routes -- the
+			// scanner's widest-scope aggregation collapses BindScope to LAN, but
+			// bindLoopback preserves the loopback bind's presence.
+			name: "loopback + LAN dual bind -> BOTH localhost and LAN routes",
+			in: serviceState{
+				port:         8080,
+				bindScope:    portscan.ScopeLAN,
+				bindHost:     "192.168.1.5",
+				bindLoopback: true,
+				listening:    true,
+				// host == "": no tailnet identity in this scenario.
+			},
+			want: []route{
+				{kind: routeLocalhost, url: "http://localhost:8080"},
+				{kind: routeLAN, url: "http://192.168.1.5:8080"},
+			},
+		},
+		{
+			// t12m finding #2: `tailscale serve` proxies to 127.0.0.1:PORT, so a
+			// served port whose ONLY listener is a specific LAN address (no
+			// loopback bind) is NOT actually reachable via serve -- the tailnet
+			// route must be stale even though something IS listening.
+			name: "served + LAN-only listener (no loopback) -> stale tailnet route",
+			in: serviceState{
+				port:      8080,
+				bindScope: portscan.ScopeLAN,
+				bindHost:  "192.168.1.5",
+				listening: true,
+				served:    true,
+				host:      "myhost",
+			},
+			want: []route{
+				{kind: routeLAN, url: "http://192.168.1.5:8080"},
+				{kind: routeTailnet, served: true, stale: true, url: "http://myhost:8080"},
+			},
+		},
+		{
+			// Companion to the above: the SAME served+LAN scenario, but the
+			// loopback bind is ALSO present (bindLoopback) -- serve's proxy
+			// target really is up, so the tailnet route must NOT be stale, and
+			// all three routes (localhost, LAN, tailnet) coexist.
+			name: "served + loopback+LAN dual bind -> tailnet route healthy, all three routes present",
+			in: serviceState{
+				port:         8080,
+				bindScope:    portscan.ScopeLAN,
+				bindHost:     "192.168.1.5",
+				bindLoopback: true,
+				listening:    true,
+				served:       true,
+				host:         "myhost",
+			},
+			want: []route{
+				{kind: routeLocalhost, url: "http://localhost:8080"},
+				{kind: routeLAN, url: "http://192.168.1.5:8080"},
+				{kind: routeTailnet, served: true, stale: false, url: "http://myhost:8080"},
+			},
+		},
+		{
+			// t12m finding #3: a non-HTTP port (Postgres, :5432) keeps the bare
+			// host:port fallback on its localhost and tailnet routes too, not
+			// just LAN.
+			name: "non-HTTP port on loopback+tailnet -> bare host:port on localhost and tailnet",
+			in: serviceState{
+				port:      5432,
+				bindScope: portscan.ScopeLoopback,
+				listening: true,
+				served:    true,
+				host:      "myhost",
+			},
+			want: []route{
+				{kind: routeLocalhost, url: "localhost:5432"},
+				{kind: routeTailnet, served: true, stale: false, url: "myhost:5432"},
+			},
+		},
+		{
+			// Bonus fix riding the same addressFor helper: sshd bound to a
+			// specific LAN IP (not loopback/wildcard) renders "ssh <ip>" on its
+			// LAN route, matching the existing :22 handling on localhost/tailnet
+			// routes -- not an http:// URL.
+			name: "sshd bound to a specific LAN IP -> LAN route is ssh, not http",
+			in: serviceState{
+				port:      22,
+				bindScope: portscan.ScopeLAN,
+				bindHost:  "192.168.1.9",
+				listening: true,
+			},
+			want: []route{
+				{kind: routeLAN, url: "ssh 192.168.1.9"},
 			},
 		},
 	}
