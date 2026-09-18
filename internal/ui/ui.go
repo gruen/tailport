@@ -983,7 +983,7 @@ type model struct {
 
 	// Cloudflare Tunnel state (kata nc1j); see internal/ui/cftunnel.go. The
 	// whole feature is GATED on cfAvailable -- detected once at New() -- so an
-	// uninstalled cloudflared costs nothing: the `t` key is dropped from the bar
+	// uninstalled cloudflared costs nothing: the `o` key is dropped from the bar
 	// (barGroups) and pollTunnelsCmd returns a nil cmd. cfVersion is shown
 	// nowhere yet; kept for parity/debugging.
 	cfAvailable bool
@@ -999,7 +999,7 @@ type model struct {
 	// signalled -- so unlike tunnels this is populated (not discarded) and
 	// requestTunnel refuses to layer a second exposure on top of it (kata aprt).
 	tunnelForeign map[int]bool
-	// lastTunnel remembers, per port, what a port was last tunnelled as, so `t`
+	// lastTunnel remembers, per port, what a port was last tunnelled as, so `o`
 	// can re-raise a torn-down tunnel without re-prompting. SESSION-ONLY, never
 	// persisted -- the process table stays the source of truth (mirrors
 	// lastPublish).
@@ -1011,7 +1011,7 @@ type model struct {
 	// cfClientOverride, when non-nil, replaces the client built from
 	// cfg.Cloudflared for tests (mirrors caddyClientOverride).
 	cfClientOverride *cftunnel.Client
-	// tunnel-setup (`t`) flow state, carried across the dialog steps and cleared
+	// tunnel-setup (`o`) flow state, carried across the dialog steps and cleared
 	// by clearTunnelFlow. tunnelInput is the shared textinput for the named
 	// flow's hostname / tunnel-name steps.
 	tunnelInput     textinput.Model
@@ -1019,6 +1019,18 @@ type model struct {
 	tunnelSetupMode cftunnel.Mode // quick vs named for the in-flight setup
 	tunnelHostname  string        // named: the public hostname entered (held into the confirm)
 	tunnelName      string        // named: the pre-provisioned cloudflared tunnel name
+
+	// tunnelSpinner* (kata h2ef) drives the animated "<glyph> starting…" label
+	// shown in place of a quick tunnel's still-empty URL (a named tunnel's
+	// hostname is known up front, so it never needs this). tunnelSpinnerPort is
+	// the port currently being animated (0 = none); tunnelSpinnerID is a
+	// flashID-style generation guard so a tick from a superseded animation (or
+	// one that already stopped itself) is ignored on arrival rather than
+	// reviving a dead loop. See startTunnelSpinner/tunnelSpinnerTick
+	// (cftunnel.go) and the tunnelSpinnerTickMsg handler.
+	tunnelSpinnerPort  int
+	tunnelSpinnerID    int
+	tunnelSpinnerFrame int
 
 	mode       entryMode
 	portInput  textinput.Model
@@ -3798,6 +3810,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// marker flips without waiting a poll cycle.
 		m.pending = 0
 		if msg.err != nil {
+			// The start (or teardown) failed, so no route will ever appear for
+			// this port from this attempt -- if the pending-spinner was
+			// targeting it, stop animating rather than spin forever waiting on
+			// a hostname that's never coming (kata h2ef).
+			if msg.port == m.tunnelSpinnerPort {
+				m.tunnelSpinnerPort = 0
+			}
 			return m, tea.Batch(m.setErr(tunnelErrText(msg.err)), m.pollTunnelsCmd(), m.rebuildItems())
 		}
 		if msg.torndown {
@@ -3812,15 +3831,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// failed).
 			m.invalidateTunnelPolls()
 			delete(m.tunnels, msg.port)
+			if msg.port == m.tunnelSpinnerPort {
+				m.tunnelSpinnerPort = 0 // kata h2ef: nothing left to animate
+			}
 			return m, tea.Batch(m.setFlash(fmt.Sprintf("tunnel on :%d torn down", msg.port), flashInfo), m.rebuildItems())
 		}
 		// Start success: invalidate any in-flight pre-start poll (kata aprt --
 		// same rationale as the teardown branch, mirrored: a stale poll landing
 		// here would otherwise erase the entry set below) and record the running
 		// process so the row flips now. A quick tunnel's hostname isn't known yet
-		// (the poll surfaces it via /quicktunnel), so the flash says "starting…";
-		// a named tunnel's host is known up front, so name it and teach the `t`
-		// de-escalation.
+		// (the poll surfaces it via /quicktunnel, and the route row spins in its
+		// place -- kata h2ef), so the flash says "starting…"; a named tunnel's
+		// host is known up front, so name it and teach the `o` de-escalation.
 		if msg.running != nil {
 			m.invalidateTunnelPolls()
 			m.tunnels[msg.port] = tunnelInfo{
@@ -3835,7 +3857,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.running != nil && msg.running.Hostname != "" {
 			flash = m.setFlash(fmt.Sprintf("tunnelled https://%s — press o to unpublish", msg.running.Hostname), flashInfo)
 		}
-		return m, tea.Batch(save, flash, m.pollTunnelsCmd(), m.rebuildItems())
+		rebuild := m.rebuildItems()
+		if msg.running != nil {
+			// kata h2ef: land the selection on the new cloudflare route (not
+			// just the service) so the user watches the URL -- or, for a quick
+			// tunnel, the spinner then the URL -- resolve right where they're
+			// looking. rebuildItems just ran, so routes() reflects m.tunnels
+			// as set above.
+			m.selectRoute(msg.port, routeTunnel)
+		}
+		return m, tea.Batch(save, flash, m.pollTunnelsCmd(), rebuild)
 
 	case tunnelPollMsg:
 		// Drop a stale result (mirrors publishPollMsg's out-of-order guard).
@@ -3878,6 +3909,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tunnelTick()
 		}
 		return m, tea.Batch(m.pollTunnelsCmd(), tunnelTick())
+
+	case tunnelSpinnerTickMsg:
+		// kata h2ef: animate the pending-quick-tunnel spinner. id is a
+		// flashID-style guard -- a tick from a superseded animation (a newer
+		// startTunnelSpinner call bumped tunnelSpinnerID since this tick was
+		// scheduled) is dropped rather than reviving a stopped loop.
+		if msg.id != m.tunnelSpinnerID {
+			return m, nil
+		}
+		port := m.tunnelSpinnerPort
+		if port == 0 {
+			return m, nil // already stopped (error/teardown cleared the target)
+		}
+		if info, ok := m.tunnels[port]; ok && info.hostname != "" {
+			// Resolved: the poll or tunnelDoneMsg already recorded a real
+			// hostname for this port, so the route row now renders the URL
+			// itself -- stop animating, no perpetual redraw.
+			m.tunnelSpinnerPort = 0
+			return m, nil
+		}
+		m.tunnelSpinnerFrame++
+		return m, tunnelSpinnerTick(m.tunnelSpinnerID)
 
 	case cleanupDoneMsg:
 		m.cleaning = 0

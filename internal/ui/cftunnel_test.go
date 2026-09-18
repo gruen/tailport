@@ -358,6 +358,142 @@ func TestTunnelTickStopsWhenUnavailable(t *testing.T) {
 	}
 }
 
+// TestTunnelSpinnerStartsTicksAndStops covers kata h2ef's full spinner
+// lifecycle: confirmTunnelQuick arms it (bumping tunnelSpinnerID off zero and
+// targeting the port), each tick advances the frame and reschedules while the
+// port's hostname stays empty, a STALE-generation tick is ignored outright
+// (no frame advance, no reschedule -- the flashID-style guard), and the tick
+// self-stops (nil cmd, tunnelSpinnerPort cleared) the moment the hostname
+// resolves -- so it never redraws forever once the URL is known.
+func TestTunnelSpinnerStartsTicksAndStops(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.fqdn = "host.tailnet.ts.net"
+	m.tunnelPort = 3000
+	m.tunnelSetupMode = cftunnel.ModeQuick
+
+	if cmd := m.confirmTunnelQuick(); cmd == nil {
+		t.Fatal("confirmTunnelQuick should return a non-nil batched cmd")
+	}
+	if m.tunnelSpinnerPort != 3000 {
+		t.Errorf("tunnelSpinnerPort = %d, want 3000", m.tunnelSpinnerPort)
+	}
+	startID := m.tunnelSpinnerID
+	if startID == 0 {
+		t.Fatal("startTunnelSpinner should bump tunnelSpinnerID off its zero value")
+	}
+
+	// Simulate the start landing (mirrors tunnelDoneMsg's start-success
+	// branch): the port is now tracked but its quick hostname is still empty.
+	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick}}
+
+	res, tick := m.Update(tunnelSpinnerTickMsg{id: startID})
+	m = res.(model)
+	if tick == nil {
+		t.Error("a tick while the hostname is still empty should reschedule")
+	}
+	if m.tunnelSpinnerFrame != 1 {
+		t.Errorf("tunnelSpinnerFrame = %d, want 1 after one tick", m.tunnelSpinnerFrame)
+	}
+	if m.tunnelSpinnerPort != 3000 {
+		t.Error("tunnelSpinnerPort should stay set while the hostname is still empty")
+	}
+
+	// A stale-generation tick must be ignored: no frame advance, no reschedule.
+	res, staleTick := m.Update(tunnelSpinnerTickMsg{id: startID - 1})
+	m2 := res.(model)
+	if staleTick != nil {
+		t.Error("a stale-generation tick must not reschedule")
+	}
+	if m2.tunnelSpinnerFrame != m.tunnelSpinnerFrame {
+		t.Error("a stale-generation tick must not advance the frame")
+	}
+
+	// The hostname resolves (mirrors a poll landing) -- the NEXT tick must
+	// stop: no reschedule, and the target port cleared.
+	m.tunnels[3000] = tunnelInfo{mode: cftunnel.ModeQuick, hostname: "witty-fox-42.trycloudflare.com"}
+	res, stopTick := m.Update(tunnelSpinnerTickMsg{id: startID})
+	m = res.(model)
+	if stopTick != nil {
+		t.Error("a tick after the hostname resolves should NOT reschedule (spinner must self-stop)")
+	}
+	if m.tunnelSpinnerPort != 0 {
+		t.Errorf("tunnelSpinnerPort should clear once resolved; got %d", m.tunnelSpinnerPort)
+	}
+}
+
+// TestTunnelSpinnerStopsOnErrorOrTeardown covers kata h2ef's other stop path:
+// if a quick tunnel never produces a hostname at all -- the start itself
+// fails, or it's torn down before resolving -- the spinner target must clear
+// immediately (in the tunnelDoneMsg handler) rather than waiting on a tick
+// that will never see a hostname. An unrelated port's error/teardown must
+// leave a DIFFERENT port's still-pending spinner target alone.
+func TestTunnelSpinnerStopsOnErrorOrTeardown(t *testing.T) {
+	t.Run("start error", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.tunnelSpinnerPort = 3000
+		m.tunnelSpinnerID = 1
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, err: cftunnel.ErrNotInstalled})
+		if m.tunnelSpinnerPort != 0 {
+			t.Errorf("a failed start should clear tunnelSpinnerPort; got %d", m.tunnelSpinnerPort)
+		}
+	})
+	t.Run("torn down", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.tunnelSpinnerPort = 3000
+		m.tunnelSpinnerID = 1
+		m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick}}
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, torndown: true})
+		if m.tunnelSpinnerPort != 0 {
+			t.Errorf("a teardown should clear tunnelSpinnerPort; got %d", m.tunnelSpinnerPort)
+		}
+	})
+	t.Run("unrelated port is left alone", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.tunnelSpinnerPort = 3000
+		m.tunnelSpinnerID = 1
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 4000, err: cftunnel.ErrNotInstalled})
+		if m.tunnelSpinnerPort != 3000 {
+			t.Errorf("a DIFFERENT port's failure must not clear this port's spinner target; got %d", m.tunnelSpinnerPort)
+		}
+	})
+}
+
+// TestTunnelStartMovesSelectionToNewRoute covers kata h2ef's second claim:
+// when a tunnel start succeeds, the selection moves to that port's NEW
+// cloudflare route sub-row (not just the service), via selectRoute, so the
+// user watches the URL -- or, for a quick tunnel, the spinner then the URL --
+// resolve right where they're already looking.
+func TestTunnelStartMovesSelectionToNewRoute(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.allPorts = []portscan.Port{
+		{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
+		{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
+	}
+	m.showAllPorts = true
+	m.rebuildItems()
+	// Selection starts on the FIRST service (index 0, port :2000) -- unrelated
+	// to the port that's about to get a tunnel.
+	if m.list.Index() != 0 {
+		t.Fatalf("setup: expected the initial selection on index 0; got %d", m.list.Index())
+	}
+
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
+
+	pi, _, ok := m.currentService()
+	if !ok || pi.port.Number != 3000 {
+		t.Fatalf("selection should move to port :3000's service; ok=%v port=%+v", ok, pi.port)
+	}
+	routes := pi.routes()
+	if m.routeIdx < 0 || m.routeIdx >= len(routes) || routes[m.routeIdx].kind != routeTunnel {
+		t.Fatalf("routeIdx = %d should select the routeTunnel sub-row; routes=%+v", m.routeIdx, routes)
+	}
+}
+
 // hasKeyInGroup reports whether group named gname contains a binding whose help
 // key is want.
 func hasKeyInGroup(groups []keyGroup, gname, want string) bool {

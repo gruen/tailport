@@ -397,6 +397,70 @@ func TestRenderServiceHeaderOverflowTruncates(t *testing.T) {
 	}
 }
 
+// TestRenderRouteLinePendingTunnelSpinner covers kata h2ef: a quick
+// Cloudflare tunnel's route has an empty url while cloudflared hasn't
+// assigned its *.trycloudflare.com hostname yet (route.go's routeTunnel).
+// Rather than a blank URL column, the row must show the caller-supplied
+// "<glyph> starting…" placeholder (blockInput.tunnelPendingPlaceholder) so a
+// still-starting tunnel doesn't read as "nothing happened". Once the
+// hostname arrives (a non-empty url) the row must render the URL, not the
+// placeholder -- the spinner never lingers on a resolved tunnel. A FOREIGN
+// tunnel's empty url is a distinct case (never probed, kata aprt) and must
+// keep the existing "—" placeholder, never the spinner.
+func TestRenderRouteLinePendingTunnelSpinner(t *testing.T) {
+	pending := blockInput{
+		port: 3000, name: "app",
+		routes:                   []route{{kind: routeTunnel, url: ""}},
+		selectedRoute:            -1,
+		copiedRoute:              -1,
+		tunnelPendingPlaceholder: "⠋ starting…",
+	}
+	lines := blockLines(t, pending)
+	if route := lines[1]; !strings.Contains(route, "⠋ starting…") {
+		t.Errorf("pending tunnel route = %q, want the spinner placeholder %q", route, "⠋ starting…")
+	} else if strings.Contains(route, "—") {
+		t.Errorf("pending tunnel route = %q, should not render the offline/foreign em-dash placeholder", route)
+	}
+
+	resolved := pending
+	resolved.routes = []route{{kind: routeTunnel, url: "https://witty-fox-42.trycloudflare.com"}}
+	lines = blockLines(t, resolved)
+	if route := lines[1]; !strings.Contains(route, "https://witty-fox-42.trycloudflare.com") {
+		t.Errorf("resolved tunnel route = %q, want the URL", route)
+	} else if strings.Contains(route, "starting…") {
+		t.Errorf("resolved tunnel route = %q, should not still show the pending placeholder", route)
+	}
+
+	foreign := pending
+	foreign.routes = []route{{kind: routeTunnel, foreign: true}}
+	lines = blockLines(t, foreign)
+	if route := lines[1]; !strings.Contains(route, "—") {
+		t.Errorf("foreign tunnel route = %q, want the em-dash placeholder, not the spinner", route)
+	} else if strings.Contains(route, "starting…") {
+		t.Errorf("foreign tunnel route = %q, should never show the spinner (never probed)", route)
+	}
+}
+
+// TestTunnelSpinnerLabel pins tunnelSpinnerLabel's pure frame-cycling (kata
+// h2ef): both the UTF-8 braille frames and the ASCII fallback cycle
+// deterministically by frame % len(frames), wrapping around past the frame
+// set's length, and the utf8Capable argument alone picks which set is used.
+func TestTunnelSpinnerLabel(t *testing.T) {
+	for i, want := range tunnelSpinnerFramesUTF8 {
+		if got, wantLabel := tunnelSpinnerLabel(i, true), want+" starting…"; got != wantLabel {
+			t.Errorf("tunnelSpinnerLabel(%d, true) = %q, want %q", i, got, wantLabel)
+		}
+	}
+	if got, want := tunnelSpinnerLabel(len(tunnelSpinnerFramesUTF8), true), tunnelSpinnerFramesUTF8[0]+" starting…"; got != want {
+		t.Errorf("tunnelSpinnerLabel should wrap past the frame set's length: got %q, want %q", got, want)
+	}
+	for i, want := range tunnelSpinnerFramesASCII {
+		if got, wantLabel := tunnelSpinnerLabel(i, false), want+" starting…"; got != wantLabel {
+			t.Errorf("tunnelSpinnerLabel(%d, false) = %q, want %q", i, got, wantLabel)
+		}
+	}
+}
+
 // TestRenderServiceBlockDimmed covers z6yf's restored dimming: the
 // single-column renderer had no concept of portItem.dimmed at all (the field
 // was only ever read by the retired grid's list delegate, which View() no

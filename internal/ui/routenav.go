@@ -154,6 +154,32 @@ func (m *model) moveRoute(delta int) {
 	m.routeIdx = idx
 }
 
+// selectRoute points BOTH cursors -- the service (m.list, via selectPort) and
+// the route sub-row (m.routeIdx) -- at port's route of the given kind, so a
+// caller can steer the user at a SPECIFIC route rather than just the service
+// (kata h2ef: landing on a freshly-started cloudflare tunnel's own sub-row so
+// its spinner, then its resolved URL, is what's on screen without the user
+// having to navigate there themselves). No-op if port isn't present in the
+// current list; if kind isn't found among the port's current routes, the
+// service cursor still moves but the route cursor is left to clampRouteIdx's
+// existing safety net (selectPort already calls ensureRouteVisible, which
+// itself relies on m.routeIdx staying in range).
+func (m *model) selectRoute(port int, kind routeKind) {
+	m.selectPort(port)
+	pi, _, ok := m.currentService()
+	if !ok || pi.port.Number != port {
+		return
+	}
+	for i, r := range pi.routes() {
+		if r.kind == kind {
+			m.routeIdx = i
+			break
+		}
+	}
+	m.clampRouteIdx()
+	m.ensureRouteVisible()
+}
+
 // jumpService moves the SERVICE cursor by delta (Shift+arrows / J,K), landing on
 // the target service's FIRST route (design §4).
 func (m *model) jumpService(delta int) {
@@ -183,6 +209,13 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 	// off-screen -- clamping keeps the last item selected instead, which
 	// ensureRouteVisible can then scroll into view.
 	cur := clampInt(m.list.Index(), 0, len(items)-1)
+	// Precomputed once per render (kata h2ef): every pending-tunnel route
+	// shares the same animation frame, so there's no need to recompute this
+	// per service. m.emoji -- the egg's own resolved emojiCapable(), not the
+	// separate --markers-driven m.markerEmoji -- is the terminal-capability
+	// signal this reuses, matching how the egg picks its own UTF-8-vs-ASCII
+	// fallback.
+	pendingLabel := tunnelSpinnerLabel(m.tunnelSpinnerFrame, m.emoji)
 	for i, it := range items {
 		pi, ok := it.(portItem)
 		if !ok {
@@ -191,19 +224,20 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 		routes := pi.routes()
 		name, was := pi.displayName()
 		b := blockInput{
-			port:          pi.port.Number,
-			name:          name,
-			nameWas:       was,
-			pid:           pi.port.Pid,
-			favorite:      pi.meta.Favorite,
-			locked:        pi.meta.Locked,
-			dimmed:        pi.dimmed,
-			routes:        routes,
-			current:       i == cur,
-			selectedRoute: -1,
-			copiedRoute:   -1,
-			emoji:         pi.emoji,
-			width:         m.width,
+			port:                     pi.port.Number,
+			name:                     name,
+			nameWas:                  was,
+			pid:                      pi.port.Pid,
+			favorite:                 pi.meta.Favorite,
+			locked:                   pi.meta.Locked,
+			dimmed:                   pi.dimmed,
+			routes:                   routes,
+			current:                  i == cur,
+			selectedRoute:            -1,
+			copiedRoute:              -1,
+			emoji:                    pi.emoji,
+			width:                    m.width,
+			tunnelPendingPlaceholder: pendingLabel,
 		}
 		if i == cur {
 			b.selectedRoute = clampInt(m.routeIdx, 0, len(routes)-1)

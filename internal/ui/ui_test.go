@@ -1620,6 +1620,49 @@ func TestInlineCopyUniversal(t *testing.T) {
 	}
 }
 
+// TestSelectRoute covers the routenav.go focus helper added for kata h2ef: it
+// moves BOTH cursors -- the service (m.list, via selectPort) and the route
+// sub-row (m.routeIdx) -- to a specific port's route of the given kind, not
+// just the service. If that kind isn't present among the port's current
+// routes, the service cursor still moves (clampRouteIdx keeps routeIdx safe
+// either way).
+func TestSelectRoute(t *testing.T) {
+	m := New(config.Config{})
+	m.allPorts = []portscan.Port{
+		{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
+	}
+	m.showAllPorts = true
+	m.rebuildItems()
+
+	// No tunnel route exists yet -- selectRoute should still move the service
+	// cursor (there's nothing to select beyond that).
+	m.selectRoute(3000, routeTunnel)
+	if pi, _, ok := m.currentService(); !ok || pi.port.Number != 3000 {
+		t.Fatalf("selectRoute should move the service cursor to :3000 even with no matching route; ok=%v port=%+v", ok, pi.port)
+	}
+
+	// Add a second port and a tunnel route on :3000; start the selection
+	// elsewhere so the move is observable.
+	m.allPorts = []portscan.Port{
+		{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
+		{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
+	}
+	m.tunnels = map[int]tunnelInfo{3000: {pid: 111, hostname: "app.trycloudflare.com"}}
+	m.rebuildItems()
+	m.selectPort(2000)
+	m.routeIdx = 0
+
+	m.selectRoute(3000, routeTunnel)
+	pi, _, ok := m.currentService()
+	if !ok || pi.port.Number != 3000 {
+		t.Fatalf("selectRoute should move the service cursor to :3000; ok=%v port=%+v", ok, pi.port)
+	}
+	routes := pi.routes()
+	if m.routeIdx < 0 || m.routeIdx >= len(routes) || routes[m.routeIdx].kind != routeTunnel {
+		t.Errorf("selectRoute should land routeIdx on the routeTunnel sub-row; routeIdx=%d routes=%+v", m.routeIdx, routes)
+	}
+}
+
 // TestCopiedRouteStableIdentity covers z6yf: the inline "✓ copied" annotation
 // used to be tracked by route INDEX (m.copiedRouteIdx, clamped into range on
 // every render), so a route list that reorders underneath it -- a poll

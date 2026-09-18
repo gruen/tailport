@@ -41,6 +41,32 @@ var routeSelURLStyle = lipgloss.NewStyle().
 	Bold(true).
 	Underline(true)
 
+// tunnelSpinnerFramesUTF8/ASCII (kata h2ef) are the two frame sets cycled for
+// a still-pending quick tunnel's placeholder label. UTF8 is the classic
+// braille spinner (10 frames, smooth motion); ASCII is the plain 4-frame spin
+// for a terminal that can't be trusted with anything past 7-bit ASCII --
+// mirrors the egg's own UTF-8-vs-ASCII fallback (model.emoji, resolved from
+// emojiCapable()) rather than inventing a third capability signal.
+var (
+	tunnelSpinnerFramesUTF8  = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	tunnelSpinnerFramesASCII = []string{"|", "/", "-", "\\"}
+)
+
+// tunnelSpinnerLabel returns the "<glyph> starting…" placeholder shown in
+// place of a pending quick tunnel's URL, cycling frame through the UTF-8 or
+// ASCII frame set per utf8Capable. Pure and deterministic (same frame+flag in
+// -> same string out) so it's trivially unit-testable without a running
+// ticker.
+func tunnelSpinnerLabel(frame int, utf8Capable bool) string {
+	frames := tunnelSpinnerFramesASCII
+	if utf8Capable {
+		frames = tunnelSpinnerFramesUTF8
+	}
+	n := len(frames)
+	glyph := frames[((frame%n)+n)%n] // %n twice: frame is never negative in practice, but stay defensive
+	return glyph + " starting…"
+}
+
 // blockInput is the resolved, pure input to renderServiceBlock: everything
 // about one service's display already decided by the caller (name
 // resolution, which route is selected/just-copied, terminal width) so this
@@ -68,6 +94,16 @@ type blockInput struct {
 
 	emoji bool
 	width int // total available width (for URL truncation); <=0 means "don't truncate"
+
+	// tunnelPendingPlaceholder (kata h2ef) is the "<glyph> starting…" label
+	// rendered in place of a routeTunnel route's still-empty URL -- a quick
+	// Cloudflare tunnel's *.trycloudflare.com hostname isn't assigned until a
+	// few seconds after it starts (a NAMED tunnel's hostname is known up
+	// front, so its url is never empty and this is never consulted for it).
+	// Precomputed by the caller (bodyLines, which owns the animation-frame
+	// counter and the emoji-capability check) so this file stays a pure
+	// renderer with no model/timer access of its own.
+	tunnelPendingPlaceholder string
 }
 
 // renderServiceBlock returns the styled lines for one service: a header line
@@ -197,11 +233,19 @@ func renderRouteLine(b blockInput, r route, i int) string {
 	prefix := bar + "  " + pointer + " " + marker + " " + label + "  "
 
 	urlText := r.url
-	if r.kind == routeOffline || r.foreign {
+	switch {
+	case r.kind == routeOffline || r.foreign:
 		// Offline (no address at all) and a foreign tunnel (an address we
 		// deliberately never probe) both stand in for a URL with the design's
 		// em-dash placeholder.
 		urlText = "—"
+	case r.kind == routeTunnel && r.url == "":
+		// A QUICK Cloudflare tunnel whose hostname cloudflared hasn't assigned
+		// yet (kata h2ef) -- render the animated placeholder where the URL
+		// will appear once the poll picks it up. (foreign is excluded above:
+		// a foreign tunnel's url is also always "", but it gets the em-dash,
+		// never a spinner -- tailport never probes it.)
+		urlText = b.tunnelPendingPlaceholder
 	}
 
 	adorn := routeAdornments(b, r, i)

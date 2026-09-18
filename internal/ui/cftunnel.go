@@ -1,11 +1,12 @@
 package ui
 
-// Cloudflare Tunnel (the `t` key, kata nc1j): a THIRD public-exposure path
-// alongside funnel (`P`) and Caddy-publish (`p`), modeled on publish but adapted
-// to cloudflared's process model. Unlike publish -- a stateless client of a
-// remote edge -- a tunnel is a LONG-RUNNING LOCAL process tailport supervises
-// (internal/cftunnel). The whole feature is gated on cfAvailable: when
-// cloudflared isn't installed the `t` key is inert (barGroups drops it) and the
+// Cloudflare Tunnel (the `o` key, kata nc1j; remapped from `t`, kata 7nss
+// BREAKING): a THIRD public-exposure path alongside funnel (`P`) and
+// Caddy-publish (`p`), modeled on publish but adapted to cloudflared's process
+// model. Unlike publish -- a stateless client of a remote edge -- a tunnel is a
+// LONG-RUNNING LOCAL process tailport supervises (internal/cftunnel). The
+// whole feature is gated on cfAvailable: when cloudflared isn't installed the
+// `o` key is inert (barGroups drops it) and the
 // poll never runs, mirroring how the Caddy poll stays dark until caddy.domain is
 // set.
 //
@@ -42,7 +43,7 @@ type tunnelInfo struct {
 }
 
 // tunnelMemory is the session-only shortcut (mirrors publishInfo/lastPublish):
-// what a port was last tunnelled as, so `t` can re-raise a torn-down tunnel
+// what a port was last tunnelled as, so `o` can re-raise a torn-down tunnel
 // without re-running the setup prompts. Never persisted.
 type tunnelMemory struct {
 	mode     cftunnel.Mode
@@ -88,6 +89,38 @@ const tunnelPollInterval = 4 * time.Second
 
 func tunnelTick() tea.Cmd {
 	return tea.Tick(tunnelPollInterval, func(time.Time) tea.Msg { return tunnelTickMsg{} })
+}
+
+// tunnelSpinnerTickMsg advances the pending-quick-tunnel spinner one frame
+// (kata h2ef). id is a flashID-style generation guard: startTunnelSpinner
+// bumps m.tunnelSpinnerID, so a tick from an earlier, superseded animation is
+// dropped on arrival rather than reviving a loop that already stopped itself.
+type tunnelSpinnerTickMsg struct{ id int }
+
+// tunnelSpinnerInterval is a plain animation cadence -- fast enough to read as
+// motion, cheap enough that redrawing on every tick is a non-issue (a handful
+// of ticks total: quick tunnels resolve in a few seconds, and the loop
+// self-stops the moment they do -- see the tunnelSpinnerTickMsg handler).
+const tunnelSpinnerInterval = 120 * time.Millisecond
+
+func tunnelSpinnerTick(id int) tea.Cmd {
+	return tea.Tick(tunnelSpinnerInterval, func(time.Time) tea.Msg { return tunnelSpinnerTickMsg{id: id} })
+}
+
+// startTunnelSpinner arms the pending-URL spinner for port and returns its
+// first tick cmd. Called only from the quick-tunnel confirm path
+// (confirmTunnelQuick) -- a named tunnel's hostname is known up front, so it
+// never needs this. Bumping tunnelSpinnerID invalidates any previous
+// animation's in-flight tick, so two quick-tunnel starts in a row can't have
+// their ticks cross-talk. The loop stops itself (no explicit "stop" call
+// needed): the tunnelSpinnerTickMsg handler clears tunnelSpinnerPort once
+// m.tunnels[port] reports a non-empty hostname, and the tunnelDoneMsg error/
+// teardown branches clear it early if the start never produces one.
+func (m *model) startTunnelSpinner(port int) tea.Cmd {
+	m.tunnelSpinnerID++
+	m.tunnelSpinnerFrame = 0
+	m.tunnelSpinnerPort = port
+	return tunnelSpinnerTick(m.tunnelSpinnerID)
 }
 
 // tunnelStartupCmd is Init's tunnel entry point: the first poll plus the
@@ -188,7 +221,7 @@ func tunnelStopCmd(client *cftunnel.Client, pid, port int) tea.Cmd {
 	}
 }
 
-// requestTunnel is the `t` key's up-front gate, mirroring requestPublish. Guards
+// requestTunnel is the `o` key's up-front gate, mirroring requestPublish. Guards
 // run in order, then it toggles: an already-tunnelled port tears down
 // immediately (de-escalation, never gated); a port tunnelled earlier this
 // session re-raises from memory (still confirmed); otherwise it runs the full
@@ -312,7 +345,8 @@ func (m *model) updateTunnelEntry(msg tea.KeyMsg) tea.Cmd {
 // confirmTunnelQuick is the entryConfirmTunnelQuick "yes" path: spawn a quick
 // tunnel and remember the port as quick for re-raise. The URL isn't known yet
 // (it appears via the poll), so the confirm named nothing and the flash says
-// "starting…".
+// "starting…" -- and, since kata h2ef, the route row shows an animated
+// spinner in the URL's place until it resolves (startTunnelSpinner).
 func (m *model) confirmTunnelQuick() tea.Cmd {
 	port := m.tunnelPort
 	m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
@@ -322,6 +356,7 @@ func (m *model) confirmTunnelQuick() tea.Cmd {
 	return tea.Batch(
 		m.setFlash(fmt.Sprintf("starting Cloudflare quick tunnel for :%d…", port), flashInfo),
 		tunnelStartCmd(m.cfClient(), spec),
+		m.startTunnelSpinner(port),
 	)
 }
 
