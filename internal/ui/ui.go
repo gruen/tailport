@@ -7561,6 +7561,22 @@ func (m model) renderBottom() string {
 		// to match, so the list already reclaimed the freed rows.
 		bar += "\n" + m.renderHintFooter()
 	} else if legend := m.renderLegend(); legend != "" {
+		// Pad the live legend up to the height listBodyHeight already reserved
+		// (legendReservationLines -- the worst case over the contextual "C clean
+		// stale" hint). Without this, the reserved-but-unused rows surface as a
+		// phantom blank ABOVE the bar instead of being absorbed here: 04rb's fold
+		// is non-monotonic, so at some widths the live legend renders a row
+		// SHORTER than the reservation (e.g. cleanEnabled=false, or -- as CI hit
+		// after the space->t remap -- with cloudflared absent so the `o` tunnel
+		// row is dropped from the Toggle column). Tying the rendered height to the
+		// reservation here keeps the separator at exactly one row
+		// (TestNoPhantomGap) and the bar a constant height when a dangling forward
+		// or the `o` row appears/vanishes. Padding lives here, not in renderLegend,
+		// so the grid-mechanics tests still measure the unpadded grid; and
+		// legendReservationLines measures via renderLegendWith, so no recursion.
+		if reserved := m.legendReservationLines(); reserved > lipgloss.Height(legend) {
+			legend += strings.Repeat("\n", reserved-lipgloss.Height(legend))
+		}
 		bar += "\n" + legend
 	}
 	return bar

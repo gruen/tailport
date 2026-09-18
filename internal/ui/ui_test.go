@@ -6710,6 +6710,62 @@ func TestNoPhantomGap(t *testing.T) {
 	}
 }
 
+// TestNoPhantomGapAcrossCfAvailable pins the phantom-gap invariant DETERMINISTICALLY
+// against both cloudflared states (kata cp2c). The plain TestNoPhantomGap reads
+// cfAvailable from New()'s live detection, so it only exercised whichever state
+// the test host happened to be in -- which is exactly how the 7nss remap
+// regression shipped: it passed locally (cloudflared installed -> the `o` tunnel
+// row padded the Toggle column so the reserved-vs-live legend height incidentally
+// re-tied) yet failed in CI (no cloudflared -> the live legend rendered one row
+// shorter than listBodyHeight's worst-case reservation, surfacing as a phantom
+// blank above the bar). Forcing cfAvailable both ways makes the guard fire on any
+// host regardless of whether cloudflared is installed.
+func TestNoPhantomGapAcrossCfAvailable(t *testing.T) {
+	for _, cfAvailable := range []bool{false, true} {
+		name := "cloudflared-absent"
+		if cfAvailable {
+			name = "cloudflared-present"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			m := New(config.Config{})
+			m.cfAvailable = cfAvailable // pin the state BEFORE layout is sized
+			m.host = "host"
+			var ports []portscan.Port
+			for i := 0; i < 40; i++ {
+				ports = append(ports, portscan.Port{Number: 3000 + i, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+			}
+			m.allPorts = ports
+			m.showAllPorts = true
+			m.rebuildItems()
+
+			const height = 24
+			res, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: height})
+			m = res.(model)
+
+			view := m.View()
+			if got := lipgloss.Height(view); got != height {
+				t.Fatalf("View height = %d, want exactly %d:\n%s", got, height, stripANSI(view))
+			}
+			lines := strings.Split(stripANSI(view), "\n")
+			barStart := len(lines) - lipgloss.Height(m.renderBottom())
+			if barStart < 2 {
+				t.Fatalf("bottom bar leaves no room for a body in %d lines", len(lines))
+			}
+			blanks := 0
+			for i := barStart - 1; i >= 0 && strings.TrimSpace(lines[i]) == ""; i-- {
+				blanks++
+			}
+			if blanks != 1 {
+				t.Errorf("blank rows between body and bottom bar = %d, want exactly 1:\n%s", blanks, strings.Join(lines, "\n"))
+			}
+			if ind := lines[barStart-2]; !strings.Contains(ind, " of ") {
+				t.Errorf("expected the scroll indicator directly above the separator; got %q", ind)
+			}
+		})
+	}
+}
+
 // TestBannerActivationKeepsSelectionVisible guards the regression roborev job
 // 2190 flagged in the phantom-gap fix: now that an INACTIVE banner reserves no
 // rows, a banner APPEARING genuinely shrinks the visible list, so a selection
