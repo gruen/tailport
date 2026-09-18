@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Pre-push gate: tests must pass before anything reaches a remote.
+#
+# Tracked in-repo and enabled per-clone with:
+#     git config core.hooksPath .githooks
+# See AGENTS.md, "Green before push". This binds EVERY agent and human that
+# pushes this repo -- not just whoever remembers to run the tests, and not any
+# one tool's private setting. Bypass only in a genuine emergency, with the same
+# explicit authorization as a force-push:  git push --no-verify
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+fail() {
+	echo "" >&2
+	echo "pre-push BLOCKED: $1" >&2
+	echo "Fix it before pushing (real emergency only: git push --no-verify)." >&2
+	exit 1
+}
+
+echo "pre-push: gofmt / go build / go vet / go test ./... -count=1 (this repo's CI gate)…"
+
+# gofmt: -count=1 on the test step defeats a stale test cache, which once masked
+# a real failure (kata cp2c); do the same "trust nothing cached" for formatting.
+unformatted="$(gofmt -l . 2>/dev/null || true)"
+[ -z "$unformatted" ] || fail "gofmt needs to run on:"$'\n'"$unformatted"
+
+go build ./... || fail "go build failed."
+go vet ./...   || fail "go vet failed."
+go test ./... -count=1 || fail "go test failed."
+
+echo "pre-push: all green."

@@ -207,6 +207,30 @@ unless one is generated from the other).
   it with an honest caveat in the message — never claim untested code
   paths as verified.
 
+### Green before push (enforced, not left to trust)
+
+Tests must pass before anything reaches `origin/main` — for EVERY agent and
+human that works here, not just whoever remembers to check, and not via one
+assistant's private memory or a single tool's settings. It is a repo mechanism:
+
+- A tracked hook, `.githooks/pre-push`, runs `gofmt -l`, `go build ./...`,
+  `go vet ./...`, and `go test ./... -count=1`, and BLOCKS the push on any
+  failure. The `-count=1` is deliberate: a stale test cache once masked a real
+  failure that reached `main` (kata cp2c).
+- Enable it once per clone — this is step zero for any agent or human working
+  here: `git config core.hooksPath .githooks`. A checkout without this is not
+  set up; do it before your first push.
+- The hook runs in your LOCAL environment, so it is the first line, not the
+  last. CI (`.github/workflows/ci.yml`) is authoritative: it runs the same
+  suite plus `go test -race ./internal/ui/` on the Go version pinned in
+  `go.mod`. Some failures are environment-divergent — e.g. a bottom-bar layout
+  test that only fails when `cloudflared` is absent (CI's state, not most dev
+  boxes'; kata cp2c). So after pushing, WATCH the run to green
+  (`gh run watch <id>`) before calling the work done or cutting a release; never
+  report success off a local pass alone.
+- `git push --no-verify` (skipping the hook) is for a genuine emergency only and
+  needs the same explicit, per-action authorization as force-push (see below).
+
 ### Workflow
 
 - Use kata for all real feature/bug work in this repo. Search before
