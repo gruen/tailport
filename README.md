@@ -168,6 +168,8 @@ or `?` when the port belongs to a process owned by a different user (commonly
 | `e` | Edit a published port's auth in place (can't move it to a new hostname) |
 | `o` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
+| `i` | Copy the selected **port's** bare PID (e.g. `12345`) — refuses if it can't be resolved |
+| `I` | Copy a ready-to-run `kill <pid>` command (SIGTERM) — same refusal as `i` |
 | `C` | Tear down stale forwards (served with nothing listening) |
 | `x` | Lock / unlock the selected port (`:22` ships locked; unlocking it needs a typed `ssh`) |
 | `n` | Add a port to Favorites by number (even one nothing's listening on yet) |
@@ -187,6 +189,12 @@ Every action is service-scoped **except** copy (`c`/`y`), which acts on the
 exact route row you've navigated to. A copy is confirmed inline with a ✓ on that
 route's line, or by a toast when the route has no URL yet (e.g. an `offline`
 route or a still-starting quick tunnel).
+
+`i` and `I` copy a property of the **port**, not the route, so they resolve to
+the port even when a route sub-row is selected, and always confirm by toast
+(there's no per-route line to annotate). Both refuse — a toast naming the
+port, nothing copied — when the port's PID can't be resolved (`0`): a
+foreign-owned port, or a favorite that's currently down.
 
 ## Exposing a port
 

@@ -206,8 +206,16 @@ type keyMap struct {
 	Redo    key.Binding
 	ShowAll key.Binding
 	Copy    key.Binding
-	Clean   key.Binding
-	Refresh key.Binding
+	// CopyPid copies the selected port's bare PID (kata 4ref), and CopyKill
+	// copies a ready-to-run "kill <pid>" command (SIGTERM default -- a safe
+	// manual escape hatch until an in-app kill lands, see q1cy). Both reuse
+	// Copy's clip/OSC 52 path and toast (setFlash) rather than Copy's inline
+	// per-route "✓ copied" annotation, since Pid is port-scoped, not
+	// route-scoped -- see the Update handlers for the Pid==0 refusal.
+	CopyPid  key.Binding
+	CopyKill key.Binding
+	Clean    key.Binding
+	Refresh  key.Binding
 	// Hints toggles the bottom-bar keybinding legend on/off (the `h` key). When
 	// hidden, a single right-aligned "h show/hide key bindings" footer persists
 	// so it stays discoverable; the reclaimed rows go back to the port list.
@@ -234,14 +242,16 @@ type keyGroup struct {
 // group with x lock/unlock always the last item. Clean is contextual: barGroups
 // drops it unless a dangling forward exists, so ordering it before Lock keeps
 // Lock last in every state. Copy moved out to sit under "n new favorite" in
-// Favorites. Edit (kata prp1) sits right after Lock -- it's a publish-flow
-// variant, not an exposure guard, but there's no later slot that reads better.)
+// Favorites, with CopyPid/CopyKill (kata 4ref: i/I) directly beneath it --
+// same clip/OSC 52 family, port-scoped rather than route-scoped. Edit (kata
+// prp1) sits right after Lock -- it's a publish-flow variant, not an
+// exposure guard, but there's no later slot that reads better.)
 // The three public paths run publish (p) -> cloudflare tunnel (t) -> funnel (P):
 // funnel sits BELOW the tunnel per mg's ordering (nc1j follow-up).
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
 		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Publish, k.Tunnel, k.Funnel, k.Clean, k.Lock, k.Edit}},
-		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.Label}},
+		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.CopyPid, k.CopyKill, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
 		// edit, including the lock changes that live in the exposure column, so
@@ -317,6 +327,11 @@ func newKeyMap() keyMap {
 		Redo:    key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "redo")),
 		ShowAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
 		Copy:    key.NewBinding(key.WithKeys("c", "y"), key.WithHelp("c", "copy URL")),
+		// CopyPid/CopyKill (kata 4ref): i/I were freed by 7nss's t/o remap.
+		// Both refuse (toast, no clipboard write) when the port's Pid is 0 --
+		// see the "i"/"I" Update handlers.
+		CopyPid:  key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "copy PID")),
+		CopyKill: key.NewBinding(key.WithKeys("I"), key.WithHelp("I", "copy kill cmd")),
 		// Clean moved to shift-C when "c" was reassigned to copy (vnq7); it's
 		// contextual (only enabled when dangling forwards exist), so demoting
 		// it to a shifted key is fine.
@@ -2035,12 +2050,18 @@ func httpURL(host string, port int) string {
 	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
+// clipCopy is the clipboard-write hook copyCmd invokes -- a package var
+// (default clip.Copy) so tests can substitute a spy and assert exactly what
+// was copied (kata 4ref), rather than only inferring it from the toast text.
+// Production code never reassigns it.
+var clipCopy = clip.Copy
+
 // copyCmd performs the clipboard write off the render path (it may shell out to
 // a local helper). clip.Copy is best-effort and can't be confirmed, so it
 // returns no message -- the toast set by copyURL is the user's feedback.
 func copyCmd(url string) tea.Cmd {
 	return func() tea.Msg {
-		clip.Copy(url)
+		clipCopy(url)
 		return nil
 	}
 }
@@ -4404,6 +4425,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.setFlash(fmt.Sprintf(":%d %s — nothing to copy yet", sel.port.Number, r.label()), flashWarn)
 			}
 			return m, m.copyRoute(sel.port.Number, r.kind, r.url)
+		case "i":
+			// Copy the selected port's bare PID (kata 4ref). sel.port is
+			// already the OWNING port regardless of which route sub-row
+			// m.routeIdx points at -- routes are a display-only cursor into
+			// one portItem (routenav.go: routes()/currentService()), not
+			// separate list items -- so this is the same resolution "c"
+			// above uses, with nothing extra needed to walk up from a route.
+			// Refuses (toast, no clipboard write) when Pid is unresolved
+			// (0): a foreign-owned port, or a favorite that's currently down.
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			if sel.port.Pid == 0 {
+				return m, m.setFlash(fmt.Sprintf("no PID for :%d", sel.port.Number), flashWarn)
+			}
+			pid := strconv.Itoa(sel.port.Pid)
+			return m, tea.Batch(copyCmd(pid), m.setFlash(fmt.Sprintf(":%d — copied PID %s", sel.port.Number, pid), flashInfo))
+		case "I":
+			// Copy a ready-to-run "kill <pid>" command (SIGTERM default --
+			// lines up with the future in-app kill, q1cy -- and is a safe
+			// manual escape hatch until that lands). Same owning-port
+			// resolution and Pid==0 refusal as "i" above.
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			if sel.port.Pid == 0 {
+				return m, m.setFlash(fmt.Sprintf("no PID for :%d", sel.port.Number), flashWarn)
+			}
+			killCmd := fmt.Sprintf("kill %d", sel.port.Pid)
+			return m, tea.Batch(copyCmd(killCmd), m.setFlash(fmt.Sprintf(":%d — copied %q", sel.port.Number, killCmd), flashInfo))
 		case "C":
 			// Batch-tear-down of dangling forwards, behind a y/n confirm (moved
 			// from "c" to shift-C when "c" became copy; see vnq7). No-op while a
@@ -4999,8 +5052,8 @@ func legendFoldedLayout(name string, cells []legendCell) legendGroupLayout {
 // cell is padded so the columns line up. It returns the rendered grid and its
 // total display width, which renderLegendWith uses as the responsive threshold.
 //
-// (04rb) Bar height is set by the tallest group (today, Favorites' 5
-// bindings). When width leaves surplus room past the packed (unfolded) grid,
+// (04rb) Bar height is set by the tallest group (today, Favorites' 7
+// bindings, kata 4ref). When width leaves surplus room past the packed (unfolded) grid,
 // that surplus is spent folding a group's single body sub-column into 2
 // column-major sub-columns instead -- which SHORTENS the bar, rather than
 // spreading the groups apart with bigger gutters (explicitly rejected: it
@@ -6456,6 +6509,8 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. o is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
+		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
+		"I":      "Copy a ready-to-run kill command for the selected port's PID\n(e.g. \"kill 12345\", SIGTERM -- no signal flag), via the same path as\ni. A safe manual stand-in until an in-app kill exists. Same Pid==0\nrefusal as i: no command is copied for an unresolved PID.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
 		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them. (To restore a\nforce-purged route is a SEPARATE affordance on its own key — R,\nshown in the status line right after the purge — not this.)",

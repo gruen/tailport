@@ -1620,6 +1620,200 @@ func TestInlineCopyUniversal(t *testing.T) {
 	}
 }
 
+// drainClipCopy runs a tea.Cmd (including a nested tea.Batch, as the i/I
+// handlers return: copyCmd paired with setFlash's expiry timer) far enough to
+// capture every clip write, substituting a spy for clipCopy so the test can
+// assert the EXACT string(s) written to the clipboard -- not just infer them
+// from the toast text. It restores the real clipCopy before returning.
+//
+// setFlash's expiry cmd is a real tea.Tick that BLOCKS for 3-5s when invoked
+// directly (outside bubbletea's own runtime, which would run it
+// concurrently) -- copyCmd never does. Each leaf cmd therefore runs on its
+// own goroutine with a short deadline: copyCmd's synchronous write is always
+// well within it, and a still-running cmd past the deadline is abandoned
+// (harmless -- it doesn't touch clipCopy) rather than blocking the test for
+// seconds.
+func drainClipCopy(cmd tea.Cmd) []string {
+	var got []string
+	orig := clipCopy
+	clipCopy = func(s string) { got = append(got, s) }
+	defer func() { clipCopy = orig }()
+	var drain func(c tea.Cmd)
+	drain = func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		done := make(chan tea.Msg, 1)
+		go func() { done <- c() }()
+		select {
+		case msg := <-done:
+			if batch, ok := msg.(tea.BatchMsg); ok {
+				for _, sub := range batch {
+					drain(sub)
+				}
+			}
+		case <-time.After(200 * time.Millisecond):
+			// Abandon a slow cmd (e.g. setFlash's multi-second expiry tick) --
+			// nothing under test lives there.
+		}
+	}
+	drain(cmd)
+	return got
+}
+
+// TestCopyPidAndKill covers kata 4ref: `i` copies the selected port's bare
+// PID and `I` copies a ready-to-run "kill <pid>" command (SIGTERM, no signal
+// flag) -- both via the same copyCmd/clip path as `c` (vnq7), confirmed by a
+// toast that names the exact value copied. Unlike `c`, Pid is PORT-scoped,
+// not route-scoped, so there's no per-route line to annotate inline -- both
+// keys always toast, success or refusal. portscan.Port.Pid == 0 (unresolved,
+// or a favorite that's currently down) must refuse: a toast naming the port,
+// nothing written to the clipboard.
+func TestCopyPidAndKill(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	newModel := func(pid int) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+		m.host = "host"
+		m.width = 80
+		// A served wildcard bind -> routes[0]=localhost, routes[1]=tailnet
+		// (mirrors TestCopyURL's fixture, needed for the route-resolution case
+		// below).
+		m.allPorts = []portscan.Port{{Number: 8080, Process: "web", Pid: pid, BindScope: portscan.ScopeWildcard}}
+		m.active = map[int]bool{8080: true}
+		m.showAllPorts = true
+		m.rebuildItems()
+		return m
+	}
+
+	t.Run("i copies the bare PID", func(t *testing.T) {
+		m := newModel(12345)
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 1 || copied[0] != "12345" {
+			t.Fatalf("clipboard writes = %v, want exactly [%q]", copied, "12345")
+		}
+		if m.flashLevel != flashInfo || !strings.Contains(m.flash, "12345") {
+			t.Errorf("flash = %q level=%v, want an info toast naming 12345", m.flash, m.flashLevel)
+		}
+	})
+
+	t.Run("I copies a kill command", func(t *testing.T) {
+		m := newModel(12345)
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 1 || copied[0] != "kill 12345" {
+			t.Fatalf("clipboard writes = %v, want exactly [%q]", copied, "kill 12345")
+		}
+		if m.flashLevel != flashInfo || !strings.Contains(m.flash, "kill 12345") {
+			t.Errorf("flash = %q level=%v, want an info toast naming \"kill 12345\"", m.flash, m.flashLevel)
+		}
+	})
+
+	t.Run("i refuses when Pid is unresolved (0)", func(t *testing.T) {
+		m := newModel(0)
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 0 {
+			t.Errorf("clipboard writes = %v, want none (refused)", copied)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, "no PID for :8080") {
+			t.Errorf("flash = %q level=%v, want a warn toast reading \"no PID for :8080\"", m.flash, m.flashLevel)
+		}
+	})
+
+	t.Run("I refuses when Pid is unresolved (0)", func(t *testing.T) {
+		m := newModel(0)
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 0 {
+			t.Errorf("clipboard writes = %v, want none (refused)", copied)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, "no PID for :8080") {
+			t.Errorf("flash = %q level=%v, want a warn toast reading \"no PID for :8080\"", m.flash, m.flashLevel)
+		}
+	})
+
+	// A down favorite is the OTHER documented Pid==0 cause (not foreign-owned,
+	// just nothing listening) -- same refusal, no clipboard write.
+	t.Run("i refuses for a down favorite (Pid 0, nothing listening)", func(t *testing.T) {
+		m := New(config.Config{Ports: map[int]config.PortMeta{6379: {Favorite: true}}})
+		m.host = "host"
+		m.width = 80
+		m.allPorts = nil // down favorite: nothing listening, Pid stays 0
+		m.active = map[int]bool{}
+		m.showAllPorts = true
+		m.rebuildItems()
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 0 {
+			t.Errorf("clipboard writes = %v, want none (refused)", copied)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, "no PID for :6379") {
+			t.Errorf("flash = %q level=%v, want a warn toast reading \"no PID for :6379\"", m.flash, m.flashLevel)
+		}
+	})
+
+	// Route-to-port resolution (the ticket's core requirement, th05-era copy
+	// is route-scoped but Pid is port-scoped): move the route cursor off
+	// routeIdx 0 onto a different route sub-row (the tailnet route) and
+	// confirm i/I still resolve to the OWNING port's Pid, not zero and not
+	// some other port's.
+	t.Run("i resolves the owning port from a route sub-row", func(t *testing.T) {
+		m := newModel(12345)
+		r1, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}}) // down -> tailnet route
+		m = r1.(model)
+		if m.routeIdx == 0 {
+			t.Fatal("setup: expected the route cursor to have moved off routeIdx 0")
+		}
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 1 || copied[0] != "12345" {
+			t.Fatalf("clipboard writes = %v, want exactly [%q] (resolved from the route sub-row to the owning port)", copied, "12345")
+		}
+		if !strings.Contains(m.flash, ":8080") {
+			t.Errorf("flash = %q, want it to name :8080 (the owning port), not the route", m.flash)
+		}
+	})
+
+	t.Run("I resolves the owning port from a route sub-row", func(t *testing.T) {
+		m := newModel(12345)
+		r1, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}}) // down -> tailnet route
+		m = r1.(model)
+		if m.routeIdx == 0 {
+			t.Fatal("setup: expected the route cursor to have moved off routeIdx 0")
+		}
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 1 || copied[0] != "kill 12345" {
+			t.Fatalf("clipboard writes = %v, want exactly [%q] (resolved from the route sub-row to the owning port)", copied, "kill 12345")
+		}
+		if !strings.Contains(m.flash, ":8080") {
+			t.Errorf("flash = %q, want it to name :8080 (the owning port), not the route", m.flash)
+		}
+	})
+}
+
+// TestCopyPidKeymap pins the i/I bindings themselves: `i` matches CopyPid and
+// nothing else, `I` matches CopyKill and nothing else (kata 4ref, mirroring
+// TestCopyKeymap's c/C pin).
+func TestCopyPidKeymap(t *testing.T) {
+	k := newKeyMap()
+	if k.CopyPid.Help().Key != "i" {
+		t.Errorf("CopyPid help key = %q, want i", k.CopyPid.Help().Key)
+	}
+	if k.CopyKill.Help().Key != "I" {
+		t.Errorf("CopyKill help key = %q, want I", k.CopyKill.Help().Key)
+	}
+	iLower := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}}
+	iUpper := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}}
+	if !key.Matches(iLower, k.CopyPid) || key.Matches(iLower, k.CopyKill) {
+		t.Error("'i' should match CopyPid, not CopyKill")
+	}
+	if !key.Matches(iUpper, k.CopyKill) || key.Matches(iUpper, k.CopyPid) {
+		t.Error("'I' should match CopyKill, not CopyPid")
+	}
+}
+
 // TestSelectRoute covers the routenav.go focus helper added for kata h2ef: it
 // moves BOTH cursors -- the service (m.list, via selectPort) and the route
 // sub-row (m.routeIdx) -- to a specific port's route of the given kind, not
@@ -3885,10 +4079,12 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// documents it even though barGroups hides it from the bottom bar. h (hints)
 	// also lives in App. nc1j: exposure column runs t/p/o/P (funnel below the
 	// cloudflare tunnel) then C/x/e. (7nss BREAKING: toggle moved space->t,
-	// tunnel moved t->o.)
+	// tunnel moved t->o.) kata 4ref: i (copy PID) / I (copy kill cmd) sit
+	// directly under c (copy URL) in Favorites -- same clip/OSC 52 family,
+	// port-scoped rather than route-scoped.
 	wantKeys := [][]string{
 		{"t", "p", "o", "P", "C", "x", "e"}, // Publish=p, Tunnel=o (nc1j), Funnel=P below it; Edit=e (kata prp1)
-		{"f", "F", "n", "c", "l"},
+		{"f", "F", "n", "c", "i", "I", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "h", "?", "q"},
 	}
@@ -3926,15 +4122,17 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 // floor width, with a header row and aligned gutters: descriptions line up
 // within a column and columns line up across rows. With no dangling, Toggle
 // Service Exposure is t/p/P/x/e (edit last, kata prp1; clean dropped;
-// `o` cloudflare tunnel is pinned off, see cfAvailable below) and Favorites
-// is f/F/n/c/l -- TIED for tallest column at 5 rows each -- so the grid is a
-// header + 5 rows. (nc1j lengthened the header to "Toggle Service Exposure"
-// and added the App-group `h` hints key, pushing the packed floor from 64 to
-// 82 wide -- see TestBottomBarGridFolds for the fold thresholds.)
+// `o` cloudflare tunnel is pinned off, see cfAvailable below) at 5 rows, and
+// Favorites is f/F/n/c/i/I/l (kata 4ref added i/I under c) at 7 rows -- the
+// column that now sets the grid's height, so the grid is a header + 7 rows.
+// (nc1j lengthened the header to "Toggle Service Exposure" and added the
+// App-group `h` hints key, pushing the packed floor to 80 wide (81 with `o`
+// shown); 4ref's wider "I copy kill cmd" cell then added 1 more, to 81 (82
+// with `o`) -- see TestBottomBarGridFolds for the fold thresholds.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
 	m.cfAvailable = false // pin: this exercises grid mechanics with the classic key set (no `o`), independent of whether the test host has cloudflared (kata nc1j)
-	const width = 90      // packed floor is 82 wide; Toggle Service Exposure's fold needs >=104
+	const width = 90      // packed floor is 81 wide (kata 4ref); Favorites' fold needs >=100
 	m.help.Width = width
 	m.width = width
 
@@ -4035,6 +4233,14 @@ func TestBottomBarGridAligned(t *testing.T) {
 // is set by the tallest group's row count), tallest group first, never past
 // 2 sub-columns per group, and stops folding as soon as a candidate no
 // longer fits.
+//
+// kata 4ref added CopyPid/CopyKill (i/I) to Favorites, right under Copy, so
+// Favorites now carries 7 bindings (f/F/n/c/i/I/l) -- no longer tied with
+// Toggle Service Exposure's 5 (t/p/P/x/e), but OUTRIGHT the tallest group.
+// Since the fold order is sorted by UNFOLDED row count descending (ties
+// broken by groups() order) and computed once up front, Favorites is now
+// tried FIRST regardless of ties, ahead of Toggle Service Exposure -- a
+// genuine behavior change from the pre-4ref tie, not just a relabeling.
 func TestBottomBarGridFolds(t *testing.T) {
 	lineOf := func(lines []string, needle string) int {
 		for i, ln := range lines {
@@ -4048,37 +4254,64 @@ func TestBottomBarGridFolds(t *testing.T) {
 	m := New(config.Config{})
 	m.cfAvailable = false // pin the classic key set (no `t`) for deterministic grid mechanics (kata nc1j)
 
-	// Floor: below the fold threshold (the first fold -- Toggle Service
-	// Exposure, see below -- needs total width >=104; see the 82-wide packed
-	// floor in TestBottomBarNarrowFallback), the grid is the exact packed
-	// layout -- header + 5 rows. Toggle Service Exposure (t/p/P/x/e, kata
-	// prp1 added e) and Favorites (f/F/n/c/l) are TIED for tallest at 5 rows
-	// each. (nc1j lengthened the header and added App's `h` hints key, which
-	// pushed the packed floor from 64 to 82 -- see TestBottomBarGridAligned.)
+	// Floor: below the first fold threshold, the grid is the exact packed
+	// layout -- header + 7 rows, Favorites' now-uncontested tallest count
+	// (f/F/n/c/i/I/l). (nc1j lengthened the header and added App's `h` hints
+	// key, pushing the packed floor to 80 wide -- see TestBottomBarGridAligned;
+	// 4ref then grew Favorites from 5 to 7 rows -- taller, and its widest cell
+	// "I copy kill cmd" is also 1 char wider than the old "n new favorite",
+	// so the packed floor grew to 81 wide too, not just taller.)
 	m.help.Width, m.width = 90, 90
 	floor := stripANSI(m.renderLegend())
 	floorLines := strings.Split(floor, "\n")
-	if len(floorLines) != 6 {
-		t.Fatalf("floor (width 90) grid should be header + 5 rows (6 lines); got %d:\n%s", len(floorLines), floor)
+	if len(floorLines) != 8 {
+		t.Fatalf("floor (width 90) grid should be header + 7 rows (8 lines); got %d:\n%s", len(floorLines), floor)
 	}
 
-	// Wide: 120 cols is enough surplus to fold Toggle Service Exposure and
-	// Favorites (kata prp1: Toggle Service Exposure is tied with Favorites at
-	// 5 rows, and -- since the fold candidates are sorted STABLE by row count
-	// and Toggle Service Exposure comes first in groups() -- it is tried
-	// FIRST on the tie) but NOT View (3 rows) or App (nc1j: now 4 rows, since
-	// `h` hints joined u/?/q -- which makes App OUT-RANK View in the
-	// tallest-first order, so App is tried before View; App still doesn't fit
-	// the fold at 120, checked below, and View -- tried LAST -- never even
-	// gets attempted until App's fold fits, see below). Folding SHORTENS the
-	// bar: after both folds, the tallest UNFOLDED group (App, 4 rows) sets the
-	// height, so header+4 = 5 lines, fewer than the floor's 6.
+	// Favorites-only fold: 100 cols is enough surplus to fold ONLY Favorites
+	// (the sole tallest, tried first). Toggle Service Exposure (5 rows) does
+	// NOT fold yet -- it's tried next but doesn't fit at this width -- and
+	// since the algorithm stops at the first candidate that doesn't fit
+	// (never backtracks to try a later, smaller one), App and View never even
+	// get attempted here. Folded, Favorites splits top-heavy 4/3 (f/F/n/c
+	// left, i/I/l right), dropping its row count from 7 to 4 -- below Toggle
+	// Service Exposure's still-unfolded 5, which now sets the bar's height:
+	// header+5 = 6 lines, shorter than the floor's 8.
+	m.help.Width, m.width = 100, 100
+	favOnly := stripANSI(m.renderLegend())
+	favOnlyLines := strings.Split(favOnly, "\n")
+	if len(favOnlyLines) != 6 {
+		t.Fatalf("favorites-only-folded (width 100) grid should be header + 5 rows (6 lines); got %d:\n%s", len(favOnlyLines), favOnly)
+	}
+	if r1, r2 := lineOf(favOnlyLines, "f favorite"), lineOf(favOnlyLines, "i copy PID"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold f favorite/i copy PID onto the same row at width 100; f favorite row %d, i copy PID row %d:\n%s", r1, r2, favOnly)
+	}
+	if r1, r2 := lineOf(favOnlyLines, "F forget"), lineOf(favOnlyLines, "I copy kill cmd"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold F forget/I copy kill cmd onto the same row at width 100; F forget row %d, I copy kill cmd row %d:\n%s", r1, r2, favOnly)
+	}
+	if r1, r2 := lineOf(favOnlyLines, "n new favorite"), lineOf(favOnlyLines, "l label"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should fold n new favorite/l label onto the same row at width 100; n new favorite row %d, l label row %d:\n%s", r1, r2, favOnly)
+	}
+	if r := lineOf(favOnlyLines, "c copy URL"); r < 0 {
+		t.Errorf("c copy URL missing from favorites-only-folded grid:\n%s", favOnly)
+	} else if strings.Contains(favOnlyLines[r], "l label") {
+		t.Errorf("c copy URL's row should have an empty second sub-col (top-heavy 4/3 split, only 3 right-col items): %q", favOnlyLines[r])
+	}
+	// Toggle Service Exposure must NOT have folded yet at this width.
+	if r1, r2 := lineOf(favOnlyLines, "t on tailscale"), lineOf(favOnlyLines, "x lock/unlock"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("Toggle Service Exposure should NOT fold at width 100 (Favorites folds first and alone); t on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, favOnly)
+	}
+
+	// Wide: 120 cols is enough surplus to ALSO fold Toggle Service Exposure
+	// (tried second, now that Favorites' fold succeeded) but not yet App (4
+	// rows) or View (3 rows). Folding SHORTENS the bar further: Favorites'
+	// already-folded 4 rows now sets the height (Toggle Service Exposure
+	// folds to 3), so header+4 = 5 lines.
 	m.help.Width, m.width = 120, 120
 	wide := stripANSI(m.renderLegend())
 	wideLines := strings.Split(wide, "\n")
-	if len(wideLines) >= len(floorLines) {
-		t.Errorf("wide (120) grid (%d lines) should be shorter than the floor grid (%d lines) once tall groups fold:\nfloor:\n%s\nwide:\n%s",
-			len(wideLines), len(floorLines), floor, wide)
+	if len(wideLines) != 5 {
+		t.Fatalf("wide (width 120) grid should be header + 4 rows (5 lines); got %d:\n%s", len(wideLines), wide)
 	}
 
 	// Toggle Service Exposure folded: top-heavy column-major split --
@@ -4105,20 +4338,9 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("P on ts.net (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
-	// Favorites folded too: top-heavy column-major split -- f/F/n down the
-	// first sub-column, c/l down the second (never a dangling item left
-	// stranded atop an empty second sub-column). "c copy URL" now sits beside
-	// "f favorite" on the SAME row, not two rows below it as in the floor.
-	if r1, r2 := lineOf(wideLines, "f favorite"), lineOf(wideLines, "c copy URL"); r1 < 0 || r1 != r2 {
-		t.Errorf("Favorites should fold f favorite/c copy URL onto the same row; f favorite row %d, c copy URL row %d:\n%s", r1, r2, wide)
-	}
-	if r1, r2 := lineOf(wideLines, "F forget"), lineOf(wideLines, "l label"); r1 < 0 || r1 != r2 {
-		t.Errorf("Favorites should fold F forget/l label onto the same row; F forget row %d, l label row %d:\n%s", r1, r2, wide)
-	}
-	if r := lineOf(wideLines, "n new favorite"); r < 0 {
-		t.Errorf("n new favorite missing from wide grid:\n%s", wide)
-	} else if strings.Contains(wideLines[r], "l label") {
-		t.Errorf("n new favorite's row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+	// Favorites is still folded exactly as at width 100 above.
+	if r1, r2 := lineOf(wideLines, "f favorite"), lineOf(wideLines, "i copy PID"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should stay folded (f favorite/i copy PID same row) at width 120; f favorite row %d, i copy PID row %d:\n%s", r1, r2, wide)
 	}
 
 	// App (4 bar bindings since nc1j added `h` hints -- u undo, h hints, ?
@@ -4130,32 +4352,33 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("App should NOT fold at width 120 (no surplus left after the other 2 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
 	}
 
-	// App folds once there's room for it (nc1j: it now out-ranks View at 4
-	// rows, so it's tried before View -- and the algorithm never backtracks to
-	// a later, smaller candidate once one doesn't fit, so View can't fold
-	// before App does). At 130 App's 4 items split column-major: "u undo"
+	// App folds once there's room for it (nc1j: it out-ranks View at 4 rows,
+	// so it's tried before View -- and the algorithm never backtracks to a
+	// later, smaller candidate once one doesn't fit, so View can't fold
+	// before App does). At 125 App's 4 items split column-major: "u undo"
 	// beside "? help" on one row, "h show/hide key bindings" beside "q quit"
-	// on the next -- but View still doesn't fit (its own fold needs >=135, past
-	// 130), so "/ filter"/"a switch view"/"r refresh" stay on SEPARATE rows.
-	m.help.Width, m.width = 130, 130
-	w130 := strings.Split(stripANSI(m.renderLegend()), "\n")
-	if r1, r2 := lineOf(w130, "u undo"), lineOf(w130, "? help"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold u undo/? help onto the same row at width 130; u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	// on the next -- but View still doesn't fit (its own fold needs >=140,
+	// past 125), so "/ filter"/"a switch view"/"r refresh" stay on SEPARATE
+	// rows.
+	m.help.Width, m.width = 125, 125
+	w125 := strings.Split(stripANSI(m.renderLegend()), "\n")
+	if r1, r2 := lineOf(w125, "u undo"), lineOf(w125, "? help"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold u undo/? help onto the same row at width 125; u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
-	if r1, r2 := lineOf(w130, "show/hide key bindings"), lineOf(w130, "q quit"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold h show/hide key bindings/q quit onto the same row at width 130; h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	if r1, r2 := lineOf(w125, "show/hide key bindings"), lineOf(w125, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold h show/hide key bindings/q quit onto the same row at width 125; h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
-	if r1, r2 := lineOf(w130, "/ filter"), lineOf(w130, "r refresh"); r1 < 0 || r2 < 0 || r1 == r2 {
-		t.Errorf("View should NOT fold at width 130 (needs >=135); / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w130, "\n"))
+	if r1, r2 := lineOf(w125, "/ filter"), lineOf(w125, "r refresh"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("View should NOT fold at width 125 (needs >=140); / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
 
-	// View folds last, once there's room for it (its own fold needs >=135,
-	// past App's 130 above). At 135 its 3 items split column-major: "/ filter"
+	// View folds last, once there's room for it (its own fold needs >=140,
+	// past App's 125 above). At 140 its 3 items split column-major: "/ filter"
 	// beside "r refresh" on one row, "a switch view" below.
-	m.help.Width, m.width = 135, 135
-	w135 := strings.Split(stripANSI(m.renderLegend()), "\n")
-	if r1, r2 := lineOf(w135, "/ filter"), lineOf(w135, "r refresh"); r1 < 0 || r1 != r2 {
-		t.Errorf("View should fold / filter and r refresh onto the same row at width 135; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w135, "\n"))
+	m.help.Width, m.width = 140, 140
+	w140 := strings.Split(stripANSI(m.renderLegend()), "\n")
+	if r1, r2 := lineOf(w140, "/ filter"), lineOf(w140, "r refresh"); r1 < 0 || r1 != r2 {
+		t.Errorf("View should fold / filter and r refresh onto the same row at width 140; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
 	}
 
 	// Ceiling: a very wide terminal folds ALL FOUR groups, App included,
@@ -4172,13 +4395,17 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// App's 4 bar bindings (nc1j added `h`) fold EVEN column-major: u/h down
 	// the first sub-column, ?/q down the second -- so "u undo" pairs with "?
 	// help" on one row, and "h show/hide key bindings" pairs with "q quit" on
-	// the next (before nc1j, App was 3 bindings and folded top-heavy 2/1,
-	// reading "u undo | q quit" / "? help" alone).
+	// the next.
 	if r1, r2 := lineOf(ceilingLines, "u undo"), lineOf(ceilingLines, "? help"); r1 < 0 || r1 != r2 {
 		t.Errorf("App should fold at the ceiling width (u undo | ? help on one row); u undo row %d, ? help row %d:\n%s", r1, r2, ceiling)
 	}
 	if r1, r2 := lineOf(ceilingLines, "show/hide key bindings"), lineOf(ceilingLines, "q quit"); r1 < 0 || r1 != r2 {
 		t.Errorf("App's folded second sub-col pairs h show/hide key bindings with q quit; h row %d, q quit row %d:\n%s", r1, r2, ceiling)
+	}
+	// Favorites' folded shape (4/3 split, kata 4ref) is unchanged at the
+	// ceiling -- it never gets a second fold pass.
+	if r1, r2 := lineOf(ceilingLines, "f favorite"), lineOf(ceilingLines, "i copy PID"); r1 < 0 || r1 != r2 {
+		t.Errorf("Favorites should stay folded (f favorite/i copy PID same row) at the ceiling; f favorite row %d, i copy PID row %d:\n%s", r1, r2, ceiling)
 	}
 
 	// Still no truncation/ellipsis at the ceiling: every hint present. ("P
@@ -4190,7 +4417,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// that padding regardless.)
 	for _, want := range []string{
 		"t on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
-		"f favorite", "F forget", "n new favorite", "c copy URL", "l label",
+		"f favorite", "F forget", "n new favorite", "c copy URL", "i copy PID", "I copy kill cmd", "l label",
 		"/ filter", "a switch view", "r refresh",
 		"u undo", "show/hide key bindings", "? help", "q quit",
 	} {
@@ -4208,16 +4435,18 @@ func TestBottomBarGridFolds(t *testing.T) {
 
 // TestBottomBarGridFoldedSubColAligned covers kata xqdk: a folded group's
 // SECOND sub-column must begin at the same display column on every row, not
-// hug the previous row's (possibly shorter) sub-col-1 content. Favorites
-// folds at width 120 (see TestBottomBarGridFolds) into a top-heavy 3/2 split:
-// f/u/n down sub-col 1, c/l down sub-col 2. Sub-col 1's rendered content width
-// varies by row -- "f favorite" is 10 wide, "u unfavorite" is 12, "n add
+// hug the previous row's (possibly shorter) sub-col-1 content. Favorites now
+// carries 7 bindings (kata 4ref added i/I under c), so it folds top-heavy
+// 4/3: f/F/n/c down sub-col 1, i/I/l down sub-col 2 -- and it's now the sole
+// tallest group, so unlike before it folds well below the width where Toggle
+// Service Exposure does too (see TestBottomBarGridFolds). Sub-col 1's
+// rendered content width varies by row -- "f favorite" is 10 wide, "n new
 // favorite" is 14 (the widest, setting subWidth[0]) -- which is exactly the
-// shape that exposed the bug: sub-col 2 used to start right after each row's
-// OWN sub-col-1 content instead of at the fixed subWidth[0] edge, so "c copy
-// URL" (behind the short "f favorite") landed left of where "l label" (behind
-// the longer "u unfavorite") landed, instead of both landing on the same
-// column.
+// shape that exposed the original bug: sub-col 2 used to start right after
+// each row's OWN sub-col-1 content instead of at the fixed subWidth[0] edge,
+// so "i copy PID" (behind the short "f favorite") landed left of where
+// "l label" (behind the longer "n new favorite") landed, instead of both
+// landing on the same column.
 func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 	m := New(config.Config{})
 	m.cfAvailable = false // pin the classic key set (no `t`) for deterministic grid mechanics (kata nc1j)
@@ -4236,22 +4465,22 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 		return -1
 	}
 
-	// Sub-col 2's two cells ("c copy URL" on the "f favorite" row, "l label" on
-	// the "u unfavorite" row) must start at the SAME column -- the fixed
+	// Sub-col 2's two cells ("i copy PID" on the "f favorite" row, "l label" on
+	// the "n new favorite" row) must start at the SAME column -- the fixed
 	// subWidth[0] edge -- regardless of how much shorter sub-col 1's own
 	// content is on either row.
-	cCol, lCol := col("c copy URL"), col("l label")
-	if cCol != lCol {
-		t.Errorf("Favorites sub-col 2 misaligned across rows: 'c copy URL' at %d, 'l label' at %d (should match):\n%s", cCol, lCol, grid)
+	iCol, lCol := col("i copy PID"), col("l label")
+	if iCol != lCol {
+		t.Errorf("Favorites sub-col 2 misaligned across rows: 'i copy PID' at %d, 'l label' at %d (should match):\n%s", iCol, lCol, grid)
 	}
 
 	// A short sub-col-1 cell doesn't shift sub-col 2 left: "n new favorite" is
 	// sub-col 1's widest row (14 wide, == subWidth[0]), so sub-col 2's fixed
 	// edge must sit exactly one sub-column gap past where that row's content
-	// ends -- not past the shorter "f favorite"/"u unfavorite" rows' content.
+	// ends -- not past the shorter "f favorite" row's content.
 	nEnd := col("n new favorite") + len("n new favorite")
-	if want := nEnd + legendSubColGap; cCol != want {
-		t.Errorf("Favorites sub-col 2 should start at %d (widest sub-col-1 row %q ends at %d, + %d-wide gap); got %d:\n%s", want, "n new favorite", nEnd, legendSubColGap, cCol, grid)
+	if want := nEnd + legendSubColGap; iCol != want {
+		t.Errorf("Favorites sub-col 2 should start at %d (widest sub-col-1 row %q ends at %d, + %d-wide gap); got %d:\n%s", want, "n new favorite", nEnd, legendSubColGap, iCol, grid)
 	}
 }
 
@@ -4259,9 +4488,10 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	// The 4-column grid's packed floor is 82 cells wide (84 when the `o`
+	// The 4-column grid's packed floor is 81 cells wide (82 when the `o`
 	// cloudflare-tunnel key is also shown, kata nc1j -- see m.cfAvailable
-	// below); 50 forces the wrapped fallback either way.
+	// below; kata 4ref's wider "I copy kill cmd" Favorites cell added 1 to
+	// both); 50 forces the wrapped fallback either way.
 	const width = 50
 	m := New(config.Config{})
 	m.help.Width = width
@@ -4289,6 +4519,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	want := []string{
 		"Toggle Service Exposure", "Favorites", "View", "App",
 		"t on tailscale", "P on ts.net (public)", "c copy URL",
+		"i copy PID", "I copy kill cmd",
 		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
 		"u undo", "h show/hide key bindings", "? help", "q quit",
