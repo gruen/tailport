@@ -135,7 +135,7 @@ var (
 	// cosmetic color; TestBottomBarHintStylesContrast pins the value.
 	barHintColor = lipgloss.AdaptiveColor{Light: "#A49FA5", Dark: "#777777"}
 
-	// barKeyStyle colors the KEY of each bottom-bar hint (the "space" in "space
+	// barKeyStyle colors the KEY of each bottom-bar hint (the "t" in "t
 	// serve"); barDescStyle colors its description. Both replace bubbles/help's
 	// built-in ShortKey/ShortDesc defaults and share barHintColor -- the same
 	// muted grey as the list's idle description -- so the bar doesn't outshine
@@ -275,11 +275,12 @@ func (k keyMap) FullHelp() [][]key.Binding {
 
 func newKeyMap() keyMap {
 	return keyMap{
-		// "on tailscale" in the bar's Serve Toggles column: it names what space
+		// "on tailscale" in the bar's Serve Toggles column: it names what t
 		// does -- serve the port on the tailnet -- as one of three parallel serve
 		// toggles (p on caddy, P on ts.net). The "?" overlay keeps the fuller
-		// "toggle serve on/off" prose (keyLegendDescs).
-		Toggle: key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "on tailscale")),
+		// "toggle serve on/off" prose (keyLegendDescs). Remapped from space to t
+		// (kata 7nss, BREAKING): t = tailscale (mnemonic); space is now unbound.
+		Toggle: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "on tailscale")),
 		// p/P swapped (vzj4): capital guards the more-permanent exposure, so
 		// funnel (tailnet-only cert, easy to drop) takes the shifted key and
 		// publish (custom domain via Caddy edge) takes the bare key.
@@ -290,8 +291,10 @@ func newKeyMap() keyMap {
 		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "on caddy (public)")),
 		// "on cloudflare (public)": the third public path (kata nc1j), a
 		// cloudflared-tunnel sibling to funnel/publish in the Serve Toggles group.
-		// t is a TOGGLE: tear down / re-raise / first-setup, see requestTunnel.
-		Tunnel: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "on cloudflare (public)")),
+		// o is a TOGGLE: tear down / re-raise / first-setup, see requestTunnel.
+		// Remapped from t to o (kata 7nss, BREAKING) to free t for tailnet serve;
+		// o is the owner's explicit pick, not a mnemonic.
+		Tunnel: key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "on cloudflare (public)")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -408,7 +411,7 @@ func (d portDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 // `tailscale serve` is a separate app-layer reverse proxy that only matters
 // for a loopback-bound app -- a wildcard/tailnet-IP bind (e.g. sshd on :22)
 // is already tailnet-reachable at the IP layer with or without serve. Post-th05
-// this resolver backs only the space serve-guard (the row text is now per-route
+// this resolver backs only the t serve-guard (the row text is now per-route
 // via routesFor); several of the states below are still produced but only
 // reachTailnet/reachLAN/reachLocalhost are consumed by that guard.
 type reachState int
@@ -419,7 +422,7 @@ const (
 	reachLAN                         // B': specific LAN-IP bind, unserved -- LAN only, NOT tailnet
 	reachServed                      // C: served AND something is listening
 	reachFunnel                      // D: funnelled to the public internet -- outranks everything
-	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel; th05 lets them coexist, so reach() returns funnel > publish when both are present (it now only feeds the space serve-guard)
+	reachPublish                     // D': published to the public internet via the Caddy edge -- SIBLING of reachFunnel; th05 lets them coexist, so reach() returns funnel > publish when both are present (it now only feeds the t serve-guard)
 	reachTunnel                      // D'': tunnelled to the public internet via cloudflared (kata nc1j) -- a THIRD public sibling; likewise coexists post-th05, ranked last of the three by reach()
 	reachStale                       // E: served but nothing listening -- a dangling forward
 	reachOffline                     // F: not served, not listening (e.g. a down favorite)
@@ -427,7 +430,7 @@ const (
 
 // reach resolves a portItem's reachState. Since th05 replaced the single
 // aggregate row with per-route sub-rows (routesFor), reach() is no longer the
-// row renderer; its ONE remaining caller is the space serve-guard, which needs
+// row renderer; its ONE remaining caller is the t serve-guard, which needs
 // to tell a loopback-only port (serve applies) from an already-tailnet /
 // LAN-only bind (serve is a no-op or broken). Multiple public paths coexisting
 // on one port is NORMAL now (th05 relaxed the funnel/publish/tunnel mutual
@@ -1455,7 +1458,7 @@ func (m model) Init() tea.Cmd {
 	// periodic tick then only re-reads the cheap serve/funnel state.
 	// detectOperator is the best-effort proactive check (kata tapv): it runs
 	// once here so the sticky hint can appear before the user's first
-	// space-press, without waiting on a failed toggle.
+	// t-press, without waiting on a failed toggle.
 	//
 	// tea.SetWindowTitle emits OSC 2 through Bubble Tea's own renderer, so
 	// (unlike clip.go's OSC 52 clipboard write) there's no manual /dev/tty
@@ -1636,7 +1639,7 @@ func fetchFQDN() tea.Msg {
 
 // detectOperator runs the proactive, read-only operator check (kata tapv):
 // batched into Init so the sticky hint can appear before the user's first
-// space-press, and re-run on a manual "r" refresh so fixing the operator
+// t-press, and re-run on a manual "r" refresh so fixing the operator
 // (then pressing r) clears the banner without needing another failed
 // attempt first.
 func detectOperator() tea.Msg {
@@ -2287,7 +2290,7 @@ func (m *model) remember(port int) tea.Cmd {
 // favorite registers port with Favorite=true, preserving any existing label
 // or lock, and persists it. Backs the "n" add-port flow (ykgj): the port
 // sticks in the Favorites view even before its service is running, ready to be
-// served with space once it is.
+// served with t once it is.
 func (m *model) favorite(port int) tea.Cmd {
 	if m.cfg.Ports == nil {
 		m.cfg.Ports = map[int]config.PortMeta{}
@@ -2299,7 +2302,7 @@ func (m *model) favorite(port int) tea.Cmd {
 }
 
 // requestToggle begins toggling a port on/off from either entry point (the
-// space handler or the "n" add-port submit). It enforces the lock guard
+// t handler or the "n" add-port submit). It enforces the lock guard
 // (turning a locked port on is refused) and interposes the :22 SSH confirm:
 // for port 22 -- in either direction, since turning serve off is what kicks
 // you off SSH -- it opens an entryConfirm22 prompt and returns a nil cmd,
@@ -3071,10 +3074,10 @@ func (m *model) beginRestore() tea.Cmd {
 // here would otherwise leave it on silently — a footgun. The port is captured
 // BEFORE clearPurgeFlow zeroes it.
 //
-// It also reconciles the serve state so "space to stop" is honest (roborev ve95
-// FIX 4). The space toggle decides on/off from m.active[port], but that map can be
+// It also reconciles the serve state so "t to stop" is honest (roborev ve95
+// FIX 4). The t toggle decides on/off from m.active[port], but that map can be
 // STALE here — the 15s poll hasn't necessarily run since publishCmd auto-enabled
-// serve — so a lingering false would make the very next space try to turn serve ON
+// serve — so a lingering false would make the very next t press try to turn serve ON
 // AGAIN instead of stopping it. Serve being ON is a known fact by this point (a
 // serve-enable failure short-circuits publishCmd before any conflict), so hand-set
 // m.active[port]=true now for an immediate, honest toggle, AND issue a refresh so
@@ -3086,13 +3089,13 @@ func (m *model) cancelPurgeFlow() tea.Cmd {
 	var rebuild tea.Cmd
 	if port != 0 {
 		m.active[port] = true
-		// Reflect serve=on in the cached row now so "space to stop" works before
-		// the async refresh lands (roborev 2wts — the space toggle reads the
+		// Reflect serve=on in the cached row now so "t to stop" works before
+		// the async refresh lands (roborev 2wts — the t toggle reads the
 		// cached portItem.active, not m.active).
 		rebuild = m.rebuildItems()
 	}
 	return tea.Batch(
-		m.setFlash(fmt.Sprintf("serve left on for :%d — space to stop", port), flashWarn),
+		m.setFlash(fmt.Sprintf("serve left on for :%d — t to stop", port), flashWarn),
 		rebuild, refresh,
 	)
 }
@@ -3101,7 +3104,7 @@ func (m *model) cancelPurgeFlow() tea.Cmd {
 // through tailport (a hijacked @id, a non-disclosable foreign route, a
 // cleared-then-returned conflict, or a failed classification). publishCmd enabled
 // serve for the port BEFORE the conflict surfaced, so -- like cancelPurgeFlow --
-// this reconciles m.active[port] and appends "serve left on … space to stop" to
+// this reconciles m.active[port] and appends "serve left on … t to stop" to
 // the refusal, so a single toast carries both the reason and the honest serve
 // state rather than leaving serve on silently (roborev xzns). refresh + the
 // published-state poll ride along.
@@ -3110,12 +3113,12 @@ func (m *model) refuseConflict(port int, msg string) tea.Cmd {
 	var rebuild tea.Cmd
 	if port != 0 {
 		m.active[port] = true
-		// Reflect serve=on in the CACHED row now (roborev 2wts): the space toggle
+		// Reflect serve=on in the CACHED row now (roborev 2wts): the t toggle
 		// reads the selected portItem.active, not m.active, so without an immediate
-		// rebuild pressing space before the async refresh lands would still see the
+		// rebuild pressing t before the async refresh lands would still see the
 		// row as inactive and turn serve ON instead of stopping it.
 		rebuild = m.rebuildItems()
-		full = fmt.Sprintf("%s (serve left on for :%d — space to stop)", msg, port)
+		full = fmt.Sprintf("%s (serve left on for :%d — t to stop)", msg, port)
 	}
 	return tea.Batch(m.setErr(full), rebuild, refresh, m.pollPublishedCmd())
 }
@@ -3830,7 +3833,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		save := m.remember(msg.port) // keep a tunnelled port visible in the registry
 		var flash tea.Cmd
 		if msg.running != nil && msg.running.Hostname != "" {
-			flash = m.setFlash(fmt.Sprintf("tunnelled https://%s — press t to unpublish", msg.running.Hostname), flashInfo)
+			flash = m.setFlash(fmt.Sprintf("tunnelled https://%s — press o to unpublish", msg.running.Hostname), flashInfo)
 		}
 		return m, tea.Batch(save, flash, m.pollTunnelsCmd(), m.rebuildItems())
 
@@ -4124,7 +4127,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.setFlash(fmt.Sprintf(":%d already favorited — no change", port), flashInfo)
 					}
 					// "n" registers + favorites the port; it does NOT serve
-					// (ykgj). Exposing is always space. A not-yet-running
+					// (ykgj). Exposing is always t. A not-yet-running
 					// favorite then shows in the Favorites view as a synthetic
 					// entry, ready to serve once its service is up -- so an
 					// added port sticks instead of vanishing. No lock/:22 guard
@@ -4455,7 +4458,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.pushUndo(sel.port.Number, before, fmt.Sprintf("%s :%d", verb, sel.port.Number))
 			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
-		case " ":
+		case "t": // tailnet serve toggle (remapped from space, kata 7nss BREAKING)
 			if m.pending != 0 {
 				return m, nil // a toggle is already in flight
 			}
@@ -4486,7 +4489,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Wildcard bind owned by the APP (0.0.0.0), not a tailport
 					// serve, so there's no mapping to toggle. Honest about WHY,
 					// and actionable: rebinding to loopback -> reach()==reachLocalhost,
-					// which the guard does NOT block -> space then serves it.
+					// which the guard does NOT block -> t then serves it.
 					return m, m.setFlash("on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable", flashInfo)
 				case reachLAN:
 					return m, m.setFlash("on your LAN only; serve can't reach this bind", flashInfo)
@@ -4532,7 +4535,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// unpublishes -- it always runs the full setup flow so a
 			// published port's hostname/auth can be changed in place.
 			return m, m.requestEditPublish(sel.port.Number)
-		case "t": // cloudflared tunnel (kata nc1j)
+		case "o": // cloudflared tunnel (kata nc1j; remapped from t, kata 7nss BREAKING)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel/publish/tunnel is already in flight
 			}
@@ -4542,9 +4545,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// requestTunnel runs the tunnel guards in order (busy, availability,
 			// de-escalation, :22, funnel/publish mutual-exclusion, lock) and
-			// otherwise opens the tunnel dialog. t is a TOGGLE: tear down /
+			// otherwise opens the tunnel dialog. o is a TOGGLE: tear down /
 			// same-session re-raise / first-setup.
 			return m, m.requestTunnel(sel.port.Number)
+		case " ": // dropped in the remap (kata 7nss BREAKING): now a no-op, with
+			// a one-time-per-press transitional toast pointing at the new key.
+			return m, m.setFlash("serve is now 't'", flashInfo)
 		}
 	}
 
@@ -4699,7 +4705,7 @@ func (m *model) rebuildItems() tea.Cmd {
 // index is left pointing past the end whenever the item count shrinks
 // (e.g. switching from the All ports view back to Favorites, or a refresh
 // that drops a since-unregistered port), which makes SelectedItem() return
-// nil and silently turns every selection-based key (space, l, f, u) into a
+// nil and silently turns every selection-based key (t, l, f, u) into a
 // no-op. Returns SetItems' cmd (a re-filter request while a filter is active).
 func (m *model) setItems(items []list.Item) tea.Cmd {
 	cmd := m.list.SetItems(items)
@@ -4783,12 +4789,12 @@ func (m model) renderLegend() string {
 // height; the live render passes m.hasDangling().
 //
 // TODO(79xb): the issue's secondary polish asks for a SECOND contextual hint
-// here -- grey/hide "space on tailscale" when the selected port is already
-// B/B' tailnet/LAN reachable (space would just no-op it with an info toast;
-// see the pt3 guard in the space key handler). Prototyped as a second
-// spaceEnabled bool threaded through here/barGroups exactly like
+// here -- grey/hide "t on tailscale" when the selected port is already
+// B/B' tailnet/LAN reachable (t would just no-op it with an info toast;
+// see the pt3 guard in the t key handler). Prototyped as a second
+// tEnabled bool threaded through here/barGroups exactly like
 // cleanEnabled, but MEASURED to break TestLegendReservationDominatesLive's
-// brute-force width scan: at width 54, hiding "space" while "clean" stays
+// brute-force width scan: at width 54, hiding "t" while "clean" stays
 // shown renders the Serve Toggles column at 6 lines against a 4-line worst-case
 // reservation (both hints assumed shown) -- i.e. hiding one hint does NOT
 // always make the bar shorter, because it can shift which fold split the
@@ -4796,7 +4802,7 @@ func (m model) renderLegend() string {
 // That's the same "incidental tie, not enforced" fragility the comment below
 // already flags for the existing single-hint case, now demonstrated to break
 // with a second independent hint. Deferred per the issue ("do not block on
-// this"); the handler guard (space key case, ~1673) is the shipped
+// this"); the handler guard (t key case, ~4461) is the shipped
 // must-have and needs no bar change to be correct.
 func (m model) renderLegendWith(cleanEnabled bool) string {
 	groups := m.barGroups(cleanEnabled)
@@ -6378,7 +6384,7 @@ type KeyLegendGroup struct {
 
 // keyLegendDescs maps a binding's display key to its rich "?"/quickstart prose
 // (deliberately fuller than the terse bottom-bar labels). emoji picks which
-// exposure glyph (🌒/🌑/🌫️ vs ◉/●/▲) is quoted inline in the space/p/C rows,
+// exposure glyph (🌒/🌑/🌫️ vs ◉/●/▲) is quoted inline in the t/p/C rows,
 // matching whichever marker set the caller is using (see resolveMarkerEmoji;
 // callers pass m.markerEmoji, not m.emoji -- this is exposure-marker prose,
 // not egg/fireworks).
@@ -6390,18 +6396,18 @@ func keyLegendDescs(emoji bool) map[string]string {
 		tunnelled = "☁️"
 	}
 	return map[string]string{
-		"space": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so space is a no-op there.",
+		"t": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so t is a no-op there.",
 		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
 		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
 		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
-		"t":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. t is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
+		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. o is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
 		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them. (To restore a\nforce-purged route is a SEPARATE affordance on its own key — R,\nshown in the status line right after the purge — not this.)",
 		"ctrl+r": "Redo the last undone registry edit. Any new edit clears the redo\nstack, so you can't redo onto a changed registry.",
-		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press space there to serve it once its service is up.",
+		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press t there to serve it once its service is up.",
 		"l":      "Set a text label for the selected port.",
 		"x":      "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
 		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
@@ -6530,10 +6536,10 @@ func (m model) markerLegend() string {
 func OperatorSetupText() string {
 	return "tailscale itself requires an operator to be set before a non-root\n" +
 		"user can run `tailscale serve`/`funnel` -- without it you'll see\n" +
-		"\"Access denied\" the first time you press space. Run this once:\n" +
+		"\"Access denied\" the first time you press t. Run this once:\n" +
 		"  sudo tailscale set --operator=$(whoami)\n" +
 		"(or run tailport itself with sudo). If it's not set yet, pressing\n" +
-		"space shows a persistent on-screen reminder with this exact command;\n" +
+		"t shows a persistent on-screen reminder with this exact command;\n" +
 		"press r afterward to re-check and clear it."
 }
 
@@ -6601,7 +6607,7 @@ func (m model) helpContent() string {
 			"app won't start with \"address already in use\", it's binding\n" +
 			"0.0.0.0:<port>, which collides with tailscale's serve listener on that\n" +
 			"port — bind it to 127.0.0.1:<port> instead (what serve proxies to, and\n" +
-			"off your LAN). Or unbind it: space on the row, or C to clear all stale\n" +
+			"off your LAN). Or unbind it: t on the row, or C to clear all stale\n" +
 			"forwards."))
 	b.WriteString("\n\n")
 	for _, line := range configSaveLines(m.configPath) {

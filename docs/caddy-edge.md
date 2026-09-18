@@ -20,7 +20,7 @@ what each file does and the root [README](../README.md#configuration) for
 the `caddy.*` config fields this deploy has to line up with.
 
 **This is a one-time (or occasional) operator task**, separate from
-day-to-day tailport use — everything else (`tailscale serve`/`space`,
+day-to-day tailport use — everything else (`tailscale serve`/`t`,
 Funnel/`P`) needs no edge at all. Do it once per edge, not once per
 tailport machine: several tailport computers can publish through the same
 edge (see step 4).

@@ -223,8 +223,8 @@ func TestRequestToggle(t *testing.T) {
 	}
 }
 
-// TestUpdateToggleKeys covers g87s at the Update layer: space toggles the
-// selected port, enter no longer does.
+// TestUpdateToggleKeys covers g87s at the Update layer: t toggles the
+// selected port (remapped from space, kata 7nss BREAKING), enter no longer does.
 func TestUpdateToggleKeys(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	newModel := func() model {
@@ -237,12 +237,12 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 
 	m := newModel()
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	if cmd == nil {
-		t.Error("space should return a toggle cmd")
+		t.Error("t should return a toggle cmd")
 	}
 	if got := res.(model); got.pending != 8080 {
-		t.Errorf("after space, pending = %d, want 8080", got.pending)
+		t.Errorf("after t, pending = %d, want 8080", got.pending)
 	}
 
 	m = newModel()
@@ -252,14 +252,16 @@ func TestUpdateToggleKeys(t *testing.T) {
 	}
 }
 
-// TestSpaceGuardForReachablePorts covers 79xb pt3's footgun guard: `tailscale
+// TestToggleGuardForReachablePorts covers 79xb pt3's footgun guard: `tailscale
 // serve` always proxies tailnet -> 127.0.0.1:PORT, so turning it ON only ever
 // makes sense for a loopback-bound port (state A). Selecting an already
 // tailnet-reachable port (B, wildcard/tailnet-IP bind) or a LAN-only port (B',
-// a specific non-tailnet IP) and pressing space must NO-OP with an
+// a specific non-tailnet IP) and pressing t must NO-OP with an
 // informational toast rather than begin a serve. A (loopback, serve-ON) and C
-// (served, serve-OFF) must be unaffected.
-func TestSpaceGuardForReachablePorts(t *testing.T) {
+// (served, serve-OFF) must be unaffected. (Renamed from
+// TestSpaceGuardForReachablePorts: the toggle key moved from space to t,
+// kata 7nss BREAKING.)
+func TestToggleGuardForReachablePorts(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	newModel := func(port int, scope portscan.BindScope, active bool) model {
 		m := New(config.Config{Ports: map[int]config.PortMeta{port: {Favorite: true}}})
@@ -273,77 +275,78 @@ func TestSpaceGuardForReachablePorts(t *testing.T) {
 		m.rebuildItems()
 		return m
 	}
+	press := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}}
 
-	// B (wildcard bind, unserved, non-:22): space no-ops with the general
+	// B (wildcard bind, unserved, non-:22): t no-ops with the general
 	// "app bound wide (0.0.0.0)" info toast (83wv pt2 -- reworded from the
 	// old "nothing to serve" line to be honest about WHY and actionable
 	// about how to make it toggleable), no toggle begun.
 	const wantGeneralWildcard = "on tailnet — app bound wide (0.0.0.0); rebind to localhost (or 127.0.0.1) to make toggleable"
 	m := newModel(8080, portscan.ScopeWildcard, false)
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, cmd := m.Update(press)
 	got := res.(model)
 	if got.pending != 0 {
-		t.Errorf("space on a B (tailnet) port should not begin a toggle; pending = %d", got.pending)
+		t.Errorf("t on a B (tailnet) port should not begin a toggle; pending = %d", got.pending)
 	}
 	if got.flashLevel != flashInfo || got.flash != wantGeneralWildcard {
-		t.Errorf("space on a B port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantGeneralWildcard)
+		t.Errorf("t on a B port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantGeneralWildcard)
 	}
 	if cmd == nil {
-		t.Error("space on a B port should still return the toast's flash cmd")
+		t.Error("t on a B port should still return the toast's flash cmd")
 	}
 
 	// B (wildcard bind, unserved, :22 -- the operator's own live SSH port):
-	// space no-ops with the DEDICATED SSH variant, not the general
+	// t no-ops with the DEDICATED SSH variant, not the general
 	// "rebind to localhost" line, which would be nonsensical (and
 	// self-locking) advice for sshd (83wv pt2).
 	const wantSSHVariant = "on tailnet as SSH — this is how you're connected; nothing for tailport to serve"
 	m = newModel(22, portscan.ScopeWildcard, false)
-	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, cmd = m.Update(press)
 	got = res.(model)
 	if got.pending != 0 {
-		t.Errorf("space on a wildcard-bound :22 port should not begin a toggle; pending = %d", got.pending)
+		t.Errorf("t on a wildcard-bound :22 port should not begin a toggle; pending = %d", got.pending)
 	}
 	if got.flashLevel != flashInfo || got.flash != wantSSHVariant {
-		t.Errorf("space on a wildcard-bound :22 port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantSSHVariant)
+		t.Errorf("t on a wildcard-bound :22 port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantSSHVariant)
 	}
 	if cmd == nil {
-		t.Error("space on a wildcard-bound :22 port should still return the toast's flash cmd")
+		t.Error("t on a wildcard-bound :22 port should still return the toast's flash cmd")
 	}
 
-	// B' (specific LAN IP, unserved): space no-ops with the "can't reach this
+	// B' (specific LAN IP, unserved): t no-ops with the "can't reach this
 	// bind" info toast, no toggle begun -- unchanged by 83wv pt2.
 	const wantLAN = "on your LAN only; serve can't reach this bind"
 	m = newModel(3000, portscan.ScopeLAN, false)
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, _ = m.Update(press)
 	got = res.(model)
 	if got.pending != 0 {
-		t.Errorf("space on a B' (LAN) port should not begin a toggle; pending = %d", got.pending)
+		t.Errorf("t on a B' (LAN) port should not begin a toggle; pending = %d", got.pending)
 	}
 	if got.flashLevel != flashInfo || got.flash != wantLAN {
-		t.Errorf("space on a B' port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantLAN)
+		t.Errorf("t on a B' port flash = %q (level=%v), want %q at flashInfo", got.flash, got.flashLevel, wantLAN)
 	}
 
-	// A (loopback bind, unserved): space still initiates the toggle -- the
+	// A (loopback bind, unserved): t still initiates the toggle -- the
 	// only state serve-ON is meaningful for.
 	m = newModel(9000, portscan.ScopeLoopback, false)
-	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, cmd = m.Update(press)
 	got = res.(model)
 	if cmd == nil {
-		t.Error("space on an A (loopback) port should return a toggle cmd")
+		t.Error("t on an A (loopback) port should return a toggle cmd")
 	}
 	if got.pending != 9000 {
-		t.Errorf("space on an A port should begin a toggle; pending = %d, want 9000", got.pending)
+		t.Errorf("t on an A port should begin a toggle; pending = %d, want 9000", got.pending)
 	}
 
-	// C (already served): space still toggles OFF, regardless of bind scope.
+	// C (already served): t still toggles OFF, regardless of bind scope.
 	m = newModel(8080, portscan.ScopeWildcard, true)
-	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, cmd = m.Update(press)
 	got = res.(model)
 	if cmd == nil {
-		t.Error("space on a served (C) port should return a toggle-off cmd")
+		t.Error("t on a served (C) port should return a toggle-off cmd")
 	}
 	if got.pending != 8080 {
-		t.Errorf("space on a served (C) port should begin a toggle; pending = %d, want 8080", got.pending)
+		t.Errorf("t on a served (C) port should begin a toggle; pending = %d, want 8080", got.pending)
 	}
 }
 
@@ -534,7 +537,7 @@ func TestFilterDiscoverable(t *testing.T) {
 // hand-copied duplicate -- so it and `tailport quickstart` (cmd/tailport,
 // which calls the same two functions) can never drift apart. Checked in both
 // EXPOSURE-marker modes (m.markerEmoji, not the egg's m.emoji -- qwcw split
-// the two), since the space/p/C rows quote the mode-specific exposure glyph.
+// the two), since the t/p/C rows quote the mode-specific exposure glyph.
 // Asserted on helpContent (the full overlay text) with width unset, where the
 // legend is a single vertical column so the shared block appears verbatim;
 // helpView windows that content to the terminal height (v10j) and the
@@ -1344,14 +1347,14 @@ func TestUnlockSSHConfirm(t *testing.T) {
 		t.Errorf("x on :8080 should lock instantly; mode=%v locked=%v", m.mode, m.cfg.Ports[8080].Locked)
 	}
 
-	// (8) Modality: space/P while confirming must NOT toggle serve/funnel.
+	// (8) Modality: t/P while confirming must NOT toggle serve/funnel.
 	m = lockedModel()
 	res, _ = m.Update(xKey)
 	m = res.(model)
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	m = res.(model)
 	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
-		t.Errorf("space in ssh-confirm must not toggle; pending=%d mode=%v", m.pending, m.mode)
+		t.Errorf("t in ssh-confirm must not toggle; pending=%d mode=%v", m.pending, m.mode)
 	}
 	// P is the funnel key (swapped from p, vzj4).
 	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
@@ -2051,7 +2054,7 @@ func TestFunnelItemRender(t *testing.T) {
 		funnelPublic: 8443, // ... but funnel outranks it
 	}
 	// reach() still resolves funnel as the widest public path (it now backs only
-	// the space serve-guard).
+	// the t serve-guard).
 	if got := it.reach(); got != reachFunnel {
 		t.Errorf("reach() = %v, want reachFunnel", got)
 	}
@@ -2631,7 +2634,7 @@ func TestFilterValue(t *testing.T) {
 // TestReachStateDescriptions covers 79xb's honest 7-state lexicon: reach()
 // resolves the right state from a portItem's fields. Post-th05 reach() no
 // longer renders row text (that's per-route via routesFor -- see
-// routerender_test.go); its ONE remaining consumer is the space serve-guard,
+// routerender_test.go); its ONE remaining consumer is the t serve-guard,
 // so this pins the resolver's truth table directly. D (funnel/publish/tunnel)
 // coexistence is covered by TestFunnelItemRender, TestPublishReachDriftSurfaced
 // and cftunnel_test's TestReachTunnel.
@@ -3837,10 +3840,11 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// 3cwx: Favorites carries F (forget, the old "u"); u is undo and lives in
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
 	// documents it even though barGroups hides it from the bottom bar. h (hints)
-	// also lives in App. nc1j: exposure column runs space/p/t/P (funnel below the
-	// cloudflare tunnel) then C/x/e.
+	// also lives in App. nc1j: exposure column runs t/p/o/P (funnel below the
+	// cloudflare tunnel) then C/x/e. (7nss BREAKING: toggle moved space->t,
+	// tunnel moved t->o.)
 	wantKeys := [][]string{
-		{"space", "p", "t", "P", "C", "x", "e"}, // Publish=p, Tunnel=t (nc1j), Funnel=P below it; Edit=e (kata prp1)
+		{"t", "p", "o", "P", "C", "x", "e"}, // Publish=p, Tunnel=o (nc1j), Funnel=P below it; Edit=e (kata prp1)
 		{"f", "F", "n", "c", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "h", "?", "q"},
@@ -3878,15 +3882,15 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 // the bar renders the four grouped columns UNFOLDED, at their exact packed
 // floor width, with a header row and aligned gutters: descriptions line up
 // within a column and columns line up across rows. With no dangling, Toggle
-// Service Exposure is space/p/P/x/e (edit last, kata prp1; clean dropped;
-// `t` cloudflare tunnel is pinned off, see cfAvailable below) and Favorites
+// Service Exposure is t/p/P/x/e (edit last, kata prp1; clean dropped;
+// `o` cloudflare tunnel is pinned off, see cfAvailable below) and Favorites
 // is f/F/n/c/l -- TIED for tallest column at 5 rows each -- so the grid is a
 // header + 5 rows. (nc1j lengthened the header to "Toggle Service Exposure"
 // and added the App-group `h` hints key, pushing the packed floor from 64 to
 // 82 wide -- see TestBottomBarGridFolds for the fold thresholds.)
 func TestBottomBarGridAligned(t *testing.T) {
 	m := New(config.Config{})
-	m.cfAvailable = false // pin: this exercises grid mechanics with the classic key set (no `t`), independent of whether the test host has cloudflared (kata nc1j)
+	m.cfAvailable = false // pin: this exercises grid mechanics with the classic key set (no `o`), independent of whether the test host has cloudflared (kata nc1j)
 	const width = 90      // packed floor is 82 wide; Toggle Service Exposure's fold needs >=104
 	m.help.Width = width
 	m.width = width
@@ -3932,10 +3936,11 @@ func TestBottomBarGridAligned(t *testing.T) {
 			t.Errorf("%s misaligned: %q header at %d, cell %q at %d", label, header, h, needle, c)
 		}
 	}
-	// Toggle Service Exposure's key gutter is 5 wide (from "space"), so its cells render
-	// like "x     lock/unlock"; anchor its column on "space on tailscale" (which starts
-	// flush at the column) rather than a padded cell.
-	col("Toggle Service Exposure/on tailscale", "Toggle Service Exposure", "space on tailscale")
+	// Toggle Service Exposure's keys (t/p/P/x/e) are all single-char now that
+	// the toggle moved off "space" (kata 7nss BREAKING), so the key gutter is 1
+	// wide and every cell -- including "t on tailscale" -- starts flush at the
+	// column.
+	col("Toggle Service Exposure/on tailscale", "Toggle Service Exposure", "t on tailscale")
 	col("Favorites/favorite", "Favorites", "f favorite")
 	col("Favorites/label", "Favorites", "l label")
 	col("View/filter", "View", "/ filter")
@@ -3971,8 +3976,8 @@ func TestBottomBarGridAligned(t *testing.T) {
 	}
 
 	// Within the Toggle Service Exposure column the key gutter aligns the
-	// descriptions: "on tailscale" (after "space ") and "on ts.net (public)"
-	// (after "P     ") start at the same offset.
+	// descriptions: "on tailscale" (after "t ") and "on ts.net (public)"
+	// (after "P ") start at the same offset.
 	_, serveCol := at("on tailscale")
 	_, funnelCol := at("on ts.net (public)")
 	if serveCol != funnelCol {
@@ -4003,7 +4008,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// Floor: below the fold threshold (the first fold -- Toggle Service
 	// Exposure, see below -- needs total width >=104; see the 82-wide packed
 	// floor in TestBottomBarNarrowFallback), the grid is the exact packed
-	// layout -- header + 5 rows. Toggle Service Exposure (space/p/P/x/e, kata
+	// layout -- header + 5 rows. Toggle Service Exposure (t/p/P/x/e, kata
 	// prp1 added e) and Favorites (f/F/n/c/l) are TIED for tallest at 5 rows
 	// each. (nc1j lengthened the header and added App's `h` hints key, which
 	// pushed the packed floor from 64 to 82 -- see TestBottomBarGridAligned.)
@@ -4034,22 +4039,23 @@ func TestBottomBarGridFolds(t *testing.T) {
 	}
 
 	// Toggle Service Exposure folded: top-heavy column-major split --
-	// space/p/P down the first sub-column, x/e down the second (never a
+	// t/p/P down the first sub-column, x/e down the second (never a
 	// dangling item left stranded atop an empty second sub-column). "x
-	// lock/unlock" sits beside "space on tailscale" on the SAME row, and "e
+	// lock/unlock" sits beside "t on tailscale" on the SAME row, and "e
 	// edit publish config" beside "p on caddy (public)"; "P on ts.net
 	// (public)" is left alone on the third row (top-heavy 3/2 split of 5
-	// items). (nc1j: the exposure order is now space/p/P -- Publish before
+	// items). (nc1j: the exposure order is now t/p/P -- Publish before
 	// Funnel -- so p, not P, now pairs with edit; P sits alone.)
-	if r1, r2 := lineOf(wideLines, "space on tailscale"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
-		t.Errorf("Toggle Service Exposure should fold space on tailscale/x lock/unlock onto the same row; space on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
+	if r1, r2 := lineOf(wideLines, "t on tailscale"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
+		t.Errorf("Toggle Service Exposure should fold t on tailscale/x lock/unlock onto the same row; t on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
 	if r1, r2 := lineOf(wideLines, "on caddy (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
 		t.Errorf("Toggle Service Exposure should fold p on caddy (public)/e edit publish config onto the same row; p on caddy (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
 	}
-	// "on ts.net (public)" (desc only, not "P on ts.net (public)" -- the
-	// folded left sub-col's key gutter is 5 wide (from "space"), so the
-	// rendered key is padded: "P     on ts.net (public)").
+	// "on ts.net (public)" (desc only, not "P on ts.net (public)" -- since
+	// 7nss the exposure keys are all single-char, so the folded left sub-col's
+	// key gutter is only 1 wide: the rendered key is "P on ts.net (public)",
+	// a single space, not a padded gutter).
 	if r := lineOf(wideLines, "on ts.net (public)"); r < 0 {
 		t.Errorf("P on ts.net (public) missing from wide grid:\n%s", wide)
 	} else if strings.Contains(wideLines[r], "edit publish config") {
@@ -4135,11 +4141,12 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// Still no truncation/ellipsis at the ceiling: every hint present. ("P
 	// on ts.net (public)" isn't checked as a single-space literal here: unlike
 	// the wrapped fallback, the grid pads keys to their sub-column's gutter --
-	// Toggle Service Exposure's folded left sub-col gutter is 5 (from
-	// "space"), so "P" renders padded ("P     on ts.net (public)") --
-	// checking the description alone sidesteps that padding.)
+	// since 7nss the exposure keys are all single-char, Toggle Service
+	// Exposure's folded left sub-col gutter is only 1 wide, so "P" renders
+	// as "P on ts.net (public)" -- checking the description alone sidesteps
+	// that padding regardless.)
 	for _, want := range []string{
-		"space on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
+		"t on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
 		"f favorite", "F forget", "n new favorite", "c copy URL", "l label",
 		"/ filter", "a switch view", "r refresh",
 		"u undo", "show/hide key bindings", "? help", "q quit",
@@ -4209,7 +4216,7 @@ func TestBottomBarGridFoldedSubColAligned(t *testing.T) {
 // content-derived threshold the bar becomes a wrapped grouped bar that never
 // truncates (every key+desc still present) and never overflows the width.
 func TestBottomBarNarrowFallback(t *testing.T) {
-	// The 4-column grid's packed floor is 82 cells wide (84 when the `t`
+	// The 4-column grid's packed floor is 82 cells wide (84 when the `o`
 	// cloudflare-tunnel key is also shown, kata nc1j -- see m.cfAvailable
 	// below); 50 forces the wrapped fallback either way.
 	const width = 50
@@ -4233,18 +4240,18 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	}
 
 	// Every hint is still present -- no truncation, no elision. (C is contextual
-	// and absent with no dangling. This test doesn't pin m.cfAvailable, so `t`
+	// and absent with no dangling. This test doesn't pin m.cfAvailable, so `o`
 	// on cloudflare only belongs in the want-list when this host actually has
 	// cloudflared, kata nc1j.)
 	want := []string{
 		"Toggle Service Exposure", "Favorites", "View", "App",
-		"space on tailscale", "P on ts.net (public)", "c copy URL",
+		"t on tailscale", "P on ts.net (public)", "c copy URL",
 		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
 		"u undo", "h show/hide key bindings", "? help", "q quit",
 	}
 	if m.cfAvailable {
-		want = append(want, "t on cloudflare (public)")
+		want = append(want, "o on cloudflare (public)")
 	}
 	for _, hint := range want {
 		if !strings.Contains(bar, hint) {
@@ -4258,7 +4265,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
 // Protect is folded into Toggle Service Exposure: with no dangling the
-// column ends at "e edit publish config" (space/p/P/x/e, no clean, no
+// column ends at "e edit publish config" (t/p/P/x/e, no clean, no
 // reserved blank slot); when a dangling forward exists it gains "C clean
 // stale" -- inserted just ABOVE lock so "x lock/unlock" then "e edit publish
 // config" stay the last two items, in that order, in either state. (kata
@@ -4266,8 +4273,10 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 // under vzj4 so it's now P funnel, p publish; kata prp1 added e edit right
 // after lock, so edit -- not lock -- is now the column's last item. nc1j
 // renamed the column "Toggle Service Exposure" and reordered it to
-// space/p/t/P; `t` (cloudflare tunnel) is pinned off here via cfAvailable,
-// so the column stays space/p/P/x/e -- see the pinned tests' comments.)
+// t/p/o/P; `o` (cloudflare tunnel) is pinned off here via cfAvailable,
+// so the column stays t/p/P/x/e -- see the pinned tests' comments. 7nss
+// BREAKING moved the toggle key from space to t and the tunnel key from t
+// to o.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.cfAvailable = false // pin the classic key set (no `t`); this tests contextual-Clean, not the tunnel key (kata nc1j)
@@ -4290,11 +4299,11 @@ func TestExposeContextualClean(t *testing.T) {
 		return g.bindings[len(g.bindings)-1].Help().Key
 	}
 
-	// No dangling -> Toggle Service Exposure is space/p/P/x/e (clean
+	// No dangling -> Toggle Service Exposure is t/p/P/x/e (clean
 	// dropped), edit last, and the rendered bar omits "clean".
 	noClean := expose(m.barGroups(false))
 	if got := len(noClean.bindings); got != 5 {
-		t.Errorf("Toggle Service Exposure should be 5 bindings (space/p/P/x/e) with no dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 5 bindings (t/p/P/x/e) with no dangling; got %d", got)
 	}
 	if k := lastKey(noClean); k != "e" {
 		t.Errorf("edit (e) should be the last Toggle Service Exposure binding with no dangling; got %q", k)
@@ -4311,7 +4320,7 @@ func TestExposeContextualClean(t *testing.T) {
 	}
 	withClean := expose(m.barGroups(true))
 	if got := len(withClean.bindings); got != 6 {
-		t.Errorf("Toggle Service Exposure should be 6 bindings (space/p/P/C/x/e) with a dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 6 bindings (t/p/P/C/x/e) with a dangling; got %d", got)
 	}
 	if k := lastKey(withClean); k != "e" {
 		t.Errorf("edit (e) should STILL be the last Toggle Service Exposure binding with a dangling; got %q", k)
@@ -4398,7 +4407,7 @@ func TestLegendSizingNoClip(t *testing.T) {
 // of both states (legendReservationLines). This test pins that the
 // reservation the code actually uses is never shorter than EITHER live
 // render, brute-forcing width rather than sampling a few. (79xb: this
-// brute-force scan is also what caught the second-hint "space on tailscale"
+// brute-force scan is also what caught the second-hint "t on tailscale"
 // contextual polish breaking the reservation at width 54 -- see the
 // TODO(79xb) on renderLegendWith.)
 func TestLegendReservationDominatesLive(t *testing.T) {
@@ -7434,7 +7443,7 @@ func TestFunnelCoexistsWithPublished(t *testing.T) {
 }
 
 // TestPublishReachDriftSurfaced, migrated for th05: reach() still resolves the
-// widest public path (it now backs only the space serve-guard), and coexisting
+// widest public path (it now backs only the t serve-guard), and coexisting
 // public paths are SURFACED as separate route sub-rows -- the retired "drift"
 // collapse is gone (multi-public coexistence is legitimate now).
 func TestPublishReachDriftSurfaced(t *testing.T) {
@@ -7980,7 +7989,7 @@ func TestPublishConflictForeignDisclosableGate(t *testing.T) {
 		// The refusal must reconcile serve and warn it's left on (roborev xzns):
 		// publishCmd enabled serve for the port before the conflict surfaced.
 		if !m.active[8080] {
-			t.Error("a conflict refusal must reconcile serve state (m.active[8080]) so space stops it")
+			t.Error("a conflict refusal must reconcile serve state (m.active[8080]) so t stops it")
 		}
 		if !strings.Contains(m.flash, "serve left on for :8080") {
 			t.Errorf("the refusal must warn serve is left on; flash=%q", m.flash)
@@ -7989,10 +7998,10 @@ func TestPublishConflictForeignDisclosableGate(t *testing.T) {
 }
 
 // TestConflictRefusalReconcilesRowForSpaceStop (roborev 2wts): a conflict refusal
-// reconciles serve state so the "space to stop" hint actually stops it. The space
+// reconciles serve state so the "t to stop" hint actually stops it. The t
 // toggle reads the cached portItem.active, not m.active, so the refusal must
 // rebuild the list immediately -- otherwise, with a stale row reading serve=OFF,
-// space would turn serve ON before the async refresh lands.
+// t would turn serve ON before the async refresh lands.
 func TestConflictRefusalReconcilesRowForSpaceStop(t *testing.T) {
 	cfg := config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}
 	cfg.Caddy.Domain, cfg.Caddy.Hostname, cfg.Caddy.ServerName, cfg.Caddy.AdminPort = "example.com", "caddy", "tailport", 2019
@@ -8015,7 +8024,7 @@ func TestConflictRefusalReconcilesRowForSpaceStop(t *testing.T) {
 		if pi, ok := it.(portItem); ok && pi.port.Number == 8080 {
 			found = true
 			if !pi.active {
-				t.Error("after a conflict refusal the cached :8080 row must read serve=ON, so space stops it (roborev 2wts)")
+				t.Error("after a conflict refusal the cached :8080 row must read serve=ON, so t stops it (roborev 2wts)")
 			}
 		}
 	}
@@ -8866,7 +8875,7 @@ func TestTakeoverResumeFailurePartialToast(t *testing.T) {
 func TestPurgeCancelFlashesServeLeftOn(t *testing.T) {
 	const host = "app.example.com"
 	id := caddyedge.IDFor(host)
-	wantFlash := "serve left on for :8080 — space to stop"
+	wantFlash := "serve left on for :8080 — t to stop"
 
 	assertServeFlash := func(t *testing.T, m model) {
 		t.Helper()
@@ -8929,11 +8938,11 @@ func TestPurgeCancelFlashesServeLeftOn(t *testing.T) {
 // TestPurgeCancelReconcilesServeState (roborev ve95 FIX 4): publishCmd auto-
 // enables serve BEFORE the conflicting publish, but m.active can be STALE at the
 // purge confirm (the 15s poll hasn't run since the auto-enable). The cancel toast
-// promises "space to stop", and the space toggle decides on/off from
-// m.active[port] — so a stale false would make space try to turn serve ON again
+// promises "t to stop", and the t toggle decides on/off from
+// m.active[port] — so a stale false would make t try to turn serve ON again
 // instead of stopping it. Drive the real publish→conflict→cancel sequence with a
 // stale (false) serve state and assert the cancel reconciles it to ON, so the
-// selected row reflects serve=on and space genuinely stops it.
+// selected row reflects serve=on and t genuinely stops it.
 func TestPurgeCancelReconcilesServeState(t *testing.T) {
 	const host = "app.example.com"
 	id := caddyedge.IDFor(host)
@@ -8951,10 +8960,10 @@ func TestPurgeCancelReconcilesServeState(t *testing.T) {
 	if m.mode != entryNone {
 		t.Fatalf("cancel should return to entryNone; mode=%v", m.mode)
 	}
-	// Reconciled to ON: the space toggle now computes turnOn = !active = false, i.e.
+	// Reconciled to ON: the t toggle now computes turnOn = !active = false, i.e.
 	// it will STOP serve rather than try to enable it again.
 	if !m.active[8080] {
-		t.Errorf("cancel must reconcile serve state to ON so 'space to stop' is honest; m.active[8080]=%v", m.active[8080])
+		t.Errorf("cancel must reconcile serve state to ON so 't to stop' is honest; m.active[8080]=%v", m.active[8080])
 	}
 }
 

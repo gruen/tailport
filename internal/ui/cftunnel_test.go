@@ -255,23 +255,23 @@ func TestRequestTunnelReraise(t *testing.T) {
 	}
 }
 
-// TestBarGroupsTunnelGating: the `t` key shows in the bottom bar only when
+// TestBarGroupsTunnelGating: the `o` key shows in the bottom bar only when
 // cloudflared is available; it's always in the full groups() (documented in ?).
 func TestBarGroupsTunnelGating(t *testing.T) {
 	m := New(config.Config{})
 
 	m.cfAvailable = true
-	if !hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "t") {
-		t.Error("cfAvailable=true: `t` should appear in the Serve Toggles bar group")
+	if !hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "o") {
+		t.Error("cfAvailable=true: `o` should appear in the Serve Toggles bar group")
 	}
 
 	m.cfAvailable = false
-	if hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "t") {
-		t.Error("cfAvailable=false: `t` should be dropped from the bar")
+	if hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "o") {
+		t.Error("cfAvailable=false: `o` should be dropped from the bar")
 	}
 	// still documented in the full grouping regardless
-	if !hasKeyInGroup(m.keys.groups(), "Toggle Service Exposure", "t") {
-		t.Error("`t` should always be in the full groups() for the ? overlay")
+	if !hasKeyInGroup(m.keys.groups(), "Toggle Service Exposure", "o") {
+		t.Error("`o` should always be in the full groups() for the ? overlay")
 	}
 }
 

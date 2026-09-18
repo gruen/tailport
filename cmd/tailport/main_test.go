@@ -136,7 +136,7 @@ func TestRunHelpFlag(t *testing.T) {
 			}
 		}
 		// The keybinding legend belongs to `quickstart`, not --help (5dgj).
-		if strings.Contains(got, "space") || strings.Contains(got, "Toggle tailscale serve") {
+		if strings.Contains(got, "Toggle tailscale serve") {
 			t.Errorf("run(%v) stdout should not include the TUI keybinding legend; got:\n%s", args, got)
 		}
 	}
@@ -214,8 +214,12 @@ func TestRunQuickstart(t *testing.T) {
 		"P` key", "y/n confirm", ":22", "hard-blocked",
 		// Resolved config path.
 		"Config path:", filepath.Join(xdg, "tailport", "config.yaml"),
-		// The keybinding legend (spot-check a few rows).
-		"space", "Toggle tailscale serve", "Quit.",
+		// The keybinding legend (spot-check a few rows). The serve-toggle key
+		// row is pinned by its exact rendering ("  t       Toggle tailscale
+		// serve...") since kata 7nss remapped the toggle from space to the
+		// single-char "t", which is otherwise too common a substring to spot-check
+		// on its own.
+		"  t       Toggle tailscale serve", "Quit.",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("run([quickstart]) stdout missing %q; got:\n%s", want, got)

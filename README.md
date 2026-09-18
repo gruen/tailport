@@ -35,7 +35,7 @@ only as a deliberate, per-port, confirmed opt-in — see
    ```sh
    tailport
    ```
-   Arrow-key to a port, press `space` to serve it on your tailnet, then `c` to
+   Arrow-key to a port, press `t` to serve it on your tailnet, then `c` to
    copy its URL. Press `?` for the full keybinding overlay, or run
    `tailport quickstart` for a non-interactive tour.
 
@@ -162,11 +162,11 @@ or `?` when the port belongs to a process owned by a different user (commonly
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move between route rows (a flat walk across every service's routes) |
 | `Shift+↑`/`Shift+↓`, `J`/`K` | Jump between services (land on the target's first route) |
-| `space` | Serve on your tailnet — toggle (loopback-bound ports only) |
+| `t` | Serve on your tailnet — toggle (loopback-bound ports only) |
 | `P` | Funnel to the public internet — toggle, behind a confirm |
 | `p` | Publish via your Caddy edge — toggle, behind a confirm |
 | `e` | Edit a published port's auth in place (can't move it to a new hostname) |
-| `t` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
+| `o` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
 | `C` | Tear down stale forwards (served with nothing listening) |
 | `x` | Lock / unlock the selected port (`:22` ships locked; unlocking it needs a typed `ssh`) |
@@ -196,12 +196,12 @@ hard-blocked from all three public paths.
 
 | Level | Key | Reach | Transport |
 | --- | --- | --- | --- |
-| **Serve** | `space` | Your tailnet | `tailscale serve` (plain HTTP) |
+| **Serve** | `t` | Your tailnet | `tailscale serve` (plain HTTP) |
 | **Funnel** | `P` | Public internet | `tailscale funnel` (HTTPS via `*.ts.net`) |
 | **Publish** | `p` | Public internet | Your own [Caddy edge](#publishing-to-the-public-internet-caddy-edge) — custom `https://` hostname |
-| **Tunnel** | `t` | Public internet | [Cloudflare Tunnel](#tunnelling-to-the-public-internet-cloudflare-tunnel) (`cloudflared`) |
+| **Tunnel** | `o` | Public internet | [Cloudflare Tunnel](#tunnelling-to-the-public-internet-cloudflare-tunnel) (`cloudflared`) |
 
-**Serve** is the default path and the reason tailport exists. Press `space` on a
+**Serve** is the default path and the reason tailport exists. Press `t` on a
 loopback-bound port and it's reachable at `http://<hostname>:<port>` across your
 tailnet. (An already-reachable port shows an info toast instead — there's
 nothing to serve.) Two deliberate constraints:
@@ -212,7 +212,7 @@ nothing to serve.) Two deliberate constraints:
 - **1:1 port mapping.** A served port always keeps its own number; serve never
   remaps.
 
-**The three public paths** (`P`, `p`, `t`) each expose a port to *anyone on the
+**The three public paths** (`P`, `p`, `o`) each expose a port to *anyone on the
 internet*, so each:
 
 - requires a strong y/n confirmation before going live, naming the resulting
@@ -242,7 +242,7 @@ of:
   favorited, locked, or added by number.
 
 A port earns its place in the registry the moment you interact with it — serving
-(`space`), adding (`n`), labeling (`l`), favoriting (`f`), or locking (`x`) all
+(`t`), adding (`n`), labeling (`l`), favoriting (`f`), or locking (`x`) all
 add it — and it keeps showing up (marked inactive) even after you toggle it off,
 persisting across restarts. `F` (forget) on a port with no label and no lock
 reverses this: it's dropped from the registry and disappears from the default
@@ -428,7 +428,7 @@ run — Tailscale ACL and auth key, DNS) is a separate one-time operator task; s
 
 ### Tunnel (Cloudflare)
 
-*Advanced — only needed if you use the `t` Cloudflare tunnel path.*
+*Advanced — only needed if you use the `o` Cloudflare tunnel path.*
 
 A `cloudflared` block configures the optional
 [tunnel-to-the-internet path](#tunnelling-to-the-public-internet-cloudflare-tunnel).
@@ -453,7 +453,7 @@ cloudflared:
 ```
 
 - **`binary`** (default `""`) — path to the cloudflared executable. Blank means
-  tailport looks it up on `$PATH`; the whole `t` feature (key, discovery,
+  tailport looks it up on `$PATH`; the whole `o` feature (key, discovery,
   polling) stays dormant unless it's found there (or at this path).
 - **`domain`** (default `""`) — a public base domain used only to **prefill**
   the hostname prompt when starting a **named** tunnel. Purely a convenience:
@@ -528,7 +528,7 @@ ingress slot (Funnel). The `cloudflared` binary *is* the connector; a tunnel is
 up only while its process stays alive.
 
 The whole feature exists only when `cloudflared` is installed: tailport detects
-it once at startup, and when it's absent the `t` key is dropped from the bar
+it once at startup, and when it's absent the `o` key is dropped from the bar
 entirely — no key, no discovery, no polling, zero cost. There are two flavors,
 matching Cloudflare's two account scenarios:
 
@@ -549,7 +549,7 @@ own session, so quitting the TUI doesn't drop the tunnel — it keeps running
 until you tear it down or kill it yourself. tailport never persists tunnel state
 to disk; instead it reads the OS process table live on every poll, so a tunnel
 started in a previous session is re-discovered next launch and stays
-re-toggleable with `t`. Only **tailport-owned** tunnels — the ones carrying a
+re-toggleable with `o`. Only **tailport-owned** tunnels — the ones carrying a
 sentinel `--logfile` flag tailport always passes — are tracked this way; a
 `cloudflared` process started outside tailport is left alone entirely.
 
@@ -558,16 +558,16 @@ and Publish on the same port, every path still requires its own per-service
 confirm, and `:22` stays hard-blocked. A tunnelled service shows its own
 `cloudflare` route row (marker `◈` / ☁️) with the exact public URL once known.
 
-### The tunnel toggle (`t`)
+### The tunnel toggle (`o`)
 
-`t` behaves differently depending on the port's state:
+`o` behaves differently depending on the port's state:
 
-- **Already tunnelled** — `t` tears it down immediately. No confirm.
+- **Already tunnelled** — `o` tears it down immediately. No confirm.
 - **Tunnelled earlier this session, then torn down** — tailport remembers that
   port's mode (and, for a named tunnel, its hostname) in memory for as long as
-  the process runs, and `t` re-raises it, skipping setup — straight to the
+  the process runs, and `o` re-raises it, skipping setup — straight to the
   confirm.
-- **Never tunnelled this session** — `t` runs the full setup. If you're logged
+- **Never tunnelled this session** — `o` runs the full setup. If you're logged
   in to Cloudflare, you pick quick or named; choosing named asks for the
   hostname you've routed and the tunnel's name. Without an account, only the
   quick path exists, so setup skips straight to its confirm.
@@ -596,7 +596,7 @@ A **named** tunnel's confirm has no such gap — it names the exact
   in-memory-only state to lose if tailport is killed rather than quit normally.
 
 tailport has no dependencies beyond the `tailscale` CLI and the OS tools above
-(and, only if you use the `t` tunnel feature, `cloudflared`) — no daemon,
+(and, only if you use the `o` tunnel feature, `cloudflared`) — no daemon,
 nothing installed or modified system-wide other than the `serve` mappings you
 toggle yourself.
 
@@ -605,11 +605,11 @@ toggle yourself.
 ### Dangling forward (`▲` / `🌫️`, "bound to tailnet, but stale")
 
 A row marked `▲` / `🌫️` — whose description reads *"bound to tailnet, but stale —
-space to unbind"* — means the `serve` mapping is up but no local process holds
+t to unbind"* — means the `serve` mapping is up but no local process holds
 the port. Two common cases:
 
 - **The app just isn't running** (it died, or hasn't started). Start it, or
-  unbind the port — `space` on the row, or `C` to clear all stale forwards. The
+  unbind the port — `t` on the row, or `C` to clear all stale forwards. The
   mapping deliberately outlives the app so you can restart it freely, so
   tailport won't tear it down for you.
 - **The app can't start with "address already in use."** When you serve `:8025`,
@@ -626,7 +626,7 @@ the port. Two common cases:
 
   This resolves the collision and keeps the app off your LAN — reachable only
   over the tailnet, through `serve`. If you genuinely need the app on
-  `0.0.0.0:<port>`, unbind the port first (`space`, or `C`) — note that once
+  `0.0.0.0:<port>`, unbind the port first (`t`, or `C`) — note that once
   it's on `0.0.0.0` it's already reachable on the tailnet on its own (state
   `on tailnet`), so there's nothing left to serve.
 
