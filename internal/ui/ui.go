@@ -4220,7 +4220,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					before := m.portState(port)
 					cmd := m.favorite(port)
 					m.pushUndo(port, before, fmt.Sprintf("add :%d", port))
-					return m, tea.Batch(cmd, m.rebuildItems())
+					// kata kcey: rebuildItems runs synchronously (its returned
+					// cmd is only setItems' filter-reapply, not a deferred
+					// mutation -- see rebuildItems/setItems), so the list
+					// already reflects the new favorite by the time we call
+					// selectPort here -- same ordering the "a" view-toggle
+					// case above relies on. A not-yet-listening favorite can
+					// land anywhere in sort order, so jump the cursor to it
+					// rather than leaving the user to hunt for it (mirrors "f",
+					// where the cursor is already on the port).
+					rebuildCmd := m.rebuildItems()
+					m.selectPort(port)
+					return m, tea.Batch(cmd, rebuildCmd)
 				case entryLabel:
 					label := strings.TrimSpace(m.labelInput.Value())
 					port := m.labelPort

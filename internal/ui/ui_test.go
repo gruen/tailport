@@ -632,6 +632,36 @@ func TestAddPortPreservesMeta(t *testing.T) {
 	}
 }
 
+// TestAddPortSelectsNewFavorite covers kata kcey: after "n" adds a favorite,
+// the cursor jumps to that port's row so the user can see where it landed,
+// rather than staying wherever it happened to be before the add. A
+// not-yet-listening favorite can sort anywhere among the existing ones (here,
+// the middle), so this only passes if the selection is actively repointed at
+// the new port, not just left alone by coincidence. Scoped to the "n"
+// add-by-number path -- "f" already has the cursor on the port it favorites.
+func TestAddPortSelectsNewFavorite(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{
+		3000: {Favorite: true},
+		9000: {Favorite: true},
+	}})
+	m.allPorts = nil
+	m.active = map[int]bool{}
+	m.showAllPorts = false // Favorites view
+	m.rebuildItems()
+	m.list.Select(0) // cursor starts on :3000, the FIRST row
+
+	m = addPort(m, "5000")
+
+	if got := portNumbers(m); !reflect.DeepEqual(got, []int{3000, 5000, 9000}) {
+		t.Fatalf("setup: want the three favorites sorted 3000/5000/9000; got %v", got)
+	}
+	sel, ok := m.list.SelectedItem().(portItem)
+	if !ok || sel.port.Number != 5000 {
+		t.Errorf("after adding :5000, selection should land on :5000; got %+v (ok=%v)", sel, ok)
+	}
+}
+
 // TestEggArt covers amac's invariants (the shape itself is visual): the
 // borderless egg's rows never exceed the width budget, its height matches the
 // clamp, it's deterministic per (frame,size), it changes with the frame
