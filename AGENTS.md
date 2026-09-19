@@ -21,8 +21,8 @@ contract. The short version:
   path. `tailscale funnel` (public internet exposure) IS supported, but only
   as a deliberate, per-service opt-in via the `p` key (kata vzj4 swapped this
   to `P`, on the theory that capital guards the more-permanent exposure; kata
-  58ws REVERSED that call at the owner's request — funnel is back on the bare
-  `p`, and Publish moved to `d`, see below) behind a strong y/n
+  58ws REVERSED that call at the owner's request — funnel is back on the
+  bare `p`, and Publish moved to `d`, see below) behind a strong y/n
   confirm that names the port and shows the resulting public URL. `:22` (SSH)
   is hard-blocked from funnel. Never funnel implicitly, in bulk, or without
   that confirm. (Implemented under kata yt69: the `P` key, `entryConfirmFunnel`
@@ -30,13 +30,13 @@ contract. The short version:
   under kata 58ws.)
 - Publish-via-edge is a SECOND public path (the `d` key, kata v1z5; swapped
   from `P` to `p` under vzj4, then moved from `p` to `d` under kata 58ws,
-  which reversed vzj4's swap for Funnel), **independent of Funnel — not
-  layered or ranked above
-  it, and no longer mutually exclusive with it: kata th05 relaxed that rule
-  (an owner-approved reversal)**. A local port may now carry Funnel AND
-  Publish at once, each its own navigable route sub-row: the `d` path no
-  longer refuses a funnelled port, nor does the `p` path refuse a
-  Caddy-published one — there's no more "remove the other exposure first."
+  which also reversed vzj4's swap for Funnel), **independent of Funnel —
+  not layered or ranked above it, and no longer mutually exclusive with
+  it: kata th05 relaxed that rule (an owner-approved reversal)**. A local
+  port may now carry Funnel AND Publish at once, each its own navigable
+  route sub-row: the `d` path no longer refuses a funnelled port, nor does
+  the `p` path refuse a Caddy-published one — there's no more "remove the
+  other exposure first."
   There is no implicit precedence between them, and multiple public paths on
   one port are now a legitimate, expected state, not drift — never silently
   collapsed to one marker. It carries the same funnel-grade guardrails:
