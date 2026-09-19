@@ -177,7 +177,8 @@ type keyMap struct {
 	Toggle key.Binding
 	Funnel key.Binding
 	// Publish exposes a port to the public internet through a user-controlled
-	// Caddy edge (the `p` key, kata v1z5; swapped from `P` under vzj4). It is a
+	// Caddy edge (the `d` key, kata v1z5; moved from `p` under 58ws, which
+	// itself reversed vzj4's earlier `P`/`p` swap). It is a
 	// SECOND public path, sibling to Funnel -- never ranked above. Since kata
 	// th05 it may COEXIST with funnel/tunnel on one port (each its own route).
 	Publish key.Binding
@@ -246,11 +247,14 @@ type keyGroup struct {
 // same clip/OSC 52 family, port-scoped rather than route-scoped. Edit (kata
 // prp1) sits right after Lock -- it's a publish-flow variant, not an
 // exposure guard, but there's no later slot that reads better.)
-// The three public paths run publish (p) -> cloudflare tunnel (t) -> funnel (P):
-// funnel sits BELOW the tunnel per mg's ordering (nc1j follow-up).
+// The toggle-group order was reworked under 58ws: t (serve) -> p (funnel) ->
+// d (publish) -> o (cloudflare tunnel) -- matching the key letters left to
+// right roughly, and putting funnel (the lighter-weight, easiest-to-drop
+// public path) ahead of publish/tunnel rather than the earlier
+// publish-tunnel-funnel order from the nc1j follow-up.
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Publish, k.Tunnel, k.Funnel, k.Clean, k.Lock, k.Edit}},
+		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Tunnel, k.Clean, k.Lock, k.Edit}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.CopyPid, k.CopyKill, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
@@ -291,14 +295,16 @@ func newKeyMap() keyMap {
 		// "toggle serve on/off" prose (keyLegendDescs). Remapped from space to t
 		// (kata 7nss, BREAKING): t = tailscale (mnemonic); space is now unbound.
 		Toggle: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "on tailscale")),
-		// p/P swapped (vzj4): capital guards the more-permanent exposure, so
-		// funnel (tailnet-only cert, easy to drop) takes the shifted key and
-		// publish (custom domain via Caddy edge) takes the bare key.
-		Funnel: key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "on ts.net (public)")),
+		// p/P swapped back (58ws): the owner reversed vzj4's "capital guards
+		// the more-permanent exposure" call. Funnel (tailnet-only cert, easy
+		// to drop) now takes the bare key; publish (custom domain via Caddy
+		// edge) moves to d. P is unbound.
+		Funnel: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "on ts.net (public)")),
 		// "on caddy (public)": the second public path (kata v1z5), a Caddy-edge
-		// publish sibling to funnel, in the Serve Toggles group. p is a TOGGLE
+		// publish sibling to funnel, in the Serve Toggles group. d is a TOGGLE
 		// (kata prp1): unpublish/republish/first-setup, see requestPublish.
-		Publish: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "on caddy (public)")),
+		// Moved from p to d under 58ws (freed p for funnel).
+		Publish: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "on caddy (public)")),
 		// "on cloudflare (public)": the third public path (kata nc1j), a
 		// cloudflared-tunnel sibling to funnel/publish in the Serve Toggles group.
 		// o is a TOGGLE: tear down / re-raise / first-setup, see requestTunnel.
@@ -783,7 +789,8 @@ const (
 	// stray "x" must not remove it. Only unlocking is gated -- locking :22 and
 	// any non-:22 lock toggle stay a single instant keypress.
 	entryConfirmUnlockSSH
-	// The publish (`p`) flow (kata v1z5; swapped from `P` under vzj4) is a
+	// The publish (`d`) flow (kata v1z5; moved from `p` under 58ws, which
+	// reversed vzj4's earlier `P`/`p` swap) is a
 	// small state machine of its own,
 	// all handled in updatePublishEntry. It gathers a public hostname, an
 	// optional shared basic-auth credential (first authed publish only), then a
@@ -943,7 +950,7 @@ type model struct {
 	// lastPublish remembers, per local port, the hostname + auth of every
 	// port that has been published (successfully) at ANY point THIS session
 	// -- kata prp1. Unlike published, entries are NEVER removed on unpublish:
-	// that's the whole point -- it's what lets the `p` toggle re-publish a
+	// that's the whole point -- it's what lets the `d` toggle re-publish a
 	// port's remembered config with the setup prompts skipped (requestPublish)
 	// and lets `e` prefill its host dialog from it (enterPublishHostDialog).
 	// Populated from two sources: a successful, non-unpublish publishDoneMsg,
@@ -1067,7 +1074,8 @@ type model struct {
 	funnelPort   int
 	funnelPublic int
 	funnelTurnOn bool
-	// Publish (`p`) flow state (kata v1z5; swapped from `P` under vzj4), carried
+	// Publish (`d`) flow state (kata v1z5; moved from `p` under 58ws, which
+	// reversed vzj4's earlier `P`/`p` swap), carried
 	// across the dialog steps and
 	// cleared by clearPublishFlow on esc/abort/confirm. publishInput is the ONE
 	// shared textinput reused for the host / cred-user / cred-pass steps (its
@@ -1158,8 +1166,9 @@ type model struct {
 	// operatorHintText, and the detectOperatorMsg/toggleDoneMsg handlers.
 	operatorNotSet bool
 	// domainSetupPending is a SECOND sticky banner, PARALLEL to and independent
-	// of operatorNotSet (kata w131, ycv1 r3-NEW-1): it is raised when the `p`
-	// flow (swapped from `P` under vzj4) captures a blank caddy.domain inline
+	// of operatorNotSet (kata w131, ycv1 r3-NEW-1): it is raised when the `d`
+	// flow (moved from `p` under 58ws, which reversed vzj4's earlier `P`/`p`
+	// swap) captures a blank caddy.domain inline
 	// (entryPublishDomain) and reminds
 	// the user that saving the config FIELD is not the same as doing the edge
 	// SETUP -- they still owe the *.<domain> wildcard DNS pointed at the edge and
@@ -2366,8 +2375,8 @@ func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
 	return tea.Batch(saveCmd, toggle(port, turnOn))
 }
 
-// requestFunnel begins toggling the public funnel for a port (the "P" key,
-// swapped from "p" under vzj4).
+// requestFunnel begins toggling the public funnel for a port (the "p" key,
+// swapped back from "P" under 58ws, which reversed vzj4's earlier swap).
 // Turning ON is the escalation to the public internet, so it's hard-blocked
 // for :22 (SSH), refused when all three ingress ports are taken, and
 // otherwise deferred to a strong y/n confirm (entryConfirmFunnel). Turning
@@ -2456,8 +2465,8 @@ func looksHTTP(port int, process string) bool {
 	return false
 }
 
-// requestPublish is the `p` key's up-front gate (swapped from `P` under vzj4;
-// kata v1z5 step 3), mirroring
+// requestPublish is the `d` key's up-front gate (moved from `p` under 58ws,
+// which reversed vzj4's earlier `P`/`p` swap; kata v1z5 step 3), mirroring
 // requestFunnel. It runs the local guards IN ORDER before opening the publish
 // dialog (or, for de-escalation, before the immediate unpublish). Beyond these
 // local guards, caddyedge.Publish itself enforces route ownership (a hostname
@@ -2466,7 +2475,7 @@ func looksHTTP(port int, process string) bool {
 // truth, so it surfaces later as a publishDoneMsg error. Returns a nil cmd
 // whenever it defers to the dialog.
 //
-// `p` is a TOGGLE (kata prp1): unpublish on an already-published port
+// `d` is a TOGGLE (kata prp1): unpublish on an already-published port
 // (unchanged, guard 5 below); a same-session RE-publish (skipping every setup
 // prompt) on a port remembered in m.lastPublish once caddy.domain is
 // configured; otherwise the full first-time setup flow (guards 7/8, via
@@ -2582,7 +2591,7 @@ func (m *model) publishSetupOrHostDialog() tea.Cmd {
 	return m.enterPublishHostDialog()
 }
 
-// republishFromMemory is the `p` toggle's fast path (kata prp1) for a port
+// republishFromMemory is the `d` toggle's fast path (kata prp1) for a port
 // with a remembered publishInfo (requestPublish guard 6b): it re-publishes
 // with THAT hostname/auth, skipping the host/auth setup prompts, by setting
 // the SAME flow fields confirmPublish (the entryConfirmPublish "yes" path)
@@ -2604,7 +2613,7 @@ func (m *model) republishFromMemory(port int, info publishInfo) tea.Cmd {
 	return m.enterConfirmPublish()
 }
 
-// requestEditPublish is the `e` key's up-front gate (kata prp1): unlike `p`
+// requestEditPublish is the `e` key's up-front gate (kata prp1): unlike `d`
 // it NEVER de-escalates (no unpublish branch) and NEVER takes the lastPublish
 // shortcut -- editing always runs the FULL host/auth/confirm setup flow
 // (publishSetupOrHostDialog), prefilled with the port's remembered/current
@@ -2641,7 +2650,7 @@ func (m *model) requestEditPublish(port int) tea.Cmd {
 	}
 	// Deliberately NO "already published -> unpublish" branch here: `e`
 	// always edits forward into the setup flow, whether or not the port is
-	// currently published. De-escalation stays `p`'s job.
+	// currently published. De-escalation stays `d`'s job.
 	m.publishPort = port
 	return m.publishSetupOrHostDialog()
 }
@@ -2848,7 +2857,7 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			// than leave the old route dangling and publicly exposed. EqualFold:
 			// Caddy canonicalises hostnames, so a case-only change is the SAME
 			// route and is allowed. Only reachable via `e` (a published port's
-			// `p` unpublishes; it never enters this host dialog).
+			// `d` unpublishes; it never enters this host dialog).
 			//
 			// BEST-EFFORT (roborev 44n7): this keys off the poll cache
 			// (m.published), which can be stale/empty -- before the first poll,
@@ -2862,7 +2871,7 @@ func (m *model) updatePublishEntry(msg tea.KeyMsg) tea.Cmd {
 			// time / an atomic replace -- is tracked in srx1 (v0.2.1).
 			if cur, ok := m.published[m.publishPort]; ok && !strings.EqualFold(host, cur.hostname) {
 				m.clearPublishFlow()
-				return m.setErr(fmt.Sprintf("port :%d is published at %s — press p to unpublish first, then publish it at the new hostname", m.publishPort, cur.hostname))
+				return m.setErr(fmt.Sprintf("port :%d is published at %s — press d to unpublish first, then publish it at the new hostname", m.publishPort, cur.hostname))
 			}
 			m.publishHostname = host
 			m.mode = entryPublishAuth
@@ -3448,7 +3457,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Capture BEFORE the terminal-success clear below (mirroring tookOver):
 		// the hostname THIS publish targeted, confirmPublish's pendingPublish
 		// carry (kata qfbf) -- used for the plain publish-success toast's
-		// "press p to unpublish" teaching clause (71ga) AND (kata prp1) to seed
+		// "press d to unpublish" teaching clause (71ga) AND (kata prp1) to seed
 		// m.lastPublish on a successful, non-unpublish outcome below.
 		publishedHost := m.pendingPublish.hostname
 		publishedAuth := m.pendingPublish.withAuth
@@ -3558,16 +3567,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over. armTimer (ttfh) starts the
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
-			// take-over, which arms nothing). "press p to unpublish" (71ga) teaches
+			// take-over, which arms nothing). "press d to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press p to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press p to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
@@ -4157,7 +4166,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clearTunnelFlow()
 				return m, nil
 			}
-			// The publish (`p`) flow (kata v1z5; swapped from `P` under vzj4) is
+			// The publish (`d`) flow (kata v1z5; moved from `p` under 58ws, which
+			// reversed vzj4's earlier `P`/`p` swap) is
 			// a self-contained state
 			// machine handled here, BEFORE the generic esc/enter switch and the
 			// textinput fallthrough below -- so its keystrokes reach publishInput
@@ -4604,7 +4614,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestToggle applies the lock guard and, for :22 only, the SSH
 			// y/n confirm before any serve call.
 			return m, m.requestToggle(sel.port.Number, !sel.active)
-		case "P": // funnel key (swapped from "p", vzj4)
+		case "p": // funnel key (swapped back from "P", kata 58ws)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel is already in flight
 			}
@@ -4615,7 +4625,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// requestFunnel hard-blocks :22, refuses when all ingress ports are
 			// taken, and defers a turn-on to the strong public-internet confirm.
 			return m, m.requestFunnel(sel.port.Number)
-		case "p": // publish key (swapped from "P", vzj4)
+		case "d": // publish key (moved from "p", kata 58ws)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel/publish is already in flight
 			}
@@ -4625,7 +4635,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// requestPublish runs the publish guards in order (busy, :22, empty
 			// fqdn, funnel mutual-exclusion, de-escalation, config, lock) and
-			// otherwise opens the publish dialog (kata v1z5). p is a TOGGLE
+			// otherwise opens the publish dialog (kata v1z5). d is a TOGGLE
 			// (kata prp1): unpublish / same-session re-publish / first-setup.
 			return m, m.requestPublish(sel.port.Number)
 		case "e": // edit publish config, without unpublishing first (kata prp1)
@@ -6503,11 +6513,12 @@ func keyLegendDescs(emoji bool) map[string]string {
 	}
 	return map[string]string{
 		"t": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so t is a no-op there.",
-		// p/P swapped (vzj4): funnel now lives under "P", publish under "p".
-		"P":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press P again to drop the port\nback to tailnet-served.",
-		"p":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). p is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
+		// p/P swapped back (58ws): funnel now lives under "p" again, publish
+		// moved to "d" (was "p" under vzj4).
+		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
+		"d":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). d is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
 		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. o is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
-		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm p uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with p, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as p\n(busy, :22, locked); e never de-escalates.",
+		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
 		"I":      "Copy a ready-to-run kill command for the selected port's PID\n(e.g. \"kill 12345\", SIGTERM -- no signal flag), via the same path as\ni. A safe manual stand-in until an in-app kill exists. Same Pid==0\nrefusal as i: no command is copied for an unresolved PID.",
@@ -6673,8 +6684,8 @@ func (m model) helpContent() string {
 			"wildcard-bound port (0.0.0.0) is already reachable on the tailnet\n" +
 			"without serving — see the marker legend and each row's description.\n" +
 			"A port can also be exposed to the PUBLIC internet two independent,\n" +
-			"mutually-exclusive ways (opt-in, see below): `P` funnels it via\n" +
-			"tailscale, and `p` publishes it at a custom hostname through your own\n" +
+			"mutually-exclusive ways (opt-in, see below): `p` funnels it via\n" +
+			"tailscale, and `d` publishes it at a custom hostname through your own\n" +
 			"Caddy edge (first publish prompts for caddy.hostname/domain if\n" +
 			"unset — see docs/caddy-edge.md)."))
 	b.WriteString("\n\n")
@@ -6857,7 +6868,7 @@ func (m model) emptyStateMessage() string {
 		t("tailport exposes your machine's listening TCP ports to your tailnet."),
 		t("It discovers them with ") + k("ss") + t(" (Linux) / ") + k("lsof") + t(" (macOS), and turns"),
 		t("each one on or off with ") + k("tailscale serve --http=<port>") + t(" -- tailnet-only,"),
-		t("plain HTTP, same port in and out. Press ") + k("P") + t(" to funnel one publicly."),
+		t("plain HTTP, same port in and out. Press ") + k("p") + t(" to funnel one publicly."),
 		"",
 	}
 	if m.showAllPorts {
@@ -7084,7 +7095,8 @@ func (m model) operatorHintTextRaw() string {
 }
 
 // domainSetupHintText returns the STICKY setup-reminder banner raised after the
-// `p` flow (swapped from `P` under vzj4) captures a blank caddy.domain inline
+// `d` flow (moved from `p` under 58ws, which reversed vzj4's earlier `P`/`p`
+// swap) captures a blank caddy.domain inline
 // (kata w131, ycv1 r3-NEW-1), or
 // "" when it isn't active (see m.domainSetupPending). It follows
 // operatorHintText's PATTERN -- sticky, single line, warnStyle at the render

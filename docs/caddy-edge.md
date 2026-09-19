@@ -3,7 +3,8 @@
 Runbook for standing up the **Caddy edge**: a small always-on host running
 tailscaled + Caddy that lets tailport publish a local port to a custom public
 hostname — `https://app.example.com`, no port in the URL, no `*.ts.net` — over
-your tailnet (the `p` key, kata v1z5; swapped from `P` under vzj4).
+your tailnet (the `d` key, kata v1z5; moved from `p` under 58ws, which
+reversed vzj4's earlier `P`/`p` swap).
 
 **The edge is not tied to any one provider.** tailport only ever speaks Caddy's
 admin API over the tailnet, so *any* host that meets the [requirements
@@ -21,7 +22,7 @@ the `caddy.*` config fields this deploy has to line up with.
 
 **This is a one-time (or occasional) operator task**, separate from
 day-to-day tailport use — everything else (`tailscale serve`/`t`,
-Funnel/`P`) needs no edge at all. Do it once per edge, not once per
+Funnel/`p`) needs no edge at all. Do it once per edge, not once per
 tailport machine: several tailport computers can publish through the same
 edge (see step 4).
 
@@ -306,7 +307,7 @@ Set **`domain`** to the base whose DNS you pointed at the edge in step 3, at the
 wildcard depth you actually publish at (`*.apps.example.com` → `domain:
 apps.example.com`). While it's blank the background published-state poll stays
 off (zero cost until you opt in); you don't have to hand-edit it, though —
-pressing `p` on a port with a blank `domain` prompts for it inline and saves it
+pressing `d` on a port with a blank `domain` prompts for it inline and saves it
 for you (a targeted write that preserves the rest of the file), then continues
 the publish.
 
@@ -315,17 +316,17 @@ config, so normally you only edit the `domain:` line. **If your `config.yaml`
 predates the publish feature the block won't be there yet** — trigger one save
 with any change that writes the file (favouriting or labelling a port), or
 paste the block above in by hand, then set `domain:`. Publishing can also seed
-it: pressing `p` with a blank `domain` captures it inline and saves it rather
-than refusing. Full field reference, including `silent_republish` (`p`'s
+it: pressing `d` with a blank `domain` captures it inline and saves it rather
+than refusing. Full field reference, including `silent_republish` (`d`'s
 opt-in to skip the confirm when re-publishing a port already published this
 session): the root README's [Configuration](../README.md#configuration)
-section and its [Publish is a toggle](../README.md#publish-is-a-toggle-p)
+section and its [Publish is a toggle](../README.md#publish-is-a-toggle-d)
 section.
 
 `hostname` is the edge's own short MagicDNS name (default `caddy`), used only so
 tailport can find its admin API over the tailnet — it is unrelated to any
 published *public* hostname. Hand-editing it is no longer the only path: on a
-fresh setup (blank `domain`), pressing `p` also prompts for `hostname` first
+fresh setup (blank `domain`), pressing `d` also prompts for `hostname` first
 (prefilled with the current value, so accepting the default is a no-op),
 *before* the `domain` prompt above — it's needed to reach the admin API at all.
 Already-configured setups aren't re-prompted. `server_name` must be identical
@@ -352,7 +353,7 @@ effectively-first, boot.
 
 Do this once, after the edge is deployed, DNS points at it, and you've
 published at least one port from a tailport-managed backend machine (press
-`p`). It deliberately checks **two separate things**, so a failure tells you
+`d`). It deliberately checks **two separate things**, so a failure tells you
 which half broke:
 
 ```sh
@@ -485,7 +486,7 @@ stale after changing `caddy.hostname`/`TS_HOSTNAME`, per step 4's Known
 limitation) you have to either clear the autosave file on the volume
 (`fly ssh console`, remove `$XDG_CONFIG_HOME/caddy/autosave.json`) or destroy
 and recreate the volume outright. Either way, every previously published
-route is gone and each backend has to republish (press `p` again) — tailport
+route is gone and each backend has to republish (press `d` again) — tailport
 itself keeps no per-port publish state to restore from; Caddy's live config
 is the only source of truth (see kata v1z5's Architecture notes).
 
@@ -669,7 +670,7 @@ echo "*.$DOMAIN   AAAA   <v6>"
 
 A wildcard matches exactly one label: `*.$DOMAIN` covers `foo.$DOMAIN` but not
 `foo.bar.$DOMAIN`, so `*.$DOMAIN` suffices **only** for hostnames exactly one
-label beneath `$DOMAIN`. The publish hostname is editable in the `p` flow and
+label beneath `$DOMAIN`. The publish hostname is editable in the `d` flow and
 its prefill can nest (e.g. `<label>.<group>.$DOMAIN`), so if you publish nested
 names, add a matching wildcard/record for each level — §3 covers this in full.
 
@@ -677,7 +678,7 @@ names, add a matching wildcard/record for each level — §3 covers this in full
 
 On **each** machine that will publish, set in `~/.config/tailport/config.yaml`:
 `caddy.domain: <your DOMAIN>` (and `caddy.hostname: <your HOSTNAME>` if you
-changed it off `caddy`). Restart tailport, publish a port with `p` — note the
+changed it off `caddy`). Restart tailport, publish a port with `d` — note the
 **exact** hostname it confirms (that's what DNS must cover and what you test,
 not an assumed `<label>.$DOMAIN`) — then from a host **not** on your tailnet:
 

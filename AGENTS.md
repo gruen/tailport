@@ -19,25 +19,30 @@ contract. The short version:
 
 - Tailnet-first. `tailscale serve` (tailnet-only exposure) is the default
   path. `tailscale funnel` (public internet exposure) IS supported, but only
-  as a deliberate, per-service opt-in via the `P` key (swapped from `p` under
-  kata vzj4 — capital guards the more-permanent exposure) behind a strong y/n
+  as a deliberate, per-service opt-in via the `p` key (kata vzj4 swapped this
+  to `P`, on the theory that capital guards the more-permanent exposure; kata
+  58ws REVERSED that call at the owner's request — funnel is back on the bare
+  `p`, and Publish moved to `d`, see below) behind a strong y/n
   confirm that names the port and shows the resulting public URL. `:22` (SSH)
   is hard-blocked from funnel. Never funnel implicitly, in bulk, or without
   that confirm. (Implemented under kata yt69: the `P` key, `entryConfirmFunnel`
-  gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`.)
-- Publish-via-edge is a SECOND public path (the `p` key, kata v1z5; swapped
-  from `P` under vzj4), **independent of Funnel — not layered or ranked above
+  gate, and `tsserve.FunnelOn/FunnelOff/FunnelStatus`; re-lettered `P` -> `p`
+  under kata 58ws.)
+- Publish-via-edge is a SECOND public path (the `d` key, kata v1z5; swapped
+  from `P` to `p` under vzj4, then moved from `p` to `d` under kata 58ws,
+  which reversed vzj4's swap for Funnel), **independent of Funnel — not
+  layered or ranked above
   it, and no longer mutually exclusive with it: kata th05 relaxed that rule
   (an owner-approved reversal)**. A local port may now carry Funnel AND
-  Publish at once, each its own navigable route sub-row: the `p` path no
-  longer refuses a funnelled port, nor does the `P` path refuse a
+  Publish at once, each its own navigable route sub-row: the `d` path no
+  longer refuses a funnelled port, nor does the `p` path refuse a
   Caddy-published one — there's no more "remove the other exposure first."
   There is no implicit precedence between them, and multiple public paths on
   one port are now a legitimate, expected state, not drift — never silently
   collapsed to one marker. It carries the same funnel-grade guardrails:
   per-service opt-in, a strong y/n confirm naming the exact `https://<hostname>`
   URL, `:22` hard-blocked, ungated de-escalation (an immediate unpublish, no
-  confirm), and unpublish never touches serve state. The `p` key is a TOGGLE
+  confirm), and unpublish never touches serve state. The `d` key is a TOGGLE
   (kata prp1): pressed again on a port published earlier THIS session
   (remembered hostname + auth, session-only, never persisted), it re-publishes
   with that remembered config, skipping the host/auth setup prompts — still
@@ -67,13 +72,14 @@ contract. The short version:
   the `caddy:` config block, and the `p` key / `entryConfirmPublish` gate /
   published-state poll in `internal/ui`. The `p` toggle, the `e` edit key, the
   session-only `lastPublish` memory, and `caddy.silent_republish` were added
-  under kata prp1.)
+  under kata prp1. Re-lettered `p` -> `d` under kata 58ws, which also swapped
+  Funnel back to the bare `p` — see that bullet above for the reversal.)
 - Cloudflare Tunnel is a THIRD public path (the `t` key, kata nc1j),
   **independent of both Funnel and Publish — never layered or ranked above
   either, and no longer mutually exclusive with them: kata th05 relaxed that
   rule (an owner-approved reversal)**. A local port may now carry all three
   public paths at once, each its own navigable route sub-row: `t` no longer
-  refuses an already-funnelled or already-published port, and `P`/`p` no
+  refuses an already-funnelled or already-published port, and `p`/`d` no
   longer refuse an already-tunnelled one — there's no more "remove the other
   exposure first." Coexistence across the three public paths is a
   legitimate, expected state, never silently collapsed to one marker or

@@ -1347,7 +1347,7 @@ func TestUnlockSSHConfirm(t *testing.T) {
 		t.Errorf("x on :8080 should lock instantly; mode=%v locked=%v", m.mode, m.cfg.Ports[8080].Locked)
 	}
 
-	// (8) Modality: t/P while confirming must NOT toggle serve/funnel.
+	// (8) Modality: t/p while confirming must NOT toggle serve/funnel.
 	m = lockedModel()
 	res, _ = m.Update(xKey)
 	m = res.(model)
@@ -1356,11 +1356,11 @@ func TestUnlockSSHConfirm(t *testing.T) {
 	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
 		t.Errorf("t in ssh-confirm must not toggle; pending=%d mode=%v", m.pending, m.mode)
 	}
-	// P is the funnel key (swapped from p, vzj4).
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	// p is the funnel key (kata 58ws; back from P, which had swapped from p under vzj4).
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = res.(model)
 	if m.pending != 0 || m.mode != entryConfirmUnlockSSH {
-		t.Errorf("P in ssh-confirm must not funnel; pending=%d mode=%v", m.pending, m.mode)
+		t.Errorf("p in ssh-confirm must not funnel; pending=%d mode=%v", m.pending, m.mode)
 	}
 }
 
@@ -2351,9 +2351,9 @@ func TestRouteURLFormatting(t *testing.T) {
 	}
 }
 
-// TestUpdateFunnelKey covers the "P" key (swapped from "p", vzj4) at the
-// Update layer: on a selected non-:22 port it opens the public-internet
-// confirm.
+// TestUpdateFunnelKey covers the "p" key (kata 58ws; back from "P", which
+// had swapped from "p" under vzj4) at the Update layer: on a selected
+// non-:22 port it opens the public-internet confirm.
 func TestUpdateFunnelKey(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
@@ -2362,12 +2362,12 @@ func TestUpdateFunnelKey(t *testing.T) {
 	m.showAllPorts = true
 	m.rebuildItems()
 
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	if cmd != nil {
-		t.Error("P should defer to the confirm (nil cmd)")
+		t.Error("p should defer to the confirm (nil cmd)")
 	}
 	if got := res.(model); got.mode != entryConfirmFunnel || got.funnelPort != 8080 {
-		t.Errorf("after P, mode=%v funnelPort=%d, want entryConfirmFunnel/8080", got.mode, got.funnelPort)
+		t.Errorf("after p, mode=%v funnelPort=%d, want entryConfirmFunnel/8080", got.mode, got.funnelPort)
 	}
 }
 
@@ -4077,13 +4077,14 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// 3cwx: Favorites carries F (forget, the old "u"); u is undo and lives in
 	// App alongside ctrl+r (redo), which groups() includes so the "?" overlay
 	// documents it even though barGroups hides it from the bottom bar. h (hints)
-	// also lives in App. nc1j: exposure column runs t/p/o/P (funnel below the
-	// cloudflare tunnel) then C/x/e. (7nss BREAKING: toggle moved space->t,
-	// tunnel moved t->o.) kata 4ref: i (copy PID) / I (copy kill cmd) sit
-	// directly under c (copy URL) in Favorites -- same clip/OSC 52 family,
-	// port-scoped rather than route-scoped.
+	// also lives in App. 58ws: exposure column runs t/p/d/o (funnel, then
+	// publish, then the cloudflare tunnel) then C/x/e. (7nss BREAKING: toggle
+	// moved space->t, tunnel moved t->o. 58ws BREAKING: funnel P->p, publish
+	// p->d, reordered ahead of tunnel.) kata 4ref: i (copy PID) / I (copy kill
+	// cmd) sit directly under c (copy URL) in Favorites -- same clip/OSC 52
+	// family, port-scoped rather than route-scoped.
 	wantKeys := [][]string{
-		{"t", "p", "o", "P", "C", "x", "e"}, // Publish=p, Tunnel=o (nc1j), Funnel=P below it; Edit=e (kata prp1)
+		{"t", "p", "d", "o", "C", "x", "e"}, // Funnel=p, Publish=d, Tunnel=o (58ws order); Edit=e (kata prp1)
 		{"f", "F", "n", "c", "i", "I", "l"},
 		{"/", "a", "r"},
 		{"u", "ctrl+r", "h", "?", "q"},
@@ -4121,7 +4122,7 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 // the bar renders the four grouped columns UNFOLDED, at their exact packed
 // floor width, with a header row and aligned gutters: descriptions line up
 // within a column and columns line up across rows. With no dangling, Toggle
-// Service Exposure is t/p/P/x/e (edit last, kata prp1; clean dropped;
+// Service Exposure is t/p/d/x/e (edit last, kata prp1; clean dropped;
 // `o` cloudflare tunnel is pinned off, see cfAvailable below) at 5 rows, and
 // Favorites is f/F/n/c/i/I/l (kata 4ref added i/I under c) at 7 rows -- the
 // column that now sets the grid's height, so the grid is a header + 7 rows.
@@ -4177,7 +4178,7 @@ func TestBottomBarGridAligned(t *testing.T) {
 			t.Errorf("%s misaligned: %q header at %d, cell %q at %d", label, header, h, needle, c)
 		}
 	}
-	// Toggle Service Exposure's keys (t/p/P/x/e) are all single-char now that
+	// Toggle Service Exposure's keys (t/p/d/x/e) are all single-char now that
 	// the toggle moved off "space" (kata 7nss BREAKING), so the key gutter is 1
 	// wide and every cell -- including "t on tailscale" -- starts flush at the
 	// column.
@@ -4236,7 +4237,7 @@ func TestBottomBarGridAligned(t *testing.T) {
 //
 // kata 4ref added CopyPid/CopyKill (i/I) to Favorites, right under Copy, so
 // Favorites now carries 7 bindings (f/F/n/c/i/I/l) -- no longer tied with
-// Toggle Service Exposure's 5 (t/p/P/x/e), but OUTRIGHT the tallest group.
+// Toggle Service Exposure's 5 (t/p/d/x/e), but OUTRIGHT the tallest group.
 // Since the fold order is sorted by UNFOLDED row count descending (ties
 // broken by groups() order) and computed once up front, Favorites is now
 // tried FIRST regardless of ties, ahead of Toggle Service Exposure -- a
@@ -4315,27 +4316,28 @@ func TestBottomBarGridFolds(t *testing.T) {
 	}
 
 	// Toggle Service Exposure folded: top-heavy column-major split --
-	// t/p/P down the first sub-column, x/e down the second (never a
+	// t/p/d down the first sub-column, x/e down the second (never a
 	// dangling item left stranded atop an empty second sub-column). "x
 	// lock/unlock" sits beside "t on tailscale" on the SAME row, and "e
-	// edit publish config" beside "p on caddy (public)"; "P on ts.net
-	// (public)" is left alone on the third row (top-heavy 3/2 split of 5
-	// items). (nc1j: the exposure order is now t/p/P -- Publish before
-	// Funnel -- so p, not P, now pairs with edit; P sits alone.)
+	// edit publish config" beside "p on ts.net (public)" (funnel); "d on
+	// caddy (public)" (publish) is left alone on the third row (top-heavy
+	// 3/2 split of 5 items). (58ws: the exposure order is now t/p/d --
+	// Funnel before Publish -- so p (funnel), not d (publish), now pairs
+	// with edit; d sits alone.)
 	if r1, r2 := lineOf(wideLines, "t on tailscale"), lineOf(wideLines, "x lock/unlock"); r1 < 0 || r1 != r2 {
 		t.Errorf("Toggle Service Exposure should fold t on tailscale/x lock/unlock onto the same row; t on tailscale row %d, x lock/unlock row %d:\n%s", r1, r2, wide)
 	}
-	if r1, r2 := lineOf(wideLines, "on caddy (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
-		t.Errorf("Toggle Service Exposure should fold p on caddy (public)/e edit publish config onto the same row; p on caddy (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
+	if r1, r2 := lineOf(wideLines, "on ts.net (public)"), lineOf(wideLines, "edit publish config"); r1 < 0 || r1 != r2 {
+		t.Errorf("Toggle Service Exposure should fold p on ts.net (public)/e edit publish config onto the same row; p on ts.net (public) row %d, e edit publish config row %d:\n%s", r1, r2, wide)
 	}
-	// "on ts.net (public)" (desc only, not "P on ts.net (public)" -- since
+	// "on caddy (public)" (desc only, not "d on caddy (public)" -- since
 	// 7nss the exposure keys are all single-char, so the folded left sub-col's
-	// key gutter is only 1 wide: the rendered key is "P on ts.net (public)",
+	// key gutter is only 1 wide: the rendered key is "d on caddy (public)",
 	// a single space, not a padded gutter).
-	if r := lineOf(wideLines, "on ts.net (public)"); r < 0 {
-		t.Errorf("P on ts.net (public) missing from wide grid:\n%s", wide)
+	if r := lineOf(wideLines, "on caddy (public)"); r < 0 {
+		t.Errorf("d on caddy (public) missing from wide grid:\n%s", wide)
 	} else if strings.Contains(wideLines[r], "edit publish config") {
-		t.Errorf("P on ts.net (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
+		t.Errorf("d on caddy (public)'s row should have an empty second sub-col (only 5 items, top-heavy 3/2 split): %q", wideLines[r])
 	}
 
 	// Favorites is still folded exactly as at width 100 above.
@@ -4412,8 +4414,8 @@ func TestBottomBarGridFolds(t *testing.T) {
 	// on ts.net (public)" isn't checked as a single-space literal here: unlike
 	// the wrapped fallback, the grid pads keys to their sub-column's gutter --
 	// since 7nss the exposure keys are all single-char, Toggle Service
-	// Exposure's folded left sub-col gutter is only 1 wide, so "P" renders
-	// as "P on ts.net (public)" -- checking the description alone sidesteps
+	// Exposure's folded left sub-col gutter is only 1 wide, so "p" renders
+	// as "p on ts.net (public)" -- checking the description alone sidesteps
 	// that padding regardless.)
 	for _, want := range []string{
 		"t on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
@@ -4518,7 +4520,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 	// cloudflared, kata nc1j.)
 	want := []string{
 		"Toggle Service Exposure", "Favorites", "View", "App",
-		"t on tailscale", "P on ts.net (public)", "c copy URL",
+		"t on tailscale", "p on ts.net (public)", "c copy URL",
 		"i copy PID", "I copy kill cmd",
 		"f favorite", "F forget", "n new favorite", "l label",
 		"x lock/unlock", "/ filter", "a switch view", "r refresh",
@@ -4539,18 +4541,19 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 
 // TestExposeContextualClean covers the contextual "C clean stale" now that
 // Protect is folded into Toggle Service Exposure: with no dangling the
-// column ends at "e edit publish config" (t/p/P/x/e, no clean, no
+// column ends at "e edit publish config" (t/p/d/x/e, no clean, no
 // reserved blank slot); when a dangling forward exists it gains "C clean
 // stale" -- inserted just ABOVE lock so "x lock/unlock" then "e edit publish
 // config" stay the last two items, in that order, in either state. (kata
 // v1z5 added publish edge to the exposure column, after funnel; p/P swapped
-// under vzj4 so it's now P funnel, p publish; kata prp1 added e edit right
+// under vzj4 so it was P funnel, p publish; kata prp1 added e edit right
 // after lock, so edit -- not lock -- is now the column's last item. nc1j
 // renamed the column "Toggle Service Exposure" and reordered it to
-// t/p/o/P; `o` (cloudflare tunnel) is pinned off here via cfAvailable,
-// so the column stays t/p/P/x/e -- see the pinned tests' comments. 7nss
-// BREAKING moved the toggle key from space to t and the tunnel key from t
-// to o.)
+// t/p/o/P; kata 58ws then reversed the p/P swap AND reordered again, to
+// t/p/d/o (funnel p, publish d, ahead of tunnel). `o` (cloudflare tunnel) is
+// pinned off here via cfAvailable, so the column stays t/p/d/x/e -- see the
+// pinned tests' comments. 7nss BREAKING moved the toggle key from space to
+// t and the tunnel key from t to o.)
 func TestExposeContextualClean(t *testing.T) {
 	m := New(config.Config{})
 	m.cfAvailable = false // pin the classic key set (no `t`); this tests contextual-Clean, not the tunnel key (kata nc1j)
@@ -4573,11 +4576,11 @@ func TestExposeContextualClean(t *testing.T) {
 		return g.bindings[len(g.bindings)-1].Help().Key
 	}
 
-	// No dangling -> Toggle Service Exposure is t/p/P/x/e (clean
+	// No dangling -> Toggle Service Exposure is t/p/d/x/e (clean
 	// dropped), edit last, and the rendered bar omits "clean".
 	noClean := expose(m.barGroups(false))
 	if got := len(noClean.bindings); got != 5 {
-		t.Errorf("Toggle Service Exposure should be 5 bindings (t/p/P/x/e) with no dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 5 bindings (t/p/d/x/e) with no dangling; got %d", got)
 	}
 	if k := lastKey(noClean); k != "e" {
 		t.Errorf("edit (e) should be the last Toggle Service Exposure binding with no dangling; got %q", k)
@@ -4594,7 +4597,7 @@ func TestExposeContextualClean(t *testing.T) {
 	}
 	withClean := expose(m.barGroups(true))
 	if got := len(withClean.bindings); got != 6 {
-		t.Errorf("Toggle Service Exposure should be 6 bindings (t/p/P/C/x/e) with a dangling; got %d", got)
+		t.Errorf("Toggle Service Exposure should be 6 bindings (t/p/d/C/x/e) with a dangling; got %d", got)
 	}
 	if k := lastKey(withClean); k != "e" {
 		t.Errorf("edit (e) should STILL be the last Toggle Service Exposure binding with a dangling; got %q", k)
@@ -5633,7 +5636,7 @@ func TestShortLabel(t *testing.T) {
 func TestPublishFlowWalkNoAuth(t *testing.T) {
 	m := newPublishModel(t, nil)
 
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHost {
 		t.Fatalf("after P, mode = %v, want entryPublishHost", m.mode)
 	}
@@ -5685,7 +5688,7 @@ func TestPublishFlowWalkNoAuth(t *testing.T) {
 func TestPublishConfirmViewEnablesServe(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.active = map[int]bool{} // serve OFF -> confirm should say it'll turn serve on
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m = mustUpdate(t, m, enterKey) // accept prefill host
 	m = mustUpdate(t, m, rkey("n"))
 	if !m.publishEnableServe {
@@ -5711,7 +5714,7 @@ func TestPublishConfirmViewEnablesServe(t *testing.T) {
 func TestPublishFlowWithAuthPersistsHash(t *testing.T) {
 	m := newPublishModel(t, nil)
 
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user (no stored cred yet)
 	if m.mode != entryPublishCredUser {
@@ -5777,7 +5780,7 @@ func TestPublishSaveFailureAbortsPublish(t *testing.T) {
 
 	// Walk P -> host -> auth(y) -> user -> pass -> confirm, gathering a NEW
 	// shared credential (none stored yet, so confirm must Save).
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> cred user
 	m = mustUpdate(t, m, rkey("admin"))
@@ -5822,7 +5825,7 @@ func TestPublishAuthReusesStoredCredential(t *testing.T) {
 	m.cfg.Caddy.AuthHash = "$2a$10$abcdefghijklmnopqrstuv" // opaque stored hash
 	before := m.cfg.Caddy.AuthHash
 
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m = mustUpdate(t, m, enterKey)  // host -> auth
 	m = mustUpdate(t, m, rkey("y")) // auth yes -> should SKIP cred steps
 	if m.mode != entryConfirmPublish {
@@ -5847,11 +5850,11 @@ func TestPublishEscClearsPlaintext(t *testing.T) {
 		name string
 		walk []tea.KeyMsg // keys to reach the step (before the esc)
 	}{
-		{"host", []tea.KeyMsg{rkey("p")}},
-		{"auth", []tea.KeyMsg{rkey("p"), enterKey}},
-		{"credUser", []tea.KeyMsg{rkey("p"), enterKey, rkey("y")}},
-		{"credPass", []tea.KeyMsg{rkey("p"), enterKey, rkey("y"), rkey("bob"), enterKey}},
-		{"confirm", []tea.KeyMsg{rkey("p"), enterKey, rkey("y"), rkey("bob"), enterKey, rkey("hunter2"), enterKey}},
+		{"host", []tea.KeyMsg{rkey("d")}},
+		{"auth", []tea.KeyMsg{rkey("d"), enterKey}},
+		{"credUser", []tea.KeyMsg{rkey("d"), enterKey, rkey("y")}},
+		{"credPass", []tea.KeyMsg{rkey("d"), enterKey, rkey("y"), rkey("bob"), enterKey}},
+		{"confirm", []tea.KeyMsg{rkey("d"), enterKey, rkey("y"), rkey("bob"), enterKey, rkey("hunter2"), enterKey}},
 	}
 	for _, s := range steps {
 		t.Run(s.name, func(t *testing.T) {
@@ -6179,7 +6182,7 @@ func TestPublishHostSuffixRendersFlush(t *testing.T) {
 // on the step with an error, never advancing to the auth gate.
 func TestPublishInvalidHostnameRefused(t *testing.T) {
 	m := newPublishModel(t, nil)
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m.publishInput.SetValue("not a host") // spaces are invalid
 	m = mustUpdate(t, m, enterKey)
 	if m.mode != entryPublishHost {
@@ -6226,7 +6229,7 @@ func TestPublishDomainCaptureHappyPath(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = "" // force the capture path
 
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHostname {
 		t.Fatalf("blank domain: mode=%v, want entryPublishHostname", m.mode)
 	}
@@ -6286,7 +6289,7 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 		t.Run(bad, func(t *testing.T) {
 			m := newPublishModel(t, nil)
 			m.cfg.Caddy.Domain = ""
-			m = mustUpdate(t, m, rkey("p"))
+			m = mustUpdate(t, m, rkey("d"))
 			m = mustUpdate(t, m, enterKey) // accept the default hostname, land on the domain step
 			if bad != "" {
 				m.publishInput.SetValue(bad)
@@ -6314,7 +6317,7 @@ func TestPublishDomainInvalidStaysOnPrompt(t *testing.T) {
 func TestPublishDomainEscAborts(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = ""
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m = mustUpdate(t, m, enterKey) // accept the default hostname, land on the domain step
 	if m.mode != entryPublishDomain {
 		t.Fatalf("setup: mode=%v, want entryPublishDomain", m.mode)
@@ -6337,7 +6340,7 @@ func TestPublishDomainEscAborts(t *testing.T) {
 func TestPublishHostnameEscAborts(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = ""
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHostname {
 		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
 	}
@@ -6358,7 +6361,7 @@ func TestPublishHostnameEscAborts(t *testing.T) {
 // straight to the shared host dialog, matching pre-ztzg behavior exactly.
 func TestPublishHostnameSkippedWhenConfigured(t *testing.T) {
 	m := newPublishModel(t, nil) // domain "example.com" (already configured)
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode == entryPublishHostname {
 		t.Fatal("an already-configured setup must not be prompted for the hostname")
 	}
@@ -6376,7 +6379,7 @@ func TestPublishHostnameInvalidStaysOnPrompt(t *testing.T) {
 		t.Run(bad, func(t *testing.T) {
 			m := newPublishModel(t, nil)
 			m.cfg.Caddy.Domain = ""
-			m = mustUpdate(t, m, rkey("p"))
+			m = mustUpdate(t, m, rkey("d"))
 			m.publishInput.SetValue(bad)
 			m = mustUpdate(t, m, enterKey)
 			if m.mode != entryPublishHostname {
@@ -6407,7 +6410,7 @@ func TestPublishHostnameValidAdvancesAndPersists(t *testing.T) {
 		t.Fatalf("seeding config: %v", err)
 	}
 	m.cfg.Caddy.Domain = ""
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHostname {
 		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
 	}
@@ -6444,7 +6447,7 @@ func TestPublishHostnameBlankStoredAcceptsDefaultOnEnter(t *testing.T) {
 	}
 	m.cfg.Caddy.Domain = ""
 	m.cfg.Caddy.Hostname = ""
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHostname {
 		t.Fatalf("setup: mode=%v, want entryPublishHostname", m.mode)
 	}
@@ -6659,7 +6662,7 @@ func TestSetupPromptShowsValidationFlash(t *testing.T) {
 func TestPublishHostnameCaptureSkipsWriteWhenUnchanged(t *testing.T) {
 	m := newPublishModel(t, nil)
 	m.cfg.Caddy.Domain = ""
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if got := m.publishInput.Value(); got != "caddy" {
 		t.Fatalf("setup: hostname prefill = %q, want caddy", got)
 	}
@@ -6723,17 +6726,18 @@ func TestPublishSuccessClearsPendingPublish(t *testing.T) {
 
 // TestPublishSuccessTeachesUnpublish covers 71ga: a successful PLAIN publish
 // (not a take-over resume, not an unpublish) teaches the de-escalation path --
-// its toast names the (now) `p` key. An unpublish success stays silent about
-// it: pressing p again on an unpublished port would just re-publish, not
-// "unpublish an unpublish", so the clause is scoped to !msg.unpublish only.
+// its toast names the (now, kata 58ws) `d` key. An unpublish success stays
+// silent about it: pressing d again on an unpublished port would just
+// re-publish, not "unpublish an unpublish", so the clause is scoped to
+// !msg.unpublish only.
 func TestPublishSuccessTeachesUnpublish(t *testing.T) {
-	t.Run("plain publish success mentions press p to unpublish", func(t *testing.T) {
+	t.Run("plain publish success mentions press d to unpublish", func(t *testing.T) {
 		m := newPublishModel(t, nil)
 		m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 8080}
 		res, _ := m.Update(publishDoneMsg{port: 8080, err: nil})
 		got := res.(model)
-		if !strings.Contains(got.flash, "press p to unpublish") {
-			t.Errorf("publish-success flash = %q, want it to contain %q", got.flash, "press p to unpublish")
+		if !strings.Contains(got.flash, "press d to unpublish") {
+			t.Errorf("publish-success flash = %q, want it to contain %q", got.flash, "press d to unpublish")
 		}
 	})
 
@@ -7551,7 +7555,7 @@ func TestPublishKeyToggleDispatch(t *testing.T) {
 
 		m := newPublishModel(t, srv)
 		m.published = map[int]publishInfo{8080: {hostname: "web.example.com"}}
-		m = mustUpdate(t, m, rkey("p"))
+		m = mustUpdate(t, m, rkey("d"))
 		if m.mode != entryNone {
 			t.Errorf("unpublish should not open a dialog; mode=%v", m.mode)
 		}
@@ -7568,7 +7572,7 @@ func TestPublishKeyToggleDispatch(t *testing.T) {
 		m := newPublishModel(t, srv)
 		m.cfg.Caddy.SilentRepublish = true
 		m.lastPublish = map[int]publishInfo{8080: {hostname: "web.example.com"}}
-		m = mustUpdate(t, m, rkey("p"))
+		m = mustUpdate(t, m, rkey("d"))
 		if m.mode != entryNone {
 			t.Errorf("silent re-publish should not open a dialog; mode=%v", m.mode)
 		}
@@ -7579,7 +7583,7 @@ func TestPublishKeyToggleDispatch(t *testing.T) {
 
 	t.Run("never published -> full setup dialog", func(t *testing.T) {
 		m := newPublishModel(t, nil)
-		m = mustUpdate(t, m, rkey("p"))
+		m = mustUpdate(t, m, rkey("d"))
 		if m.mode != entryPublishHost {
 			t.Fatalf("never-published port should open the host dialog; mode=%v", m.mode)
 		}
@@ -8452,7 +8456,7 @@ func TestPublishTickNeverStops(t *testing.T) {
 // publish host step feeds publishInput, never labelInput.
 func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
 	m := newPublishModel(t, nil)
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	m.publishInput.SetValue("") // clear the prefill to type fresh
 	m = mustUpdate(t, m, rkey("abc"))
 	if got := m.publishInput.Value(); got != "abc" {
@@ -8486,7 +8490,7 @@ func TestPublishKeyDoesNotLeakToLabelInput(t *testing.T) {
 // share.
 func publishOnce(t *testing.T, m model) model {
 	t.Helper()
-	m = mustUpdate(t, m, rkey("p"))
+	m = mustUpdate(t, m, rkey("d"))
 	if m.mode != entryPublishHost {
 		t.Fatalf("publishOnce: after p, mode = %v, want entryPublishHost", m.mode)
 	}
@@ -8535,7 +8539,7 @@ func pollOnce(t *testing.T, m model) model {
 // edge, and feeds it back through Update.
 func unpublishOnce(t *testing.T, m model) model {
 	t.Helper()
-	res, cmd := m.Update(rkey("p"))
+	res, cmd := m.Update(rkey("d"))
 	m = res.(model)
 	if m.mode != entryNone {
 		t.Fatalf("unpublishOnce: de-escalation must not open a dialog; mode=%v", m.mode)
@@ -8568,7 +8572,7 @@ func TestFlowPublishConfirmPollUnpublish(t *testing.T) {
 	if info, ok := m.lastPublish[8080]; !ok || info.hostname != "web.example.com" {
 		t.Errorf("lastPublish[8080] = %+v (ok=%v), want hostname web.example.com", info, ok)
 	}
-	if !strings.Contains(m.flash, "press p to unpublish") {
+	if !strings.Contains(m.flash, "press d to unpublish") {
 		t.Errorf("flash = %q, want the de-escalation teaching clause", m.flash)
 	}
 	if len(fc.mutations) != 1 {
@@ -8624,7 +8628,7 @@ func TestFlowRepublishFromMemoryConfirmThenSilent(t *testing.T) {
 	// silent_republish is off (the default): p on the remembered port must
 	// land on the confirm gate naming the exact remembered hostname, WITHOUT
 	// re-walking the host/auth setup prompts.
-	res, cmd := m.Update(rkey("p"))
+	res, cmd := m.Update(rkey("d"))
 	m = res.(model)
 	if cmd != nil {
 		t.Error("the confirm path should not itself return a cmd yet")
@@ -8659,7 +8663,7 @@ func TestFlowRepublishFromMemoryConfirmThenSilent(t *testing.T) {
 	m = unpublishOnce(t, m)
 	m = pollOnce(t, m)
 	m.cfg.Caddy.SilentRepublish = true
-	res, cmd = m.Update(rkey("p"))
+	res, cmd = m.Update(rkey("d"))
 	m = res.(model)
 	if m.mode != entryNone {
 		t.Errorf("silent re-publish must not open a dialog or confirm; mode=%v", m.mode)

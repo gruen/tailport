@@ -1,4 +1,5 @@
-# Caddy edge image for tailport's `p` (publish) path (kata v1z5; swapped from `P` under vzj4).
+# Caddy edge image for tailport's `d` (publish) path (kata v1z5; moved from
+# `p` under 58ws, which reversed vzj4's earlier `P`/`p` swap).
 #
 # Two upstream images, copied together -- nothing here is rebuilt from
 # source. See ./README.md for how this maps to tailport's `caddy.*` config

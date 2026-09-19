@@ -163,8 +163,8 @@ or `?` when the port belongs to a process owned by a different user (commonly
 | `↑`/`↓`, `j`/`k` | Move between route rows (a flat walk across every service's routes) |
 | `Shift+↑`/`Shift+↓`, `J`/`K` | Jump between services (land on the target's first route) |
 | `t` | Serve on your tailnet — toggle (loopback-bound ports only) |
-| `P` | Funnel to the public internet — toggle, behind a confirm |
-| `p` | Publish via your Caddy edge — toggle, behind a confirm |
+| `p` | Funnel to the public internet — toggle, behind a confirm |
+| `d` | Publish via your Caddy edge — toggle, behind a confirm |
 | `e` | Edit a published port's auth in place (can't move it to a new hostname) |
 | `o` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
@@ -205,8 +205,8 @@ hard-blocked from all three public paths.
 | Level | Key | Reach | Transport |
 | --- | --- | --- | --- |
 | **Serve** | `t` | Your tailnet | `tailscale serve` (plain HTTP) |
-| **Funnel** | `P` | Public internet | `tailscale funnel` (HTTPS via `*.ts.net`) |
-| **Publish** | `p` | Public internet | Your own [Caddy edge](#publishing-to-the-public-internet-caddy-edge) — custom `https://` hostname |
+| **Funnel** | `p` | Public internet | `tailscale funnel` (HTTPS via `*.ts.net`) |
+| **Publish** | `d` | Public internet | Your own [Caddy edge](#publishing-to-the-public-internet-caddy-edge) — custom `https://` hostname |
 | **Tunnel** | `o` | Public internet | [Cloudflare Tunnel](#tunnelling-to-the-public-internet-cloudflare-tunnel) (`cloudflared`) |
 
 **Serve** is the default path and the reason tailport exists. Press `t` on a
@@ -220,7 +220,7 @@ nothing to serve.) Two deliberate constraints:
 - **1:1 port mapping.** A served port always keeps its own number; serve never
   remaps.
 
-**The three public paths** (`P`, `p`, `o`) each expose a port to *anyone on the
+**The three public paths** (`p`, `d`, `o`) each expose a port to *anyone on the
 internet*, so each:
 
 - requires a strong y/n confirmation before going live, naming the resulting
@@ -365,7 +365,7 @@ existing dark-terminal setups see no change either way.
 
 ### Publish (Caddy edge)
 
-*Advanced — only needed if you use the `p` publish path.*
+*Advanced — only needed if you use the `d` publish path.*
 
 A `caddy` block configures the optional
 [publish-to-the-internet path](#publishing-to-the-public-internet-caddy-edge).
@@ -377,7 +377,7 @@ knobs are discoverable without reading docs:
 > feature landed has **no `caddy:` block yet** — that's expected, and it's why
 > there's no `domain:` line to edit. It appears on the next save (any change
 > that writes the file, e.g. favoriting or labeling a port), or paste the block
-> below in by hand and set `domain:` there. Pressing `p` with a blank `domain`
+> below in by hand and set `domain:` there. Pressing `d` with a blank `domain`
 > also captures it inline and saves it, rather than refusing.
 
 ```yaml
@@ -412,7 +412,7 @@ caddy:
   `app.example.com`): private edge identity and public route identity are
   deliberately separate.
 - **`domain`** (default `""`) — the public base domain publish hostnames are
-  built from. Blank doesn't block publishing: pressing `p` captures the domain
+  built from. Blank doesn't block publishing: pressing `d` captures the domain
   inline and saves it before continuing, and until it's set the background
   published-state poll doesn't run (zero cost until you set it).
 - **`server_name`** (default `tailport`) — the shared Caddy HTTP server tailport
@@ -424,7 +424,7 @@ caddy:
   auth at a publish confirmation. `auth_hash` is always a bcrypt hash of the
   password you typed then, never the plaintext; every published route that opts
   into auth shares this one credential — it isn't per-hostname.
-- **`silent_republish`** (default `false`) — skips the `p` key's y/n confirm
+- **`silent_republish`** (default `false`) — skips the `d` key's y/n confirm
   when re-publishing a port already published earlier in the **same** session
   (its hostname and auth are remembered in memory only). A port's first publish
   this session always confirms regardless, and Funnel's confirm is unaffected.
@@ -499,19 +499,19 @@ Once configured, publishing works the same shape as Funnel: select a port,
 confirm the public hostname and (optionally) a shared basic-auth credential, and
 confirm again against the exact `https://` URL before anything goes live.
 
-### Publish is a toggle (`p`)
+### Publish is a toggle (`d`)
 
-`p` behaves differently depending on the port's state:
+`d` behaves differently depending on the port's state:
 
-- **Already published** — `p` unpublishes immediately. No confirm: reducing
+- **Already published** — `d` unpublishes immediately. No confirm: reducing
   exposure is never gated.
 - **Published earlier this session, then unpublished** — tailport remembers that
   port's hostname and auth in memory (never written to config; the edge stays
-  the source of truth) for as long as the process runs. Pressing `p` again
+  the source of truth) for as long as the process runs. Pressing `d` again
   re-publishes with that remembered config, skipping the setup prompts — straight
   to the y/n confirm naming the exact `https://<hostname>`, unless you've set
   `silent_republish: true`, in which case it re-publishes with no confirm.
-- **Never published this session** — `p` runs the full setup: hostname, optional
+- **Never published this session** — `d` runs the full setup: hostname, optional
   basic auth, then the confirm. This always happens on a port's first publish,
   regardless of `silent_republish`.
 
@@ -521,7 +521,7 @@ ends in the same y/n confirm, then updates the live route in place — the port 
 never briefly unpublished in between. `e` **cannot move a still-published port to
 a new hostname**: that would be a non-atomic delete-and-create that could leave
 the old route dangling, so tailport refuses it with a message telling you to
-unpublish (`p`) first and re-publish at the new hostname.
+unpublish (`d`) first and re-publish at the new hostname.
 
 ## Tunnelling to the public internet (Cloudflare Tunnel)
 
