@@ -11,7 +11,7 @@ yourself, not something CI does on a release tag.
 
 **This is not required to use tailport.** It's opt-in infrastructure for the
 one feature (`d`) that needs a public-facing component. Everything else —
-`tailscale serve`/`space`, Funnel/`p` — works with no edge at all.
+`tailscale serve`/`t`, Funnel/`p` — works with no edge at all.
 
 For the full deploy runbook (Tailscale ACL, Fly setup, DNS, first-publish
 smoke test, troubleshooting), see

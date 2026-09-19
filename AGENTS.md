@@ -74,7 +74,8 @@ contract. The short version:
   session-only `lastPublish` memory, and `caddy.silent_republish` were added
   under kata prp1. Re-lettered `p` -> `d` under kata 58ws, which also swapped
   Funnel back to the bare `p` — see that bullet above for the reversal.)
-- Cloudflare Tunnel is a THIRD public path (the `t` key, kata nc1j),
+- Cloudflare Tunnel is a THIRD public path (the `o` key, kata nc1j;
+  re-lettered from `t` under kata 7nss, which moved serve onto `t`),
   **independent of both Funnel and Publish — never layered or ranked above
   either, and no longer mutually exclusive with them: kata th05 relaxed that
   rule (an owner-approved reversal)**. A local port may now carry all three
@@ -109,9 +110,9 @@ contract. The short version:
   tracked this way; a foreign `cloudflared` process is surfaced as drift,
   never signalled or touched. The whole feature is gated on `cloudflared`
   being installed — detected once at startup — so an absent binary drops
-  the `t` key from the bar entirely: no key, no discovery, no polling.
+  the `o` key from the bar entirely: no key, no discovery, no polling.
   (Implemented under kata nc1j: `internal/cftunnel`, the `cloudflared:`
-  config block, and the `t` key / `requestTunnel` gate / tunnel-state poll
+  config block, and the `o` key / `requestTunnel` gate / tunnel-state poll
   in `internal/ui`.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel
@@ -148,14 +149,14 @@ contract. The short version:
   primary clipboard path is OSC 52 (pure Go, no external binary), and a
   missing helper is silently skipped.
   Carve-out (nc1j): `cloudflared` is a SECOND optional, opt-in third-party
-  binary, required only if you use the `t` Cloudflare Tunnel feature (see
+  binary, required only if you use the `o` Cloudflare Tunnel feature (see
   the Cloudflare Tunnel design-constraints bullet above and
   `internal/cftunnel`). Unlike the clipboard helper's fire-and-forget
   shell-out, cloudflared is a **supervised local daemon** — the first
   long-running process tailport itself spawns and supervises, distinct
   from the remote Caddy edge tailport only ever talks to over HTTP. Like
   the clipboard carve-out, it is never required to build or run tailport:
-  absence just disables the `t` key (no key, no discovery, no polling) and
+  absence just disables the `o` key (no key, no discovery, no polling) and
   costs nothing.
 
 ### Docs stay honest (a claim is a test)
