@@ -195,8 +195,22 @@ func (m *model) jumpService(delta int) {
 // separated by a single blank line) and reports the line index of the
 // currently-selected route (-1 when the list is empty). It is the SINGLE layout
 // shared by the renderer (renderList) and the scroll-keeper (ensureRouteVisible),
-// so the two can never disagree about where a given route sits.
+// so the two can never disagree about where a given route sits. It's a thin
+// wrapper around bodyLinesFull (kata k4cj) that drops the per-line owner slice,
+// keeping the existing ~10 callers (ensureRouteVisible, ui_test.go) unchanged.
 func (m model) bodyLines() (lines []string, headerLine, selLine int) {
+	lines, _, headerLine, selLine = m.bodyLinesFull()
+	return lines, headerLine, selLine
+}
+
+// bodyLinesFull is bodyLines' full form (kata k4cj): alongside the flat line
+// slice it also reports, per line, which service header OWNS that line --
+// owners[i] is the index in lines of the service-header line that line i
+// belongs to, or -1 for a blank block-separator line. renderList uses this to
+// pin the owning header as the top row when the viewport clips mid-block (the
+// sticky_header feature); ensureRouteVisible and everything else keeps using
+// the bodyLines wrapper above and never sees owners.
+func (m model) bodyLinesFull() (lines []string, owners []int, headerLine, selLine int) {
 	items := m.list.VisibleItems()
 	headerLine, selLine = -1, -1
 	// Clamp like currentService() does (z6yf): bubbles/list's OWN cursor
@@ -261,14 +275,20 @@ func (m model) bodyLines() (lines []string, headerLine, selLine int) {
 		}
 		if len(lines) > 0 {
 			lines = append(lines, "") // blank separator between records
+			owners = append(owners, -1)
 		}
+		headerIdx := len(lines)
 		if i == cur {
-			headerLine = len(lines)
+			headerLine = headerIdx
 			selLine = headerLine + 1 + b.selectedRoute // +1 for the header line
 		}
-		lines = append(lines, renderServiceBlock(b)...)
+		block := renderServiceBlock(b)
+		lines = append(lines, block...)
+		for range block {
+			owners = append(owners, headerIdx)
+		}
 	}
-	return lines, headerLine, selLine
+	return lines, owners, headerLine, selLine
 }
 
 // ensureRouteVisible nudges m.scrollOff just enough to keep the selected route
@@ -330,20 +350,34 @@ func (m *model) reconcileViewport() {
 	m.ensureRouteVisible()
 }
 
-// renderList is the single-column body: the stacked service blocks (bodyLines),
-// scrolled to m.scrollOff and sliced to the list body height, followed by a
-// one-line scroll indicator (blank when everything fits) so renderList always
-// emits exactly the body-height + pageIndicatorLines rows listBodyHeight
-// reserves. Called from View in place of the retired renderGrid.
+// renderList is the single-column body: the stacked service blocks
+// (bodyLinesFull), scrolled to m.scrollOff and sliced to the list body height,
+// followed by a one-line scroll indicator (blank when everything fits) so
+// renderList always emits exactly the body-height + pageIndicatorLines rows
+// listBodyHeight reserves. Called from View in place of the retired
+// renderGrid.
 func (m model) renderList() string {
-	lines, _, _ := m.bodyLines()
+	lines, owners, _, selLine := m.bodyLinesFull()
 	h := m.listBodyHeight()
 	off := clampInt(m.scrollOff, 0, maxInt(0, len(lines)-h))
 	end := off + h
 	if end > len(lines) {
 		end = len(lines)
 	}
-	body := strings.Join(lines[off:end], "\n")
+	visible := make([]string, end-off)
+	copy(visible, lines[off:end])
+	// Sticky service header (kata k4cj): when the viewport top lands mid-block,
+	// replace that top route line with its owning service's header so the
+	// routes below always show which service they belong to. Height-neutral
+	// (replaces, never adds a row) so ensureRouteVisible's math is unaffected.
+	// Guarded by off != selLine so the SELECTED route is never the line hidden
+	// (matters only in the h==1 tall-block corner).
+	if m.stickyHeader && off > 0 && off != selLine && len(visible) > 0 {
+		if oh := owners[off]; oh >= 0 && oh < off {
+			visible[0] = lines[oh]
+		}
+	}
+	body := strings.Join(visible, "\n")
 	indicator := ""
 	if off > 0 || end < len(lines) {
 		indicator = helpStyle.Render(fmt.Sprintf("%d–%d of %d", off+1, end, len(lines)))

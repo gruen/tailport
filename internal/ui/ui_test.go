@@ -5492,6 +5492,178 @@ func TestScrollTopHeaderVisible(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Sticky service header (kata k4cj): renderList pins the top-clipped
+// service's header as the top row of the single-column body, config-gated by
+// sticky_header (default on). Height-neutral -- it REPLACES the top line,
+// never adds one -- so listBodyHeight's row budget never drifts (the z6yf
+// regression class).
+// ---------------------------------------------------------------------------
+
+// buildStickyHeaderModel builds a model with n services, each carrying five
+// routes (localhost, tailnet, funnel, caddy publish, cloudflare tunnel) so
+// every block spans six lines (header + 5 routes) -- comfortably ">= 2
+// routes" and long enough that a small viewport clips mid-block. sticky sets
+// m.stickyHeader directly, bypassing cfg.StickyHeaderEnabled()/New's default
+// resolution, so both the on and off cases share one builder.
+func buildStickyHeaderModel(t *testing.T, sticky bool, n int) model {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "host"
+	m.stickyHeader = sticky
+	m.funnel = map[int]int{}
+	m.published = map[int]publishInfo{}
+	m.tunnels = map[int]tunnelInfo{}
+	var ports []portscan.Port
+	for i := 0; i < n; i++ {
+		port := 3000 + i
+		ports = append(ports, portscan.Port{Number: port, Process: fmt.Sprintf("proc%d", i), BindScope: portscan.ScopeWildcard})
+		m.funnel[port] = 443
+		m.published[port] = publishInfo{hostname: fmt.Sprintf("svc%d.example.com", i)}
+		m.tunnels[port] = tunnelInfo{pid: 1000 + i, hostname: fmt.Sprintf("svc%d.trycloudflare.com", i), ready: true}
+	}
+	m.allPorts = ports
+	m.showAllPorts = true
+	m.rebuildItems()
+	return m
+}
+
+// TestStickyHeaderPinsOwningHeaderMidBlock covers the core k4cj behavior:
+// sticky_header ON, four services of six lines each (120x24 -> listBodyHeight
+// 11 here, verified against the 27-line body below), scrollOff parked at line
+// 9 -- the "tailnet" route of the SECOND (non-selected) service, i.e. the
+// viewport top lands mid-block. renderList must pin that service's header (a
+// byte-identical copy of the real rendered header, carrying :3001/proc1) as
+// the top row, and the total rendered row count must still equal
+// listBodyHeight()+1 (the indicator line) -- no height drift.
+func TestStickyHeaderPinsOwningHeaderMidBlock(t *testing.T) {
+	m := buildStickyHeaderModel(t, true, 4)
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = res.(model)
+
+	lines, owners, _, selLine := m.bodyLinesFull()
+	const off = 9
+	if h := m.listBodyHeight(); off+h > len(lines) || off == selLine || owners[off] < 0 || owners[off] >= off {
+		t.Fatalf("fixture assumption broken: off=%d h=%d totalLines=%d selLine=%d owner=%d -- adjust the fixture", off, h, len(lines), selLine, owners[off])
+	}
+	if got := stripANSI(lines[off]); !strings.Contains(got, "tailnet") || !strings.Contains(got, "http://host:3001") {
+		t.Fatalf("fixture assumption broken: line %d = %q, want the :3001 service's tailnet route", off, got)
+	}
+	m.scrollOff = off
+
+	rendered := strings.Split(m.renderList(), "\n")
+	h := m.listBodyHeight()
+	if want := h + 1; len(rendered) != want {
+		t.Errorf("renderList() produced %d rows, want %d (listBodyHeight()+1) -- height drift", len(rendered), want)
+	}
+	first := stripANSI(rendered[0])
+	if !strings.Contains(first, ":3001") || !strings.Contains(first, "proc1") {
+		t.Errorf("first rendered row = %q, want the pinned :3001/proc1 service header", first)
+	}
+	if strings.Contains(first, "tailnet") {
+		t.Errorf("first rendered row = %q, still shows the clipped route line -- header was not pinned", first)
+	}
+}
+
+// TestStickyHeaderTallBlockShowsOwningHeader covers the tall-block case
+// (th05 relaxed exclusivity: a block can now run up to ~6 lines and exceed a
+// short viewport entirely). Height 16 at width 120 yields listBodyHeight()==3
+// -- shorter than any single six-line block -- and scrollOff is parked deep
+// inside the THIRD service's block (line 17, its "ts.net" route). Even though
+// that whole block can never fit on screen at once, the pinned header still
+// names the service.
+func TestStickyHeaderTallBlockShowsOwningHeader(t *testing.T) {
+	m := buildStickyHeaderModel(t, true, 4)
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 16})
+	m = res.(model)
+
+	lines, owners, _, selLine := m.bodyLinesFull()
+	const off = 17
+	h := m.listBodyHeight()
+	if off+h > len(lines) || off == selLine || owners[off] < 0 || owners[off] >= off {
+		t.Fatalf("fixture assumption broken: off=%d h=%d totalLines=%d selLine=%d owner=%d -- adjust the fixture", off, h, len(lines), selLine, owners[off])
+	}
+	blockStart := owners[off]
+	// The owning block must itself be taller than the viewport for this to be
+	// the tall-block case, not just an ordinary mid-block clip.
+	blockLen := 1
+	for i := blockStart + 1; i < len(lines) && owners[i] == blockStart; i++ {
+		blockLen++
+	}
+	if blockLen <= h {
+		t.Fatalf("fixture assumption broken: owning block is %d lines, not taller than listBodyHeight()=%d", blockLen, h)
+	}
+	m.scrollOff = off
+
+	rendered := strings.Split(m.renderList(), "\n")
+	if want := h + 1; len(rendered) != want {
+		t.Errorf("renderList() produced %d rows, want %d (listBodyHeight()+1) -- height drift", len(rendered), want)
+	}
+	first := stripANSI(rendered[0])
+	if !strings.Contains(first, ":3002") || !strings.Contains(first, "proc2") {
+		t.Errorf("first rendered row = %q, want the pinned :3002/proc2 service header (tall-block case)", first)
+	}
+}
+
+// TestStickyHeaderOffKeepsPlainMidBlockRoute covers sticky_header OFF: the
+// exact same mid-block scrollOff as TestStickyHeaderPinsOwningHeaderMidBlock,
+// but with stickyHeader=false. The design's "Settled" note requires this to
+// reproduce today's plain per-route scroll exactly -- the header must NOT be
+// pinned, and the top row stays the orphan route line.
+func TestStickyHeaderOffKeepsPlainMidBlockRoute(t *testing.T) {
+	m := buildStickyHeaderModel(t, false, 4)
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = res.(model)
+
+	lines, _, _, _ := m.bodyLinesFull()
+	const off = 9
+	want := stripANSI(lines[off])
+	m.scrollOff = off
+
+	rendered := strings.Split(m.renderList(), "\n")
+	h := m.listBodyHeight()
+	if wantRows := h + 1; len(rendered) != wantRows {
+		t.Errorf("renderList() produced %d rows, want %d (listBodyHeight()+1) -- height drift", len(rendered), wantRows)
+	}
+	first := stripANSI(rendered[0])
+	if first != want {
+		t.Errorf("sticky_header=false: first rendered row = %q, want the untouched mid-block line %q (today's plain scroll)", first, want)
+	}
+	if strings.Contains(first, "proc1") {
+		t.Errorf("sticky_header=false: first rendered row = %q unexpectedly shows the service header -- pinning must be fully disabled", first)
+	}
+}
+
+// TestStickyHeaderNeverHidesSelectedRoute covers the h==1 corner the design
+// calls out explicitly: when the viewport is exactly one row tall and that
+// row IS the selected route (off == selLine, which ensureRouteVisible's own
+// math produces here), sticky pinning must never replace it with a header --
+// the selected route always stays visible, never hidden behind its own
+// service's pinned header.
+func TestStickyHeaderNeverHidesSelectedRoute(t *testing.T) {
+	m := buildStickyHeaderModel(t, true, 4)
+	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 13})
+	m = res.(model)
+
+	if h := m.listBodyHeight(); h != 1 {
+		t.Fatalf("fixture assumption broken: listBodyHeight() = %d, want 1", h)
+	}
+	_, _, _, selLine := m.bodyLinesFull()
+	if m.scrollOff != selLine {
+		t.Fatalf("fixture assumption broken: scrollOff=%d, want it to equal selLine=%d (ensureRouteVisible's h==1 anchor)", m.scrollOff, selLine)
+	}
+
+	rendered := strings.Split(m.renderList(), "\n")
+	if len(rendered) != 2 { // the single body row + the indicator row
+		t.Fatalf("renderList() produced %d rows, want 2 (listBodyHeight()+1)", len(rendered))
+	}
+	first := stripANSI(rendered[0])
+	if !strings.Contains(first, "localhost") || !strings.Contains(first, "http://localhost:3000") {
+		t.Errorf("first rendered row = %q, want the selected localhost route left visible, not replaced by its header", first)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Publish (`p`) path -- kata v1z5 steps 3/4/5; swapped from `P` under vzj4.
 // These are the primary
 // verification for w7k4: bubbletea Model.Update walks driving the whole dialog

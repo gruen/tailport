@@ -138,6 +138,16 @@ type Config struct {
 	// ApplyTheme for how this is applied.
 	Theme string `yaml:"theme,omitempty"`
 
+	// StickyHeader gates the single-column body's sticky service header (kata
+	// k4cj): when the viewport's top clips mid-block, the top row is pinned to
+	// the owning service's header instead of showing an orphan route line with
+	// no visible service context. A POINTER, deliberately with NO omitempty:
+	// a plain bool's zero value (false) can't distinguish "explicitly turned
+	// off" from "key absent", and this defaults to ON -- including for a
+	// config file written before this feature existed -- so the pointer stays
+	// nil until Default()/Load() normalize it. See StickyHeaderEnabled.
+	StickyHeader *bool `yaml:"sticky_header"`
+
 	// path is the file this Config was resolved against by Load/WriteDefault
 	// (see Path), and what Save writes back to. Unexported so it never
 	// round-trips into the YAML file itself. Zero value ("") means "not yet
@@ -152,6 +162,12 @@ type Config struct {
 // routed through either (e.g. a literal built directly by a test).
 func (c Config) ResolvedPath() string { return c.path }
 
+// StickyHeaderEnabled reports whether the sticky service header (kata k4cj)
+// is on: true when StickyHeader is unset (nil -- including a Config literal
+// built directly, e.g. in tests) or explicitly true; false only when the
+// config file has an explicit `sticky_header: false`.
+func (c Config) StickyHeaderEnabled() bool { return c.StickyHeader == nil || *c.StickyHeader }
+
 // Default returns a registry seeded with port 22 (SSH) locked, so a
 // fresh install doesn't accidentally expose it via tailscale serve
 // before the user has looked at the tool. All other ports start
@@ -159,6 +175,8 @@ func (c Config) ResolvedPath() string { return c.path }
 func Default() Config {
 	cfg := Config{Ports: map[int]PortMeta{22: {Locked: true}}}
 	cfg.Caddy.applyDefaults()
+	t := true
+	cfg.StickyHeader = &t
 	return cfg
 }
 
@@ -210,6 +228,15 @@ func Load(override string) (Config, error) {
 	// in-memory struct here, and the block appears -- with its comments --
 	// on the next Save.
 	cfg.Caddy.applyDefaults()
+	// A pre-existing config file from before k4cj has no sticky_header key at
+	// all, which unmarshals to a nil pointer here -- same as an explicit
+	// `sticky_header: null`. Normalize that to true (the default) rather than
+	// leaving it nil, so an old install's very first render already has the
+	// sticky header on, not merely "on until the next Save re-derives it".
+	if cfg.StickyHeader == nil {
+		t := true
+		cfg.StickyHeader = &t
+	}
 	cfg.path = path
 	return cfg, nil
 }
@@ -263,6 +290,14 @@ func Load(override string) (Config, error) {
 // Default()/Load().
 func (c Config) Save() error {
 	c.Caddy.applyDefaults()
+	// Defensive nil->true normalization (mirrors Load), so a raw Config
+	// literal built directly (never routed through Default()/Load()) never
+	// marshals a bare `sticky_header: null` -- it always writes an explicit
+	// true or false.
+	if c.StickyHeader == nil {
+		t := true
+		c.StickyHeader = &t
+	}
 	path := c.path
 	if path == "" {
 		var err error
@@ -281,6 +316,7 @@ func (c Config) Save() error {
 	}
 	applyCaddyComments(&root)
 	applyCloudflaredComments(&root)
+	applyStickyHeaderComment(&root)
 	data, err := yaml.Marshal(&root)
 	if err != nil {
 		return err
@@ -402,6 +438,7 @@ func (c Config) SaveCaddyDomain(domain string) error {
 			return err
 		}
 		applyCaddyComments(&root)
+		applyStickyHeaderComment(&root)
 		data, err := yaml.Marshal(&root)
 		if err != nil {
 			return err
@@ -538,6 +575,7 @@ func (c Config) SaveCaddyHostname(hostname string) error {
 			return err
 		}
 		applyCaddyComments(&root)
+		applyStickyHeaderComment(&root)
 		data, err := yaml.Marshal(&root)
 		if err != nil {
 			return err
@@ -741,6 +779,23 @@ func applyCloudflaredComments(root *yaml.Node) {
 		"\nOptional public base domain used to prefill the hostname prompt when\n"+
 			"starting a named (authenticated) tunnel. Blank by default; quick\n"+
 			"(unauthenticated) tunnels ignore it.")
+}
+
+// applyStickyHeaderComment sets the explanatory head comment on the
+// TOP-LEVEL sticky_header key (kata k4cj) -- unlike applyCaddyComments/
+// applyCloudflaredComments, which comment keys INSIDE a nested block,
+// sticky_header sits directly on root, so this is called with the SAME root
+// the caddy/cloudflared helpers are (see Save, WriteDefault via Save, and the
+// no-existing-file branches of SaveCaddyDomain/SaveCaddyHostname). Like those
+// helpers, the comment text is a constant tailport owns, re-applied on every
+// write so it survives saves that touch unrelated fields.
+func applyStickyHeaderComment(root *yaml.Node) {
+	setKeyHeadComment(root, "sticky_header",
+		"Pins the top-clipped service's header row at the top of the single-\n"+
+			"column list, so a route sitting at the very top of the viewport\n"+
+			"always shows which service it belongs to. Set to false for the plain\n"+
+			"per-route scroll (no pinned header, today's classic behavior).\n"+
+			"Default true.")
 }
 
 // mappingValueNode returns the value node for key within mapping node m, or

@@ -1207,6 +1207,14 @@ type model struct {
 	// emoji/detection via an explicit "emoji"/"auto" mode. Copied onto each
 	// portItem in rebuildItems so markerGlyph()/Title() pick the same set.
 	markerEmoji bool
+	// stickyHeader gates the sticky service header (kata k4cj): when the
+	// single-column body's viewport top clips mid-block, renderList pins the
+	// owning service's header as the top row instead of leaving an orphan
+	// route line with no visible service context. Resolved once at New() from
+	// cfg.StickyHeaderEnabled(), not read from m.cfg directly, so a model
+	// built as a bare literal (most tests) defaults to false -- today's plain
+	// per-route scroll -- while the real New() path defaults it on.
+	stickyHeader bool
 }
 
 // filterNoHighlight ranks items with the list's default fuzzy filter but clears
@@ -1467,6 +1475,9 @@ func New(cfg config.Config, markersOverride ...string) model {
 		// markerEmoji (exposure markers) obeys --markers/cfg.Markers, defaulting
 		// to mono when unset (qwcw).
 		markerEmoji: resolveMarkerEmoji(markersMode),
+		// stickyHeader (kata k4cj) obeys cfg.sticky_header, defaulting to ON
+		// (StickyHeaderEnabled treats a nil/unset pointer as true).
+		stickyHeader: cfg.StickyHeaderEnabled(),
 	}
 }
 

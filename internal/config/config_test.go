@@ -1317,3 +1317,100 @@ func TestSaveCaddyDomainRejectsNonMappingCaddy(t *testing.T) {
 		t.Errorf("config was modified despite refusal, got:\n%s", raw)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Sticky service header (kata k4cj): a top-level `sticky_header` display
+// preference, default ON -- including for a pre-existing config file written
+// before this feature existed.
+// ---------------------------------------------------------------------------
+
+// TestStickyHeaderDefaultEnabled covers Default(): a freshly seeded Config
+// has the sticky header on.
+func TestStickyHeaderDefaultEnabled(t *testing.T) {
+	cfg := Default()
+	if !cfg.StickyHeaderEnabled() {
+		t.Errorf("Default().StickyHeaderEnabled() = false, want true")
+	}
+}
+
+// TestStickyHeaderOldFileDefaultsEnabled covers the upgrade path: a config
+// file written without a sticky_header key at all (as every pre-k4cj file
+// is) must still load as enabled, not silently opt a pre-existing install
+// out of the feature.
+func TestStickyHeaderOldFileDefaultsEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// A minimal, hand-written file with no sticky_header key -- stands in for
+	// any config.yaml saved before kata k4cj.
+	if err := os.WriteFile(path, []byte("ports:\n  22:\n    locked: true\n"), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !got.StickyHeaderEnabled() {
+		t.Errorf("Load() of a pre-k4cj file (no sticky_header key) StickyHeaderEnabled() = false, want true")
+	}
+}
+
+// TestStickyHeaderExplicitFalseRoundTrips covers the opt-out: an explicit
+// `sticky_header: false` in the file loads as disabled, and Save/Load
+// preserves that false rather than reverting to the true default.
+func TestStickyHeaderExplicitFalseRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("sticky_header: false\n"), 0o600); err != nil {
+		t.Fatalf("seeding fixture: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.StickyHeaderEnabled() {
+		t.Errorf("Load() of sticky_header: false StickyHeaderEnabled() = true, want false")
+	}
+
+	// Round-trip: saving and reloading must preserve the explicit false, not
+	// silently flip it back to the true default.
+	if err := got.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("re-Load() error: %v", err)
+	}
+	if reloaded.StickyHeaderEnabled() {
+		t.Errorf("after Save/Load round-trip, StickyHeaderEnabled() = true, want false (explicit false must survive)")
+	}
+}
+
+// TestStickyHeaderSaveWritesTrueAndComment covers Save's self-documenting
+// invariant for this key (mirrors TestFreshSeedIncludesCaddyBlockAndComments
+// for the caddy block): a default Config's saved file has an explicit
+// `sticky_header: true` line plus its explanatory head comment, so the knob
+// is discoverable without reading docs.
+func TestStickyHeaderSaveWritesTrueAndComment(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	cfg := Default()
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	path, err := Path("")
+	if err != nil {
+		t.Fatalf("Path(\"\") error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading saved config: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "sticky_header: true") {
+		t.Errorf("expected saved config to contain %q, got:\n%s", "sticky_header: true", text)
+	}
+	if !strings.Contains(text, "Pins the top-clipped service's header row") {
+		t.Errorf("expected saved config to contain the sticky_header explanatory comment, got:\n%s", text)
+	}
+}

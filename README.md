@@ -363,6 +363,21 @@ or the `--theme` flag, which wins over the config value. `auto` detects the
 background itself; when it can't tell at all, it falls back to `dark`, so
 existing dark-terminal setups see no change either way.
 
+### Sticky service header
+
+The single-column body scrolls by route, not by block, so the viewport's top
+edge can land mid-block — a route row (e.g. a `cloudflare` sub-row) with its
+service's header scrolled just out of view above it. A top-level
+`sticky_header` key (default on) pins that top-clipped service's header as
+the list's top row whenever this happens, so a route at the very top of the
+viewport always shows which service it belongs to:
+
+```yaml
+sticky_header: true # true (default) | false
+```
+
+Set it to `false` for the plain per-route scroll (no pinned header) instead.
+
 ### Publish (Caddy edge)
 
 *Advanced — only needed if you use the `d` publish path.*
