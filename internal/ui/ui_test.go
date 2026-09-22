@@ -1821,6 +1821,60 @@ func TestCopyPidAndKill(t *testing.T) {
 			t.Errorf("flash = %q, want it to name :8080 (the owning port), not the route", m.flash)
 		}
 	})
+
+	// kata 9x3e: "I" hands over a ready-to-run kill command, so it carries the
+	// same `x`-lock guard as serve/funnel/publish. The lock check runs BEFORE
+	// the Pid==0 check (ui.go "I" case), so it fires even when Pid resolves --
+	// pinning "lock beats a resolvable PID".
+	t.Run("I refuses on a locked port even with a valid Pid (kata 9x3e)", func(t *testing.T) {
+		m := newModel(12345)
+		m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Locked: true}
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 0 {
+			t.Errorf("clipboard writes = %v, want none (refused, lock beats a resolvable PID)", copied)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, "locked") || !strings.Contains(m.flash, "press x") {
+			t.Errorf("flash = %q level=%v, want a warn toast mentioning \"locked\" and \"press x\"", m.flash, m.flashLevel)
+		}
+	})
+
+	// :22 ships locked by default (config.Default), and is usually
+	// foreign-owned (Pid==0) too -- the lock-before-Pid ordering means the
+	// toast explains the LOCK, not an incidental "no PID" (kata 9x3e).
+	t.Run("I refuses on :22 (locked by default) (kata 9x3e)", func(t *testing.T) {
+		m := New(config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}})
+		m.host = "host"
+		m.width = 80
+		m.allPorts = []portscan.Port{{Number: 22, Process: "sshd", Pid: 0, BindScope: portscan.ScopeWildcard}}
+		m.active = map[int]bool{22: true}
+		m.showAllPorts = true
+		m.rebuildItems()
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 0 {
+			t.Errorf("clipboard writes = %v, want none (refused)", copied)
+		}
+		if m.flashLevel != flashWarn || !strings.Contains(m.flash, "locked") || !strings.Contains(m.flash, "press x") {
+			t.Errorf("flash = %q level=%v, want a warn toast mentioning \"locked\" and \"press x\"", m.flash, m.flashLevel)
+		}
+	})
+
+	// `i` (bare PID) is deliberately left UNGATED -- it's informational, not a
+	// ready-to-run kill command, so the lock guard added for "I" must not
+	// touch it (kata 9x3e).
+	t.Run("i still copies the bare PID on a locked port (kata 9x3e: i stays ungated)", func(t *testing.T) {
+		m := newModel(12345)
+		m.cfg.Ports[8080] = config.PortMeta{Favorite: true, Locked: true}
+		res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+		m = res.(model)
+		if copied := drainClipCopy(cmd); len(copied) != 1 || copied[0] != "12345" {
+			t.Fatalf("clipboard writes = %v, want exactly [%q] (i is not gated by the lock)", copied, "12345")
+		}
+		if m.flashLevel != flashInfo || !strings.Contains(m.flash, "12345") {
+			t.Errorf("flash = %q level=%v, want an info toast naming 12345", m.flash, m.flashLevel)
+		}
+	})
 }
 
 // TestCopyPidKeymap pins the i/I bindings themselves: `i` matches CopyPid and

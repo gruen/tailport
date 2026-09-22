@@ -4479,10 +4479,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Copy a ready-to-run "kill <pid>" command (SIGTERM default --
 			// lines up with the future in-app kill, q1cy -- and is a safe
 			// manual escape hatch until that lands). Same owning-port
-			// resolution and Pid==0 refusal as "i" above.
+			// resolution and Pid==0 refusal as "i" above, PLUS a lock guard
+			// (kata 9x3e): "I" is the manual stand-in for a real kill, so it
+			// carries the same `x`-lock guard as serve/funnel/publish. The
+			// lock check runs BEFORE the Pid==0 check -- deliberately: the
+			// default-locked :22 is usually foreign-owned (Pid==0 too), and
+			// lock-first surfaces the real reason ("locked") instead of an
+			// incidental "no PID". "i" (bare PID) stays completely ungated --
+			// it's informational/non-destructive; only "I" hands over a
+			// ready-to-run kill command.
 			sel, ok := m.list.SelectedItem().(portItem)
 			if !ok {
 				return m, nil
+			}
+			if m.cfg.Ports[sel.port.Number].Locked {
+				return m, m.setFlash(fmt.Sprintf(":%d is locked — press x to unlock before copying a kill command", sel.port.Number), flashWarn)
 			}
 			if sel.port.Pid == 0 {
 				return m, m.setFlash(fmt.Sprintf("no PID for :%d", sel.port.Number), flashWarn)
@@ -6543,7 +6554,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
-		"I":      "Copy a ready-to-run kill command for the selected port's PID\n(e.g. \"kill 12345\", SIGTERM -- no signal flag), via the same path as\ni. A safe manual stand-in until an in-app kill exists. Same Pid==0\nrefusal as i: no command is copied for an unresolved PID.",
+		"I":      "Copy a ready-to-run kill command for the selected port's PID\n(e.g. \"kill 12345\", SIGTERM -- no signal flag), via the same path as\ni. A safe manual stand-in until an in-app kill exists. Refuses on a\nlocked port (press x to unlock first); that lock check runs before\nthe Pid==0 refusal below. Same Pid==0 refusal as i: no command is\ncopied for an unresolved PID.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",
 		"F":      "Forget the selected port: clears ★ and drops it out of the\nFavorites view. Shift-F, so a stray f-key press can't undo your\nshortlist. (This was \"u\" before; u is undo now.)",
 		"u":      "Undo the last registry edit — favorite, forget, label, lock or\nadd. Stepping back through them one at a time; " + strconv.Itoa(undoStackLimit) + " deep, this session\nonly. It does NOT touch what's exposed: serve and funnel have\ntheir own keys and confirms, and undo never flips them. (To restore a\nforce-purged route is a SEPARATE affordance on its own key — R,\nshown in the status line right after the purge — not this.)",

@@ -169,7 +169,7 @@ or `?` when the port belongs to a process owned by a different user (commonly
 | `o` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
 | `i` | Copy the selected **port's** bare PID (e.g. `12345`) — refuses if it can't be resolved |
-| `I` | Copy a ready-to-run `kill <pid>` command (SIGTERM) — same refusal as `i` |
+| `I` | Copy a ready-to-run `kill <pid>` command (SIGTERM) — same refusal as `i`, plus refuses on a locked port |
 | `C` | Tear down stale forwards (served with nothing listening) |
 | `x` | Lock / unlock the selected port (`:22` ships locked; unlocking it needs a typed `ssh`) |
 | `n` | Add a port to Favorites by number (even one nothing's listening on yet) |
@@ -194,7 +194,11 @@ route or a still-starting quick tunnel).
 the port even when a route sub-row is selected, and always confirm by toast
 (there's no per-route line to annotate). Both refuse — a toast naming the
 port, nothing copied — when the port's PID can't be resolved (`0`): a
-foreign-owned port, or a favorite that's currently down.
+foreign-owned port, or a favorite that's currently down. `I` also refuses,
+with its own toast, on a **locked** port (`x`) — it hands over a
+ready-to-run kill command, so it carries the same lock guard as
+serve/funnel/publish; `i` (the bare PID) is informational and stays
+ungated even when the port is locked.
 
 ## Exposing a port
 
