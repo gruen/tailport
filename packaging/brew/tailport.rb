@@ -1,8 +1,8 @@
 class Tailport < Formula
   desc "TUI to expose local ports across your tailnet via tailscale serve"
   homepage "https://github.com/gruen/tailport"
-  url "https://github.com/gruen/tailport/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "732d0f7bcc4958b600cec70ea94dc01a3624c5b59c7faf30e304de4b5f4f1f28"
+  url "https://github.com/gruen/tailport/archive/refs/tags/v0.3.1.tar.gz"
+  sha256 "4a5dfc3f2e7251b2baa185ae19ff1afb87e39048b91a6c5daa09f7ba75b1e408"
   license "MIT"
   head "https://github.com/gruen/tailport.git", branch: "main"
 
