@@ -5528,14 +5528,38 @@ func buildStickyHeaderModel(t *testing.T, sticky bool, n int) model {
 	return m
 }
 
+// resizeToBodyHeight resizes m (a WindowSizeMsg at width w) to the smallest
+// height whose listBodyHeight() equals target, and returns that model. Tests
+// that need a specific body height use this instead of hardcoding a window
+// size: the height a given window yields shifts with the bottom-bar legend,
+// which is TALLER when cloudflared is installed (the extra `o` key) than when
+// it isn't. A hardcoded size therefore passed on a dev box with cloudflared
+// but failed on CI without it -- exactly the environment-divergent class
+// AGENTS.md flags (kata cp2c). listBodyHeight is monotonic in window height,
+// so scanning upward returns the smallest match; a clear failure fires if the
+// reservation ever changes enough that no height in range yields target.
+func resizeToBodyHeight(t *testing.T, m model, w, target int) model {
+	t.Helper()
+	for hh := target + 1; hh <= 80; hh++ {
+		res, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: hh})
+		mm := res.(model)
+		if mm.listBodyHeight() == target {
+			return mm
+		}
+	}
+	t.Fatalf("no window height in [%d,80] at width %d yields listBodyHeight()==%d (bottom-bar reservation changed?)", target+1, w, target)
+	return m
+}
+
 // TestStickyHeaderPinsOwningHeaderMidBlock covers the core k4cj behavior:
-// sticky_header ON, four services of six lines each (120x24 -> listBodyHeight
-// 11 here, verified against the 27-line body below), scrollOff parked at line
-// 9 -- the "tailnet" route of the SECOND (non-selected) service, i.e. the
-// viewport top lands mid-block. renderList must pin that service's header (a
-// byte-identical copy of the real rendered header, carrying :3001/proc1) as
-// the top row, and the total rendered row count must still equal
-// listBodyHeight()+1 (the indicator line) -- no height drift.
+// sticky_header ON, four services of six lines each (a 27-line body), scrollOff
+// parked at line 9 -- the "tailnet" route of the SECOND (non-selected)
+// service, i.e. the viewport top lands mid-block. renderList must pin that
+// service's header (a byte-identical copy of the real rendered header,
+// carrying :3001/proc1) as the top row, and the total rendered row count must
+// still equal listBodyHeight()+1 (the indicator line) -- no height drift. The
+// 120x24 window leaves ample body height for line 9 to be a valid scroll
+// offset in any environment (the fixture guard below asserts that).
 func TestStickyHeaderPinsOwningHeaderMidBlock(t *testing.T) {
 	m := buildStickyHeaderModel(t, true, 4)
 	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
@@ -5567,15 +5591,15 @@ func TestStickyHeaderPinsOwningHeaderMidBlock(t *testing.T) {
 
 // TestStickyHeaderTallBlockShowsOwningHeader covers the tall-block case
 // (th05 relaxed exclusivity: a block can now run up to ~6 lines and exceed a
-// short viewport entirely). Height 16 at width 120 yields listBodyHeight()==3
-// -- shorter than any single six-line block -- and scrollOff is parked deep
+// short viewport entirely). The viewport is sized to a body height of 3 --
+// shorter than any single six-line block -- and scrollOff is parked deep
 // inside the THIRD service's block (line 17, its "ts.net" route). Even though
 // that whole block can never fit on screen at once, the pinned header still
-// names the service.
+// names the service. (The window height that yields body height 3 is derived
+// at runtime, so this holds whether or not cloudflared inflates the legend.)
 func TestStickyHeaderTallBlockShowsOwningHeader(t *testing.T) {
 	m := buildStickyHeaderModel(t, true, 4)
-	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 16})
-	m = res.(model)
+	m = resizeToBodyHeight(t, m, 120, 3)
 
 	lines, owners, _, selLine := m.bodyLinesFull()
 	const off = 17
@@ -5642,8 +5666,9 @@ func TestStickyHeaderOffKeepsPlainMidBlockRoute(t *testing.T) {
 // service's pinned header.
 func TestStickyHeaderNeverHidesSelectedRoute(t *testing.T) {
 	m := buildStickyHeaderModel(t, true, 4)
-	res, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 13})
-	m = res.(model)
+	// Body height 1 is derived at runtime (the window height that produces it
+	// depends on the legend, hence on cloudflared -- see resizeToBodyHeight).
+	m = resizeToBodyHeight(t, m, 120, 1)
 
 	if h := m.listBodyHeight(); h != 1 {
 		t.Fatalf("fixture assumption broken: listBodyHeight() = %d, want 1", h)
