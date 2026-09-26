@@ -206,7 +206,11 @@ type keyMap struct {
 	Undo    key.Binding
 	Redo    key.Binding
 	ShowAll key.Binding
-	Copy    key.Binding
+	// Sort toggles the list's item order (kata s93r): port number (default,
+	// ascending) <-> name (label/process, case-insensitive, ascending).
+	// Session-only -- see model.sortMode.
+	Sort key.Binding
+	Copy key.Binding
 	// CopyPid copies the selected port's bare PID (kata 4ref), and CopyKill
 	// copies a ready-to-run "kill <pid>" command (SIGTERM default -- a safe
 	// manual escape hatch until an in-app kill lands, see q1cy). Both reuse
@@ -256,7 +260,7 @@ func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
 		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Tunnel, k.Clean, k.Lock, k.Edit}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.CopyPid, k.CopyKill, k.Label}},
-		{"View", []key.Binding{k.Filter, k.ShowAll, k.Refresh}},
+		{"View", []key.Binding{k.Filter, k.ShowAll, k.Sort, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
 		// edit, including the lock changes that live in the exposure column, so
 		// filing them under Favorites would understate their reach. Hints (h)
@@ -332,6 +336,7 @@ func newKeyMap() keyMap {
 		Undo:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "undo")),
 		Redo:    key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "redo")),
 		ShowAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "filtered")),
+		Sort:    key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Copy:    key.NewBinding(key.WithKeys("c", "y"), key.WithHelp("c", "copy URL")),
 		// CopyPid/CopyKill (kata 4ref): i/I were freed by 7nss's t/o remap.
 		// Both refuse (toast, no clipboard write) when the port's Pid is 0 --
@@ -1215,7 +1220,23 @@ type model struct {
 	// built as a bare literal (most tests) defaults to false -- today's plain
 	// per-route scroll -- while the real New() path defaults it on.
 	stickyHeader bool
+	// sortMode selects the list's item order (kata s93r): sortByPort (default)
+	// orders ascending by port number -- today's only order, unchanged --
+	// sortByName orders case-insensitively by displayName() (label | process |
+	// "was <proc>" | "?"), tiebreaking on port number. Toggled by "s".
+	// SESSION-ONLY, like showAllPorts above: never persisted, resets to
+	// sortByPort (its zero value) on restart.
+	sortMode sortMode
 }
+
+// sortMode is the list's item-order mode (kata s93r). Its zero value,
+// sortByPort, is deliberately the default -- see model.sortMode.
+type sortMode int
+
+const (
+	sortByPort sortMode = iota
+	sortByName
+)
 
 // filterNoHighlight ranks items with the list's default fuzzy filter but clears
 // the matched-rune indices, so the delegate's ANSI-unaware highlighter never
@@ -4426,6 +4447,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectPort(cur)
 			}
 			return m, cmd
+		case "s":
+			// Cycle the session-only sort mode (kata s93r): port number <->
+			// name. Mirrors "a"'s cursor-anchoring pattern so the cursor
+			// follows the SAME service across the re-sort rather than
+			// landing on whatever row it ends up in.
+			var cur int
+			if sel, ok := m.list.SelectedItem().(portItem); ok {
+				cur = sel.port.Number
+			}
+			if m.sortMode == sortByPort {
+				m.sortMode = sortByName
+			} else {
+				m.sortMode = sortByPort
+			}
+			cmd := m.rebuildItems()
+			if cur != 0 {
+				m.selectPort(cur)
+			}
+			label := "sorted by port"
+			if m.sortMode == sortByName {
+				label = "sorted by name"
+			}
+			return m, tea.Batch(cmd, m.setFlash(label, flashInfo))
 		case "h":
 			// Toggle the bottom-bar legend. resizeList recomputes the list body
 			// height against the new legend reservation (1 line when hidden), so
@@ -4743,6 +4787,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// sortItems orders items in place per mode (kata s93r): sortByPort by
+// port.Number (today's only order -- a no-op when items already arrive in
+// ascending port order, as both rebuildItems branches build them);
+// sortByName by displayName() case-insensitively, tiebreaking on port.Number
+// so two same-named ports (e.g. two "Api"s) land in a stable, deterministic
+// order rather than whatever order they happened to arrive in. SliceStable
+// throughout so ties never reorder relative to their pre-sort position
+// beyond what the tiebreak itself decides.
+func sortItems(items []list.Item, mode sortMode) {
+	switch mode {
+	case sortByName:
+		sort.SliceStable(items, func(i, j int) bool {
+			a, b := items[i].(portItem), items[j].(portItem)
+			an, _ := a.displayName()
+			bn, _ := b.displayName()
+			an, bn = strings.ToLower(an), strings.ToLower(bn)
+			if an != bn {
+				return an < bn
+			}
+			return a.port.Number < b.port.Number
+		})
+	default: // sortByPort
+		sort.SliceStable(items, func(i, j int) bool {
+			return items[i].(portItem).port.Number < items[j].(portItem).port.Number
+		})
+	}
+}
+
 // rebuildItems recomputes the visible list for the current view. In the
 // All ports view (showAllPorts) it shows every currently-listening port,
 // full stop. In the Favorites view it shows only ports marked
@@ -4754,6 +4826,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ports regardless of view, so the filter searches everything; when the
 // origin view is Favorites, non-favorite matches are flagged dimmed so real
 // favorites still stand out among the pulled-in results.
+//
+// Both branches finish by applying m.sortMode (kata s93r) just before handing
+// items to setItems -- port mode is a no-op re-sort (items already arrive in
+// ascending port order below), name mode reorders by displayName().
+//
 // It returns the list's SetItems command, which is non-nil (a re-filter
 // request) only when rebuilding while a filter is active; callers made from
 // Update must propagate it so the filtered view doesn't blank out.
@@ -4821,6 +4898,7 @@ func (m *model) rebuildItems() tea.Cmd {
 			tun := m.tunnels[n]
 			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
+		sortItems(items, m.sortMode)
 		return m.setItems(items)
 	}
 
@@ -4846,6 +4924,7 @@ func (m *model) rebuildItems() tea.Cmd {
 		tun := m.tunnels[n]
 		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
+	sortItems(items, m.sortMode)
 	return m.setItems(items)
 }
 
@@ -4898,19 +4977,30 @@ func (m *model) selectPort(number int) {
 	m.ensureRouteVisible()
 }
 
-// selectIndexForPort returns the index in numbers (sorted ascending) to
-// select when anchoring the cursor to target. If target is present, its
-// index is returned. Otherwise the nearest next-lowest port is chosen (the
-// row just before target's insertion point), falling back to the first row
-// when target is below every remaining port. Example: numbers=[3000,8080],
-// target 9000 -> index 1 (:8080); target 22 -> index 0 (:3000).
+// selectIndexForPort returns the index in numbers to select when anchoring
+// the cursor to target. If target is present, its index is returned.
+// Otherwise the nearest next-lowest port BY VALUE is chosen, falling back to
+// the first row when target is below every remaining port. Example:
+// numbers=[3000,8080], target 9000 -> index 1 (:8080); target 22 -> index 0
+// (:3000).
+//
+// numbers is NOT assumed sorted (kata s93r): with the name sort mode, the
+// list's item order no longer tracks ascending port number, so this scans
+// rather than sort.SearchInts-ing -- a binary search over an unsorted slice
+// would silently return a wrong index instead of failing loudly. The linear
+// scan costs nothing that matters at the list sizes this app renders.
 func selectIndexForPort(numbers []int, target int) int {
-	i := sort.SearchInts(numbers, target)
-	if i < len(numbers) && numbers[i] == target {
-		return i
+	bestIdx, bestVal := -1, 0
+	for i, n := range numbers {
+		if n == target {
+			return i
+		}
+		if n < target && (bestIdx < 0 || n > bestVal) {
+			bestIdx, bestVal = i, n
+		}
 	}
-	if i > 0 {
-		return i - 1
+	if bestIdx >= 0 {
+		return bestIdx
 	}
 	return 0
 }
@@ -6565,6 +6655,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
 		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
 		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
+		"s":      "Sort the list: toggle between port number (the default, ascending)\nand name (label, else process, else \"was <proc>\", else \"?\";\ncase-insensitive, port number breaks ties). Session-only -- it\nresets to port-number order on restart.",
 		"r":      "Refresh the port list and serve status.",
 		"h":      "Show or hide the keyboard-shortcuts legend at the bottom of the\nscreen. When hidden, a single \"h show/hide key bindings\" reminder\nstays bottom-right and the reclaimed rows go back to the port list.\n(This just collapses the bar; ? opens the full help overlay.)",
 		"?":      "Toggle this help. esc or q also close it.",
@@ -6942,12 +7033,19 @@ func (m model) renderHeader() string {
 	if v := displayVersion(m.version); v != "" {
 		logo += " " + versionStyle.Render(v)
 	}
+	// The sort chip (kata s93r) and the Favorites|All-ports toggle share the
+	// header's right side, in that order, separated by sep -- logo stays
+	// pinned left, gap absorbs whatever width is left between them. This
+	// stays ONE logical line (no wrap): View sizes the header via
+	// lipgloss.Height, so a newline here would throw that off.
+	sortChip := m.renderSortIndicator()
 	toggle := m.renderViewIndicator()
-	gap := m.width - lipgloss.Width(logo) - lipgloss.Width(toggle)
+	const sep = "  "
+	gap := m.width - lipgloss.Width(logo) - lipgloss.Width(sortChip) - lipgloss.Width(sep) - lipgloss.Width(toggle)
 	if gap < 1 {
 		gap = 1 // too narrow to justify; keep at least a space (may wrap)
 	}
-	return logo + strings.Repeat(" ", gap) + toggle
+	return logo + strings.Repeat(" ", gap) + sortChip + sep + toggle
 }
 
 // displayVersion formats a build version for the header. Release builds stamp
@@ -6984,6 +7082,18 @@ func (m model) renderViewIndicator() string {
 		return viewInactiveStyle.Render(fav) + viewActiveStyle.Render(all)
 	}
 	return viewActiveStyle.Render(fav) + viewInactiveStyle.Render(all)
+}
+
+// renderSortIndicator renders the Port | Name segmented control for the
+// active sort mode (kata s93r), same pattern as renderViewIndicator: the
+// active mode is a filled chip, the inactive one dim, so it's unmistakable
+// which order "s" is currently showing.
+func (m model) renderSortIndicator() string {
+	port, name := " Port ", " Name "
+	if m.sortMode == sortByName {
+		return viewInactiveStyle.Render(port) + viewActiveStyle.Render(name)
+	}
+	return viewActiveStyle.Render(port) + viewInactiveStyle.Render(name)
 }
 
 // statusText is the human-readable status shown at the bottom: the current

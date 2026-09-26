@@ -104,8 +104,14 @@ func TestDanglingPorts(t *testing.T) {
 }
 
 // TestSelectIndexForPort covers the cursor-anchoring helper behind the "a"
-// view toggle (vk30): the cursor tracks the port number, not the row index.
-// numbers is always sorted ascending (rebuildItems sorts before setItems).
+// view toggle (vk30) and, since kata s93r, the "s" sort toggle: the cursor
+// tracks the port number, not the row index. numbers used to always arrive
+// sorted ascending (rebuildItems sorted before setItems, unconditionally);
+// kata s93r's name sort mode broke that invariant, so selectIndexForPort no
+// longer assumes sorted input (it used to sort.SearchInts, which silently
+// returned a wrong index on unsorted input -- see
+// TestUpdateSortKeyAnchorsCursor for the Update-level regression this caused
+// and fixed). The unsorted-* cases below pin that fix directly.
 func TestSelectIndexForPort(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -123,6 +129,10 @@ func TestSelectIndexForPort(t *testing.T) {
 		{"missing above all", []int{3000, 8080}, 65535, 1},
 		{"missing below all", []int{3000, 8080}, 80, 0},
 		{"single item", []int{3000}, 9000, 0},
+		// kata s93r: name-sorted order is NOT ascending by port number.
+		{"unsorted exact match", []int{8080, 22, 3000}, 22, 1},
+		{"unsorted missing lands on next-lowest by value", []int{8080, 3000}, 9000, 0},
+		{"unsorted missing below all", []int{8080, 3000}, 80, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -169,6 +179,73 @@ func TestRebuildItemsViews(t *testing.T) {
 		if pi.port.Number == 4000 && pi.listening {
 			t.Error(":4000 (down favorite) should be a non-listening synthetic entry in All ports")
 		}
+	}
+}
+
+// TestSortByPortMatchesPreS93ROrder is the regression guard for kata s93r's
+// port-mode claim: sortByPort (the DEFAULT, zero-value sortMode) must
+// reproduce rebuildItems' ascending-by-port order byte-identically to before
+// this kata -- items already arrive pre-sorted by number in both branches,
+// so sortItems(items, sortByPort) is meant to be a pure no-op re-sort over
+// that existing order, in both the Favorites and All-ports views.
+func TestSortByPortMatchesPreS93ROrder(t *testing.T) {
+	cfg := config.Config{Ports: map[int]config.PortMeta{
+		3000: {Favorite: true},
+		8080: {Favorite: true, Label: "web"},
+		4000: {Favorite: true}, // favorite but not listening -> synthetic entry
+		5000: {Label: "api"},   // labeled, not favorited, not listening -> nowhere
+	}}
+	m := New(cfg)
+	m.allPorts = []portscan.Port{{Number: 3000, Process: "node"}, {Number: 9000, Process: "x"}, {Number: 8080, Process: "srv"}}
+	m.active = map[int]bool{}
+
+	if m.sortMode != sortByPort {
+		t.Fatalf("model.sortMode zero value = %v, want sortByPort", m.sortMode)
+	}
+
+	m.showAllPorts = false
+	m.rebuildItems()
+	if got, want := portNumbers(m), []int{3000, 4000, 8080}; !reflect.DeepEqual(got, want) {
+		t.Errorf("favorites view, port mode = %v, want %v (unchanged from pre-s93r order)", got, want)
+	}
+
+	m.showAllPorts = true
+	m.rebuildItems()
+	if got, want := portNumbers(m), []int{3000, 4000, 8080, 9000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("all ports view, port mode = %v, want %v (unchanged from pre-s93r order)", got, want)
+	}
+}
+
+// TestSortItemsByName pins the name-sort mode (kata s93r): items order by
+// displayName() (label | process | "was <proc>" | "?") case-insensitively,
+// tiebreaking on port number. Fixture from the issue: two case-variant "api"
+// labels at different ports plus one alphabetically-later label --
+// exercises both the case-fold and the tiebreak in one pass. A
+// case-SENSITIVE bug (comparing raw, un-lowered strings) would sort "Zed"
+// and "Api" ahead of "api" on raw byte order (capitals sort before
+// lowercase in ASCII), badly failing the assertion below.
+func TestSortItemsByName(t *testing.T) {
+	cfg := config.Config{Ports: map[int]config.PortMeta{
+		8080: {Label: "Api", Favorite: true},
+		3000: {Label: "api", Favorite: true},
+		9000: {Label: "Zed", Favorite: true},
+	}}
+	m := New(cfg)
+	m.allPorts = []portscan.Port{{Number: 8080}, {Number: 3000}, {Number: 9000}}
+	m.active = map[int]bool{}
+	m.sortMode = sortByName
+
+	m.rebuildItems()
+	if got, want := portNumbers(m), []int{3000, 8080, 9000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("name-sorted order = %v, want %v (api:3000, Api:8080, Zed:9000)", got, want)
+	}
+
+	// Same fixture, All-ports view: rebuildItems' OTHER branch must apply the
+	// same sortItems call.
+	m.showAllPorts = true
+	m.rebuildItems()
+	if got, want := portNumbers(m), []int{3000, 8080, 9000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("name-sorted order (all ports view) = %v, want %v", got, want)
 	}
 }
 
@@ -2455,6 +2532,90 @@ func TestUpdateFunnelKey(t *testing.T) {
 	}
 }
 
+// TestUpdateSortKeyCycles pins the "s" key handler (kata s93r): each press
+// cycles the session-only sort mode port -> name -> port, and toasts a
+// confirmation naming the NEW mode.
+func TestUpdateSortKeyCycles(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m.allPorts = []portscan.Port{{Number: 8080, Process: "srv"}}
+	m.active = map[int]bool{}
+	m.rebuildItems()
+
+	if m.sortMode != sortByPort {
+		t.Fatalf("default sortMode = %v, want sortByPort", m.sortMode)
+	}
+
+	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = res.(model)
+	if m.sortMode != sortByName {
+		t.Errorf("after first s, sortMode = %v, want sortByName", m.sortMode)
+	}
+	if cmd == nil {
+		t.Error("s should return a non-nil cmd (at least the flash's expiry tick)")
+	}
+	if !strings.Contains(m.flash, "sorted by name") {
+		t.Errorf("flash after switching to name sort = %q, want it to mention %q", m.flash, "sorted by name")
+	}
+
+	res, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = res.(model)
+	if m.sortMode != sortByPort {
+		t.Errorf("after second s, sortMode = %v, want sortByPort", m.sortMode)
+	}
+	if cmd == nil {
+		t.Error("s should return a non-nil cmd (at least the flash's expiry tick)")
+	}
+	if !strings.Contains(m.flash, "sorted by port") {
+		t.Errorf("flash after switching to port sort = %q, want it to mention %q", m.flash, "sorted by port")
+	}
+}
+
+// TestUpdateSortKeyAnchorsCursor is the regression guard for a real bug found
+// while exercising kata s93r: selectIndexForPort used sort.SearchInts, which
+// silently returns a WRONG index when its numbers slice isn't sorted
+// ascending -- true before this kata (items always built in port order) but
+// no longer true once the list can be name-sorted. The fixture below deliberately
+// makes name order the REVERSE of port order (higher port, earlier name) so a
+// regression -- the cursor jumping to whatever row now occupies the OLD
+// index, instead of following the selected port -- fails loudly instead of
+// coincidentally passing.
+func TestUpdateSortKeyAnchorsCursor(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := config.Config{Ports: map[int]config.PortMeta{
+		18080: {Label: "Aaa Service", Favorite: true},
+		13000: {Label: "Zzz api", Favorite: true},
+	}}
+	m := New(cfg)
+	m.allPorts = []portscan.Port{{Number: 18080, Process: "x"}, {Number: 13000, Process: "y"}}
+	m.active = map[int]bool{}
+	m.rebuildItems()
+
+	sel, ok := m.list.SelectedItem().(portItem)
+	if !ok || sel.port.Number != 13000 {
+		t.Fatalf("fixture setup: initial selection = %+v, want :13000 selected (index 0, ascending port order)", sel)
+	}
+
+	// Toggling to name mode reorders the list (18080 "Aaa..." now sorts
+	// first), but the cursor must stay on :13000.
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if got, want := portNumbers(m), []int{18080, 13000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fixture setup: name-sorted order = %v, want %v", got, want)
+	}
+	sel, ok = m.list.SelectedItem().(portItem)
+	if !ok || sel.port.Number != 13000 {
+		t.Errorf("after switching to name sort, selected port = %+v, want :13000 (same service, now at a different row)", sel)
+	}
+
+	// Toggling back to port mode reorders it again; the cursor must still
+	// follow :13000.
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	sel, ok = m.list.SelectedItem().(portItem)
+	if !ok || sel.port.Number != 13000 {
+		t.Errorf("after switching back to port sort, selected port = %+v, want :13000", sel)
+	}
+}
+
 // TestHeader covers ttny: the cyan "tailport" wordmark and the Favorites|All
 // toggle live in one persistent top header, drawn above both the list and the
 // empty state -- so the logo survives an empty view -- and the toggle no
@@ -2486,6 +2647,54 @@ func TestHeader(t *testing.T) {
 	// grouped legend never contains.)
 	if bottom := m.renderBottom(); strings.Contains(bottom, "All ports") {
 		t.Errorf("bottom bar should not contain the view toggle; got %q", bottom)
+	}
+}
+
+// TestRenderSortIndicator pins the header sort chip (kata s93r): it reflects
+// the active sort mode and renderHeader folds it in alongside the existing
+// view toggle without breaking it or wrapping the header onto a second line
+// (renderHeader must stay one logical line -- View sizes it via
+// lipgloss.Height). The header is one line and not height-sensitive, so a
+// fixed width is fine here (see resizeToBodyHeight for the height-sensitive
+// case elsewhere).
+func TestRenderSortIndicator(t *testing.T) {
+	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m.width = 80
+
+	if m.sortMode != sortByPort {
+		t.Fatalf("default sortMode = %v, want sortByPort", m.sortMode)
+	}
+	if got := m.renderSortIndicator(); !strings.Contains(got, "Port") {
+		t.Errorf("port-mode sort chip = %q, want it to mention Port", got)
+	}
+	header := m.renderHeader()
+	if strings.Contains(header, "\n") {
+		t.Errorf("renderHeader must stay one logical line; got %q", header)
+	}
+	if !strings.Contains(header, "Port") {
+		t.Errorf("header should contain the sort chip's Port label; got %q", header)
+	}
+	for _, seg := range []string{"Favorites", "All ports"} {
+		if !strings.Contains(header, seg) {
+			t.Errorf("header should still contain view toggle segment %q alongside the sort chip; got %q", seg, header)
+		}
+	}
+
+	m.sortMode = sortByName
+	if got := m.renderSortIndicator(); !strings.Contains(got, "Name") {
+		t.Errorf("name-mode sort chip = %q, want it to mention Name", got)
+	}
+	header = m.renderHeader()
+	if strings.Contains(header, "\n") {
+		t.Errorf("renderHeader must stay one logical line; got %q", header)
+	}
+	if !strings.Contains(header, "Name") {
+		t.Errorf("header should contain the sort chip's Name label after toggling; got %q", header)
+	}
+	for _, seg := range []string{"Favorites", "All ports"} {
+		if !strings.Contains(header, seg) {
+			t.Errorf("header should still contain view toggle segment %q alongside the sort chip; got %q", seg, header)
+		}
 	}
 }
 
@@ -4166,11 +4375,12 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// moved space->t, tunnel moved t->o. 58ws BREAKING: funnel P->p, publish
 	// p->d, reordered ahead of tunnel.) kata 4ref: i (copy PID) / I (copy kill
 	// cmd) sit directly under c (copy URL) in Favorites -- same clip/OSC 52
-	// family, port-scoped rather than route-scoped.
+	// family, port-scoped rather than route-scoped. kata s93r: s (sort)
+	// joins View, right after a (switch view) and before r (refresh).
 	wantKeys := [][]string{
 		{"t", "p", "d", "o", "C", "x", "e"}, // Funnel=p, Publish=d, Tunnel=o (58ws order); Edit=e (kata prp1)
 		{"f", "F", "n", "c", "i", "I", "l"},
-		{"/", "a", "r"},
+		{"/", "a", "s", "r"},
 		{"u", "ctrl+r", "h", "?", "q"},
 	}
 	full := k.FullHelp()
@@ -4438,33 +4648,49 @@ func TestBottomBarGridFolds(t *testing.T) {
 		t.Errorf("App should NOT fold at width 120 (no surplus left after the other 2 groups); ? help row %d, q quit row %d:\n%s", r1, r2, wide)
 	}
 
-	// App folds once there's room for it (nc1j: it out-ranks View at 4 rows,
-	// so it's tried before View -- and the algorithm never backtracks to a
-	// later, smaller candidate once one doesn't fit, so View can't fold
-	// before App does). At 125 App's 4 items split column-major: "u undo"
-	// beside "? help" on one row, "h show/hide key bindings" beside "q quit"
-	// on the next -- but View still doesn't fit (its own fold needs >=140,
-	// past 125), so "/ filter"/"a switch view"/"r refresh" stay on SEPARATE
-	// rows.
+	// kata s93r: View gained a 4th item ("s sort"), so it now TIES App at 4
+	// unfolded rows. The fold order sorts by unfolded row count descending,
+	// stable on ties -- and View sits before App in groups() -- so View is
+	// now tried BEFORE App wherever they'd have tied. At 125, View's fold
+	// doesn't fit (its own fold needs >=140, see below), and the algorithm
+	// never backtracks to a later candidate once one fails to fit -- so App
+	// no longer gets a chance to fold at 125 either (it used to, when View
+	// was the smaller, later-tried group at 3 rows). Both stay single
+	// column: "u undo"/"? help" and "h show/hide key bindings"/"q quit" on
+	// SEPARATE rows, same as "/ filter"/"a switch view"/"s sort"/"r refresh".
 	m.help.Width, m.width = 125, 125
 	w125 := strings.Split(stripANSI(m.renderLegend()), "\n")
-	if r1, r2 := lineOf(w125, "u undo"), lineOf(w125, "? help"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold u undo/? help onto the same row at width 125; u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
+	if r1, r2 := lineOf(w125, "u undo"), lineOf(w125, "? help"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("App should NOT fold at width 125 (View ties it and is tried first, but View's own fold needs >=140); u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
-	if r1, r2 := lineOf(w125, "show/hide key bindings"), lineOf(w125, "q quit"); r1 < 0 || r1 != r2 {
-		t.Errorf("App should fold h show/hide key bindings/q quit onto the same row at width 125; h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
+	if r1, r2 := lineOf(w125, "show/hide key bindings"), lineOf(w125, "q quit"); r1 < 0 || r2 < 0 || r1 == r2 {
+		t.Errorf("App should NOT fold at width 125 (same reason); h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
 	if r1, r2 := lineOf(w125, "/ filter"), lineOf(w125, "r refresh"); r1 < 0 || r2 < 0 || r1 == r2 {
 		t.Errorf("View should NOT fold at width 125 (needs >=140); / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w125, "\n"))
 	}
 
-	// View folds last, once there's room for it (its own fold needs >=140,
-	// past App's 125 above). At 140 its 3 items split column-major: "/ filter"
-	// beside "r refresh" on one row, "a switch view" below.
+	// View folds once there's room for it (its own fold needs >=140, past
+	// 125 above). At 140 its 4 items split column-major, evenly this time
+	// (4 items, not the old odd-3 top-heavy case): "/ filter" beside "s
+	// sort" on one row, "a switch view" beside "r refresh" on the next.
+	// Having now fit, the algorithm continues to the next candidate -- App,
+	// tied with View at 4 rows but tried after it -- and App's OWN fold
+	// also fits at 140, splitting evenly too: "u undo"/"? help" then "h
+	// show/hide key bindings"/"q quit".
 	m.help.Width, m.width = 140, 140
 	w140 := strings.Split(stripANSI(m.renderLegend()), "\n")
-	if r1, r2 := lineOf(w140, "/ filter"), lineOf(w140, "r refresh"); r1 < 0 || r1 != r2 {
-		t.Errorf("View should fold / filter and r refresh onto the same row at width 140; / filter row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
+	if r1, r2 := lineOf(w140, "/ filter"), lineOf(w140, "s sort"); r1 < 0 || r1 != r2 {
+		t.Errorf("View should fold / filter and s sort onto the same row at width 140; / filter row %d, s sort row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
+	}
+	if r1, r2 := lineOf(w140, "a switch view"), lineOf(w140, "r refresh"); r1 < 0 || r1 != r2 {
+		t.Errorf("View should fold a switch view and r refresh onto the same row at width 140; a switch view row %d, r refresh row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
+	}
+	if r1, r2 := lineOf(w140, "u undo"), lineOf(w140, "? help"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should also fold (u undo/? help) onto the same row at width 140, now that View's fold fit and the algorithm moved on to App; u undo row %d, ? help row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
+	}
+	if r1, r2 := lineOf(w140, "show/hide key bindings"), lineOf(w140, "q quit"); r1 < 0 || r1 != r2 {
+		t.Errorf("App should fold h show/hide key bindings/q quit onto the same row at width 140; h row %d, q quit row %d:\n%s", r1, r2, strings.Join(w140, "\n"))
 	}
 
 	// Ceiling: a very wide terminal folds ALL FOUR groups, App included,
@@ -4504,7 +4730,7 @@ func TestBottomBarGridFolds(t *testing.T) {
 	for _, want := range []string{
 		"t on tailscale", "on ts.net (public)", "on caddy (public)", "x lock/unlock", "edit publish config",
 		"f favorite", "F forget", "n new favorite", "c copy URL", "i copy PID", "I copy kill cmd", "l label",
-		"/ filter", "a switch view", "r refresh",
+		"/ filter", "a switch view", "s sort", "r refresh",
 		"u undo", "show/hide key bindings", "? help", "q quit",
 	} {
 		if !strings.Contains(ceiling, want) {

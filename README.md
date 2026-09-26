@@ -156,6 +156,10 @@ resolved process name — or `was <name>` for a favorite whose process has exite
 or `?` when the port belongs to a process owned by a different user (commonly
 `root`) than the one running tailport.
 
+Services are listed in ascending port-number order by default; press `s` to
+sort by that name instead (case-insensitive, ties broken by port number) — a
+session-only toggle that resets to port order on restart.
+
 ### Keybindings
 
 | Key | Action |
@@ -179,6 +183,7 @@ or `?` when the port belongs to a process owned by a different user (commonly
 | `u` | Undo the last registry edit (favorite/forget/label/lock/add) |
 | `ctrl+r` | Redo the last undone registry edit |
 | `a` | Show every listening port — toggle |
+| `s` | Sort the list by port number or name — toggle (session-only) |
 | `/` | Filter by port number, process, or label (fuzzy) |
 | `r` | Refresh the port list and serve status |
 | `h` | Show/hide the bottom-bar keybinding legend |
