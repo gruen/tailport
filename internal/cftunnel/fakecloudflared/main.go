@@ -9,10 +9,10 @@
 //
 //   - `version --short` (Client.Detect)
 //   - the SAME "Incorrect Usage" rejection real cloudflared gives when a
-//     tunnel-level flag (--metrics/--logfile/--no-autoupdate) is placed AFTER
-//     `run` (see cftunnel.buildArgs's doc comment) -- this is what lets
-//     TestFakeMatchesRealPlacement compare the fake against the real binary
-//     on the SAME argv and expect the SAME verdict;
+//     tunnel-level flag (--config/--metrics/--logfile/--no-autoupdate) is
+//     placed AFTER `run` (see cftunnel.buildArgs's doc comment) -- this is
+//     what lets TestFakeMatchesRealPlacement compare the fake against the
+//     real binary on the SAME argv and expect the SAME verdict;
 //   - a `--metrics 127.0.0.1:PORT` HTTP server serving /ready and
 //     /quicktunnel, matching Client.Health's expectations;
 //   - graceful exit on SIGTERM/SIGINT (what Client.Stop sends), and two
@@ -60,7 +60,10 @@ const fakeVersion = "2026.9.1-fake"
 // Placing any of them after `run` is exactly the bug nc1j fixed (the named
 // argv was broken since v0.2.1), so the fake must reject it identically to
 // the real binary for TestFakeMatchesRealPlacement to mean anything.
-var tunnelLevelFlags = []string{"--metrics", "--logfile", "--no-autoupdate"}
+// --config joined this list under the hermetic-config follow-up fix (kata
+// nc1j): live-verified that `cloudflared tunnel run --config X --help`
+// prints the same "Incorrect Usage" rejection.
+var tunnelLevelFlags = []string{"--config", "--metrics", "--logfile", "--no-autoupdate"}
 
 func main() {
 	args := os.Args[1:]

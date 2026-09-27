@@ -54,6 +54,26 @@ func TestSplitPSCommand(t *testing.T) {
 			command: "cloudflared tunnel --url http://localhost:9000 --logfile=/x/cftunnel-9000.log",
 			want:    []string{"cloudflared", "tunnel", "--url", "http://localhost:9000", "--logfile=/x/cftunnel-9000.log"},
 		},
+		{
+			// kata nc1j (hermetic --config fix): a spaced --config value,
+			// immediately followed by --url, must survive as ONE arg too.
+			name:    "spaced state dir -- config value preserved as ONE arg, followed by --url",
+			command: "cloudflared tunnel --config /Users/Jane Doe/.local/state/tailport/cftunnel-config.yml --url http://localhost:3000 --metrics 127.0.0.1:1 --logfile /home/u/.local/state/tailport/cftunnel-3000.log --no-autoupdate",
+			want: []string{"cloudflared", "tunnel", "--config", "/Users/Jane Doe/.local/state/tailport/cftunnel-config.yml",
+				"--url", "http://localhost:3000", "--metrics", "127.0.0.1:1",
+				"--logfile", "/home/u/.local/state/tailport/cftunnel-3000.log", "--no-autoupdate"},
+		},
+		{
+			// Both --config AND --logfile spaced in the SAME command line --
+			// each must be protected independently without corrupting the
+			// other (named order: --config precedes --metrics here).
+			name:    "named tunnel: BOTH --config and --logfile spaced in the same line",
+			command: "cloudflared tunnel --config /Users/Jane Doe/.local/state/tailport/cftunnel-config.yml --metrics 127.0.0.1:1 --logfile /Users/Jane Doe/.local/state/tailport/cftunnel-8080-app.example.com.log --no-autoupdate run --url http://localhost:8080 web",
+			want: []string{"cloudflared", "tunnel", "--config", "/Users/Jane Doe/.local/state/tailport/cftunnel-config.yml",
+				"--metrics", "127.0.0.1:1",
+				"--logfile", "/Users/Jane Doe/.local/state/tailport/cftunnel-8080-app.example.com.log", "--no-autoupdate",
+				"run", "--url", "http://localhost:8080", "web"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -86,35 +106,57 @@ func TestParseRunningSpacedLogfilePath(t *testing.T) {
 
 // TestSplitPSCommandRoundTripsBuildArgs pins that splitPSCommand's parsing
 // survives a full round trip through buildArgs's OWN argv shape -- quick and
-// named, with both a plain and a space-containing --logfile path -- so a
-// future reshuffle of buildArgs's flag order (kata nc1j moved the named
-// tunnel's tunnel-level flags before `run`) can't silently break macOS's
-// ps-based discovery without failing here first.
+// named, with plain, --config-only-spaced, --logfile-only-spaced, and
+// BOTH-spaced state-dir paths (kata nc1j's hermetic --config fix put a
+// SECOND space-containing value on the line) -- so a future reshuffle of
+// buildArgs's flag order can't silently break macOS's ps-based discovery
+// without failing here first.
 func TestSplitPSCommandRoundTripsBuildArgs(t *testing.T) {
+	const (
+		unspacedDir = "/home/u/.local/state/tailport"
+		spacedDir   = "/Users/Jane Doe/.local/state/tailport"
+	)
 	cases := []struct {
-		name    string
-		spec    Spec
-		logfile string
+		name       string
+		spec       Spec
+		logfile    string
+		configPath string
 	}{
 		{
-			name:    "quick, unspaced logfile",
-			spec:    Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
-			logfile: "/home/u/.local/state/tailport/cftunnel-3000.log",
+			name:       "quick, unspaced config and logfile",
+			spec:       Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
+			logfile:    unspacedDir + "/cftunnel-3000.log",
+			configPath: unspacedDir + "/cftunnel-config.yml",
 		},
 		{
-			name:    "quick, spaced logfile",
-			spec:    Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
-			logfile: "/Users/Jane Doe/.local/state/tailport/cftunnel-3000.log",
+			name:       "quick, spaced config only",
+			spec:       Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
+			logfile:    unspacedDir + "/cftunnel-3000.log",
+			configPath: spacedDir + "/cftunnel-config.yml",
 		},
 		{
-			name:    "named, unspaced logfile",
-			spec:    Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942},
-			logfile: "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log",
+			name:       "quick, spaced logfile only",
+			spec:       Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
+			logfile:    spacedDir + "/cftunnel-3000.log",
+			configPath: unspacedDir + "/cftunnel-config.yml",
 		},
 		{
-			name:    "named, spaced logfile",
-			spec:    Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942},
-			logfile: "/Users/Jane Doe/.local/state/tailport/cftunnel-8080-app.example.com.log",
+			name:       "quick, BOTH config and logfile spaced",
+			spec:       Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941},
+			logfile:    spacedDir + "/cftunnel-3000.log",
+			configPath: spacedDir + "/cftunnel-config.yml",
+		},
+		{
+			name:       "named, unspaced config and logfile",
+			spec:       Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942},
+			logfile:    unspacedDir + "/cftunnel-8080-app.example.com.log",
+			configPath: unspacedDir + "/cftunnel-config.yml",
+		},
+		{
+			name:       "named, BOTH config and logfile spaced",
+			spec:       Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942},
+			logfile:    spacedDir + "/cftunnel-8080-app.example.com.log",
+			configPath: spacedDir + "/cftunnel-config.yml",
 		},
 	}
 	for _, tc := range cases {
@@ -123,7 +165,7 @@ func TestSplitPSCommandRoundTripsBuildArgs(t *testing.T) {
 			// `ps -o command=` -- argv[0] (the binary name) followed by the
 			// space-joined arguments, exactly as splitPSCommand's caller
 			// (enumerateCloudflared) hands it a single space-joined string.
-			want := append([]string{"cloudflared"}, buildArgs(tc.spec, tc.logfile)...)
+			want := append([]string{"cloudflared"}, buildArgs(tc.spec, tc.logfile, tc.configPath)...)
 			command := strings.Join(want, " ")
 			got := splitPSCommand(command)
 			if !reflect.DeepEqual(got, want) {

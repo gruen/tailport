@@ -15,9 +15,10 @@ import (
 )
 
 func TestBuildArgs(t *testing.T) {
-	quick := buildArgs(Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941}, "/state/cftunnel-3000.log")
+	quick := buildArgs(Spec{Port: 3000, Mode: ModeQuick, MetricsPort: 20941}, "/state/cftunnel-3000.log", "/state/cftunnel-config.yml")
 	wantQuick := []string{
 		"tunnel",
+		"--config", "/state/cftunnel-config.yml",
 		"--url", "http://localhost:3000",
 		"--metrics", "127.0.0.1:20941",
 		"--logfile", "/state/cftunnel-3000.log",
@@ -27,16 +28,18 @@ func TestBuildArgs(t *testing.T) {
 		t.Errorf("quick args:\n got %q\nwant %q", quick, wantQuick)
 	}
 
-	// Named order (kata nc1j): the tunnel-level flags (--metrics, --logfile,
-	// --no-autoupdate) come BEFORE `run` -- real cloudflared 2026.9.1 rejects
-	// them after it ("Incorrect Usage: flag provided but not defined:
-	// -metrics", exit 0). --url and the trailing tunnel name come after `run`.
-	// This pins the exact shape README.md's "Tunnelling to the public
-	// internet (Cloudflare Tunnel)" section documents for a named tunnel. See
-	// TestNamedArgvAcceptedByRealCloudflared for the real-binary proof.
-	named := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log")
+	// Named order (kata nc1j): the tunnel-level flags (--config, --metrics,
+	// --logfile, --no-autoupdate) come BEFORE `run` -- real cloudflared
+	// 2026.9.1 rejects them after it ("Incorrect Usage: flag provided but not
+	// defined: -metrics", exit 0). --url and the trailing tunnel name come
+	// after `run`. This pins the exact shape README.md's "Tunnelling to the
+	// public internet (Cloudflare Tunnel)" section documents for a named
+	// tunnel. See TestNamedArgvAcceptedByRealCloudflared for the real-binary
+	// proof, including that --config is rejected after `run` too.
+	named := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log", "/state/cftunnel-config.yml")
 	wantNamed := []string{
 		"tunnel",
+		"--config", "/state/cftunnel-config.yml",
 		"--metrics", "127.0.0.1:20942",
 		"--logfile", "/state/cftunnel-8080.log",
 		"--no-autoupdate",
@@ -50,15 +53,16 @@ func TestBuildArgs(t *testing.T) {
 }
 
 // TestBuildArgsNamedFlagPlacement pins the shape TestNamedArgvAcceptedByRealCloudflared
-// depends on: every tunnel-level flag must sit before `run`, --url must sit
-// after it, and the tunnel name must be the last element (kata nc1j).
+// depends on: every tunnel-level flag (including --config, added for the
+// hermetic-config fix, kata nc1j) must sit before `run`, --url must sit
+// after it, and the tunnel name must be the last element.
 func TestBuildArgsNamedFlagPlacement(t *testing.T) {
-	args := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log")
+	args := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log", "/state/cftunnel-config.yml")
 	runIdx := argIndex(args, "run")
 	if runIdx < 0 {
 		t.Fatal(`named argv must contain "run"`)
 	}
-	for _, flag := range []string{"--metrics", "--logfile", "--no-autoupdate"} {
+	for _, flag := range []string{"--config", "--metrics", "--logfile", "--no-autoupdate"} {
 		i := argIndex(args, flag)
 		if i < 0 {
 			t.Errorf("named argv is missing tunnel-level flag %q", flag)
@@ -104,6 +108,21 @@ func TestParseRunning(t *testing.T) {
 			ok:   true,
 		},
 		{
+			// Current (kata nc1j, hermetic-config fix) argv shape: --config
+			// first, right after "tunnel", ahead of --url. namedTunnelName's
+			// valueFlags already treats --config as value-consuming, so this
+			// must not disturb hostname/name recovery.
+			name: "quick owned, with --config",
+			args: []string{"cloudflared", "tunnel",
+				"--config", "/home/u/.local/state/tailport/cftunnel-config.yml",
+				"--url", "http://localhost:3001",
+				"--metrics", "127.0.0.1:20943",
+				"--logfile", "/home/u/.local/state/tailport/cftunnel-3001.log",
+				"--no-autoupdate"},
+			want: Running{Port: 3001, Mode: ModeQuick, MetricsPort: 20943, Owned: true, LogFile: "/home/u/.local/state/tailport/cftunnel-3001.log"},
+			ok:   true,
+		},
+		{
 			// Current (kata nc1j) argv shape: tunnel-level flags before `run`.
 			name: "named owned, new flag order (hostname recovered from logfile)",
 			args: []string{"/usr/bin/cloudflared", "tunnel",
@@ -116,12 +135,30 @@ func TestParseRunning(t *testing.T) {
 			ok: true,
 		},
 		{
+			// Current (kata nc1j, hermetic-config fix) named argv shape,
+			// including --config: --config/--metrics/--logfile/--no-autoupdate
+			// all before `run`, --url and the name after it. namedTunnelName
+			// must still recover "web" as the trailing positional, not
+			// --config's own value.
+			name: "named owned, with --config (hostname recovered from logfile)",
+			args: []string{"/usr/bin/cloudflared", "tunnel",
+				"--config", "/home/u/.local/state/tailport/cftunnel-config.yml",
+				"--metrics", "127.0.0.1:20944",
+				"--logfile", "/home/u/.local/state/tailport/cftunnel-8081-app2.example.com.log",
+				"--no-autoupdate", "run",
+				"--url", "http://localhost:8081", "web"},
+			want: Running{Port: 8081, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20944, Hostname: "app2.example.com", Owned: true,
+				LogFile: "/home/u/.local/state/tailport/cftunnel-8081-app2.example.com.log"},
+			ok: true,
+		},
+		{
 			// parseRunning is order-independent (it scans for tokens/flags by
 			// name, not position). This pins that a tunnel started by a
 			// PRE-nc1j tailport build -- whose --metrics/--logfile/--no-autoupdate
 			// sat AFTER `run`, an argv real cloudflared actually rejects -- is
 			// still discoverable and re-toggleable across the upgrade rather than
-			// silently dropping out.
+			// silently dropping out. It carries no --config at all (that flag
+			// didn't exist yet), which must also still be discoverable.
 			name: "named owned, old (pre-nc1j) flag order",
 			args: []string{"/usr/bin/cloudflared", "tunnel", "run",
 				"--url", "http://localhost:8080",
@@ -750,11 +787,20 @@ func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// The hermetic --config file's own content must be present and valid for
+	// cloudflared to parse it at all (see writeHermeticConfig); this probe
+	// writes the exact same content Start would.
+	configPath := filepath.Join(home, "cftunnel-config.yml")
+	if err := os.WriteFile(configPath, []byte(hermeticConfigContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	// The named argv's flags minus the trailing positional (there's no real
 	// tunnel to run against), plus --help so cloudflared parses the flags and
 	// prints usage without ever dialing out.
 	newArgs := []string{
 		"tunnel",
+		"--config", configPath,
 		"--metrics", "127.0.0.1:0",
 		"--logfile", filepath.Join(home, "cftunnel-test.log"),
 		"--no-autoupdate",
@@ -766,10 +812,10 @@ func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
 	newCmd.Env = append(os.Environ(), "HOME="+home)
 	newOut, _ := newCmd.CombinedOutput()
 	if strings.Contains(string(newOut), "Incorrect Usage") {
-		t.Errorf("current named argv order rejected by real cloudflared:\n%s", newOut)
+		t.Errorf("current named argv order (including --config) rejected by real cloudflared:\n%s", newOut)
 	}
 
-	// Negative control: the OLD (pre-nc1j) order -- tunnel-level flags AFTER
+	// Negative control 1: the OLD (pre-nc1j) order -- tunnel-level flags AFTER
 	// `run` -- must still be rejected, proving this test would actually catch
 	// a regression back to the broken order.
 	oldArgs := []string{"tunnel", "run", "--url", "http://localhost:1", "--metrics", "127.0.0.1:0", "--help"}
@@ -778,6 +824,20 @@ func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
 	oldOut, _ := oldCmd.CombinedOutput()
 	if !strings.Contains(string(oldOut), "Incorrect Usage") {
 		t.Fatalf("negative control: old flag order should be rejected by real cloudflared but wasn't:\n%s", oldOut)
+	}
+
+	// Negative control 2 (hermetic-config fix, kata nc1j): --config is ALSO a
+	// tunnel-LEVEL-only flag, like --metrics/--logfile/--no-autoupdate --
+	// live-verified that `cloudflared tunnel run --config X --help` prints
+	// "Incorrect Usage: flag provided but not defined: -config". This proves
+	// --config genuinely must precede `run`, not just that buildArgs happens
+	// to put it there.
+	configAfterRunArgs := []string{"tunnel", "run", "--config", configPath, "--help"}
+	configAfterRunCmd := exec.CommandContext(ctx, bin, configAfterRunArgs...)
+	configAfterRunCmd.Env = append(os.Environ(), "HOME="+home)
+	configAfterRunOut, _ := configAfterRunCmd.CombinedOutput()
+	if !strings.Contains(string(configAfterRunOut), "Incorrect Usage") {
+		t.Fatalf("negative control: --config after run should be rejected by real cloudflared but wasn't:\n%s", configAfterRunOut)
 	}
 }
 
@@ -881,6 +941,61 @@ func TestStartConsoleMode0600(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("console file mode = %o, want 0600", perm)
+	}
+}
+
+// TestStartWritesHermeticConfig is the regression test for the hermetic
+// --config fix (kata nc1j): every Start (quick AND named) must (re)write
+// tailport's own --config file with "{}" content and mode 0600, even if the
+// file already existed with different (junk) content -- a hand-edit, or a
+// stale file from before this feature existed, must never survive a Start
+// and silently change what --url the tunnel actually serves. See
+// configFilePath/writeHermeticConfig and buildArgs's doc comment for WHY:
+// live-verified against cloudflared 2026.9.1, an ingress: config.yml
+// anywhere on cloudflared's config search path otherwise silently overrides
+// --url with no error and no warning.
+func TestStartWritesHermeticConfig(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	configPath, err := configFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("ingress:\n  - service: http_status:418\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3015})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading hermetic config file: %v", err)
+	}
+	if strings.Contains(string(data), "ingress:") {
+		t.Errorf("pre-seeded junk (ingress: rules) survived Start, should have been O_TRUNC'd away: %q", data)
+	}
+	if !strings.Contains(string(data), "{}") {
+		t.Errorf("hermetic config content = %q, want it to contain \"{}\"", data)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat hermetic config file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("hermetic config file mode = %o, want 0600 (pre-seeded as 0644)", perm)
 	}
 }
 

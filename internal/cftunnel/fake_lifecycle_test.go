@@ -247,6 +247,14 @@ func TestFakeMatchesRealPlacement(t *testing.T) {
 	fakeBin := buildFakeCloudflared(t)
 	home := t.TempDir()
 
+	// The hermetic --config file must exist with valid content for the REAL
+	// binary to parse it (see cftunnel.writeHermeticConfig); the fake doesn't
+	// care, but sharing one file keeps both probes identical.
+	configPath := filepath.Join(home, "cftunnel-config.yml")
+	if err := os.WriteFile(configPath, []byte(hermeticConfigContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	// The named argv's flags minus the trailing positional (there's no real
 	// tunnel to run against), plus --help so both binaries parse the flags
 	// and print usage without ever dialing out -- mirrors
@@ -254,6 +262,7 @@ func TestFakeMatchesRealPlacement(t *testing.T) {
 	// tests are provably checking the same shapes.
 	newArgs := []string{
 		"tunnel",
+		"--config", configPath,
 		"--metrics", "127.0.0.1:0",
 		"--logfile", filepath.Join(home, "cftunnel-test.log"),
 		"--no-autoupdate",
@@ -262,14 +271,19 @@ func TestFakeMatchesRealPlacement(t *testing.T) {
 		"--help",
 	}
 	oldArgs := []string{"tunnel", "run", "--url", "http://localhost:1", "--metrics", "127.0.0.1:0", "--help"}
+	// --config is ALSO tunnel-level-only (the hermetic-config fix, kata
+	// nc1j): placed after `run`, it must be rejected identically by both
+	// binaries too.
+	configAfterRunArgs := []string{"tunnel", "run", "--config", configPath, "--help"}
 
 	cases := []struct {
 		name string
 		args []string
 		want bool // want "Incorrect Usage" present
 	}{
-		{"new order (tunnel-level flags before run) is accepted", newArgs, false},
+		{"new order (tunnel-level flags before run, including --config) is accepted", newArgs, false},
 		{"old order (tunnel-level flags after run) is rejected", oldArgs, true},
+		{"--config after run is rejected", configAfterRunArgs, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -16,12 +16,31 @@
 //   - Named (ModeNamed): an authenticated account whose operator has already
 //     run `cloudflared tunnel login`, created a tunnel, and routed a hostname
 //     to it (`route dns`). tailport only *runs* that pre-provisioned tunnel:
-//     `cloudflared tunnel --metrics ADDR --logfile PATH --no-autoupdate run
-//     --url http://localhost:PORT <name>`. The tunnel-level flags (--metrics,
-//     --logfile, --no-autoupdate) MUST precede `run` -- cloudflared's flag
-//     parser rejects them after it ("Incorrect Usage: flag provided but not
-//     defined", exit 0; verified against cloudflared 2026.9.1, kata nc1j).
-//     tailport never mutates the user's Cloudflare account or DNS.
+//     `cloudflared tunnel --config PATH --metrics ADDR --logfile PATH
+//     --no-autoupdate run --url http://localhost:PORT <name>`. The
+//     tunnel-level flags (--config, --metrics, --logfile, --no-autoupdate)
+//     MUST precede `run` -- cloudflared's flag parser rejects them after it
+//     ("Incorrect Usage: flag provided but not defined", exit 0; verified
+//     against cloudflared 2026.9.1, kata nc1j). tailport never mutates the
+//     user's Cloudflare account or DNS.
+//
+// --config PATH is tailport's own, tunnel-run-only HERMETIC config file
+// (configFilePath/writeHermeticConfig below), passed for BOTH quick and
+// named tunnels alike. It exists because of a live-verified footgun with no
+// error and no warning: if ANY config.yml with `ingress:` rules exists
+// anywhere on cloudflared's own config search path (~/.cloudflared,
+// ~/.cloudflare-warp, ~/cloudflare-warp, /etc/cloudflared,
+// /usr/local/etc/cloudflared -- notably including the file `cloudflared
+// service install` writes to /etc/cloudflared/config.yml), cloudflared
+// SILENTLY IGNORES tailport's --url and serves that config's ingress origin
+// instead. There is no refusal and no warning -- tailport would show a port
+// as publicly served while the tunnel actually served something else
+// entirely (live-verified against cloudflared 2026.9.1, kata nc1j; this
+// replaces an earlier, now-corrected assumption that cloudflared would
+// refuse to start in that situation). Pointing --config at tailport's own
+// file (content: "{}", rewritten on every Start) makes --url authoritative
+// regardless of what's on that search path -- see
+// TestStartWritesHermeticConfig and TestBuildArgsNamedFlagPlacement.
 //
 // Because the user chose "tunnels survive tailport", cloudflared is started
 // DETACHED (its own session via Setsid) so it outlives the TUI, and the
@@ -333,6 +352,20 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		return nil, fmt.Errorf("cftunnel: preparing log dir: %w", err)
 	}
 
+	// Hermetic --config [live-verified against cloudflared 2026.9.1, kata
+	// nc1j]: see the package doc for WHY this exists (a config.yml with
+	// ingress: rules anywhere on cloudflared's search path silently
+	// overrides --url, with no error and no warning). Rewritten with
+	// O_TRUNC on EVERY Start -- for BOTH quick and named -- so a hand-edit
+	// (or a stale file from before this existed) can never take effect.
+	configPath, err := configFilePath()
+	if err != nil {
+		return nil, err
+	}
+	if err := writeHermeticConfig(configPath); err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing hermetic --config: %w", err)
+	}
+
 	metricsPort := spec.MetricsPort
 	if metricsPort == 0 {
 		metricsPort, err = freeLoopbackPort()
@@ -355,7 +388,7 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		return nil, fmt.Errorf("cftunnel: preparing console capture: %w", err)
 	}
 
-	cmd := exec.Command(c.binary(), buildArgs(spec, logfile)...)
+	cmd := exec.Command(c.binary(), buildArgs(spec, logfile, configPath)...)
 	// Detach: new session (no controlling terminal, survives parent exit).
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
@@ -567,19 +600,28 @@ func (c *Client) metricsGet(ctx context.Context, metricsPort int, path string) (
 // buildArgs assembles the cloudflared argument vector for spec. It is pure (no
 // I/O) so it is unit-tested directly.
 //
-// The tunnel-level flags (--metrics, --logfile, --no-autoupdate) MUST precede
-// `run`: cloudflared's flag parser only registers them at the `tunnel`
-// level, not under the `run` subcommand, so passing them after `run` fails
-// with "Incorrect Usage: flag provided but not defined: -metrics" and exits 0
-// -- silently, since that's not a nonzero exit (verified against real
-// cloudflared 2026.9.1; the PREVIOUS comment here claiming all four flags
-// were "accepted under both `tunnel` and `tunnel run`" was false -- the named
-// path had been broken since v0.2.1, kata nc1j). `--url` and the trailing
-// tunnel-name positional come after `run`, since `run` is what accepts a
-// tunnel reference; Discover relies on the name staying the LAST element.
-// The quick argv is unaffected by any of this (no `run`, so ordering doesn't
-// matter to cloudflared) and stays byte-identical to before.
-func buildArgs(spec Spec, logfile string) []string {
+// The tunnel-level flags (--config, --metrics, --logfile, --no-autoupdate)
+// MUST precede `run`: cloudflared's flag parser only registers them at the
+// `tunnel` level, not under the `run` subcommand, so passing any of them
+// after `run` fails with "Incorrect Usage: flag provided but not defined:
+// -metrics" (or -config, -logfile, -no-autoupdate) and exits 0 -- silently,
+// since that's not a nonzero exit (verified against real cloudflared
+// 2026.9.1; a PREVIOUS comment here claiming these were "accepted under both
+// `tunnel` and `tunnel run`" was false -- the named path had been broken
+// since v0.2.1, kata nc1j). `--url` and the trailing tunnel-name positional
+// come after `run`, since `run` is what accepts a tunnel reference; Discover
+// relies on the name staying the LAST element. The quick argv has no `run`,
+// so flag ordering among tunnel-level flags doesn't matter to cloudflared
+// there, but --config is placed first, right after "tunnel", for both modes.
+//
+// configPath is tailport's own hermetic --config file (configFilePath /
+// writeHermeticConfig), passed for BOTH quick and named tunnels: without it,
+// an ingress: config.yml anywhere on cloudflared's search path silently
+// overrides --url (see the package doc). TestBuildArgs and
+// TestBuildArgsNamedFlagPlacement pin the exact shape; see
+// TestNamedArgvAcceptedByRealCloudflared for the real-binary proof that
+// --config, like the other tunnel-level flags, is rejected after `run`.
+func buildArgs(spec Spec, logfile, configPath string) []string {
 	urlArgs := []string{"--url", fmt.Sprintf("http://localhost:%d", spec.Port)}
 	tunnelFlags := []string{
 		"--metrics", fmt.Sprintf("127.0.0.1:%d", spec.MetricsPort),
@@ -587,12 +629,63 @@ func buildArgs(spec Spec, logfile string) []string {
 		"--no-autoupdate",
 	}
 	if spec.Mode == ModeNamed {
-		args := append([]string{"tunnel"}, tunnelFlags...)
+		args := []string{"tunnel", "--config", configPath}
+		args = append(args, tunnelFlags...)
 		args = append(args, "run")
 		args = append(args, urlArgs...)
 		return append(args, spec.TunnelName)
 	}
-	return append(append([]string{"tunnel"}, urlArgs...), tunnelFlags...)
+	args := []string{"tunnel", "--config", configPath}
+	args = append(args, urlArgs...)
+	return append(args, tunnelFlags...)
+}
+
+// configFilePath is tailport's own hermetic cloudflared --config file, ONE
+// shared by EVERY tunnel-run tailport starts (quick and named alike) --
+// unlike logfilePath, there is exactly one, living alongside the logfiles in
+// the same state dir. Its basename ("cftunnel-config.yml") deliberately
+// can't match sentinelLogRe (which requires a ".log" suffix), so it's
+// invisible to ownership detection either way -- Discover never scans the
+// state dir anyway; it only ever reads flag VALUES off a process's own argv.
+//
+// See the package doc for WHY this file exists at all: a config.yml with
+// ingress: rules anywhere on cloudflared's own config search path silently
+// overrides tailport's --url, with no error and no warning (live-verified,
+// kata nc1j). See TestStartWritesHermeticConfig.
+func configFilePath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "cftunnel-config.yml"), nil
+}
+
+// hermeticConfigContent is written to configFilePath on every Start. It must
+// NOT be empty: cloudflared logs "ERR Configuration file ... was empty" for
+// a zero-byte --config (live-verified) even though it otherwise proceeds; an
+// explicit "{}" avoids that log line while still making --url authoritative
+// over anything on cloudflared's config search path. The leading "#" comment
+// line is solely so a curious operator who opens the file understands why
+// it exists and that hand-editing it is futile -- cloudflared itself ignores
+// a leading "#" line in a YAML file.
+const hermeticConfigContent = "# tailport-managed (kata nc1j): keeps --url authoritative over any config.yml cloudflared would otherwise silently apply instead of it. Rewritten on every tunnel start -- editing this file has no effect.\n{}\n"
+
+// writeHermeticConfig (re)writes tailport's hermetic --config file at path,
+// truncating and fixing its mode to 0600 even if the file already existed
+// (e.g. pre-seeded with junk, or left over from a previous tailport
+// version): a hand-edit, or stale content from before this feature existed,
+// must never survive a Start. See TestStartWritesHermeticConfig.
+func writeHermeticConfig(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
+	_, err = f.WriteString(hermeticConfigContent)
+	return err
 }
 
 // ValidTunnelName reports whether s is an acceptable named-tunnel identifier:

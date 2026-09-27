@@ -578,14 +578,30 @@ matching Cloudflare's two account scenarios:
   a separate, one-time operator task, like standing up the Caddy edge, that
   tailport never automates. tailport only *runs* that pre-provisioned tunnel:
   ```
-  cloudflared tunnel --metrics 127.0.0.1:<metrics-port> --logfile <path> --no-autoupdate run --url http://localhost:<port> <name>
+  cloudflared tunnel --config <path> --metrics 127.0.0.1:<metrics-port> --logfile <path> --no-autoupdate run --url http://localhost:<port> <name>
   ```
-  (the tunnel-level flags must come before `run` — cloudflared rejects them
-  after it with `Incorrect Usage` and exits 0); it never mutates your
-  Cloudflare account or DNS. If that tunnel has a `config.yml` with `ingress:`
-  rules, cloudflared refuses to also take `--url` on the command line and
-  tailport shows you cloudflared's own refusal message — a CLI-created tunnel
-  with no config file (the default) is what this path expects.
+  (the tunnel-level flags, including `--config`, must come before `run` —
+  cloudflared rejects them after it with `Incorrect Usage` and exits 0); it
+  never mutates your Cloudflare account or DNS.
+
+**Every tailport-run tunnel gets its own hermetic `--config`** — quick and
+named alike — pointed at a tiny file tailport writes (and rewrites, on every
+start) itself, containing nothing but `{}`. This is not optional politeness:
+if a `config.yml` with `ingress:` rules exists anywhere on cloudflared's own
+config search path (`~/.cloudflared`, `~/.cloudflare-warp`,
+`~/cloudflare-warp`, `/etc/cloudflared`, `/usr/local/etc/cloudflared` —
+notably including the file `cloudflared service install` writes to
+`/etc/cloudflared/config.yml`), cloudflared **silently ignores** tailport's
+`--url` and serves that config's ingress origin instead — no error, no
+warning, nothing in the log (live-verified against cloudflared 2026.9.1).
+Passing tailport's own `--config` makes `--url` authoritative regardless of
+what's on that search path. Two consequences:
+- any settings in your own `config.yml` never apply to a tailport-run
+  tunnel — tailport's tunnels are hermetic by design;
+- a named tunnel's credentials must sit at cloudflared's default location,
+  next to `cert.pem` — where `cloudflared tunnel create` writes
+  `<UUID>.json`. If they aren't there, the tunnel fails to start, and
+  cloudflared's own error text appears in the toast.
 
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running

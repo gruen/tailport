@@ -380,7 +380,7 @@ with open(sys.argv[1]) as f:
         if "run" not in args:
             continue
         run_idx = args.index("run")
-        flags = ("--metrics", "--logfile", "--no-autoupdate")
+        flags = ("--config", "--metrics", "--logfile", "--no-autoupdate")
         if not all(f in args for f in flags):
             continue
         if not all(args.index(f) < run_idx for f in flags):
@@ -394,7 +394,7 @@ sys.exit(0 if ok else 1)
 PYEOF
 }
 if argv_order_ok; then
-    record "4. argv log has the exact new order" PASS "tunnel-level flags before run, --url after run, name last (see $ARGV_LOG)"
+    record "4. argv log has the exact new order" PASS "--config/tunnel-level flags before run, --url after run, name last (see $ARGV_LOG)"
 else
     record "4. argv log has the exact new order" FAIL "no logged invocation matched the new-order shape: $(tail -3 "$ARGV_LOG")"
 fi

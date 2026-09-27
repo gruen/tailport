@@ -97,11 +97,33 @@ contract. The short version:
   already run `cloudflared tunnel login`, created the tunnel, and routed its
   hostname (`cloudflared tunnel route dns`) — a separate, one-time operator
   task, exactly like standing up the Caddy edge. tailport only ever RUNS a
-  named tunnel (`cloudflared tunnel --metrics 127.0.0.1:MP --logfile PATH
-  --no-autoupdate run --url http://localhost:PORT <name>`); tunnel-level
-  flags must come before `run` — cloudflared rejects them after it
-  (`Incorrect Usage`, exit 0). It never mutates the user's Cloudflare account
-  or DNS. **Token- and dashboard-managed tunnels are out of scope**: tailport
+  named tunnel (`cloudflared tunnel --config PATH --metrics 127.0.0.1:MP
+  --logfile PATH --no-autoupdate run --url http://localhost:PORT <name>`);
+  tunnel-level flags, `--config` included, must come before `run` —
+  cloudflared rejects them after it (`Incorrect Usage`, exit 0; see
+  `TestNamedArgvAcceptedByRealCloudflared` and its `--config`-after-`run`
+  negative control). It never mutates the user's Cloudflare account or DNS.
+  **Every tailport-run tunnel — quick and named alike — gets its own
+  hermetic `--config`**, one file (`cftunnel-config.yml`, content `{}`,
+  mode 0600) shared by every tunnel and rewritten with `O_TRUNC` on EVERY
+  Start so a hand-edit can never take effect (`configFilePath`/
+  `writeHermeticConfig` in `internal/cftunnel/cftunnel.go`; see
+  `TestStartWritesHermeticConfig`). This exists because of a live-verified
+  footgun with no error and no warning: if ANY `config.yml` with `ingress:`
+  rules exists anywhere on cloudflared's own config search path
+  (`~/.cloudflared`, `~/.cloudflare-warp`, `~/cloudflare-warp`,
+  `/etc/cloudflared`, `/usr/local/etc/cloudflared` — including the file
+  `cloudflared service install` writes to `/etc/cloudflared/config.yml`),
+  cloudflared SILENTLY IGNORES `--url` and serves that config's ingress
+  origin instead of tailport's (verified against cloudflared 2026.9.1, kata
+  nc1j — this supersedes an earlier, incorrect assumption that cloudflared
+  would refuse to start in that situation). Two consequences a user-facing
+  doc must state plainly: settings in the user's own `config.yml` never
+  apply to a tailport-run tunnel, and a named tunnel's credentials must sit
+  at cloudflared's default location next to `cert.pem` (where `cloudflared
+  tunnel create` writes `<UUID>.json`) or the tunnel fails to start, with
+  cloudflared's own error text surfaced in the toast. **Token- and
+  dashboard-managed tunnels are out of scope**: tailport
   never passes `--token`, and the child's environment is scrubbed of
   identity/account-mutating/origin-override `TUNNEL_*` vars (`TUNNEL_TOKEN`,
   `TUNNEL_TOKEN_FILE`, `TUNNEL_NAME`, and others — see
