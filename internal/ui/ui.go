@@ -3912,6 +3912,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				pid:         msg.running.PID,
 				metricsPort: msg.running.MetricsPort,
 				hostname:    msg.running.Hostname, // "" for quick until assigned
+				name:        msg.running.TunnelName,
 			}
 		}
 		save := m.remember(msg.port) // keep a tunnelled port visible in the registry
@@ -3947,10 +3948,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// remember it (mirrors lastPublish), letting a tunnel from BEFORE this
 		// process started (across a restart) be re-toggled from memory too. A
 		// quick tunnel's ephemeral hostname isn't worth remembering (a re-raise
-		// gets a fresh URL), so only named tunnels seed a hostname/name.
+		// gets a fresh URL), so only named tunnels seed a hostname/name. Audit
+		// item 2 (kata nc1j): a name-less poll must never overwrite an already
+		// -remembered non-empty name with "" -- namedTunnelName is normally
+		// reliable (tailport always puts the name last in its own argv), but a
+		// blank read here would otherwise silently break the next re-raise.
 		for port, info := range m.tunnels {
 			if info.mode == cftunnel.ModeNamed {
-				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: info.hostname})
+				name := info.name
+				if name == "" {
+					name = m.lastTunnel[port].name
+				}
+				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: info.hostname, name: name})
 			} else if _, ok := m.lastTunnel[port]; !ok {
 				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
 			}
@@ -6640,7 +6649,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		// moved to "d" (was "p" under vzj4).
 		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
 		"d":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). d is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
-		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you pre-provisioned and serves your own\nstable hostname. o is a TOGGLE: on a tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first\n(:22 refused). The tunnel survives tailport exiting. A THIRD public\npath, independent of funnel and publish — since kata th05 a port may\ncarry all three at once (each is its own route sub-row and confirms\nseparately).",
+		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you already created with `cloudflared\ntunnel create` and routed a hostname to (tailport never creates,\nroutes, or otherwise provisions one) and serves your own stable\nhostname — tailport can't check the hostname is actually routed to\nthat tunnel, and a named tunnel serves only one local port at a time\n(a second port trying the same name is refused). o is a TOGGLE: on a\ntunnelled port it tears the tunnel down immediately, no confirm;\notherwise it confirms first (:22 refused). The tunnel survives\ntailport exiting. A THIRD public path, independent of funnel and\npublish — since kata th05 a port may carry all three at once (each is\nits own route sub-row and confirms separately).",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
@@ -7700,6 +7709,8 @@ func (m model) renderBottom() string {
 		lines := []string{
 			warnStyle.Render(fmt.Sprintf("⚠ Publish :%d to the PUBLIC INTERNET via Cloudflare Tunnel?", m.tunnelPort)),
 			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
+			helpStyle.Render(fmt.Sprintf("   via tunnel %q", m.tunnelName)),
+			helpStyle.Render("   tailport can't check this hostname is routed to that tunnel; it also serves any other hostname routed to it"),
 			helpStyle.Render("   (y: confirm, any other key: cancel)"),
 		}
 		return strings.Join(lines, "\n")

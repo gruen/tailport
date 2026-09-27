@@ -32,13 +32,17 @@ import (
 // tunnelInfo is the live per-port tunnel state a poll returns: the mode, the
 // supervising process, its metrics port, the public hostname (a
 // *.trycloudflare.com for quick -- "" until cloudflared assigns it -- or the
-// operator's custom host for named), and whether it has an active edge
-// connection. Keyed by local port in m.tunnels. Never persisted.
+// operator's custom host for named), the named tunnel's name (ModeNamed only;
+// recovered from the sentinel logfile -- audit item 2, kata nc1j: without
+// this a re-raise had no name to hand `Start`, which then rejected it), and
+// whether it has an active edge connection. Keyed by local port in m.tunnels.
+// Never persisted.
 type tunnelInfo struct {
 	mode        cftunnel.Mode
 	pid         int
 	metricsPort int
 	hostname    string
+	name        string
 	ready       bool
 }
 
@@ -196,6 +200,7 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 				pid:         r.PID,
 				metricsPort: r.MetricsPort,
 				hostname:    hostname,
+				name:        r.TunnelName,
 				ready:       h.Ready,
 			}
 		}
@@ -265,12 +270,34 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 
 	// 7. Session-remembered RE-raise (mirrors publish's lastPublish shortcut): a
 	// port tunnelled earlier this session skips the setup prompts and goes
-	// straight to the confirm with its remembered mode/host/name.
+	// straight to the confirm with its remembered mode/host/name. A named
+	// re-raise needs BOTH the hostname and the tunnel name -- audit item 2
+	// (kata nc1j): a name-less memory used to reach the confirm anyway, and
+	// Start rejected the empty name at the last moment. If the name is
+	// somehow missing (defensive; every path that seeds lastTunnel now sets
+	// it), fall back to asking for just the name with the hostname already
+	// held, rather than confirming with none.
 	if mem, ok := m.lastTunnel[port]; ok {
 		if mem.mode == cftunnel.ModeNamed && mem.hostname != "" {
 			m.tunnelSetupMode = cftunnel.ModeNamed
 			m.tunnelHostname = mem.hostname
 			m.tunnelName = mem.name
+			if mem.name == "" {
+				m.tunnelInput.Reset()
+				m.tunnelInput.EchoMode = textinput.EchoNormal
+				m.tunnelInput.Placeholder = "my-tunnel"
+				m.tunnelInput.Focus()
+				m.mode = entryTunnelName
+				return nil
+			}
+			// Owned-only same-tunnel guard [R3]: this named tunnel might now be
+			// serving a DIFFERENT port (started fresh, or re-raised there, since
+			// this port last remembered it) -- refuse rather than let Start spawn
+			// a second cloudflared for the same pre-provisioned tunnel.
+			if other := m.tunnelNameInUse(mem.name, port); other != 0 {
+				m.clearTunnelFlow()
+				return m.setErr(tunnelNameRefusedMsg(mem.name, other))
+			}
 			m.mode = entryConfirmTunnelNamed
 			return nil
 		}
@@ -288,6 +315,40 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 	m.tunnelSetupMode = cftunnel.ModeQuick
 	m.mode = entryConfirmTunnelQuick
 	return nil
+}
+
+// tunnelNameInUse reports the port (nonzero) already running an OWNED named
+// tunnel called name, other than exceptPort -- returning 0 when name isn't in
+// use anywhere else. This is the owned-only same-tunnel guard [R3, kata
+// nc1j]: a pre-provisioned named tunnel is a single Cloudflare-side connector
+// set, and tailport running it twice for two different local ports would
+// leave both routes pointed at the same tunnel with no way to tell which
+// serves which -- so name entry, re-raise, and confirmTunnelNamed all call
+// this before starting one. It checks ONLY tailport's own currently-discovered
+// m.tunnels (no foreign or process-table scan -- that's out of scope here,
+// same as the rest of this feature's ownership model): the same tunnel
+// running elsewhere entirely (another machine, a system service, a dashboard
+// connector) can't be seen this way, which the README documents as a limit
+// rather than a guarantee this guard doesn't make.
+func (m *model) tunnelNameInUse(name string, exceptPort int) int {
+	if name == "" {
+		return 0
+	}
+	for port, info := range m.tunnels {
+		if port == exceptPort {
+			continue
+		}
+		if info.mode == cftunnel.ModeNamed && info.name == name {
+			return port
+		}
+	}
+	return 0
+}
+
+// tunnelNameRefusedMsg is the shared refusal toast for tunnelNameInUse's three
+// call sites, kept in one place so the wording can't drift between them.
+func tunnelNameRefusedMsg(name string, port int) string {
+	return fmt.Sprintf("tunnel %q is already running for :%d — a named tunnel serves one port; press o on :%d first", name, port, port)
 }
 
 // enterTunnelNamedHost opens the named-tunnel hostname prompt, prefilled from
@@ -329,8 +390,11 @@ func (m *model) updateTunnelEntry(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case entryTunnelName:
 			name := strings.TrimSpace(m.tunnelInput.Value())
-			if name == "" {
+			if !cftunnel.ValidTunnelName(name) {
 				return m.setErr("enter the name of a cloudflared tunnel you created (cloudflared tunnel list)")
+			}
+			if other := m.tunnelNameInUse(name, m.tunnelPort); other != 0 {
+				return m.setErr(tunnelNameRefusedMsg(name, other))
 			}
 			m.tunnelName = name
 			m.mode = entryConfirmTunnelNamed
@@ -362,15 +426,26 @@ func (m *model) confirmTunnelQuick() tea.Cmd {
 
 // confirmTunnelNamed is the entryConfirmTunnelNamed "yes" path: run the
 // operator's pre-provisioned named tunnel bound to the confirmed hostname.
+// Re-checks the owned-only same-tunnel guard [R3] one last time -- state can
+// have moved between the confirm opening and "y" landing (a poll, another
+// port's re-raise) -- before ever shelling out, and flashes the exact URL
+// (named tunnels know their host up front, unlike quick's spinner-then-URL).
 func (m *model) confirmTunnelNamed() tea.Cmd {
 	port := m.tunnelPort
 	host := m.tunnelHostname
 	name := m.tunnelName
+	if other := m.tunnelNameInUse(name, port); other != 0 {
+		m.clearTunnelFlow()
+		return m.setErr(tunnelNameRefusedMsg(name, other))
+	}
 	m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: host, name: name})
 	spec := cftunnel.Spec{Port: port, Mode: cftunnel.ModeNamed, TunnelName: name, Hostname: host}
 	m.clearTunnelFlow()
 	m.pending = port
-	return tunnelStartCmd(m.cfClient(), spec)
+	return tea.Batch(
+		m.setFlash(fmt.Sprintf("starting Cloudflare tunnel https://%s…", host), flashInfo),
+		tunnelStartCmd(m.cfClient(), spec),
+	)
 }
 
 // rememberTunnel records a port's tunnel config for the session-only re-raise
@@ -407,15 +482,28 @@ func tunnelErrText(err error) string {
 }
 
 // validTunnelHostname is a light sanity check on a named-tunnel hostname: a
-// dotted DNS name, no scheme/slashes/spaces. tailport can't verify the DNS
-// route exists (that's the operator's pre-provisioning job), so this only
-// catches obvious typos.
+// dotted DNS name restricted to [A-Za-z0-9.-], containing at least one dot,
+// and not starting with '-' or '.' (tightened, kata nc1j W3a -- the previous
+// version only blocked spaces/slashes/colons, which still let a leading dot
+// or hyphen or a stray control/unicode byte through). tailport can't verify
+// the DNS route exists (that's the operator's pre-provisioning job), so this
+// only catches obvious typos.
 func validTunnelHostname(s string) bool {
 	if s == "" || !strings.Contains(s, ".") {
 		return false
 	}
-	if strings.ContainsAny(s, " /:") {
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") {
 		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-':
+		default:
+			return false
+		}
 	}
 	return true
 }

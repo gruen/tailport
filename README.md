@@ -572,16 +572,20 @@ matching Cloudflare's two account scenarios:
   `https://<name>.trycloudflare.com` hostname: unauthenticated, and ephemeral —
   a new hostname every time you start one.
 - **Named tunnel** — for an authenticated account. You've already run
-  `cloudflared tunnel login`, created a tunnel, and routed a stable custom
-  hostname to it (`cloudflared tunnel route dns`) — a separate, one-time
-  operator task, like standing up the Caddy edge, that tailport never automates.
-  tailport only *runs* that pre-provisioned tunnel:
+  `cloudflared tunnel login`, created the tunnel with `cloudflared tunnel
+  create` (dashboard- or token-managed tunnels aren't supported — see below),
+  and routed a stable custom hostname to it (`cloudflared tunnel route dns`) —
+  a separate, one-time operator task, like standing up the Caddy edge, that
+  tailport never automates. tailport only *runs* that pre-provisioned tunnel:
   ```
   cloudflared tunnel --metrics 127.0.0.1:<metrics-port> --logfile <path> --no-autoupdate run --url http://localhost:<port> <name>
   ```
   (the tunnel-level flags must come before `run` — cloudflared rejects them
   after it with `Incorrect Usage` and exits 0); it never mutates your
-  Cloudflare account or DNS.
+  Cloudflare account or DNS. If that tunnel has a `config.yml` with `ingress:`
+  rules, cloudflared refuses to also take `--url` on the command line and
+  tailport shows you cloudflared's own refusal message — a CLI-created tunnel
+  with no config file (the default) is what this path expects.
 
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running
@@ -603,13 +607,22 @@ confirm, and `:22` stays hard-blocked. A tunnelled service shows its own
 
 - **Already tunnelled** — `o` tears it down immediately. No confirm.
 - **Tunnelled earlier this session, then torn down** — tailport remembers that
-  port's mode (and, for a named tunnel, its hostname) in memory for as long as
-  the process runs, and `o` re-raises it, skipping setup — straight to the
-  confirm.
+  port's mode and, for a named tunnel, **both** its hostname **and its tunnel
+  name** in memory for as long as the process runs, and `o` re-raises it,
+  skipping setup — straight to the confirm.
 - **Never tunnelled this session** — `o` runs the full setup. If you're logged
   in to Cloudflare, you pick quick or named; choosing named asks for the
   hostname you've routed and the tunnel's name. Without an account, only the
   quick path exists, so setup skips straight to its confirm.
+
+A named tunnel serves only **one local port at a time**: if you try to start
+or re-raise the same tunnel name on a second port while the first is still
+running, tailport refuses with a toast naming which port already has it.
+**The limit:** tailport only sees tunnels *it* started this session (or
+re-discovered from a prior one) — if the same named tunnel also runs somewhere
+else entirely (another machine, a system service, a dashboard connector),
+cloudflared just adds another connector to it, and Cloudflare may send
+requests to either. tailport can't see or guard against that.
 
 Every path ends in a y/n confirm before anything goes live, and `:22` is
 hard-blocked. The **quick** tunnel's confirm is the one deliberate exception to
@@ -619,7 +632,10 @@ to name in advance. The confirm names the local port instead; tailport flashes
 `starting Cloudflare quick tunnel for :<port>…`, and the real `https://…`
 address appears in the row a few seconds later, once the next poll picks it up.
 A **named** tunnel's confirm has no such gap — it names the exact
-`https://<hostname>` up front, the same as Publish.
+`https://<hostname>` up front (the same as Publish) plus the tunnel it will
+run, e.g. `via tunnel "web"` — but that hostname is simply the one *you*
+typed: tailport has no way to check it's actually routed to that tunnel, and
+the tunnel will keep serving any other hostname already routed to it too.
 
 ## How it works
 

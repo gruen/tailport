@@ -255,6 +255,210 @@ func TestRequestTunnelReraise(t *testing.T) {
 	}
 }
 
+// TestNamedMemorySurvivesPoll is the regression test for audit item 2 (kata
+// nc1j): tunnelInfo used to carry no name field at all, so every poll
+// overwrote lastTunnel's remembered name with "" the moment it ran. It must
+// now survive a poll -- and even a poll that (defensively) reports an empty
+// name for an already-remembered port must not blank it out.
+func TestNamedMemorySurvivesPoll(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.tunnelPort = 3000
+	m.tunnelHostname = "app.example.com"
+	m.tunnelName = "web"
+	m.tunnelSetupMode = cftunnel.ModeNamed
+
+	if cmd := m.confirmTunnelNamed(); cmd == nil {
+		t.Fatal("confirmTunnelNamed should return a non-nil cmd")
+	}
+	if got := m.lastTunnel[3000].name; got != "web" {
+		t.Fatalf("confirm should remember the name immediately; got %q", got)
+	}
+
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{
+		PID: 111, Port: 3000, Mode: cftunnel.ModeNamed, TunnelName: "web", Hostname: "app.example.com",
+	}})
+	if got := m.tunnels[3000].name; got != "web" {
+		t.Fatalf("tunnels[3000].name = %q, want web", got)
+	}
+
+	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
+		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "web", ready: true},
+	}})
+	if got := m.lastTunnel[3000].name; got != "web" {
+		t.Errorf("lastTunnel[3000].name after poll = %q, want web (must survive the poll)", got)
+	}
+
+	// Defensive: even a later poll that (somehow) reports an empty name for
+	// this still-named tunnel must not clobber the remembered name to "".
+	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
+		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "", ready: true},
+	}})
+	if got := m.lastTunnel[3000].name; got != "web" {
+		t.Errorf("lastTunnel[3000].name after empty-name poll = %q, want web preserved", got)
+	}
+}
+
+// TestNamedReraiseAfterPoll drives the full cycle audit item 2 broke: start a
+// named tunnel, let a poll re-derive it from the (simulated) process table,
+// tear it down, then re-raise with `o` -- the re-raise must reach the confirm
+// with the name intact, not fall back to entryTunnelName or entryNone.
+func TestNamedReraiseAfterPoll(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.fqdn = "host.tailnet.ts.net"
+	m.tunnelPort = 3000
+	m.tunnelHostname = "app.example.com"
+	m.tunnelName = "web"
+	m.tunnelSetupMode = cftunnel.ModeNamed
+	m.confirmTunnelNamed()
+
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{
+		PID: 111, Port: 3000, Mode: cftunnel.ModeNamed, TunnelName: "web", Hostname: "app.example.com",
+	}})
+	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
+		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "web", ready: true},
+	}})
+	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, torndown: true})
+	if _, ok := m.tunnels[3000]; ok {
+		t.Fatalf("setup: torn-down tunnel should be gone from m.tunnels")
+	}
+
+	m.requestTunnel(3000)
+	if m.mode != entryConfirmTunnelNamed {
+		t.Fatalf("re-raise mode = %v, want entryConfirmTunnelNamed", m.mode)
+	}
+	if m.tunnelName != "web" {
+		t.Errorf("re-raise tunnelName = %q, want web (audit item 2)", m.tunnelName)
+	}
+	if m.tunnelHostname != "app.example.com" {
+		t.Errorf("re-raise tunnelHostname = %q, want app.example.com", m.tunnelHostname)
+	}
+}
+
+// TestNamedReraiseWithoutNameAsksForName covers the defensive fallback: if a
+// named memory somehow has a hostname but no name, re-raise must not try to
+// confirm with an empty name (Start would reject it) -- it goes to
+// entryTunnelName instead, with the hostname already held.
+func TestNamedReraiseWithoutNameAsksForName(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.fqdn = "host.tailnet.ts.net"
+	m.lastTunnel = map[int]tunnelMemory{
+		3000: {mode: cftunnel.ModeNamed, hostname: "app.example.com"},
+	}
+	m.requestTunnel(3000)
+	if m.mode != entryTunnelName {
+		t.Fatalf("re-raise without a name mode = %v, want entryTunnelName", m.mode)
+	}
+	if m.tunnelHostname != "app.example.com" {
+		t.Errorf("hostname should already be held going into the name prompt; got %q", m.tunnelHostname)
+	}
+}
+
+// TestTunnelNameInUseRefused is the regression test for audit item 6 (kata
+// nc1j, R3): nothing used to stop two ports from running the same named
+// tunnel. The owned-only same-tunnel guard must refuse at all three call
+// sites -- name entry, re-raise, and confirmTunnelNamed's last check.
+func TestTunnelNameInUseRefused(t *testing.T) {
+	base := func() model {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.fqdn = "host.tailnet.ts.net"
+		m.tunnels = map[int]tunnelInfo{4000: {mode: cftunnel.ModeNamed, pid: 222, name: "web", hostname: "app.example.com"}}
+		return m
+	}
+	const wantMsg = `tunnel "web" is already running for :4000`
+
+	t.Run("name entry", func(t *testing.T) {
+		m := base()
+		m.mode = entryTunnelName
+		m.tunnelPort = 3000
+		m.tunnelHostname = "other.example.com"
+		m.tunnelInput.SetValue("web")
+		m = mustUpdate(t, m, enterKey)
+		if m.mode != entryTunnelName {
+			t.Errorf("refused name entry should stay at entryTunnelName for retry; mode=%v", m.mode)
+		}
+		if !strings.Contains(m.flash, wantMsg) {
+			t.Errorf("flash = %q, want it to contain %q", m.flash, wantMsg)
+		}
+	})
+
+	t.Run("re-raise", func(t *testing.T) {
+		m := base()
+		m.lastTunnel = map[int]tunnelMemory{3000: {mode: cftunnel.ModeNamed, hostname: "other.example.com", name: "web"}}
+		m.requestTunnel(3000)
+		if m.mode != entryNone {
+			t.Errorf("refused re-raise should not open a modal; mode=%v", m.mode)
+		}
+		if !strings.Contains(m.flash, wantMsg) {
+			t.Errorf("flash = %q, want it to contain %q", m.flash, wantMsg)
+		}
+	})
+
+	t.Run("confirm", func(t *testing.T) {
+		m := base()
+		m.tunnelPort = 3000
+		m.tunnelHostname = "other.example.com"
+		m.tunnelName = "web"
+		cmd := m.confirmTunnelNamed()
+		if m.mode != entryNone || m.pending != 0 {
+			t.Errorf("refused confirm should abort the flow with no pending op; mode=%v pending=%d", m.mode, m.pending)
+		}
+		if cmd == nil {
+			t.Fatal("confirmTunnelNamed should still return the error-toast cmd")
+		}
+		if !strings.Contains(m.flash, wantMsg) {
+			t.Errorf("flash = %q, want it to contain %q", m.flash, wantMsg)
+		}
+	})
+}
+
+// TestNamedConfirmNamesTunnelAndCaveat is the regression test for audit item 5
+// (kata nc1j): the named confirm used to show only the hostname the operator
+// typed, with no way to tell WHICH tunnel it would run or that tailport can't
+// verify the hostname is actually routed to it. Checks the prompt string
+// only -- no hard-coded heights (kata cp2c).
+func TestNamedConfirmNamesTunnelAndCaveat(t *testing.T) {
+	m := New(config.Config{})
+	m.mode = entryConfirmTunnelNamed
+	m.tunnelPort = 3000
+	m.tunnelHostname = "app.example.com"
+	m.tunnelName = "web"
+
+	view := stripANSI(m.renderBottom())
+	if !strings.Contains(view, `via tunnel "web"`) {
+		t.Errorf("confirm should name the tunnel; view:\n%s", view)
+	}
+	if !strings.Contains(view, "can't check this hostname is routed to that tunnel") {
+		t.Errorf("confirm should carry the routing caveat; view:\n%s", view)
+	}
+	if !strings.Contains(view, "https://app.example.com") {
+		t.Errorf("confirm should still name the exact URL; view:\n%s", view)
+	}
+}
+
+// TestNamedStartFlashNamesURL covers confirmTunnelNamed's flash: unlike a
+// quick tunnel (whose URL isn't known until it starts), a named tunnel's
+// host is known up front, so the "starting…" flash should name it rather
+// than just the port.
+func TestNamedStartFlashNamesURL(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.tunnelPort = 3000
+	m.tunnelHostname = "app.example.com"
+	m.tunnelName = "web"
+	m.tunnelSetupMode = cftunnel.ModeNamed
+
+	if cmd := m.confirmTunnelNamed(); cmd == nil {
+		t.Fatal("confirmTunnelNamed should return a non-nil cmd")
+	}
+	if !strings.Contains(m.flash, "starting Cloudflare tunnel https://app.example.com") {
+		t.Errorf("flash = %q, want it to name the URL", m.flash)
+	}
+}
+
 // TestBarGroupsTunnelGating: the `o` key shows in the bottom bar only when
 // cloudflared is available; it's always in the full groups() (documented in ?).
 func TestBarGroupsTunnelGating(t *testing.T) {
@@ -275,14 +479,20 @@ func TestBarGroupsTunnelGating(t *testing.T) {
 	}
 }
 
+// TestValidTunnelHostname also pins the W3a tightening (kata nc1j): the
+// charset is restricted to [A-Za-z0-9.-] and a leading '-' or '.' is refused,
+// not just the space/slash/colon checks the original version had.
 func TestValidTunnelHostname(t *testing.T) {
-	ok := []string{"app.example.com", "api.corp.internal"}
+	ok := []string{"app.example.com", "api.corp.internal", "a-b.c-d.com"}
 	for _, s := range ok {
 		if !validTunnelHostname(s) {
 			t.Errorf("validTunnelHostname(%q) = false, want true", s)
 		}
 	}
-	bad := []string{"", "nodot", "has space.com", "http://app.example.com", "app.example.com:8080", "a/b.com"}
+	bad := []string{
+		"", "nodot", "has space.com", "http://app.example.com", "app.example.com:8080", "a/b.com",
+		"-app.example.com", ".app.example.com", "app_example.com", "app.example.com\x00", "café.example.com",
+	}
 	for _, s := range bad {
 		if validTunnelHostname(s) {
 			t.Errorf("validTunnelHostname(%q) = true, want false", s)
