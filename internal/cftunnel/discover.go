@@ -77,6 +77,10 @@ func parseRunning(pid int, args []string) (Running, bool) {
 	if lf, ok := flagValue(args, "--logfile"); ok {
 		if host, owned := sentinelHost(lf, port); owned {
 			r.Owned = true
+			// The --logfile value itself (not just its derived hostname) is
+			// what ConsolePath needs to find this tunnel's console-capture
+			// file after a tailport restart re-Discover()s it.
+			r.LogFile = lf
 			// A named tunnel's hostname is unrecoverable from the cmdline
 			// alone; the sentinel logfile carries it (see logfilePath). Quick
 			// tunnels leave it empty here (their hostname comes from

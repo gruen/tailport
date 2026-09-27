@@ -101,7 +101,23 @@ contract. The short version:
   --no-autoupdate run --url http://localhost:PORT <name>`); tunnel-level
   flags must come before `run` — cloudflared rejects them after it
   (`Incorrect Usage`, exit 0). It never mutates the user's Cloudflare account
-  or DNS. Unlike
+  or DNS. **Token- and dashboard-managed tunnels are out of scope**: tailport
+  never passes `--token`, and the child's environment is scrubbed of
+  identity/account-mutating/origin-override `TUNNEL_*` vars (`TUNNEL_TOKEN`,
+  `TUNNEL_TOKEN_FILE`, `TUNNEL_NAME`, and others — see
+  `scrubbedIdentityEnvVars` in `internal/cftunnel/cftunnel.go`) before it's
+  spawned — this, not just tailport's own argv, is how "never mutates the
+  account" is enforced against an ambient `TUNNEL_TOKEN` (which takes
+  precedence over the tunnel name) or `TUNNEL_NAME` (which means "create,
+  route, and run"). `TUNNEL_ORIGIN_CERT`/`TUNNEL_CRED_*` are deliberately kept
+  (a credential mismatch fails closed, it doesn't mutate anything). Because
+  cloudflared's own `--logfile` is a structured JSON log that can hold
+  nothing useful for a fatal startup error — those print to stderr alone —
+  tailport also captures the child's raw stdout+stderr to a sibling,
+  truncated-on-every-start `.console` file
+  (`$XDG_STATE_HOME/tailport/cftunnel-<port>[-<host>].console`), which is
+  where a toast's error text and `internal/cftunnel.ConsoleTail` actually read
+  from. Unlike
   Publish (a stateless client of a remote edge) or Funnel (a
   Tailscale-managed ingress slot), cloudflared is a LONG-RUNNING LOCAL
   PROCESS tailport supervises directly — and by design TUNNELS SURVIVE

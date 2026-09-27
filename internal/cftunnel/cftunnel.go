@@ -34,6 +34,23 @@
 // logfilePath), which is both cmdline-visible on every platform and a place to
 // capture logs. A cloudflared WITHOUT that sentinel is a foreign tunnel: it is
 // surfaced, never signalled.
+//
+// cloudflared's own --logfile is a structured JSON log at info level (a
+// user's TUNNEL_LOGLEVEL is respected, never overridden); request lines need
+// debug, so a healthy tunnel's logfile stays small. It is NOT the whole
+// story, though: fatal startup errors (a missing/empty origin cert, bad
+// credentials) print to STDERR alone, and can leave the JSON logfile with at
+// most one line, or nothing. Start also captures the child's raw
+// stdout+stderr to a separate, truncated-on-every-Start ".console" file (see
+// ConsolePath/ConsoleTail in console.go) so that text is always recoverable
+// for a toast, without ever parsing the JSON logfile.
+//
+// Start also scrubs a fixed set of identity/account-mutating/origin-override
+// TUNNEL_* environment variables from the child's environment before it
+// inherits anything (see scrubIdentityEnv) -- this, not any argv-level check
+// alone, is how "tailport never mutates the account" holds against an
+// ambient TUNNEL_TOKEN or TUNNEL_NAME. Token- and dashboard-managed tunnels
+// are out of scope for this feature entirely: tailport never passes --token.
 package cftunnel
 
 import (
@@ -131,6 +148,12 @@ type Running struct {
 	// the --logfile sentinel (see sentinelHost). A false value means a foreign
 	// cloudflared covers this port -- surfaced as drift, never signalled.
 	Owned bool
+	// LogFile is the --logfile value (tailport's own sentinel path) for an
+	// OWNED process; empty for a foreign one. ConsolePath derives that
+	// tunnel's console-capture path from it, so a caller holding only a
+	// Running (e.g. after re-Discover()ing across a tailport restart) can
+	// still find its console output.
+	LogFile string
 }
 
 // Health is the live status scraped from a tunnel's metrics endpoints.
@@ -231,6 +254,52 @@ func LoggedIn() bool {
 	return fileExists(filepath.Join(home, ".cloudflared", "cert.pem"))
 }
 
+// scrubbedIdentityEnvVars are TUNNEL_* environment variables that could
+// change WHICH tunnel runs, or otherwise mutate the account, rather than
+// merely how it connects. Letting any of these leak from tailport's own
+// environment into the child would undermine "tailport never mutates the
+// user's Cloudflare account or DNS" (see the package doc and AGENTS.md's
+// Cloudflare Tunnel bullet): TUNNEL_TOKEN/TUNNEL_TOKEN_FILE in particular take
+// PRECEDENCE over a named tunnel's positional name, so an ambient token would
+// silently run a completely different (dashboard/token-managed) tunnel
+// instead of the one tailport was asked to run -- exactly the
+// token/dashboard-managed path this feature deliberately excludes.
+// TUNNEL_NAME means "create, route, and run a tunnel", which would mutate the
+// account outright.
+//
+// Deliberately NOT scrubbed: TUNNEL_ORIGIN_CERT and TUNNEL_CRED_* (a
+// credential mismatch fails closed, it doesn't mutate anything), transport
+// and edge settings, and NO_AUTOUPDATE.
+var scrubbedIdentityEnvVars = []string{
+	"TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE",
+	"TUNNEL_NAME", "TUNNEL_HOSTNAME", "TUNNEL_LB_POOL", "TUNNEL_FORCE_PROVISIONING_DNS",
+	"TUNNEL_URL", "TUNNEL_HELLO_WORLD", "TUNNEL_UNIX_SOCKET", "TUNNEL_SOCKS", "TUNNEL_BASTION",
+	"TUNNEL_LOG_OUTPUT", "TUNNEL_MANAGEMENT_OUTPUT",
+}
+
+// scrubIdentityEnv returns environ (as from os.Environ()) with every
+// scrubbedIdentityEnvVars entry removed, preserving relative order otherwise.
+func scrubIdentityEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		scrub := false
+		for _, bad := range scrubbedIdentityEnvVars {
+			if name == bad {
+				scrub = true
+				break
+			}
+		}
+		if !scrub {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 // Start launches a detached cloudflared tunnel for spec and returns the
 // Running descriptor (PID + resolved metrics port) so the caller can begin
 // polling immediately. The process is put in its OWN session (Setsid) with its
@@ -273,13 +342,42 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	}
 	spec.MetricsPort = metricsPort
 
-	cmd := exec.Command(c.binary(), buildArgs(spec, logfile)...)
-	// Detach: new session (no controlling terminal, survives parent exit) and
-	// stdio to the null device (never write to tailport's TUI).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	// Console capture [R1]: cloudflared's fatal startup errors (bad cert,
+	// bad/missing credentials) go to STDERR ALONE, and urfave's own
+	// "Incorrect Usage" flag-parsing errors go to STDOUT and exit 0 -- so the
+	// --logfile (JSON, info level) can hold nothing useful, or nothing at all,
+	// for exactly the failures callers most need explained (see ConsoleTail).
+	// Opened O_TRUNC so a stale file from a previous Start never bleeds into
+	// this one.
+	consolePath := ConsolePath(logfile)
+	consoleFile, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing console capture: %w", err)
+	}
 
-	if err := cmd.Start(); err != nil {
+	cmd := exec.Command(c.binary(), buildArgs(spec, logfile)...)
+	// Detach: new session (no controlling terminal, survives parent exit).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdin = nil
+	// Both stdout and stderr go to the SAME file, deliberately never a pipe:
+	// once tailport exits, a pipe reader going away would SIGPIPE the still
+	// -running detached child the next time it wrote.
+	cmd.Stdout = consoleFile
+	cmd.Stderr = consoleFile
+	// Scrub identity/account-mutating/origin-override TUNNEL_* env vars before
+	// the child inherits anything (see scrubIdentityEnv) -- an ambient
+	// TUNNEL_TOKEN, for instance, takes precedence over the tunnel name and
+	// would silently run a DIFFERENT tunnel than the one requested. This is
+	// how "tailport never mutates the account" holds against the environment,
+	// not just against tailport's own argv.
+	cmd.Env = scrubIdentityEnv(os.Environ())
+
+	err = cmd.Start()
+	// The child, once started, keeps its own OS-level reference to this fd;
+	// the parent's *os.File is only needed to hand it over, so close our copy
+	// right away regardless of outcome.
+	consoleFile.Close()
+	if err != nil {
 		return nil, fmt.Errorf("cftunnel: starting cloudflared: %w", err)
 	}
 	// Reap when it exits so a tunnel that dies during this tailport session
@@ -294,10 +392,20 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// immediately exit before reporting success.
 	select {
 	case werr := <-exited:
-		if werr != nil {
-			return nil, fmt.Errorf("cftunnel: cloudflared exited immediately after starting: %w", werr)
+		// cmd.Wait() has returned by construction of this select (that's what
+		// sent on exited), so cmd.ProcessState is safely readable here with no
+		// race against the goroutine above.
+		if tail := ConsoleTail(consolePath); tail != "" {
+			return nil, fmt.Errorf("exited at startup — %s", tail)
 		}
-		return nil, errors.New("cftunnel: cloudflared exited immediately after starting")
+		status := "unknown exit status"
+		switch {
+		case cmd.ProcessState != nil:
+			status = cmd.ProcessState.String()
+		case werr != nil:
+			status = werr.Error()
+		}
+		return nil, fmt.Errorf("exited at startup (%s)", status)
 	case <-time.After(startupGrace):
 		// Still running past the grace window -- looks healthy. exited stays
 		// buffered for the reaper goroutine's eventual send.
@@ -309,6 +417,7 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		Mode:        spec.Mode,
 		TunnelName:  spec.TunnelName,
 		MetricsPort: metricsPort,
+		LogFile:     logfile,
 		Owned:       true,
 	}
 	if spec.Mode == ModeNamed {
@@ -374,6 +483,23 @@ func (c *Client) Stop(pid, port int) error {
 		return fmt.Errorf("cftunnel: signalling pid %d: %w", pid, err)
 	}
 	return nil
+}
+
+// Alive reports whether pid refers to a still-existing process, via a
+// signal-0 probe (syscall.Kill(pid, 0)): no signal is actually delivered, but
+// the kernel still validates that pid exists and is signalable by this UID.
+// ESRCH ("no such process") is the only case treated as false; any other
+// error (e.g. EPERM for a process this UID can't signal) still means the
+// process EXISTS, so it's treated as alive. A just-exited child is briefly a
+// ZOMBIE and still answers this as alive until something reaps it (Wait) --
+// callers that need to tell the two apart re-check after a short delay (see
+// the poll-based exit detection, kata nc1j).
+func Alive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return !errors.Is(err, syscall.ESRCH)
 }
 
 // Health scrapes a tunnel's metrics server (127.0.0.1:metricsPort) for its

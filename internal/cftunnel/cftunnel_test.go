@@ -100,7 +100,7 @@ func TestParseRunning(t *testing.T) {
 				"--metrics", "127.0.0.1:20941",
 				"--logfile", "/home/u/.local/state/tailport/cftunnel-3000.log",
 				"--no-autoupdate"},
-			want: Running{Port: 3000, Mode: ModeQuick, MetricsPort: 20941, Owned: true},
+			want: Running{Port: 3000, Mode: ModeQuick, MetricsPort: 20941, Owned: true, LogFile: "/home/u/.local/state/tailport/cftunnel-3000.log"},
 			ok:   true,
 		},
 		{
@@ -111,8 +111,9 @@ func TestParseRunning(t *testing.T) {
 				"--logfile", "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log",
 				"--no-autoupdate", "run",
 				"--url", "http://localhost:8080", "web"},
-			want: Running{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942, Hostname: "app.example.com", Owned: true},
-			ok:   true,
+			want: Running{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942, Hostname: "app.example.com", Owned: true,
+				LogFile: "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log"},
+			ok: true,
 		},
 		{
 			// parseRunning is order-independent (it scans for tokens/flags by
@@ -127,8 +128,9 @@ func TestParseRunning(t *testing.T) {
 				"--metrics", "127.0.0.1:20942",
 				"--logfile", "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log",
 				"--no-autoupdate", "web"},
-			want: Running{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942, Hostname: "app.example.com", Owned: true},
-			ok:   true,
+			want: Running{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942, Hostname: "app.example.com", Owned: true,
+				LogFile: "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log"},
+			ok: true,
 		},
 		{
 			name: "foreign quick (no sentinel logfile)",
@@ -148,7 +150,7 @@ func TestParseRunning(t *testing.T) {
 				"--url=http://localhost:9000",
 				"--metrics=127.0.0.1:20950",
 				"--logfile=/x/cftunnel-9000.log"},
-			want: Running{Port: 9000, Mode: ModeQuick, MetricsPort: 20950, Owned: true},
+			want: Running{Port: 9000, Mode: ModeQuick, MetricsPort: 20950, Owned: true, LogFile: "/x/cftunnel-9000.log"},
 			ok:   true,
 		},
 		{
@@ -698,6 +700,245 @@ func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
 	oldOut, _ := oldCmd.CombinedOutput()
 	if !strings.Contains(string(oldOut), "Incorrect Usage") {
 		t.Fatalf("negative control: old flag order should be rejected by real cloudflared but wasn't:\n%s", oldOut)
+	}
+}
+
+// TestStartSurfacesConsoleError is the regression test for audit item 4/R1
+// (kata nc1j): cloudflared's fatal startup errors go to STDERR ALONE, so
+// Start's error must come from the console capture, not the JSON --logfile
+// (which R1 found gets at most one line, sometimes none). This replays the
+// exact case-1 console text confirmed against real cloudflared with an empty
+// HOME (no cert.pem): a console ERR line followed by a plain, unprefixed
+// "error parsing tunnel ID: ..." line.
+func TestStartSurfacesConsoleError(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	body := `printf '2026-09-27T01:31:45Z ERR Cannot determine default origin certificate path. No file cert.pem in [~/.cloudflared ~/.cloudflare-warp ~/cloudflare-warp /etc/cloudflared /usr/local/etc/cloudflared]. You need to specify the origin certificate path by specifying the origincert option in the configuration file, or set TUNNEL_ORIGIN_CERT environment variable originCertPath=\n' >&2
+printf 'error parsing tunnel ID: Error locating origin cert: client did not specify origincert path\n' >&2
+exit 1
+`
+	c := &Client{Binary: fakeCloudflaredBin(t, body)}
+	if _, err := c.Start(Spec{Port: 3010}); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "Cannot determine default origin certificate path") {
+		t.Errorf("error = %q, want it to contain the console's ERR message", err.Error())
+	}
+}
+
+// TestStartSurfacesIncorrectUsage pins that a "successful" (exit 0) but
+// mis-flagged invocation still surfaces as an error: urfave's own
+// "Incorrect Usage" goes to STDOUT and exits 0, which would otherwise look
+// exactly like a healthy startup to the liveness check.
+func TestStartSurfacesIncorrectUsage(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	body := `printf 'Incorrect Usage: flag provided but not defined: -metrics\n\nNAME:\n  cloudflared tunnel run - Proxy a local web server\n'
+exit 0
+`
+	c := &Client{Binary: fakeCloudflaredBin(t, body)}
+	if _, err := c.Start(Spec{Port: 3011}); err == nil {
+		t.Fatal("expected an error even though cloudflared exited 0")
+	} else if !strings.Contains(err.Error(), "Incorrect Usage") {
+		t.Errorf("error = %q, want it to contain \"Incorrect Usage\"", err.Error())
+	}
+}
+
+// TestStartTruncatesConsole pins that Start opens the console file
+// O_TRUNC, so stale content from a PREVIOUS Start on the same port/hostname
+// never bleeds into a new one.
+func TestStartTruncatesConsole(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	logfile, err := logfilePath(3012, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	consolePath := ConsolePath(logfile)
+	if err := os.WriteFile(consolePath, []byte("stale junk from a previous run\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3012})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+
+	data, err := os.ReadFile(consolePath)
+	if err != nil {
+		t.Fatalf("reading console file: %v", err)
+	}
+	if strings.Contains(string(data), "stale junk") {
+		t.Errorf("console file should have been truncated on Start, still contains stale content: %q", data)
+	}
+}
+
+// TestStartConsoleMode0600 pins the console file's permissions: it can hold
+// cloudflared's own console text (never secrets tailport puts there itself,
+// but conservative is cheap).
+func TestStartConsoleMode0600(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3013})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+	logfile, err := logfilePath(3013, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(ConsolePath(logfile))
+	if err != nil {
+		t.Fatalf("stat console file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("console file mode = %o, want 0600", perm)
+	}
+}
+
+// TestConsoleTail pins ConsoleTail's priority order and text handling.
+func TestConsoleTail(t *testing.T) {
+	write := func(t *testing.T, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "x.console")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("missing file returns empty", func(t *testing.T) {
+		if got := ConsoleTail(filepath.Join(t.TempDir(), "nope.console")); got != "" {
+			t.Errorf("got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("empty file returns empty", func(t *testing.T) {
+		if got := ConsoleTail(write(t, "")); got != "" {
+			t.Errorf("got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("Incorrect Usage takes priority over an ERR line", func(t *testing.T) {
+		content := "2026-09-27T01:00:00Z ERR something else happened\n" +
+			"Incorrect Usage: flag provided but not defined: -metrics\n"
+		want := "Incorrect Usage: flag provided but not defined: -metrics"
+		if got := ConsoleTail(write(t, content)); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("the LAST ERR line wins over an earlier one", func(t *testing.T) {
+		content := "2026-09-27T01:00:00Z ERR first error\n" +
+			"some unrelated console line\n" +
+			"2026-09-27T01:00:01Z ERR second error\n"
+		if got := ConsoleTail(write(t, content)); got != "second error" {
+			t.Errorf("got %q, want %q", got, "second error")
+		}
+	})
+
+	t.Run("FTL is recognized like ERR", func(t *testing.T) {
+		content := "2026-09-27T01:00:00Z FTL fatal problem\n"
+		if got := ConsoleTail(write(t, content)); got != "fatal problem" {
+			t.Errorf("got %q, want %q", got, "fatal problem")
+		}
+	})
+
+	t.Run("ANSI escapes are stripped", func(t *testing.T) {
+		content := "\x1b[31m2026-09-27T01:00:00Z ERR colored error\x1b[0m\n"
+		if got := ConsoleTail(write(t, content)); got != "colored error" {
+			t.Errorf("got %q, want %q", got, "colored error")
+		}
+	})
+
+	t.Run("fallback to the last non-empty line", func(t *testing.T) {
+		content := "some startup banner\nanother info line\n\n"
+		if got := ConsoleTail(write(t, content)); got != "another info line" {
+			t.Errorf("got %q, want %q", got, "another info line")
+		}
+	})
+
+	t.Run("truncated to 160 runes with an ellipsis", func(t *testing.T) {
+		long := strings.Repeat("x", 200)
+		content := "2026-09-27T01:00:00Z ERR " + long + "\n"
+		got := ConsoleTail(write(t, content))
+		want := string([]rune(long)[:160]) + "…"
+		if got != want {
+			t.Errorf("got rune len %d, want %d", len([]rune(got)), len([]rune(want)))
+		}
+	})
+}
+
+// TestStartScrubsIdentityEnv is the regression test for audit item 7 (kata
+// nc1j): an ambient TUNNEL_TOKEN takes PRECEDENCE over the tunnel name and
+// would run a completely different tunnel, and TUNNEL_NAME means "create,
+// route, and run", which would mutate the account -- both must never reach
+// the child. TUNNEL_ORIGIN_CERT is explicitly NOT scrubbed (a mismatch fails
+// closed, it doesn't mutate anything).
+func TestStartScrubsIdentityEnv(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TUNNEL_TOKEN", "should-be-scrubbed")
+	t.Setenv("TUNNEL_NAME", "should-be-scrubbed-too")
+	t.Setenv("TUNNEL_ORIGIN_CERT", "/keep/this/cert.pem")
+
+	envOut := filepath.Join(t.TempDir(), "env.out")
+	t.Setenv("FAKE_ENV_OUT", envOut)
+	c := &Client{Binary: fakeCloudflaredBin(t, "env > \"$FAKE_ENV_OUT\"\nsleep 5\n")}
+	r, err := c.Start(Spec{Port: 3014})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+
+	data, err := os.ReadFile(envOut)
+	if err != nil {
+		t.Fatalf("reading captured child env: %v", err)
+	}
+	env := string(data)
+	if strings.Contains(env, "TUNNEL_TOKEN=") {
+		t.Error("TUNNEL_TOKEN leaked into the child environment")
+	}
+	if strings.Contains(env, "TUNNEL_NAME=") {
+		t.Error("TUNNEL_NAME leaked into the child environment")
+	}
+	if !strings.Contains(env, "TUNNEL_ORIGIN_CERT=/keep/this/cert.pem") {
+		t.Error("TUNNEL_ORIGIN_CERT should be preserved, not scrubbed")
+	}
+}
+
+// TestAlive pins the two states Alive must tell apart: the calling test
+// process's own pid (definitely alive), and a child that has already been
+// fully reaped via Wait (definitely not -- and specifically not a zombie,
+// which this is not, precisely because Run() already waited on it).
+func TestAlive(t *testing.T) {
+	if !Alive(os.Getpid()) {
+		t.Error("the test's own pid should be alive")
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("running a trivial child: %v", err)
+	}
+	if Alive(cmd.Process.Pid) {
+		t.Error("a fully-reaped child's pid should not be alive")
+	}
+
+	if Alive(0) || Alive(-1) {
+		t.Error("Alive should reject a non-positive pid outright")
 	}
 }
 
