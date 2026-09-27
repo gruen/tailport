@@ -22,14 +22,18 @@ name: ci
 # `caddy`-binary integration test (internal/caddyedge) self-skips whenever
 # `caddy` isn't on PATH, which is every job here except the opt-in
 # caddy-integration.yml; and internal/cftunnel's tests fake or spawn their own
-# stand-ins ((/bin/sh, a generated fake "cloudflared" script, or /proc-based
-# discovery) rather than touching a real cloudflared -- with one exception,
-# TestNamedArgvAcceptedByRealCloudflared (kata nc1j), which probes the named
-# argv's `--help` output against a REAL cloudflared and skips outright
-# whenever one isn't usable on $PATH (exec.LookPath fails, or `cloudflared
-# version --short` doesn't exit 0 with output) -- true on this runner, so it
-# self-skips here rather than running. See caddy-integration.yml and
-# darwin-tests.yml for the opt-in jobs that exercise those real binaries.
+# stand-ins (/bin/sh, a generated fake "cloudflared" script, /proc-based
+# discovery, or -- for the Tier 2 lifecycle test, kata nc1j W4 -- a real Go
+# binary built on the fly from ./fakecloudflared with the SAME Go toolchain
+# running this job, see internal/cftunnel/fake_lifecycle_test.go) rather than
+# touching a real cloudflared -- with two exceptions,
+# TestNamedArgvAcceptedByRealCloudflared and TestFakeMatchesRealPlacement
+# (both kata nc1j), which probe/compare against a REAL cloudflared and skip
+# outright whenever one isn't usable on $PATH (exec.LookPath fails, or
+# `cloudflared version --short` doesn't exit 0 with output) -- true on this
+# runner, so both self-skip here rather than running. See
+# caddy-integration.yml and darwin-tests.yml for the opt-in jobs that
+# exercise those real binaries.
 
 on:
   push:
