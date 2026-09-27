@@ -37,7 +37,7 @@ func flagValueBoundaryRe(flag string) *regexp.Regexp {
 }
 
 // configValueRe and logfileValueRe are the two flags whose value can contain
-// a space (both derive from the state dir; see stateDir, configFilePath,
+// a space (both derive from the state dir; see stateDir, tunnelConfigPath,
 // logfilePath) and therefore need splitPSCommand's boundary protection.
 // logfileValueRe is also referenced by name in comments elsewhere in this
 // package.

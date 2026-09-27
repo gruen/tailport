@@ -7808,8 +7808,13 @@ func (m model) renderBottom() string {
 			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
 			// One line, kept under 80 columns for a short name: a line wider than
 			// the terminal soft-wraps past what lipgloss.Height counts and shoves
-			// the header off-screen. The fuller caveat (it also serves any other
-			// hostname routed to the tunnel) lives in the README (kata nc1j).
+			// the header off-screen. This caveat is about the typed hostname
+			// itself (tailport can't verify the DNS route exists) -- it is
+			// still true even though S4 now pins the tunnel's ingress to this
+			// exact hostname (internal/cftunnel's per-tunnel --config), which
+			// only means a WRONG/unrouted hostname is simply unreachable, not
+			// that some OTHER hostname gets served instead. See the README's
+			// "Tunnelling to the public internet" section (kata nc1j).
 			helpStyle.Render(fmt.Sprintf("   via tunnel %q — tailport can't verify the hostname routes to it", m.tunnelName)),
 			helpStyle.Render("   (y: confirm, any other key: cancel)"),
 		}

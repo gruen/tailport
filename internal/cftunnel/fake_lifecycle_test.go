@@ -247,11 +247,13 @@ func TestFakeMatchesRealPlacement(t *testing.T) {
 	fakeBin := buildFakeCloudflared(t)
 	home := t.TempDir()
 
-	// The hermetic --config file must exist with valid content for the REAL
-	// binary to parse it (see cftunnel.writeHermeticConfig); the fake doesn't
-	// care, but sharing one file keeps both probes identical.
-	configPath := filepath.Join(home, "cftunnel-config.yml")
-	if err := os.WriteFile(configPath, []byte(hermeticConfigContent), 0o600); err != nil {
+	// The per-tunnel --config file must exist with valid content for the
+	// REAL binary to parse it (see cftunnel.writeTunnelConfig, S4); the fake
+	// doesn't care, but sharing one file keeps both probes identical. This
+	// probe has no positional tunnel name, so the exact ingress content
+	// doesn't matter -- any valid YAML that isn't a zero-byte file will do.
+	configPath := filepath.Join(home, "cftunnel-test.yml")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

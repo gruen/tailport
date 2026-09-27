@@ -24,23 +24,37 @@
 //     against cloudflared 2026.9.1, kata nc1j). tailport never mutates the
 //     user's Cloudflare account or DNS.
 //
-// --config PATH is tailport's own, tunnel-run-only HERMETIC config file
-// (configFilePath/writeHermeticConfig below), passed for BOTH quick and
-// named tunnels alike. It exists because of a live-verified footgun with no
-// error and no warning: if ANY config.yml with `ingress:` rules exists
-// anywhere on cloudflared's own config search path (~/.cloudflared,
-// ~/.cloudflare-warp, ~/cloudflare-warp, /etc/cloudflared,
-// /usr/local/etc/cloudflared -- notably including the file `cloudflared
-// service install` writes to /etc/cloudflared/config.yml), cloudflared
-// SILENTLY IGNORES tailport's --url and serves that config's ingress origin
-// instead. There is no refusal and no warning -- tailport would show a port
-// as publicly served while the tunnel actually served something else
-// entirely (live-verified against cloudflared 2026.9.1, kata nc1j; this
-// replaces an earlier, now-corrected assumption that cloudflared would
-// refuse to start in that situation). Pointing --config at tailport's own
-// file (content: "{}", rewritten on every Start) makes --url authoritative
-// regardless of what's on that search path -- see
-// TestStartWritesHermeticConfig and TestBuildArgsNamedFlagPlacement.
+// --config PATH is tailport's own, PER-TUNNEL config file (tunnelConfigPath/
+// writeTunnelConfig below -- one file per port[-hostname], living beside
+// that tunnel's log, never shared between tunnels), passed for BOTH quick
+// and named tunnels alike. It exists for two reasons:
+//
+//   - It closes a live-verified footgun with no error and no warning: if ANY
+//     config.yml with `ingress:` rules exists anywhere on cloudflared's own
+//     config search path (~/.cloudflared, ~/.cloudflare-warp,
+//     ~/cloudflare-warp, /etc/cloudflared, /usr/local/etc/cloudflared --
+//     notably including the file `cloudflared service install` writes to
+//     /etc/cloudflared/config.yml), cloudflared SILENTLY IGNORES tailport's
+//     --url and serves that config's ingress origin instead. There is no
+//     refusal and no warning -- tailport would show a port as publicly
+//     served while the tunnel actually served something else entirely
+//     (live-verified against cloudflared 2026.9.1, kata nc1j).
+//   - For a NAMED tunnel (S4, audit finding 4, verified viable), it PINS that
+//     tunnel's ingress to EXACTLY the confirmed hostname
+//     (`ingress: [{hostname: H, service: http://localhost:PORT}, {service:
+//     http_status:404}]`) instead of the catch-all `--url` alone would
+//     produce: without this, --url makes cloudflared serve the local port
+//     for EVERY hostname routed to the tunnel, including any wildcard --
+//     the confirm's promise ("this hostname reaches this port") was
+//     otherwise only as good as the operator having routed nothing else to
+//     it. A quick tunnel's hostname isn't known up front, so its config
+//     stays the same hermetic "{}" content this used to be for both modes.
+//
+// Rewritten with O_TRUNC on EVERY Start -- for BOTH quick and named -- so a
+// hand-edit can never take effect, and it can never match sentinelLogRe
+// (which requires a ".log" suffix), so it's invisible to ownership
+// detection. See TestNamedTunnelConfigContent/TestQuickTunnelConfigContent
+// and TestBuildArgsNamedFlagPlacement.
 //
 // Because the user chose "tunnels survive tailport", cloudflared is started
 // DETACHED (its own session via Setsid) so it outlives the TUI, and the
@@ -365,6 +379,14 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		if !ValidTunnelName(spec.TunnelName) {
 			return nil, fmt.Errorf("cftunnel: invalid tunnel name %q -- must be non-empty, contain no whitespace or control characters, and not start with '-'", spec.TunnelName)
 		}
+		// S4, audit finding 4: the hostname is interpolated straight into the
+		// per-tunnel --config's ingress rule (tunnelConfigContent), so it must
+		// be validated BEFORE that ever happens -- ValidHostname's restricted
+		// charset also makes that interpolation safe even without the quoting
+		// tunnelConfigContent still applies as defense in depth.
+		if !ValidHostname(spec.Hostname) {
+			return nil, fmt.Errorf("cftunnel: invalid hostname %q for named tunnel -- must be a dotted DNS name, e.g. app.example.com", spec.Hostname)
+		}
 		if !LoggedIn() {
 			return nil, ErrNotLoggedIn
 		}
@@ -397,27 +419,27 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// The 0o600 above only applies when OpenFile actually CREATES the file;
 	// a stale, pre-existing log from an old tailport version (or a manually
 	// widened one) keeps ITS OWN mode otherwise -- Chmod explicitly so this
-	// is 0600 unconditionally, matching writeHermeticConfig's same pattern.
+	// is 0600 unconditionally, matching writeTunnelConfig's same pattern.
 	if err := logFD.Chmod(0o600); err != nil {
 		logFD.Close()
 		return nil, fmt.Errorf("cftunnel: preparing log file: %w", err)
 	}
 	logFD.Close()
 
-	// Hermetic --config [live-verified against cloudflared 2026.9.1, kata
-	// nc1j]: see the package doc for WHY this exists (a config.yml with
-	// ingress: rules anywhere on cloudflared's search path silently
-	// overrides --url, with no error and no warning). Rewritten with
-	// O_TRUNC on EVERY Start -- for BOTH quick and named -- so a hand-edit
-	// (or a stale file from before this existed) can never take effect.
-	// O_NOFOLLOW (S3): a symlink planted at this path must fail Start, not
-	// get silently written through to wherever it points.
-	configPath, err := configFilePath()
+	// Per-tunnel --config [S4, audit finding 4; live-verified against
+	// cloudflared 2026.9.1, kata nc1j]: see the package doc for WHY this
+	// exists (a config.yml with ingress: rules anywhere on cloudflared's
+	// search path silently overrides --url, and for a NAMED tunnel this also
+	// PINS its ingress to exactly spec.Hostname). Rewritten with O_TRUNC on
+	// EVERY Start -- for BOTH quick and named -- so a hand-edit can never
+	// take effect. O_NOFOLLOW (S3): a symlink planted at this path must fail
+	// Start, not get silently written through to wherever it points.
+	configPath, err := tunnelConfigPath(spec.Port, spec.Hostname)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeHermeticConfig(configPath); err != nil {
-		return nil, fmt.Errorf("cftunnel: preparing hermetic --config: %w", err)
+	if err := writeTunnelConfig(configPath, tunnelConfigContent(spec)); err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing per-tunnel --config: %w", err)
 	}
 
 	metricsPort := spec.MetricsPort
@@ -689,11 +711,12 @@ func (c *Client) metricsGet(ctx context.Context, metricsPort int, path string) (
 // so flag ordering among tunnel-level flags doesn't matter to cloudflared
 // there, but --config is placed first, right after "tunnel", for both modes.
 //
-// configPath is tailport's own hermetic --config file (configFilePath /
-// writeHermeticConfig), passed for BOTH quick and named tunnels: without it,
+// configPath is tailport's own PER-TUNNEL --config file (tunnelConfigPath /
+// writeTunnelConfig), passed for BOTH quick and named tunnels: without it,
 // an ingress: config.yml anywhere on cloudflared's search path silently
-// overrides --url (see the package doc). TestBuildArgs and
-// TestBuildArgsNamedFlagPlacement pin the exact shape; see
+// overrides --url, and for a named tunnel it also PINS that tunnel's ingress
+// to exactly its confirmed hostname (S4; see the package doc).
+// TestBuildArgs and TestBuildArgsNamedFlagPlacement pin the exact shape; see
 // TestNamedArgvAcceptedByRealCloudflared for the real-binary proof that
 // --config, like the other tunnel-level flags, is rejected after `run`.
 func buildArgs(spec Spec, logfile, configPath string) []string {
@@ -715,44 +738,76 @@ func buildArgs(spec Spec, logfile, configPath string) []string {
 	return append(args, tunnelFlags...)
 }
 
-// configFilePath is tailport's own hermetic cloudflared --config file, ONE
-// shared by EVERY tunnel-run tailport starts (quick and named alike) --
-// unlike logfilePath, there is exactly one, living alongside the logfiles in
-// the same state dir. Its basename ("cftunnel-config.yml") deliberately
-// can't match sentinelLogRe (which requires a ".log" suffix), so it's
-// invisible to ownership detection either way -- Discover never scans the
-// state dir anyway; it only ever reads flag VALUES off a process's own argv.
+// tunnelConfigPath is tailport's own PER-TUNNEL cloudflared --config file
+// (S4, audit finding 4): unlike the ONE shared file this used to be, each
+// tunnel gets its own, living beside its logfile in the state dir, so a
+// named tunnel's ingress-pinning content (tunnelConfigContent) never leaks
+// between tunnels. Named its basename the same way logfilePath does
+// (cftunnel-<port>[-<host>].yml) except for the extension -- ".yml" can
+// never match sentinelLogRe (which requires a ".log" suffix), so it stays
+// invisible to ownership detection either way; Discover never scans the
+// state dir anyway, it only ever reads flag VALUES off a process's own argv.
 //
 // See the package doc for WHY this file exists at all: a config.yml with
 // ingress: rules anywhere on cloudflared's own config search path silently
 // overrides tailport's --url, with no error and no warning (live-verified,
-// kata nc1j). See TestStartWritesHermeticConfig.
-func configFilePath() (string, error) {
+// kata nc1j); for a named tunnel this file ALSO pins its ingress to exactly
+// hostname. See TestNamedTunnelConfigContent/TestQuickTunnelConfigContent.
+func tunnelConfigPath(port int, hostname string) (string, error) {
 	dir, err := stateDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "cftunnel-config.yml"), nil
+	name := fmt.Sprintf("cftunnel-%d.yml", port)
+	if hostname != "" {
+		name = fmt.Sprintf("cftunnel-%d-%s.yml", port, hostname)
+	}
+	return filepath.Join(dir, name), nil
 }
 
-// hermeticConfigContent is written to configFilePath on every Start. It must
-// NOT be empty: cloudflared logs "ERR Configuration file ... was empty" for
-// a zero-byte --config (live-verified) even though it otherwise proceeds; an
-// explicit "{}" avoids that log line while still making --url authoritative
-// over anything on cloudflared's config search path. The leading "#" comment
-// line is solely so a curious operator who opens the file understands why
-// it exists and that hand-editing it is futile -- cloudflared itself ignores
-// a leading "#" line in a YAML file.
-const hermeticConfigContent = "# tailport-managed (kata nc1j): keeps --url authoritative over any config.yml cloudflared would otherwise silently apply instead of it. Rewritten on every tunnel start -- editing this file has no effect.\n{}\n"
+// tunnelConfigComment is the leading line of every per-tunnel --config file,
+// solely so a curious operator who opens it understands why it exists and
+// that hand-editing it is futile -- cloudflared itself ignores a leading
+// "#" line in a YAML file.
+const tunnelConfigComment = "# tailport-managed (kata nc1j): pins this tunnel's ingress to the confirmed hostname and keeps --url authoritative over any config.yml cloudflared would otherwise silently apply instead of it. Rewritten on every tunnel start -- editing this file has no effect.\n"
 
-// writeHermeticConfig (re)writes tailport's hermetic --config file at path,
-// truncating and fixing its mode to 0600 even if the file already existed
-// (e.g. pre-seeded with junk, or left over from a previous tailport
+// tunnelConfigContent builds the per-tunnel --config file's content (S4,
+// audit finding 4, verified viable):
+//
+//   - NAMED: an explicit `ingress:` list that pins the tunnel to EXACTLY
+//     spec.Hostname, with a catch-all `http_status:404` after it -- so any
+//     OTHER hostname that happens to also be routed to this same
+//     pre-provisioned tunnel gets a plain 404 instead of this port. Without
+//     this, `--url` alone makes cloudflared serve the local port for EVERY
+//     hostname routed to the tunnel (including a wildcard), so the confirm's
+//     promise was only as good as the operator having routed nothing else to
+//     it. spec.Hostname is expected to have already passed ValidHostname
+//     (Start rejects an invalid one before this is ever called), whose
+//     restricted charset makes the interpolation safe on its own -- it's
+//     quoted here anyway, as defense in depth.
+//   - QUICK: the hostname isn't known until cloudflared assigns one after it
+//     starts, so there is nothing to pin yet; content stays the same
+//     hermetic "{}" both modes used before S4. cloudflared logs
+//     "ERR Configuration file ... was empty" for a zero-byte --config
+//     (live-verified) even though it otherwise proceeds, so this must never
+//     be literally empty either.
+func tunnelConfigContent(spec Spec) string {
+	if spec.Mode == ModeNamed {
+		return fmt.Sprintf("%singress:\n  - hostname: %q\n    service: http://localhost:%d\n  - service: http_status:404\n",
+			tunnelConfigComment, spec.Hostname, spec.Port)
+	}
+	return tunnelConfigComment + "{}\n"
+}
+
+// writeTunnelConfig (re)writes the per-tunnel --config file at path with
+// content, truncating and fixing its mode to 0600 even if the file already
+// existed (e.g. pre-seeded with junk, or left over from a previous tailport
 // version): a hand-edit, or stale content from before this feature existed,
-// must never survive a Start. See TestStartWritesHermeticConfig. O_NOFOLLOW
-// (S3, audit findings 3/7) makes a symlink planted at this path a hard error
-// instead of a silent write-through to wherever it points.
-func writeHermeticConfig(path string) error {
+// must never survive a Start. See TestNamedTunnelConfigContent/
+// TestQuickTunnelConfigContent. O_NOFOLLOW (S3, audit findings 3/7) makes a
+// symlink planted at this path a hard error instead of a silent
+// write-through to wherever it points.
+func writeTunnelConfig(path, content string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
@@ -761,7 +816,7 @@ func writeHermeticConfig(path string) error {
 	if err := f.Chmod(0o600); err != nil {
 		return err
 	}
-	_, err = f.WriteString(hermeticConfigContent)
+	_, err = f.WriteString(content)
 	return err
 }
 

@@ -584,18 +584,32 @@ matching Cloudflare's two account scenarios:
   cloudflared rejects them after it with `Incorrect Usage` and exits 0); it
   never mutates your Cloudflare account or DNS.
 
-**Every tailport-run tunnel gets its own hermetic `--config`** — quick and
+**Every tailport-run tunnel gets its own per-tunnel `--config`** — quick and
 named alike — pointed at a tiny file tailport writes (and rewrites, on every
-start) itself, containing nothing but `{}`. This is not optional politeness:
-if a `config.yml` with `ingress:` rules exists anywhere on cloudflared's own
-config search path (`~/.cloudflared`, `~/.cloudflare-warp`,
-`~/cloudflare-warp`, `/etc/cloudflared`, `/usr/local/etc/cloudflared` —
-notably including the file `cloudflared service install` writes to
-`/etc/cloudflared/config.yml`), cloudflared **silently ignores** tailport's
-`--url` and serves that config's ingress origin instead — no error, no
-warning, nothing in the log (live-verified against cloudflared 2026.9.1).
-Passing tailport's own `--config` makes `--url` authoritative regardless of
-what's on that search path. Two consequences:
+start) itself, next to that tunnel's log; it's never shared between tunnels.
+This is not optional politeness: if a `config.yml` with `ingress:` rules
+exists anywhere on cloudflared's own config search path (`~/.cloudflared`,
+`~/.cloudflare-warp`, `~/cloudflare-warp`, `/etc/cloudflared`,
+`/usr/local/etc/cloudflared` — notably including the file `cloudflared
+service install` writes to `/etc/cloudflared/config.yml`), cloudflared
+**silently ignores** tailport's `--url` and serves that config's ingress
+origin instead — no error, no warning, nothing in the log (live-verified
+against cloudflared 2026.9.1). Passing tailport's own `--config` makes it
+authoritative regardless of what's on that search path — and, for a
+**named** tunnel, it also **pins that tunnel's ingress to exactly the
+hostname you confirmed**:
+```
+ingress:
+  - hostname: "app.example.com"
+    service: http://localhost:3000
+  - service: http_status:404
+```
+so any *other* hostname already routed to that same tunnel gets a plain
+`404`, not your service — closing the gap where `--url` alone makes
+cloudflared serve the local port for **every** hostname routed to the
+tunnel, wildcards included. (A **quick** tunnel's config still has nothing
+to pin — its hostname isn't known until cloudflared assigns one — so it
+stays the same hermetic `{}` it always was.) Two consequences either way:
 - any settings in your own `config.yml` never apply to a tailport-run
   tunnel — tailport's tunnels are hermetic by design;
 - a named tunnel's credentials must sit at cloudflared's default location,
@@ -661,8 +675,11 @@ address appears in the row a few seconds later, once the next poll picks it up.
 A **named** tunnel's confirm has no such gap — it names the exact
 `https://<hostname>` up front (the same as Publish) plus the tunnel it will
 run, e.g. `via tunnel "web"` — but that hostname is simply the one *you*
-typed: tailport has no way to check it's actually routed to that tunnel, and
-the tunnel will keep serving any other hostname already routed to it too.
+typed: tailport has no way to check it's actually routed to that tunnel. It
+**does** now pin the tunnel's ingress to exactly that hostname (see the
+per-tunnel `--config` above), so if it's wrong or unrouted your service is
+simply unreachable at it — the tunnel no longer falls back to serving
+whatever *other* hostname happens to already be routed to it.
 
 ## How it works
 

@@ -906,11 +906,13 @@ func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// The hermetic --config file's own content must be present and valid for
-	// cloudflared to parse it at all (see writeHermeticConfig); this probe
-	// writes the exact same content Start would.
-	configPath := filepath.Join(home, "cftunnel-config.yml")
-	if err := os.WriteFile(configPath, []byte(hermeticConfigContent), 0o600); err != nil {
+	// The per-tunnel --config file's own content must be present and valid
+	// for cloudflared to parse it at all (see writeTunnelConfig); this probe
+	// writes the exact same NAMED-mode content (pinned ingress, S4) Start
+	// would for this argv's port/hostname.
+	configPath := filepath.Join(home, "cftunnel-test.yml")
+	content := tunnelConfigContent(Spec{Port: 1, Mode: ModeNamed, Hostname: "app.example.test"})
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1251,7 +1253,7 @@ func TestStartRefusesSymlinkedConsolePath(t *testing.T) {
 
 func TestStartRefusesSymlinkedConfigPath(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	configPath, err := configFilePath()
+	configPath, err := tunnelConfigPath(3020, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1309,20 +1311,48 @@ func TestConsolePathIgnoresForeignDirectory(t *testing.T) {
 	}
 }
 
-// TestStartWritesHermeticConfig is the regression test for the hermetic
-// --config fix (kata nc1j): every Start (quick AND named) must (re)write
-// tailport's own --config file with "{}" content and mode 0600, even if the
-// file already existed with different (junk) content -- a hand-edit, or a
-// stale file from before this feature existed, must never survive a Start
-// and silently change what --url the tunnel actually serves. See
-// configFilePath/writeHermeticConfig and buildArgs's doc comment for WHY:
-// live-verified against cloudflared 2026.9.1, an ingress: config.yml
-// anywhere on cloudflared's config search path otherwise silently overrides
-// --url with no error and no warning.
-func TestStartWritesHermeticConfig(t *testing.T) {
+// TestNamedTunnelConfigContent is the regression test for S4 (audit finding
+// 4, verified viable): a NAMED tunnel's per-tunnel --config must pin its
+// ingress to EXACTLY the confirmed hostname, with a catch-all 404 after it,
+// so any other hostname routed to the same pre-provisioned tunnel gets a
+// plain 404 instead of this port.
+func TestNamedTunnelConfigContent(t *testing.T) {
+	got := tunnelConfigContent(Spec{Port: 8080, Mode: ModeNamed, Hostname: "app.example.com"})
+	want := tunnelConfigComment +
+		"ingress:\n" +
+		"  - hostname: \"app.example.com\"\n" +
+		"    service: http://localhost:8080\n" +
+		"  - service: http_status:404\n"
+	if got != want {
+		t.Errorf("named tunnel config content =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestQuickTunnelConfigContent pins that a QUICK tunnel's per-tunnel
+// --config stays the same hermetic "{}" content both modes used before S4:
+// a quick tunnel's hostname isn't known until cloudflared assigns one after
+// it starts, so there's nothing to pin yet.
+func TestQuickTunnelConfigContent(t *testing.T) {
+	got := tunnelConfigContent(Spec{Port: 3000, Mode: ModeQuick})
+	want := tunnelConfigComment + "{}\n"
+	if got != want {
+		t.Errorf("quick tunnel config content =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestStartWritesPerTunnelConfig is the regression test for S4 (audit
+// finding 4): every Start (quick AND named) must (re)write tailport's own
+// per-tunnel --config file at 0600, even if the file already existed with
+// different (junk) content -- a hand-edit, or a stale file from before this
+// feature existed, must never survive a Start and silently change what
+// ingress the tunnel actually serves. See tunnelConfigPath/writeTunnelConfig
+// and the package doc for WHY: live-verified against cloudflared 2026.9.1,
+// an ingress: config.yml anywhere on cloudflared's config search path
+// otherwise silently overrides --url with no error and no warning.
+func TestStartWritesPerTunnelConfig(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
-	configPath, err := configFilePath()
+	configPath, err := tunnelConfigPath(3015, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1346,21 +1376,57 @@ func TestStartWritesHermeticConfig(t *testing.T) {
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		t.Fatalf("reading hermetic config file: %v", err)
+		t.Fatalf("reading per-tunnel config file: %v", err)
 	}
-	if strings.Contains(string(data), "ingress:") {
-		t.Errorf("pre-seeded junk (ingress: rules) survived Start, should have been O_TRUNC'd away: %q", data)
+	if strings.Contains(string(data), "http_status:418") {
+		t.Errorf("pre-seeded junk survived Start, should have been O_TRUNC'd away: %q", data)
 	}
 	if !strings.Contains(string(data), "{}") {
-		t.Errorf("hermetic config content = %q, want it to contain \"{}\"", data)
+		t.Errorf("quick tunnel config content = %q, want it to contain \"{}\"", data)
 	}
 
 	info, err := os.Stat(configPath)
 	if err != nil {
-		t.Fatalf("stat hermetic config file: %v", err)
+		t.Fatalf("stat per-tunnel config file: %v", err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("hermetic config file mode = %o, want 0600 (pre-seeded as 0644)", perm)
+		t.Errorf("per-tunnel config file mode = %o, want 0600 (pre-seeded as 0644)", perm)
+	}
+}
+
+// TestStartRejectsInvalidNamedHostname is the regression test for S4 (audit
+// finding 4): Start must reject a named Spec whose Hostname fails
+// ValidHostname BEFORE ever writing a --config file or spawning cloudflared
+// -- the hostname is interpolated into the per-tunnel config's ingress rule,
+// so it must be validated up front.
+func TestStartRejectsInvalidNamedHostname(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".cloudflared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cloudflared", "cert.pem"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []string{"", "-leading-hyphen.example.com", ".leading-dot.example.com", "no-dot-at-all", "has a space.example.com", "esc\x1b[31m.example.com"}
+	for _, host := range tests {
+		t.Run(host, func(t *testing.T) {
+			c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+			if _, err := c.Start(Spec{Port: 3021, Mode: ModeNamed, TunnelName: "web", Hostname: host}); err == nil {
+				t.Errorf("Start should reject invalid hostname %q", host)
+			}
+			// The per-tunnel config file must never have been written for a
+			// rejected hostname.
+			configPath, err := tunnelConfigPath(3021, host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, statErr := os.Stat(configPath); statErr == nil {
+				t.Errorf("config file %q should not exist for a rejected hostname", configPath)
+			}
+		})
 	}
 }
 

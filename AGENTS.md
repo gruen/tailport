@@ -104,25 +104,37 @@ contract. The short version:
   `TestNamedArgvAcceptedByRealCloudflared` and its `--config`-after-`run`
   negative control). It never mutates the user's Cloudflare account or DNS.
   **Every tailport-run tunnel — quick and named alike — gets its own
-  hermetic `--config`**, one file (`cftunnel-config.yml`, content `{}`,
-  mode 0600) shared by every tunnel and rewritten with `O_TRUNC` on EVERY
-  Start so a hand-edit can never take effect (`configFilePath`/
-  `writeHermeticConfig` in `internal/cftunnel/cftunnel.go`; see
-  `TestStartWritesHermeticConfig`). This exists because of a live-verified
-  footgun with no error and no warning: if ANY `config.yml` with `ingress:`
-  rules exists anywhere on cloudflared's own config search path
-  (`~/.cloudflared`, `~/.cloudflare-warp`, `~/cloudflare-warp`,
+  PER-TUNNEL `--config`** (`cftunnel-<port>[-<host>].yml`, mode 0600,
+  living beside that tunnel's log, never shared between tunnels — S4,
+  audit finding 4; a previous version of this bullet described ONE file
+  shared by every tunnel, `cftunnel-config.yml`, which S4 replaced) and
+  rewritten with `O_TRUNC` on EVERY Start so a hand-edit can never take
+  effect (`tunnelConfigPath`/`writeTunnelConfig`/`tunnelConfigContent` in
+  `internal/cftunnel/cftunnel.go`; see `TestNamedTunnelConfigContent`/
+  `TestQuickTunnelConfigContent`). This exists for two reasons: it closes a
+  live-verified footgun with no error and no warning (if ANY `config.yml`
+  with `ingress:` rules exists anywhere on cloudflared's own config search
+  path — `~/.cloudflared`, `~/.cloudflare-warp`, `~/cloudflare-warp`,
   `/etc/cloudflared`, `/usr/local/etc/cloudflared` — including the file
-  `cloudflared service install` writes to `/etc/cloudflared/config.yml`),
+  `cloudflared service install` writes to `/etc/cloudflared/config.yml` —
   cloudflared SILENTLY IGNORES `--url` and serves that config's ingress
-  origin instead of tailport's (verified against cloudflared 2026.9.1, kata
-  nc1j — this supersedes an earlier, incorrect assumption that cloudflared
-  would refuse to start in that situation). Two consequences a user-facing
-  doc must state plainly: settings in the user's own `config.yml` never
-  apply to a tailport-run tunnel, and a named tunnel's credentials must sit
-  at cloudflared's default location next to `cert.pem` (where `cloudflared
-  tunnel create` writes `<UUID>.json`) or the tunnel fails to start, with
-  cloudflared's own error text surfaced in the toast. **Token- and
+  origin instead of tailport's, verified against cloudflared 2026.9.1, kata
+  nc1j), AND, for a NAMED tunnel, it PINS that tunnel's ingress to EXACTLY
+  the confirmed hostname (`ingress: [{hostname: H, service:
+  http://localhost:PORT}, {service: http_status:404}]`) rather than relying
+  on `--url` alone, which makes cloudflared serve the local port for
+  **every** hostname routed to the tunnel, wildcards included — so the
+  confirm's promise ("this hostname reaches this port") used to be only as
+  good as the operator having routed nothing else to it. `Start` rejects a
+  named `Spec` whose `Hostname` fails `ValidHostname` before ever writing
+  this file. A QUICK tunnel's config stays the same hermetic `{}` both
+  modes always had — its hostname isn't known until cloudflared assigns
+  one. Two consequences a user-facing doc must state plainly: settings in
+  the user's own `config.yml` never apply to a tailport-run tunnel, and a
+  named tunnel's credentials must sit at cloudflared's default location
+  next to `cert.pem` (where `cloudflared tunnel create` writes
+  `<UUID>.json`) or the tunnel fails to start, with cloudflared's own error
+  text surfaced in the toast. **Token- and
   dashboard-managed tunnels are out of scope**: tailport
   never passes `--token`, and the child's environment is scrubbed of EVERY
   `TUNNEL_*` variable EXCEPT a small allowlist of connection/logging-only
