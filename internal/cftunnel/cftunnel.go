@@ -468,8 +468,20 @@ func (c *Client) Stop(pid, port int) error {
 		break
 	}
 	if !found {
-		// Already gone -- the tunnel is down either way.
-		return nil
+		// Discover() didn't map pid to a cloudflared invocation it recognizes.
+		// That's normally because it's genuinely gone -- the tunnel is down
+		// either way, so treat it as success. But pid could instead be alive
+		// and merely UNDISCOVERABLE: a debugger/strace wrapper, a sudo parent,
+		// or a non-exec wrapper script that left a live intermediary between
+		// itself and the real cloudflared (isCloudflaredArgv0 doesn't, and
+		// mustn't, match those [R2] -- see TestStopRefusesUndiscoverableLiveProcess).
+		// Defense in depth: re-check liveness directly before declaring
+		// success, and refuse to signal a pid we can no longer positively
+		// identify as tailport's.
+		if !Alive(pid) {
+			return nil
+		}
+		return fmt.Errorf("cftunnel: pid %d is running but tailport can no longer identify it as its cloudflared for :%d -- refusing to signal it", pid, port)
 	}
 	p, err := os.FindProcess(pid) // always non-nil on unix
 	if err != nil {

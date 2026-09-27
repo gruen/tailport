@@ -25,11 +25,22 @@ type procInfo struct {
 // config-file ingress tunnel) are omitted -- out of scope for the per-port
 // model.
 //
-// Matching argv[0] against c.binary() (not a hardcoded "cloudflared") matters:
-// Start launches whatever binary the config points at (a custom path, or a
-// wrapper script under a different name), so Discover must look for that SAME
-// name -- otherwise a renamed binary/wrapper is undiscoverable and untoggleable
-// even though tailport itself started it (roborev carryover, kata aprt).
+// Matching argv[0] against c.binary() (not JUST a hardcoded "cloudflared")
+// matters: Start launches whatever binary the config points at (a custom
+// path, or a wrapper script under a different name), so Discover must also
+// look for that SAME name -- otherwise a renamed binary/wrapper is
+// undiscoverable and untoggleable even though tailport itself started it
+// (roborev carryover, kata aprt). isCloudflaredArgv0 ALSO always accepts the
+// literal "cloudflared" regardless of c.binary() [R2]: a wrapper script
+// configured as Binary that `exec`s into the real cloudflared REPLACES the
+// process image in place (same pid), so the wrapper's own name never appears
+// in the post-exec argv0 -- only whatever the exec'd process presents itself
+// as, normally "cloudflared". Without that, a wrapper-launched tunnel would
+// vanish from discovery (and become double-startable) the moment the wrapper
+// actually execs (kata nc1j, 2z0v(a)). This alone never grants ownership:
+// parseRunning still requires the --logfile sentinel AND its embedded port to
+// match (see sentinelHost), so widening the argv0 match doesn't let a foreign
+// "cloudflared"-argv0 process masquerade as ours.
 func (c *Client) Discover() ([]Running, error) {
 	procs, err := enumerateCloudflared(c.binary())
 	if err != nil {
@@ -126,20 +137,36 @@ func sentinelHost(path string, wantPort int) (string, bool) {
 	return m[2], true
 }
 
-// isCloudflaredArgv0 reports whether an argv[0] is the configured cloudflared
-// executable wantBin (Client.binary(): "cloudflared" by default, or a config
-// Binary override), comparing basenames so both a bare name and an absolute
-// path to it match on either side (e.g. "cloudflared" and
-// "/usr/bin/cloudflared", or "my-wrapper" and "/opt/bin/my-wrapper"). Shared
-// by the Linux (/proc) and Darwin (ps) enumerators.
+// isCloudflaredArgv0 reports whether an argv[0] is EITHER the configured
+// cloudflared executable wantBin (Client.binary(): "cloudflared" by default,
+// or a config Binary override) OR the literal "cloudflared", comparing
+// basenames so both a bare name and an absolute path to it match on either
+// side (e.g. "cloudflared" and "/usr/bin/cloudflared", or "my-wrapper" and
+// "/opt/bin/my-wrapper"). Shared by the Linux (/proc) and Darwin (ps)
+// enumerators.
+//
+// The "cloudflared" fallback [R2, kata nc1j/2z0v(a)] exists for an
+// exec-wrapper Binary override: a wrapper script that does
+// `exec -a cloudflared /path/to/real/cloudflared "$@"` REPLACES its own
+// process image with the real binary's, in the SAME pid -- so the argv0
+// visible afterward is whatever the wrapper exec'd AS (normally
+// "cloudflared"), never the wrapper's own name. Matching wantBin ALONE would
+// make that process undiscoverable the moment the wrapper actually execs,
+// even though tailport itself started it (TestDiscoverFindsExecWrappedCloudflared
+// pins this). This never grants ownership by itself -- callers still require
+// parseRunning's --logfile sentinel AND matching embedded port (see
+// sentinelHost) -- so accepting the wider literal doesn't let an unrelated
+// "cloudflared"-argv0 process pass as ours; it only widens which processes
+// are even considered.
 func isCloudflaredArgv0(argv0, wantBin string) bool {
-	if i := strings.LastIndexAny(argv0, `/\`); i >= 0 {
-		argv0 = argv0[i+1:]
+	basename := func(s string) string {
+		if i := strings.LastIndexAny(s, `/\`); i >= 0 {
+			return s[i+1:]
+		}
+		return s
 	}
-	if i := strings.LastIndexAny(wantBin, `/\`); i >= 0 {
-		wantBin = wantBin[i+1:]
-	}
-	return argv0 == wantBin
+	argv0 = basename(argv0)
+	return argv0 == basename(wantBin) || argv0 == "cloudflared"
 }
 
 // containsToken reports whether tok appears as a standalone argv element (a

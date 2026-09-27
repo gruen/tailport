@@ -486,7 +486,10 @@ cloudflared:
 
 - **`binary`** (default `""`) — path to the cloudflared executable. Blank means
   tailport looks it up on `$PATH`; the whole `o` feature (key, discovery,
-  polling) stays dormant unless it's found there (or at this path).
+  polling) stays dormant unless it's found there (or at this path). A wrapper
+  script works if it `exec`s cloudflared — discovery recognizes the process
+  either as your configured `binary` or, after the wrapper's `exec` replaces
+  it, as plain `cloudflared`.
 - **`domain`** (default `""`) — a public base domain used only to **prefill**
   the hostname prompt when starting a **named** tunnel. Purely a convenience:
   leaving it blank blocks nothing, and a **quick** tunnel ignores it entirely.

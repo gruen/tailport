@@ -551,6 +551,84 @@ func TestDiscoverHonorsBinaryOverride(t *testing.T) {
 	assertExited(t, fp, 2*time.Second)
 }
 
+// TestDiscoverFindsExecWrappedCloudflared is the regression test for R2 (kata
+// nc1j, 2z0v(a)): a wrapper script configured as Binary that `exec`s into the
+// real cloudflared REPLACES its own process image in place (same pid), so
+// its post-exec argv0 is whatever it exec'd AS -- "cloudflared" here, never
+// the wrapper's own name. Before isCloudflaredArgv0 accepted that literal
+// fallback, this tunnel would vanish from Discover the moment the wrapper
+// actually exec'd, even though tailport itself started it -- and a second
+// `o` would spawn a SECOND cloudflared for the same port. This test fails on
+// pre-nc1j code.
+func TestDiscoverFindsExecWrappedCloudflared(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not on $PATH")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	wrapper := filepath.Join(t.TempDir(), "my-wrapper")
+	script := "#!/bin/bash\nexec -a cloudflared /bin/sh -c 'sleep 30; true' \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: wrapper}
+	r, err := c.Start(Spec{Port: 3020})
+	if err != nil {
+		t.Fatalf("Start via exec-wrapper: %v", err)
+	}
+	t.Cleanup(func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	})
+
+	running, err := c.Discover()
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	var found *Running
+	for i := range running {
+		if running[i].PID == r.PID {
+			found = &running[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("Discover did not find the exec-wrapped cloudflared (pid %d) among %+v", r.PID, running)
+	}
+	if !found.Owned || found.Port != 3020 {
+		t.Errorf("discovered = %+v, want Owned with Port 3020", *found)
+	}
+
+	if err := c.Stop(r.PID, 3020); err != nil {
+		t.Fatalf("Stop on the exec-wrapped tunnel: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for Alive(r.PID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d did not exit within 2s of Stop", r.PID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestStopRefusesUndiscoverableLiveProcess is the defense-in-depth regression
+// test for R2 (kata nc1j): a pid Discover() can't map to a recognized
+// cloudflared invocation (here, argv0 "strace" -- never matched by
+// isCloudflaredArgv0, on purpose: matching the --logfile sentinel ALONE would
+// let a debugger/strace wrapper or sudo parent masquerade as ours) must never
+// be silently treated as "already gone" by Stop while it's still alive.
+func TestStopRefusesUndiscoverableLiveProcess(t *testing.T) {
+	logfile := filepath.Join(t.TempDir(), "cftunnel-3021.log")
+	fp := spawnFakeProcess(t, "strace", "tunnel", "--url", "http://localhost:3021", "--logfile", logfile)
+
+	c := &Client{}
+	if err := c.Stop(fp.pid, 3021); err == nil {
+		t.Fatal("Stop must refuse a live but undiscoverable process, not silently report success")
+	}
+	assertStillRunning(t, fp, 300*time.Millisecond)
+}
+
 // TestStartLivenessCheck is the regression test for the MEDIUM roborev
 // carryover (kata aprt): Start must not report success when cloudflared
 // exits moments after cmd.Start (a bad invocation), and must not add a
