@@ -513,8 +513,13 @@ func TestBarGroupsTunnelGating(t *testing.T) {
 }
 
 // TestValidTunnelHostname also pins the W3a tightening (kata nc1j): the
-// charset is restricted to [A-Za-z0-9.-] and a leading '-' or '.' is refused,
-// not just the space/slash/colon checks the original version had.
+// charset is restricted to [A-Za-z0-9.-] and a leading '-' or '.' is
+// refused, not just the space/slash/colon checks the original version had;
+// and (N5) a trailing '.', an empty label, or a label starting/ending with
+// '-' are refused too, since validTunnelHostname is a thin wrapper around
+// cftunnel.ValidHostname and must reject exactly what that does -- a pinned
+// ingress for e.g. "app.example.com." would silently 404 every request
+// (see cftunnel.ValidHostname's doc comment).
 func TestValidTunnelHostname(t *testing.T) {
 	ok := []string{"app.example.com", "api.corp.internal", "a-b.c-d.com"}
 	for _, s := range ok {
@@ -525,6 +530,10 @@ func TestValidTunnelHostname(t *testing.T) {
 	bad := []string{
 		"", "nodot", "has space.com", "http://app.example.com", "app.example.com:8080", "a/b.com",
 		"-app.example.com", ".app.example.com", "app_example.com", "app.example.com\x00", "café.example.com",
+		"app.example.com.",     // N5: trailing dot
+		"app..example.com",     // N5: empty label
+		"app.-sub.example.com", // N5: non-first label starts with '-'
+		"app.sub-.example.com", // N5: non-first label ends with '-'
 	}
 	for _, s := range bad {
 		if validTunnelHostname(s) {

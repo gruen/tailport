@@ -77,7 +77,8 @@ func splitPSCommand(command string) []string {
 // splitPidUidCommand splits one `ps -axww -o pid=,uid=,command=` line into
 // (pid, uid, command), tolerating ps's whitespace-padded alignment of the two
 // numeric columns (S2(a), audit finding 2: ownership now additionally
-// requires the process's real UID to equal os.Getuid(), so Darwin's
+// requires the process's owner UID (effectively its EFFECTIVE uid, not its
+// real uid) to equal os.Getuid(), so Darwin's
 // enumerator needs a uid column alongside pid and command -- see
 // discover_darwin.go). Kept build-tag-free, like the rest of this file, so
 // this parsing logic is unit-tested on Linux CI too, not only exercised

@@ -28,8 +28,9 @@ import (
 // the configured Client.binary() (roborev carryover, kata aprt).
 //
 // The `uid=` column (S2(a), audit finding 2) is what lets ownership also
-// require the process's real UID to equal os.Getuid() -- macOS's ps has no
-// /proc-style out-of-band UID lookup, so it has to come from ps itself.
+// require the process's owner UID (effectively its EFFECTIVE uid, not its
+// real uid) to equal os.Getuid() -- macOS's ps has no /proc-style
+// out-of-band UID lookup, so it has to come from ps itself.
 // splitPidUidCommand (pscommand.go, build-tag-free so it's unit-tested on
 // Linux CI too) peels the pid and uid columns off before splitPSCommand ever
 // sees the command string.

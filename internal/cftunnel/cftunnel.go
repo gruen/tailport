@@ -49,6 +49,13 @@
 //     otherwise only as good as the operator having routed nothing else to
 //     it. A quick tunnel's hostname isn't known up front, so its config
 //     stays the same hermetic "{}" content this used to be for both modes.
+//     N2: this pin only holds for a LOCALLY-managed tunnel, i.e. one created
+//     with `cloudflared tunnel create` -- the only kind tailport supports.
+//     A dashboard/remotely-managed tunnel has its ingress pushed BY
+//     Cloudflare instead, which overrides this local --config entirely; such
+//     tunnels are out of scope (see the token/dashboard-managed paragraph
+//     below), and this is a documented limitation, not something a test can
+//     pin (there is no local artifact to assert against).
 //
 // Rewritten with O_TRUNC on EVERY Start -- for BOTH quick and named -- so a
 // hand-edit can never take effect, and it can never match sentinelLogRe
@@ -187,8 +194,10 @@ type Running struct {
 	// comes from /quicktunnel instead) and for foreign processes.
 	Hostname string
 	// Owned reports whether tailport started this process, decided from the
-	// --logfile sentinel (see sentinelHost), the process's real UID matching
-	// os.Getuid() (S2(a)), and -- for a named tunnel -- its recovered
+	// --logfile sentinel (see sentinelHost), the process's owner UID matching
+	// os.Getuid() (S2(a); this is the /proc/<pid> directory owner on Linux,
+	// the ps -o uid= column on macOS -- effectively the EFFECTIVE uid, not
+	// the real uid, see discover.go), and -- for a named tunnel -- its recovered
 	// hostname/name both passing ValidHostname/ValidTunnelName (S2(c)). A
 	// false value means a foreign cloudflared covers this port -- surfaced as
 	// drift, never signalled.
@@ -418,7 +427,10 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// State dir hygiene (S3, audit findings 3/7, verified): cloudflared itself
 	// creates a --logfile at 0644 and the dir it lives in was previously
 	// created at 0755 -- both readable by anyone on the box. ensureStateDir
-	// creates it 0700 and tightens an existing, self-owned dir back to 0700.
+	// creates it 0700, tightens an existing, self-owned dir back to 0700, and
+	// (N1) now REFUSES outright -- Start never proceeds -- if the dir is a
+	// symlink, isn't owned by this UID, or is still group/other-writable
+	// after that tightening attempt.
 	if err := ensureStateDir(filepath.Dir(logfile)); err != nil {
 		return nil, fmt.Errorf("cftunnel: preparing state dir: %w", err)
 	}
@@ -771,7 +783,10 @@ func buildArgs(spec Spec, logfile, configPath string) []string {
 // ingress: rules anywhere on cloudflared's own config search path silently
 // overrides tailport's --url, with no error and no warning (live-verified,
 // kata nc1j); for a named tunnel this file ALSO pins its ingress to exactly
-// hostname. See TestNamedTunnelConfigContent/TestQuickTunnelConfigContent.
+// hostname -- but only for a LOCALLY-managed tunnel (N2): a dashboard/
+// remotely-managed tunnel gets its ingress pushed by Cloudflare instead,
+// which overrides this file regardless of what it contains. See
+// TestNamedTunnelConfigContent/TestQuickTunnelConfigContent.
 func tunnelConfigPath(port int, hostname string) (string, error) {
 	dir, err := stateDir()
 	if err != nil {
@@ -788,7 +803,7 @@ func tunnelConfigPath(port int, hostname string) (string, error) {
 // solely so a curious operator who opens it understands why it exists and
 // that hand-editing it is futile -- cloudflared itself ignores a leading
 // "#" line in a YAML file.
-const tunnelConfigComment = "# tailport-managed (kata nc1j): pins this tunnel's ingress to the confirmed hostname and keeps --url authoritative over any config.yml cloudflared would otherwise silently apply instead of it. Rewritten on every tunnel start -- editing this file has no effect.\n"
+const tunnelConfigComment = "# tailport-managed (kata nc1j): pins this LOCALLY-managed tunnel's ingress to the confirmed hostname and keeps --url authoritative over any config.yml cloudflared would otherwise silently apply instead of it. Rewritten on every tunnel start -- editing this file has no effect. (A dashboard/remotely-managed tunnel ignores this file; that's unsupported.)\n"
 
 // tunnelConfigContent builds the per-tunnel --config file's content (S4,
 // audit finding 4, verified viable):
@@ -800,7 +815,11 @@ const tunnelConfigComment = "# tailport-managed (kata nc1j): pins this tunnel's 
 //     this, `--url` alone makes cloudflared serve the local port for EVERY
 //     hostname routed to the tunnel (including a wildcard), so the confirm's
 //     promise was only as good as the operator having routed nothing else to
-//     it. spec.Hostname is expected to have already passed ValidHostname
+//     it. This pin only takes effect for a LOCALLY-managed tunnel (N2): a
+//     dashboard/remotely-managed tunnel's ingress is pushed by Cloudflare
+//     and overrides whatever this file says -- out of scope, documented, not
+//     something a unit test can pin. spec.Hostname is expected to have
+//     already passed ValidHostname
 //     (Start rejects an invalid one before this is ever called), whose
 //     restricted charset makes the interpolation safe on its own -- it's
 //     quoted here anyway, as defense in depth.
@@ -840,18 +859,24 @@ func writeTunnelConfig(path, content string) error {
 }
 
 // ValidTunnelName reports whether s is an acceptable named-tunnel identifier:
-// non-empty, containing no whitespace or control characters (which would
-// either split across argv elements or corrupt the sentinel logfile name),
-// and not starting with '-' (which cloudflared's own flag parser would
-// otherwise try to interpret as another flag rather than the positional
-// tunnel name). Start rejects any spec.TunnelName that fails this before ever
-// shelling out to cloudflared.
+// non-empty, containing no whitespace, control, or Unicode FORMAT (category
+// Cf) characters (which would either split across argv elements, corrupt the
+// sentinel logfile name, or -- Cf specifically, N4 -- visually disguise what
+// is displayed without being a control byte at all: e.g. U+202E RIGHT-TO-LEFT
+// OVERRIDE can make "web<RLO>gpj.exe" render as if it ended ".exe.jpg" or
+// similar, and U+200B ZERO WIDTH SPACE can split a name invisibly), and not
+// starting with '-' (which cloudflared's own flag parser would otherwise try
+// to interpret as another flag rather than the positional tunnel name).
+// Start rejects any spec.TunnelName that fails this before ever shelling out
+// to cloudflared. See TestValidTunnelName and sanitizeDisplay (console.go),
+// which strips the same Cf category from any string tailport did NOT itself
+// validate first (e.g. a name recovered from a foreign sentinel).
 func ValidTunnelName(s string) bool {
 	if s == "" || strings.HasPrefix(s, "-") {
 		return false
 	}
 	for _, r := range s {
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return false
 		}
 	}
@@ -860,7 +885,14 @@ func ValidTunnelName(s string) bool {
 
 // ValidHostname reports whether s is an acceptable named-tunnel public
 // hostname: a dotted DNS name restricted to [A-Za-z0-9.-], containing at
-// least one dot, and not starting with '-' or '.'. This is the single source
+// least one dot, not starting with '-' or '.', not ENDING with '.' either
+// (N5: a trailing dot is syntactically a valid absolute DNS name, but a
+// pinned ingress (tunnelConfigContent) for "app.example.com." would NOT
+// match one confirmed as "app.example.com" -- cloudflared's ingress hostname
+// match is exact, so this would 404 every request), and with no EMPTY label
+// (e.g. "a..b.com") or label starting/ending with '-' (e.g. "a.-b.com",
+// "a.b-.com" -- neither is a valid DNS label, and the same silent-404 risk
+// applies). This is the single source
 // of truth for hostname syntax the UI's own validTunnelHostname used to
 // duplicate (kata nc1j W3a) -- moved/exported here (S2(c), audit finding 2)
 // so parseRunning can also apply it to a hostname RECOVERED from a
@@ -876,7 +908,7 @@ func ValidHostname(s string) bool {
 	if s == "" || !strings.Contains(s, ".") {
 		return false
 	}
-	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") {
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") {
 		return false
 	}
 	for _, r := range s {
@@ -886,6 +918,11 @@ func ValidHostname(s string) bool {
 		case r >= '0' && r <= '9':
 		case r == '.' || r == '-':
 		default:
+			return false
+		}
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
 			return false
 		}
 	}
@@ -925,12 +962,30 @@ func stateDir() (string, error) {
 }
 
 // ensureStateDir creates dir (tailport's state dir) at mode 0700 if it
-// doesn't exist yet, and tightens it back to 0700 if it already exists and
-// this UID owns it (S3, audit findings 3/7, verified: a previous version of
-// Start created it at 0755, world-readable). A directory owned by a
-// DIFFERENT uid is left untouched -- chmod would fail anyway, and the
-// per-file O_NOFOLLOW opens in Start are the actual defense against another
-// user planting a symlink inside it.
+// doesn't exist yet, and otherwise makes a best-effort attempt to TIGHTEN it
+// back to 0700 (S3, audit findings 3/7, verified: a previous version of
+// Start created it at 0755, world-readable). That chmod only succeeds when
+// this UID already owns dir -- it always fails for anyone else's directory
+// -- so this now REFUSES to proceed, with a clear error, unless dir, AFTER
+// that attempt, is BOTH owned by os.Getuid() AND carries no group/other
+// write bit (mode&0o022==0) (N1, a pre-release security-review follow-up: a
+// previous version silently proceeded regardless -- verified,
+// ensureStateDir("/tmp") used to return nil even though /tmp is neither
+// owned by the caller in general nor even close to private). The mode check
+// is independent of the ownership one, not merely implied by it: a dir we DO
+// own can still end up refused if the chmod attempt itself failed despite
+// that ownership (a read-only filesystem, an immutable attribute) and its
+// PRE-existing mode was already group/other-writable.
+//
+// A dir that is itself a SYMLINK is refused too, via the os.Lstat/IsDir
+// check below: os.MkdirAll follows a symlink (so an existing target
+// directory makes MkdirAll's own Stat call a silent no-op), but os.Lstat
+// does not, so a symlink's IsDir() is false and this returns an error before
+// ever reaching the ownership/mode checks.
+//
+// This is deliberately not the only defense: the per-file O_NOFOLLOW opens
+// in Start remain the guard against a SAME-uid, otherwise-legitimate dir
+// having a symlink planted inside it later.
 func ensureStateDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -940,13 +995,27 @@ func ensureStateDir(dir string) error {
 		return err
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("cftunnel: state dir %s is not a directory", dir)
+		return fmt.Errorf("cftunnel: state dir %s is not a directory (is it a symlink?)", dir)
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if ok && st.Uid == uint32(os.Getuid()) && info.Mode().Perm() != 0o700 {
-		if err := os.Chmod(dir, 0o700); err != nil {
+	if info.Mode().Perm() != 0o700 {
+		// Best-effort: this only succeeds if we already own dir. Its error
+		// is deliberately ignored here -- the ownership/mode re-check below,
+		// on dir's ACTUAL resulting state, is what decides whether to refuse,
+		// and reports a clear reason either way.
+		_ = os.Chmod(dir, 0o700)
+		if info, err = os.Lstat(dir); err != nil {
 			return err
 		}
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cftunnel: cannot determine the owner of state dir %s on this platform", dir)
+	}
+	if st.Uid != uint32(os.Getuid()) {
+		return fmt.Errorf("cftunnel: refusing state dir %s: owned by uid %d, not this process's uid %d -- remove it or fix its ownership", dir, st.Uid, os.Getuid())
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("cftunnel: refusing state dir %s: group/other-writable (mode %04o) -- chmod it to 0700", dir, perm)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // ConsolePath returns the console-capture file for a tunnel whose ownership
@@ -49,22 +50,31 @@ func ConsolePath(logfile string) string {
 // this misses, e.g. an OSC sequence (ESC ']' ... BEL).
 var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
-// sanitizeDisplay strips every C0 control byte (0x00-0x1F), DEL (0x7F), and
-// C1 control byte (U+0080-U+009F) from s (S2(b), audit finding 2). It is the
-// backstop for any string tailport did not itself construct -- cloudflared's
-// own console output, or a tunnel name/hostname recovered from a foreign or
-// hostile process's argv -- before it ever reaches a toast or route row
-// rendered directly to the terminal: without it, an embedded OSC 52
-// (clipboard-write) or bare CSI sequence ansiEscapeRe doesn't happen to
-// catch could be smuggled straight into the terminal. It is content-blind
-// otherwise -- printable non-ASCII text (e.g. an IDN hostname) passes
-// through untouched.
+// sanitizeDisplay strips every C0 control byte (0x00-0x1F), DEL (0x7F), C1
+// control byte (U+0080-U+009F) (S2(b), audit finding 2), and every Unicode
+// FORMAT character, category Cf (N4), from s. It is the backstop for any
+// string tailport did not itself construct -- cloudflared's own console
+// output, or a tunnel name/hostname recovered from a foreign or hostile
+// process's argv -- before it ever reaches a toast or route row rendered
+// directly to the terminal: without the control-byte stripping, an embedded
+// OSC 52 (clipboard-write) or bare CSI sequence ansiEscapeRe doesn't happen
+// to catch could be smuggled straight into the terminal; without the Cf
+// stripping, a character like U+202E RIGHT-TO-LEFT OVERRIDE or U+200B ZERO
+// WIDTH SPACE -- neither a control byte, so untouched by the check above --
+// could still make displayed text render as something other than what it
+// literally is (the classic RLO trick used to disguise a filename's real
+// extension). It is otherwise content-blind -- printable non-Cf non-ASCII
+// text (e.g. an IDN hostname) passes through untouched. ValidTunnelName
+// rejects Cf outright at input time, so this is defense in depth for a
+// string tailport did NOT validate itself.
 func sanitizeDisplay(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
 		switch {
 		case r <= 0x1F, r == 0x7F, r >= 0x80 && r <= 0x9F:
+			continue
+		case unicode.Is(unicode.Cf, r):
 			continue
 		default:
 			b.WriteRune(r)

@@ -7813,8 +7813,12 @@ func (m model) renderBottom() string {
 			// still true even though S4 now pins the tunnel's ingress to this
 			// exact hostname (internal/cftunnel's per-tunnel --config), which
 			// only means a WRONG/unrouted hostname is simply unreachable, not
-			// that some OTHER hostname gets served instead. See the README's
-			// "Tunnelling to the public internet" section (kata nc1j).
+			// that some OTHER hostname gets served instead. That pin only
+			// holds for a LOCALLY-managed tunnel (N2) -- a tunnel switched to
+			// remotely-managed in the Cloudflare dashboard has its ingress
+			// pushed by Cloudflare instead, overriding it; out of scope, see
+			// below. See the README's "Tunnelling to the public internet"
+			// section (kata nc1j).
 			helpStyle.Render(fmt.Sprintf("   via tunnel %q — tailport can't verify the hostname routes to it", m.tunnelName)),
 			helpStyle.Render("   (y: confirm, any other key: cancel)"),
 		}

@@ -596,7 +596,8 @@ service install` writes to `/etc/cloudflared/config.yml`), cloudflared
 origin instead — no error, no warning, nothing in the log (live-verified
 against cloudflared 2026.9.1). Passing tailport's own `--config` makes it
 authoritative regardless of what's on that search path — and, for a
-**named** tunnel, it also **pins that tunnel's ingress to exactly the
+**named, LOCALLY-managed tunnel** (one created with `cloudflared tunnel
+create`, as above), it also **pins that tunnel's ingress to exactly the
 hostname you confirmed**:
 ```
 ingress:
@@ -609,7 +610,12 @@ so any *other* hostname already routed to that same tunnel gets a plain
 cloudflared serve the local port for **every** hostname routed to the
 tunnel, wildcards included. (A **quick** tunnel's config still has nothing
 to pin — its hostname isn't known until cloudflared assigns one — so it
-stays the same hermetic `{}` it always was.) Two consequences either way:
+stays the same hermetic `{}` it always was.) This pin only takes effect for
+a **locally-managed** tunnel: if a tunnel's configuration is switched to
+remotely-managed in the Cloudflare dashboard, Cloudflare pushes its own
+ingress config to it, which overrides this local `--config` file entirely
+(dashboard/token-managed tunnels are already out of scope — see above). Two
+consequences either way:
 - any settings in your own `config.yml` never apply to a tailport-run
   tunnel — tailport's tunnels are hermetic by design;
 - a named tunnel's credentials must sit at cloudflared's default location,
@@ -622,6 +628,10 @@ stays the same hermetic `{}` it always was.) Two consequences either way:
 tunnels and DNS records in that account, so treat it like a secret.
 tailport only ever checks that it *exists* — it never opens or reads its
 contents.
+
+tailport refuses to start a tunnel outright if its state dir
+(`$XDG_STATE_HOME/tailport`, default `~/.local/state/tailport`) is a
+symlink, isn't owned by you, or is group- or world-writable.
 
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running
@@ -681,11 +691,13 @@ address appears in the row a few seconds later, once the next poll picks it up.
 A **named** tunnel's confirm has no such gap — it names the exact
 `https://<hostname>` up front (the same as Publish) plus the tunnel it will
 run, e.g. `via tunnel "web"` — but that hostname is simply the one *you*
-typed: tailport has no way to check it's actually routed to that tunnel. It
-**does** now pin the tunnel's ingress to exactly that hostname (see the
-per-tunnel `--config` above), so if it's wrong or unrouted your service is
-simply unreachable at it — the tunnel no longer falls back to serving
-whatever *other* hostname happens to already be routed to it.
+typed: tailport has no way to check it's actually routed to that tunnel. For
+a **locally-managed** tunnel it **does** now pin the tunnel's ingress to
+exactly that hostname (see the per-tunnel `--config` above), so if it's
+wrong or unrouted your service is simply unreachable at it — the tunnel no
+longer falls back to serving whatever *other* hostname happens to already
+be routed to it. (A tunnel switched to remotely-managed in the Cloudflare
+dashboard ignores this local pin — see above; that's out of scope.)
 
 ## How it works
 

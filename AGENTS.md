@@ -125,7 +125,15 @@ contract. The short version:
   on `--url` alone, which makes cloudflared serve the local port for
   **every** hostname routed to the tunnel, wildcards included — so the
   confirm's promise ("this hostname reaches this port") used to be only as
-  good as the operator having routed nothing else to it. `Start` rejects a
+  good as the operator having routed nothing else to it. **This pin only
+  holds for a LOCALLY-managed tunnel** (N2, doc-accuracy follow-up) — one
+  created with `cloudflared tunnel create`, the only kind tailport supports;
+  a tunnel switched to remotely-managed in the Cloudflare dashboard has its
+  ingress pushed BY Cloudflare instead, which overrides this local
+  `--config` regardless of its content. That is a documented limitation, not
+  something a unit test can pin (there is no local artifact to assert
+  against a dashboard's remote push), so it deliberately carries no pinning
+  test. `Start` rejects a
   named `Spec` whose `Hostname` fails `ValidHostname` before ever writing
   this file. A QUICK tunnel's config stays the same hermetic `{}` both
   modes always had — its hostname isn't known until cloudflared assigns
@@ -185,23 +193,39 @@ contract. The short version:
   cycle and NEVER persisted, so a tunnel from a prior session is
   re-discovered and re-toggleable on the next launch. Only tailport-OWNED
   tunnels (carrying a sentinel `--logfile` flag tailport always passes, AND
-  whose real UID equals `os.Getuid()`, AND — for a named tunnel — whose
+  whose OWNER UID equals `os.Getuid()`, AND — for a named tunnel — whose
   hostname/name recovered from that sentinel both pass `ValidHostname`/
   `ValidTunnelName` — a pre-release security audit's finding 2 confirmed the
   UID check was missing, so a same-named sentinel started by a different
   user was previously trusted as owned) are tracked this way; a foreign
   `cloudflared` process is surfaced as drift, never signalled or touched.
-  Every string tailport did not itself construct and might display —
-  `internal/cftunnel.ConsoleTail`'s output and a recovered tunnel name — is
-  passed through `sanitizeDisplay`, which strips C0/C1 control bytes and DEL
-  so a hostile console line or sentinel can never smuggle a raw
-  ESC/OSC escape sequence into a toast. `ConsolePath` also always resolves
+  ("Owner UID" — the `/proc/<pid>` directory owner on Linux, the `ps -o
+  uid=` column on macOS, per `procInfo` in `internal/cftunnel/discover.go` —
+  is effectively the process's EFFECTIVE uid, not its real uid; a previous
+  version of this bullet said "real UID", which was corrected as a doc-
+  accuracy follow-up.) Every string tailport did not itself construct and
+  might display — `internal/cftunnel.ConsoleTail`'s output and a recovered
+  tunnel name — is passed through `sanitizeDisplay`, which strips C0/C1
+  control bytes, DEL, and every Unicode FORMAT character (category Cf, e.g.
+  U+202E RIGHT-TO-LEFT OVERRIDE, U+200B ZERO WIDTH SPACE — N4) so a hostile
+  console line or sentinel can never smuggle a raw ESC/OSC escape sequence
+  or a bidi/zero-width spoof into a toast; `ValidTunnelName` rejects Cf
+  outright at input time too, so a user-typed name can't carry one either.
+  `ConsolePath` also always resolves
   under tailport's OWN state dir, never whatever directory a recovered
   `--logfile` value happens to carry. **File hygiene in the state dir** (S3,
   audit findings 3/7, verified): the dir itself is created — and an
   existing, self-owned one tightened — to `0700` (cloudflared's own
   `--logfile` create call, and an old tailport version's dir create call,
-  were both world-readable); the `.log` file is pre-created by tailport at
+  were both world-readable). **`ensureStateDir` now REFUSES outright — Start
+  never proceeds — unless, after that tightening attempt, the dir is both
+  owned by `os.Getuid()` and carries no group/other write bit** (N1,
+  pre-release security-review follow-up: a previous version silently
+  proceeded regardless of ownership or mode, verified —
+  `ensureStateDir("/tmp")` used to return `nil`); a state dir that is itself
+  a SYMLINK is refused the same way (`os.Lstat`'s `IsDir()` is false for a
+  symlink, even though `os.MkdirAll` would otherwise follow it as a no-op).
+  The `.log` file is pre-created by tailport at
   `0600` before cloudflared ever touches it (which cloudflared then KEEPS
   when it opens the existing file to append); and the `.log`/`.console`/
   `--config` files are all opened with `O_NOFOLLOW`, so a symlink planted at

@@ -229,7 +229,7 @@ func TestParseRunning(t *testing.T) {
 }
 
 // TestParseRunningRequiresMatchingUID is the regression test for S2(a)
-// (audit finding 2): a process whose real UID differs from os.Getuid() must
+// (audit finding 2): a process whose owner UID differs from os.Getuid() must
 // never be classified Owned, no matter how well its --logfile sentinel and
 // port otherwise match. This needs no privilege to test -- parseRunning
 // takes the candidate's uid as a plain argument, so a fixture just supplies
@@ -846,9 +846,9 @@ func TestStartRefusesSecondOwnedTunnelOnSamePort(t *testing.T) {
 }
 
 // TestValidTunnelName pins ValidTunnelName's acceptance rules (kata nc1j):
-// non-empty, no whitespace or control characters, and no leading '-' (which
-// cloudflared's own flag parser would otherwise try to consume as a flag
-// rather than the positional tunnel name).
+// non-empty, no whitespace, control, or Unicode format (Cf, N4) characters,
+// and no leading '-' (which cloudflared's own flag parser would otherwise
+// try to consume as a flag rather than the positional tunnel name).
 func TestValidTunnelName(t *testing.T) {
 	yes := []string{"web", "prod-api", "a", "tunnel_1", "app.example.com", "192-168"}
 	for _, s := range yes {
@@ -864,6 +864,10 @@ func TestValidTunnelName(t *testing.T) {
 		"\tweb",         // leading control/whitespace
 		"web\n",         // trailing control
 		"web\x00tunnel", // embedded NUL (control)
+		"web‮gpj.exe",   // N4: embedded U+202E RIGHT-TO-LEFT OVERRIDE (Cf) --
+		// classic bidi spoof (renders as if it ended something other than
+		// ".exe"), not a whitespace/control byte, so this needs its own check.
+		"web​tunnel", // N4: embedded U+200B ZERO WIDTH SPACE (Cf)
 	}
 	for _, s := range no {
 		if ValidTunnelName(s) {
@@ -1196,6 +1200,59 @@ func TestStartStateDirMode0700(t *testing.T) {
 	})
 }
 
+// TestEnsureStateDir is the regression test for N1 (pre-release
+// security-review follow-up): a previous version silently PROCEEDED with a
+// state dir it neither owned nor could tighten -- verified,
+// ensureStateDir("/tmp") used to return nil. It must now REFUSE, with a
+// clear error, unless the dir, after the chmod attempt, is both owned by
+// os.Getuid() and carries no group/other write bit.
+func TestEnsureStateDir(t *testing.T) {
+	t.Run("a dir we own at 0777 is tightened and accepted", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "state")
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		// MkdirAll applies umask, so force the loose mode explicitly.
+		if err := os.Chmod(dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureStateDir(dir); err != nil {
+			t.Fatalf("ensureStateDir on our own dir should succeed after tightening, got: %v", err)
+		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("mode = %o, want 0700 after ensureStateDir tightened it", perm)
+		}
+	})
+
+	t.Run("/tmp (or any dir not owned by us) is refused", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("running as root: /tmp is root-owned, so this can't exercise a foreign-owned dir")
+		}
+		if err := ensureStateDir("/tmp"); err == nil {
+			t.Error("ensureStateDir(\"/tmp\") should refuse a dir this process does not own, got nil")
+		}
+	})
+
+	t.Run("a symlinked dir is refused", func(t *testing.T) {
+		parent := t.TempDir()
+		target := filepath.Join(parent, "real")
+		if err := os.MkdirAll(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(parent, "state")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureStateDir(link); err == nil {
+			t.Error("ensureStateDir on a symlinked state dir should refuse, got nil")
+		}
+	})
+}
+
 // TestStartLogFileMode0600Truncated is the regression test for S3 (audit
 // findings 3/7, verified): cloudflared itself creates --logfile at 0644 and
 // appends forever, so tailport must PRE-CREATE it at 0600 (which cloudflared
@@ -1439,7 +1496,17 @@ func TestStartRejectsInvalidNamedHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tests := []string{"", "-leading-hyphen.example.com", ".leading-dot.example.com", "no-dot-at-all", "has a space.example.com", "esc\x1b[31m.example.com"}
+	tests := []string{
+		"", "-leading-hyphen.example.com", ".leading-dot.example.com", "no-dot-at-all", "has a space.example.com", "esc\x1b[31m.example.com",
+		// N5: a trailing dot, an empty label, and a label starting/ending
+		// with '-' each risk a pinned ingress (tunnelConfigContent) that
+		// silently 404s every request, because it would never exactly match
+		// what the operator actually routed dns for.
+		"trailing-dot.example.com.", // trailing '.'
+		"empty..label.example.com",  // empty label between two dots
+		"mid.-label.example.com",    // non-first label starts with '-'
+		"mid.label-.example.com",    // non-first label ends with '-'
+	}
 	for _, host := range tests {
 		t.Run(host, func(t *testing.T) {
 			c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
@@ -1527,6 +1594,22 @@ func TestConsoleTail(t *testing.T) {
 		}
 		if !strings.Contains(got, "evil message") {
 			t.Errorf("the rest of the message should survive, got %q", got)
+		}
+	})
+
+	// N4: sanitizeDisplay must also strip Unicode FORMAT (Cf) characters --
+	// neither a control byte nor an ANSI escape, so neither ansiEscapeRe nor
+	// the C0/C1 stripping above would catch them -- since cloudflared's
+	// console output is not tailport's own text and a hostile process could
+	// plant a bidi-override or zero-width-space trick in it.
+	t.Run("Cf format characters (RLO, ZWSP) are stripped", func(t *testing.T) {
+		content := "2026-09-27T01:00:00Z ERR before‮middle​after\n"
+		got := ConsoleTail(write(t, content))
+		if strings.ContainsRune(got, '‮') || strings.ContainsRune(got, '​') {
+			t.Errorf("result must contain no Cf character, got %q", got)
+		}
+		if !strings.Contains(got, "before") || !strings.Contains(got, "middle") || !strings.Contains(got, "after") {
+			t.Errorf("the surrounding text should survive, got %q", got)
 		}
 	})
 

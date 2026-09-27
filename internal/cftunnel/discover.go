@@ -7,16 +7,20 @@ import (
 	"strings"
 )
 
-// procInfo is one enumerated cloudflared process: its pid, its real UID, and
+// procInfo is one enumerated cloudflared process: its pid, its owner UID, and
 // full argument vector (argv, including argv[0]). The per-platform
 // enumerateCloudflared (discover_linux.go / discover_darwin.go) produces
 // these; parseRunning interprets them. Keeping the interpretation in this
 // shared, pure file is what lets it be unit-tested on any platform.
 //
-// uid is the process's real UID (S2(a), audit finding 2): ownership now
-// requires it to equal os.Getuid(), in addition to the sentinel+port match
-// below -- a same-named sentinel started by a DIFFERENT user is never ours,
-// no matter how well it matches otherwise.
+// uid is the process's OWNER uid (S2(a), audit finding 2): the /proc/<pid>
+// directory owner on Linux (procUID, discover_linux.go), the `ps -o uid=`
+// column on macOS (discover_darwin.go) -- in practice this is the process's
+// EFFECTIVE uid, not its real uid, though the two only ever differ for a
+// setuid binary, which cloudflared isn't. Ownership requires it to equal
+// os.Getuid(), in addition to the sentinel+port match below -- a same-named
+// sentinel started by a DIFFERENT user is never ours, no matter how well it
+// matches otherwise.
 type procInfo struct {
 	pid  int
 	uid  int

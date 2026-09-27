@@ -18,12 +18,13 @@ import (
 // Unreadable entries -- permission denied for another user's process, or a PID
 // that exits mid-scan -- are silently skipped.
 //
-// Each entry also carries the process's real UID (S2(a), audit finding 2),
-// read via os.Stat on the /proc/<pid> directory itself (owned by the
-// process's real UID) rather than any file inside it -- so it works
-// regardless of what the process's cmdline permissions happen to be. A PID
-// whose UID can't be read (raced past exit) is skipped, same as an unreadable
-// cmdline.
+// Each entry also carries the process's owner UID (S2(a), audit finding 2),
+// read via os.Stat on the /proc/<pid> directory itself (its owner is set by
+// the kernel to the process's EFFECTIVE uid, not its real uid, though the two
+// only ever differ for a setuid binary) rather than any file inside it -- so
+// it works regardless of what the process's cmdline permissions happen to
+// be. A PID whose UID can't be read (raced past exit) is skipped, same as an
+// unreadable cmdline.
 func enumerateCloudflared(binName string) ([]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -52,8 +53,9 @@ func enumerateCloudflared(binName string) ([]procInfo, error) {
 	return out, nil
 }
 
-// procUID reads pid's real UID via os.Stat on its /proc/<pid> directory,
-// which the kernel always sets to the process's own real UID.
+// procUID reads pid's owner UID via os.Stat on its /proc/<pid> directory,
+// which the kernel always sets to the process's own EFFECTIVE UID (not its
+// real UID, though the two coincide except for a setuid binary).
 func procUID(pid int) (int, error) {
 	info, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
 	if err != nil {
