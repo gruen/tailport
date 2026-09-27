@@ -139,7 +139,15 @@ contract. The short version:
   truncated-on-every-start `.console` file
   (`$XDG_STATE_HOME/tailport/cftunnel-<port>[-<host>].console`), which is
   where a toast's error text and `internal/cftunnel.ConsoleTail` actually read
-  from. Unlike
+  from -- `ConsoleTail`'s last-resort fallback deliberately SKIPS a leveled
+  `<timestamp> DBG|INF|WRN ...` console line (a live SIGKILL test showed a
+  routine "INF Registered tunnel connection" line being presented as if it
+  were the reason a tunnel exited; see `TestConsoleTail`'s INF/WRN-only
+  cases, kata nc1j) — it still returns a BARE, unleveled line, since
+  cloudflared's real fatal errors (e.g. an empty origin cert) have no
+  timestamp or level at all, and returns `""` if nothing qualifies, in which
+  case the toast shows just the bare exit fact with no fabricated cause.
+  Unlike
   Publish (a stateless client of a remote edge) or Funnel (a
   Tailscale-managed ingress slot), cloudflared is a LONG-RUNNING LOCAL
   PROCESS tailport supervises directly — and by design TUNNELS SURVIVE
@@ -168,9 +176,11 @@ contract. The short version:
   (never `Update`, matching the process-supervision model above) snapshots
   which owned ports were running immediately before it runs, and diffs that
   against the fresh `Discover()` result. A port that disappears this way
-  raises a toast naming the tail of its `.console` output, e.g.
-  "Cloudflare tunnel on :PORT exited — <last error line>", UNLESS the user
-  tore it down themselves with `o` (tracked
+  raises a toast naming `ConsoleTail`'s tail of its `.console` output, when
+  it found something worth showing, e.g. "Cloudflare tunnel on :PORT exited
+  — <last error line>" (or just "Cloudflare tunnel on :PORT exited", with no
+  fabricated cause, if the tail held nothing but routine leveled console
+  noise), UNLESS the user tore it down themselves with `o` (tracked
   session-only while the teardown is settling, so a draining process a poll
   transiently re-adds can't produce a false "exited" toast for an
   intentional stop). A pid that's still alive but no longer recognizable as

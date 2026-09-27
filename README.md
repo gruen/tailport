@@ -614,9 +614,12 @@ sentinel `--logfile` flag tailport always passes — are tracked this way; a
 
 **If a tunnel stops on its own** — a named tunnel that can't authenticate,
 retries running out, a crash — tailport never lets it just vanish. The next
-poll (every few seconds) notices the port is gone and shows a toast with
-cloudflared's last error, e.g. `Cloudflare tunnel on :3000 exited — <error>`.
-Full console output (not just that one line) is always in
+poll (every few seconds) notices the port is gone and shows a toast naming
+cloudflared's last error, when it logged one, e.g.
+`Cloudflare tunnel on :3000 exited — <error>`. A routine info/debug/warning
+line is never presented as if it were the reason — if nothing more useful
+was logged, the toast just reads `Cloudflare tunnel on :3000 exited` with no
+fabricated cause. Full console output (not just that one line) is always in
 `~/.local/state/tailport/cftunnel-<port>[-<host>].console`. Tearing a tunnel
 down yourself with `o` never triggers this toast.
 

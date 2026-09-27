@@ -35,6 +35,23 @@ var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 // toast has no use for it.
 var consoleLevelLineRe = regexp.MustCompile(`^\S+\s+(ERR|FTL)\s+(.*)$`)
 
+// consoleLeveledLineRe matches ANY leveled cloudflared console line --
+// "<timestamp> DBG|INF|WRN|ERR|FTL <msg>" -- regardless of which level. The
+// priority-3 fallback below uses this to SKIP a leveled line: an ERR/FTL
+// line is already handled by priority 2 (so if one exists anywhere in the
+// tail, priority 3 never even runs), which leaves only routine DBG/INF/WRN
+// noise for this to filter out. That matters: a real named tunnel SIGKILLed
+// live (kata nc1j) left a console tail of nothing but
+// "... INF Registered tunnel connection connIndex=3 connection=...", and the
+// old fallback (last non-empty line, unconditionally) surfaced that as if it
+// were the reason the tunnel exited -- a routine connection-registration
+// line, not an error. Skipping it is safe specifically because cloudflared's
+// actual fatal lines are either caught by priority 2 (ERR/FTL) or have NO
+// timestamp/level at all (e.g. the real
+// "error parsing tunnel ID: Error decoding origin cert: cannot decode empty
+// certificate" line) and so still fall through and match here as bare.
+var consoleLeveledLineRe = regexp.MustCompile(`^\S+\s+(DBG|INF|WRN|ERR|FTL)\s+.*$`)
+
 // consoleTailMaxRunes bounds ConsoleTail's result so a toast never has to
 // truncate cloudflared's raw text itself.
 const consoleTailMaxRunes = 160
@@ -52,7 +69,17 @@ const consoleTailMaxRunes = 160
 //  2. the LAST "<ts> ERR|FTL <msg>" console line, with the timestamp and
 //     level stripped, leaving just <msg> (R1: cloudflared's fatal startup
 //     errors land on stderr, sometimes as the ONLY output there is);
-//  3. otherwise, the last non-empty line, whatever it is.
+//  3. otherwise, the last non-empty line that is NOT a leveled console line
+//     (a "<ts> DBG|INF|WRN ..." line is routine noise, never presented as
+//     if it were the reason a tunnel exited -- see consoleLeveledLineRe and
+//     TestConsoleTail's INF/WRN-only cases, kata nc1j). This still returns a
+//     BARE, unleveled line: that's essential, since cloudflared's real fatal
+//     errors -- e.g. "error parsing tunnel ID: Error decoding origin cert:
+//     cannot decode empty certificate" -- have no timestamp or level at all.
+//
+// If nothing qualifies, ConsoleTail returns "" -- callers show just the bare
+// "exited" fact with no fabricated reason, never a misleading INF/WRN line
+// dressed up as an explanation.
 //
 // The result is truncated to 160 runes with a trailing "…". It returns "" if
 // the file doesn't exist (a foreign, non-tailport-owned tunnel never had one)
@@ -78,9 +105,11 @@ func ConsoleTail(path string) string {
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
-		if line := strings.TrimSpace(lines[i]); line != "" {
-			return truncateRunes(line, consoleTailMaxRunes)
+		line := strings.TrimSpace(lines[i])
+		if line == "" || consoleLeveledLineRe.MatchString(line) {
+			continue
 		}
+		return truncateRunes(line, consoleTailMaxRunes)
 	}
 	return ""
 }

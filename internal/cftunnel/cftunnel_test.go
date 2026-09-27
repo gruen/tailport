@@ -1061,6 +1061,56 @@ func TestConsoleTail(t *testing.T) {
 		}
 	})
 
+	// The following cases pin the fix for the false-positive vanish toast
+	// seen live against a real named tunnel SIGKILLed (kata nc1j): the
+	// fallback (priority 3) must SKIP leveled console lines
+	// ("<ts> DBG|INF|WRN ..."), never present one as if it explained an exit.
+
+	t.Run("INF-only tail returns empty, not a routine connection line", func(t *testing.T) {
+		// This is the EXACT content observed live: a real named tunnel exited
+		// with nothing in its console but routine connection-registration
+		// INF lines. The old fallback ("last non-empty line", unconditional)
+		// surfaced this AS the reason; it must now return "".
+		content := "2026-09-27T18:57:13Z INF Registered tunnel connection connIndex=3 connection=8f6c1e2a-...\n"
+		if got := ConsoleTail(write(t, content)); got != "" {
+			t.Errorf("got %q, want \"\" (an INF line must never be presented as the exit reason)", got)
+		}
+	})
+
+	t.Run("WRN-only tail returns empty", func(t *testing.T) {
+		content := "2026-09-27T18:57:00Z WRN Retrying connection in 1s\n"
+		if got := ConsoleTail(write(t, content)); got != "" {
+			t.Errorf("got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("INF lines followed by a bare error line -> the bare line", func(t *testing.T) {
+		// The bare line has no timestamp or level at all -- exactly the shape
+		// of cloudflared's real fatal errors (R1). It must win over the
+		// leveled INF noise above it, not get skipped along with them.
+		content := "2026-09-27T18:57:10Z INF Starting tunnel\n" +
+			"2026-09-27T18:57:11Z INF Registered tunnel connection connIndex=0\n" +
+			"error parsing tunnel ID: Error decoding origin cert: cannot decode empty certificate\n"
+		want := "error parsing tunnel ID: Error decoding origin cert: cannot decode empty certificate"
+		if got := ConsoleTail(write(t, content)); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("the real R1 case-2 content -> the bare line", func(t *testing.T) {
+		// Tier 3's documented case-2 (an empty ~/.cloudflared/cert.pem):
+		// cloudflared logs its normal INF startup lines, then a completely
+		// bare, unleveled fatal line with no timestamp -- what
+		// TestStartSurfacesConsoleError's sibling case exercises via Start.
+		content := "2026-09-27T18:56:59Z INF Version 2026.9.1\n" +
+			"2026-09-27T18:56:59Z INF GOOS: linux, GOVersion: go1.24.0, GoArch: amd64\n" +
+			"error parsing tunnel ID: Error decoding origin cert: cannot decode empty certificate\n"
+		want := "error parsing tunnel ID: Error decoding origin cert: cannot decode empty certificate"
+		if got := ConsoleTail(write(t, content)); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
 	t.Run("truncated to 160 runes with an ellipsis", func(t *testing.T) {
 		long := strings.Repeat("x", 200)
 		content := "2026-09-27T01:00:00Z ERR " + long + "\n"
