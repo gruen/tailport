@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -701,6 +703,188 @@ func TestTunnelStartMovesSelectionToNewRoute(t *testing.T) {
 	routes := pi.routes()
 	if m.routeIdx < 0 || m.routeIdx >= len(routes) || routes[m.routeIdx].kind != routeTunnel {
 		t.Fatalf("routeIdx = %d should select the routeTunnel sub-row; routes=%+v", m.routeIdx, routes)
+	}
+}
+
+// nonexistentCFClient returns a client whose Binary matches no real process
+// on the test box, so Discover() finds nothing owned -- used by the W3b
+// vanish tests below to get a deterministic "the tunnel is gone" poll
+// without a fake binary (isCloudflaredArgv0 also always accepts the literal
+// "cloudflared", but no test box runs one of those under this name either).
+func nonexistentCFClient() *cftunnel.Client {
+	return &cftunnel.Client{Binary: "tailport-test-nonexistent-cloudflared"}
+}
+
+// reapedChildPid runs a trivial child to completion and returns its pid --
+// by the time Run() returns, Wait() has already reaped it, so Alive(pid)
+// reads false immediately (no zombie window to wait out). Mirrors
+// internal/cftunnel's TestAlive.
+func reapedChildPid(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("running a trivial child: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// TestTunnelPollReportsExitedTunnel is the regression test for audit item 4
+// (kata nc1j W3b): a tunnel that exits on its own (a late auth failure, a
+// crash) used to just disappear from m.tunnels with no explanation on the
+// next poll. The vanish detection lives INSIDE pollTunnelsCmd's tea.Cmd (per
+// AGENTS.md's process-supervision model, never in Update), so this drives it
+// end to end: a reaped pid (genuinely gone, no zombie ambiguity) plus a
+// console file holding the R1 case-1 text must surface as an "exited" toast
+// naming that text.
+func TestTunnelPollReportsExitedTunnel(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.cfClientOverride = nonexistentCFClient()
+
+	pid := reapedChildPid(t)
+	consolePath := filepath.Join(t.TempDir(), "cftunnel-3000.console")
+	if err := os.WriteFile(consolePath, []byte("2026-09-27T01:00:00Z ERR Cannot determine default origin certificate path\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: pid, consolePath: consolePath}}
+
+	cmd := m.pollTunnelsCmd()
+	if cmd == nil {
+		t.Fatal("pollTunnelsCmd should be non-nil when cfAvailable")
+	}
+	msg, ok := cmd().(tunnelPollMsg)
+	if !ok {
+		t.Fatalf("cmd() = %#v, want tunnelPollMsg", msg)
+	}
+	if len(msg.vanished) != 1 || msg.vanished[0].port != 3000 {
+		t.Fatalf("vanished = %#v, want exactly port 3000", msg.vanished)
+	}
+	if msg.vanished[0].alive {
+		t.Error("a fully-reaped pid should not read as alive")
+	}
+
+	m = mustUpdate(t, m, msg)
+	want := "Cloudflare tunnel on :3000 exited — Cannot determine default origin certificate path"
+	if m.flash != want {
+		t.Errorf("flash = %q, want %q", m.flash, want)
+	}
+}
+
+// TestTunnelPollExitSuppressedAfterUserStop is the regression test for the
+// tunnelStopping race documented on the tunnelDoneMsg torndown branch: a
+// port the user just tore down with `o` must never raise a false "exited"
+// toast once a later poll confirms it's actually gone, and the suppression
+// marker must clear itself once that confirmation lands (so it doesn't leak
+// forever).
+func TestTunnelPollExitSuppressedAfterUserStop(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.cfClientOverride = nonexistentCFClient()
+	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: reapedChildPid(t)}}
+	m.tunnelStopping = map[int]bool{3000: true}
+
+	cmd := m.pollTunnelsCmd()
+	msg, ok := cmd().(tunnelPollMsg)
+	if !ok || len(msg.vanished) != 1 {
+		t.Fatalf("setup: want exactly one vanished entry; got %#v (ok=%v)", msg.vanished, ok)
+	}
+
+	m = mustUpdate(t, m, msg)
+	if m.flash != "" {
+		t.Errorf("a user-initiated stop must not raise a vanish toast; flash = %q", m.flash)
+	}
+	if m.tunnelStopping[3000] {
+		t.Error("tunnelStopping[3000] should clear once the fresh poll confirms the port is gone")
+	}
+}
+
+// TestTunnelPollExitStopsSpinner is the regression test for audit item 8
+// (kata nc1j): a quick tunnel that dies before its hostname ever resolves
+// used to leave the pending spinner animating forever, since the tick loop
+// only self-stops once a hostname appears. A vanished port must clear
+// tunnelSpinnerPort even when it's the ONLY thing that changed.
+func TestTunnelPollExitStopsSpinner(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.cfClientOverride = nonexistentCFClient()
+	m.tunnelSpinnerPort = 3000
+	m.tunnelSpinnerID = 1
+	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: reapedChildPid(t)}}
+
+	cmd := m.pollTunnelsCmd()
+	msg, ok := cmd().(tunnelPollMsg)
+	if !ok || len(msg.vanished) != 1 {
+		t.Fatalf("setup: want exactly one vanished entry; got %#v (ok=%v)", msg.vanished, ok)
+	}
+
+	m = mustUpdate(t, m, msg)
+	if m.tunnelSpinnerPort != 0 {
+		t.Errorf("a vanished tunnel's spinner should stop; tunnelSpinnerPort = %d", m.tunnelSpinnerPort)
+	}
+}
+
+// TestTunnelPollVanishedButAliveWarns is a handler-level test (constructing
+// vanished directly, not going through pollTunnelsCmd's own zombie re-check):
+// a port whose pid is STILL alive after that re-check means something other
+// than a clean exit -- tailport can no longer identify it as its own
+// cloudflared, but it may well still be serving traffic -- so the wording
+// must differ from the "exited" case and point at `ps`.
+func TestTunnelPollVanishedButAliveWarns(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+
+	m = mustUpdate(t, m, tunnelPollMsg{
+		gen:      m.tunnelPollGen,
+		tunnels:  map[int]tunnelInfo{},
+		vanished: []vanishedTunnel{{port: 3000, pid: 4242, alive: true}},
+	})
+	want := "Cloudflare tunnel on :3000 (pid 4242) is still running but tailport can no longer identify it — it may still be public; check ps"
+	if m.flash != want {
+		t.Errorf("flash = %q, want %q", m.flash, want)
+	}
+}
+
+// TestTunnelPollStaleGenDropsVanished mirrors TestTunnelDoneInvalidatesInFlightPoll's
+// technique for the vanish path specifically: a poll whose generation is
+// already stale by the time it lands must be dropped in its entirety --
+// including any vanished entries it carries -- never partially applied.
+func TestTunnelPollStaleGenDropsVanished(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.tunnelPollGen = 5
+	m.tunnelPollApplied = 5
+
+	m = mustUpdate(t, m, tunnelPollMsg{
+		gen:      3,
+		tunnels:  map[int]tunnelInfo{},
+		vanished: []vanishedTunnel{{port: 3000, pid: 1, alive: false, tail: "boom"}},
+	})
+	if m.flash != "" {
+		t.Errorf("a stale-generation poll's vanished list must be dropped entirely; flash = %q", m.flash)
+	}
+}
+
+// TestTunnelPollErrDropsVanish pins the quiet-degrade path: an errored poll
+// (a transient /proc-scan hiccup) must never raise a vanish toast and must
+// keep the last-known tunnels map, exactly like it already does for the
+// tunnels/foreign maps. pollTunnelsCmd itself never populates vanished
+// alongside err (see its early return), but the handler must not depend on
+// that alone -- it returns before ever inspecting msg.vanished.
+func TestTunnelPollErrDropsVanish(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.tunnels = map[int]tunnelInfo{3000: {pid: 111}}
+
+	m = mustUpdate(t, m, tunnelPollMsg{
+		gen:      1,
+		err:      errors.New("boom"),
+		vanished: []vanishedTunnel{{port: 3000, pid: 111, alive: false, tail: "should never surface"}},
+	})
+	if m.flash != "" {
+		t.Errorf("an errored poll must never raise a vanish toast; flash = %q", m.flash)
+	}
+	if _, ok := m.tunnels[3000]; !ok {
+		t.Error("an errored poll must keep the last-known tunnels map (quiet degrade)")
 	}
 }
 

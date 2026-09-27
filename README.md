@@ -596,6 +596,14 @@ re-toggleable with `o`. Only **tailport-owned** tunnels — the ones carrying a
 sentinel `--logfile` flag tailport always passes — are tracked this way; a
 `cloudflared` process started outside tailport is left alone entirely.
 
+**If a tunnel stops on its own** — a named tunnel that can't authenticate,
+retries running out, a crash — tailport never lets it just vanish. The next
+poll (every few seconds) notices the port is gone and shows a toast with
+cloudflared's last error, e.g. `Cloudflare tunnel on :3000 exited — <error>`.
+Full console output (not just that one line) is always in
+`~/.local/state/tailport/cftunnel-<port>[-<host>]….console`. Tearing a tunnel
+down yourself with `o` never triggers this toast.
+
 Like the other public paths, Tunnel is independent and may coexist with Funnel
 and Publish on the same port, every path still requires its own per-service
 confirm, and `:22` stays hard-blocked. A tunnelled service shows its own

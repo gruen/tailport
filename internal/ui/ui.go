@@ -1031,6 +1031,16 @@ type model struct {
 	// persisted -- the process table stays the source of truth (mirrors
 	// lastPublish).
 	lastTunnel map[int]tunnelMemory
+	// tunnelStopping marks ports a user-initiated teardown is (or was, until
+	// a later poll confirms it's gone) in flight for -- set by the
+	// tunnelDoneMsg torndown branch BEFORE it deletes from m.tunnels, cleared
+	// by the tunnelPollMsg handler once a fresh poll no longer sees the port
+	// (kata nc1j W3b). Its whole job is suppressing a false "exited" vanish
+	// toast for a stop the user asked for, including across the race where an
+	// in-flight poll re-adds a still-draining process to m.tunnels before it
+	// actually exits (see both handlers' comments). SESSION-ONLY, never
+	// persisted.
+	tunnelStopping map[int]bool
 	// tunnelPollGen/Applied VERSION async tunnel polls so an out-of-order
 	// completion can't clobber newer state (mirrors publishPollGen/Applied).
 	tunnelPollGen     int
@@ -1480,13 +1490,14 @@ func New(cfg config.Config, markersOverride ...string) model {
 		lastPublish: map[int]publishInfo{},
 		// Cloudflare Tunnel state (kata nc1j): availability decided above; the
 		// live/memory maps start empty (the process-table poll fills tunnels).
-		cfAvailable:   cfAvailable,
-		cfVersion:     cfVersion,
-		tunnels:       map[int]tunnelInfo{},
-		tunnelForeign: map[int]bool{},
-		lastTunnel:    map[int]tunnelMemory{},
-		tunnelInput:   tui,
-		portInput:     ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
+		cfAvailable:    cfAvailable,
+		cfVersion:      cfVersion,
+		tunnels:        map[int]tunnelInfo{},
+		tunnelForeign:  map[int]bool{},
+		lastTunnel:     map[int]tunnelMemory{},
+		tunnelStopping: map[int]bool{},
+		tunnelInput:    tui,
+		portInput:      ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
 		// Optimistic until the first edge poll actually fails (see the field
 		// doc), so a configured-but-not-yet-polled edge doesn't flash
 		// "unreachable" on startup.
@@ -3891,6 +3902,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// might still see the dying process and flicker the tunnel back. The
 			// 4s tick reconciles reliably (and re-adds it if the Stop somehow
 			// failed).
+			//
+			// tunnelStopping is set BEFORE the delete (kata nc1j W3b): a poll
+			// that lands while cloudflared is still draining can re-add this
+			// port to m.tunnels (see the comment above), and a LATER poll that
+			// then sees it gone would otherwise read as a surprise exit and
+			// raise a false "exited" toast for a stop the user asked for. The
+			// tunnelPollMsg handler skips a port marked here, and clears the
+			// mark itself once a fresh poll confirms the port is truly gone.
+			if m.tunnelStopping == nil {
+				m.tunnelStopping = map[int]bool{}
+			}
+			m.tunnelStopping[msg.port] = true
 			m.invalidateTunnelPolls()
 			delete(m.tunnels, msg.port)
 			if msg.port == m.tunnelSpinnerPort {
@@ -3913,6 +3936,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				metricsPort: msg.running.MetricsPort,
 				hostname:    msg.running.Hostname, // "" for quick until assigned
 				name:        msg.running.TunnelName,
+				consolePath: cftunnel.ConsolePath(msg.running.LogFile),
 			}
 		}
 		save := m.remember(msg.port) // keep a tunnelled port visible in the registry
@@ -3944,6 +3968,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.tunnels = msg.tunnels
 		m.tunnelForeign = msg.foreign
+		// Audit item 4 (kata nc1j W3b): a tunnel that exits on its own (a
+		// late auth/name-lookup failure, retries exhausted, a crash) must
+		// never just disappear. msg.vanished lists ports that were owned and
+		// running immediately before THIS poll and are missing now (computed
+		// inside the poll's own cmd -- see pollTunnelsCmd -- so it's already
+		// empty whenever msg.err != nil, and we returned above in that case
+		// regardless). Clear a matching pending-spinner target first (audit
+		// item 8: a quick tunnel that dies before its hostname resolves must
+		// stop animating, not spin forever) for EVERY vanished port, even one
+		// about to be suppressed below -- the spinner has nothing left to
+		// animate either way.
+		for _, v := range msg.vanished {
+			if v.port == m.tunnelSpinnerPort {
+				m.tunnelSpinnerPort = 0
+			}
+		}
+		var toastCmd tea.Cmd
+		if len(msg.vanished) > 0 {
+			reported := make([]vanishedTunnel, 0, len(msg.vanished))
+			for _, v := range msg.vanished {
+				if m.tunnelStopping[v.port] {
+					// The user asked for this one to stop (`o` de-escalation);
+					// the teardown branch marked it before deleting from
+					// m.tunnels, so its later disappearance here is expected,
+					// not a surprise exit -- no toast.
+					continue
+				}
+				reported = append(reported, v)
+			}
+			if len(reported) > 0 {
+				sort.Slice(reported, func(i, j int) bool { return reported[i].port < reported[j].port })
+				lead := reported[0]
+				var text string
+				if lead.alive {
+					text = fmt.Sprintf("Cloudflare tunnel on :%d (pid %d) is still running but tailport can no longer identify it — it may still be public; check ps", lead.port, lead.pid)
+				} else if lead.tail != "" {
+					text = fmt.Sprintf("Cloudflare tunnel on :%d exited — %s", lead.port, lead.tail)
+				} else {
+					text = fmt.Sprintf("Cloudflare tunnel on :%d exited", lead.port)
+				}
+				if extra := len(reported) - 1; extra > 0 {
+					text += fmt.Sprintf(" (+%d more)", extra)
+				}
+				toastCmd = m.setErr(text)
+			}
+		}
+		// Clear tunnelStopping entries once a FRESH poll confirms the port is
+		// truly gone (missing from msg.tunnels, just applied to m.tunnels
+		// above) -- not merely from msg.vanished, since a draining process the
+		// teardown branch already dropped from m.tunnels was never in THIS
+		// poll's prev snapshot and so never appears there at all (see the
+		// tunnelDoneMsg torndown branch's comment on the re-add race).
+		for port := range m.tunnelStopping {
+			if _, ok := m.tunnels[port]; !ok {
+				delete(m.tunnelStopping, port)
+			}
+		}
 		// Every tunnel the poll reports is, by definition, re-raiseable -- so
 		// remember it (mirrors lastPublish), letting a tunnel from BEFORE this
 		// process started (across a restart) be re-toggled from memory too. A
@@ -3964,7 +4045,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
 			}
 		}
-		return m, m.rebuildItems()
+		return m, tea.Batch(toastCmd, m.rebuildItems())
 
 	case tunnelTickMsg:
 		// cfAvailable is decided once at New() and never changes; once false the

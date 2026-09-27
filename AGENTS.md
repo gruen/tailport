@@ -130,6 +130,31 @@ contract. The short version:
   never signalled or touched. The whole feature is gated on `cloudflared`
   being installed — detected once at startup — so an absent binary drops
   the `o` key from the bar entirely: no key, no discovery, no polling.
+  A NAMED tunnel serves only ONE local port at a time — tailport's
+  owned-only same-tunnel guard (`tunnelNameInUse` in `internal/ui/cftunnel.go`)
+  refuses to start or re-raise the same pre-provisioned tunnel name for a
+  second port while tailport already has it running for a different one,
+  naming which port to free first. This checks only tailport's own
+  currently-discovered owned tunnels, never a foreign/process-table scan, so
+  it can't see the same tunnel running elsewhere entirely (another machine, a
+  system service, a dashboard connector) — Cloudflare may then send requests
+  to either connector, and tailport has no way to detect or prevent that.
+  Because cloudflared is a supervised process rather than a remote control
+  plane tailport polls for state, a tunnel that stops on ITS OWN — a named
+  tunnel that can't authenticate, retries exhausted, a crash — must never
+  just vanish from the UI either: the tunnel-state poll's own `tea.Cmd`
+  (never `Update`, matching the process-supervision model above) snapshots
+  which owned ports were running immediately before it runs, and diffs that
+  against the fresh `Discover()` result. A port that disappears this way
+  raises a toast naming the tail of its `.console` output, e.g.
+  "Cloudflare tunnel on :PORT exited — <last error line>", UNLESS the user
+  tore it down themselves with `o` (tracked
+  session-only while the teardown is settling, so a draining process a poll
+  transiently re-adds can't produce a false "exited" toast for an
+  intentional stop). A pid that's still alive but no longer recognizable as
+  tailport's own gets a distinct "still running but tailport can no longer
+  identify it" warning instead of an "exited" one, since it may still be
+  serving traffic.
   (Implemented under kata nc1j: `internal/cftunnel`, the `cloudflared:`
   config block, and the `o` key / `requestTunnel` gate / tunnel-state poll
   in `internal/ui`.)

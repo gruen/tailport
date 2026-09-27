@@ -34,15 +34,19 @@ import (
 // *.trycloudflare.com for quick -- "" until cloudflared assigns it -- or the
 // operator's custom host for named), the named tunnel's name (ModeNamed only;
 // recovered from the sentinel logfile -- audit item 2, kata nc1j: without
-// this a re-raise had no name to hand `Start`, which then rejected it), and
-// whether it has an active edge connection. Keyed by local port in m.tunnels.
-// Never persisted.
+// this a re-raise had no name to hand `Start`, which then rejected it),
+// consolePath (its console-capture file, from cftunnel.ConsolePath -- kata
+// nc1j W3b: pollTunnelsCmd's next poll needs this to read a since-vanished
+// tunnel's last error, so it's snapshotted here rather than re-derived after
+// the fact), and whether it has an active edge connection. Keyed by local
+// port in m.tunnels. Never persisted.
 type tunnelInfo struct {
 	mode        cftunnel.Mode
 	pid         int
 	metricsPort int
 	hostname    string
 	name        string
+	consolePath string
 	ready       bool
 }
 
@@ -74,11 +78,45 @@ type tunnelDoneMsg struct {
 // foreign tunnel must surface as drift rather than stay invisible, so unlike
 // owned tunnels it's kept (not discarded) for the UI to show and for
 // requestTunnel to refuse layering a second exposure on top of (kata aprt).
+// vanished lists ports that were owned/running immediately before THIS poll
+// and are missing now (audit item 4, kata nc1j W3b) -- computed inside the
+// poll's own tea.Cmd (see pollTunnelsCmd), never in Update, so it's empty
+// (not merely unchecked) whenever err != nil: an errored Discover has no
+// reliable "missing" list to offer, so the handler must not raise a vanish
+// toast off it (the quiet-degrade path already keeps the last-known map for
+// exactly this reason).
 type tunnelPollMsg struct {
-	tunnels map[int]tunnelInfo
-	foreign map[int]bool
-	gen     int
-	err     error
+	tunnels  map[int]tunnelInfo
+	foreign  map[int]bool
+	vanished []vanishedTunnel
+	gen      int
+	err      error
+}
+
+// tunnelSnapshot is what pollTunnelsCmd needs to know about a port's owned
+// tunnel from BEFORE a poll's Discover ran, captured AT ISSUE TIME (never
+// inside the returned tea.Cmd, which must not read m.tunnels directly -- it
+// runs off the render path) so the cmd can tell a genuinely VANISHED tunnel
+// (was here, isn't now) from one that simply was never running.
+type tunnelSnapshot struct {
+	pid         int
+	consolePath string
+}
+
+// vanishedTunnel is one port whose owned tunnel was running immediately
+// before a poll's Discover ran and is missing from it now (audit item 4,
+// kata nc1j W3b): a late failure (auth, name lookup, retries exhausted) or a
+// crash, caught on the next poll cycle rather than any fixed timeout. alive
+// distinguishes cloudflared having actually exited (Alive(pid) false, even
+// after the brief zombie re-check below) from the port simply becoming
+// unrecognizable while the pid is still running (Alive true -- something
+// else changed) -- the handler's toast wording differs between the two. tail
+// is ConsoleTail's last line for the dead case, "" if unavailable.
+type vanishedTunnel struct {
+	port  int
+	pid   int
+	alive bool
+	tail  string
 }
 
 // tunnelTickMsg fires the tunnel poll timer. Like publishTick it reschedules
@@ -163,7 +201,16 @@ func (m model) cfClient() *cftunnel.Client {
 // pollTunnelsCmd is the tunnel-state poll: Discover() the process table, then
 // Health()-scrape each owned tunnel's metrics endpoint for its readiness and
 // (quick) hostname. Nil -- zero cost -- when cloudflared is unavailable. A
-// Discover error degrades quietly (the handler keeps the last-known map).
+// Discover error degrades quietly (the handler keeps the last-known map, and
+// reports no vanished tunnels -- see tunnelPollMsg).
+//
+// It also snapshots, AT ISSUE TIME, which owned ports are running right now
+// (prev) so the returned tea.Cmd -- which runs off the render path and must
+// never read m.tunnels directly -- can tell a genuinely VANISHED tunnel from
+// one that was simply never running (audit item 4, kata nc1j W3b): a port in
+// prev but missing from this poll's fresh Discover has either exited on its
+// own or become otherwise unrecognizable, and either way must never just
+// disappear (see tunnelPollMsg's handler).
 func (m *model) pollTunnelsCmd() tea.Cmd {
 	if !m.cfAvailable {
 		return nil
@@ -171,6 +218,10 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 	client := m.cfClient()
 	m.tunnelPollGen++
 	gen := m.tunnelPollGen
+	prev := make(map[int]tunnelSnapshot, len(m.tunnels))
+	for port, info := range m.tunnels {
+		prev[port] = tunnelSnapshot{pid: info.pid, consolePath: info.consolePath}
+	}
 	return func() tea.Msg {
 		running, err := client.Discover()
 		if err != nil {
@@ -201,10 +252,35 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 				metricsPort: r.MetricsPort,
 				hostname:    hostname,
 				name:        r.TunnelName,
+				consolePath: cftunnel.ConsolePath(r.LogFile),
 				ready:       h.Ready,
 			}
 		}
-		return tunnelPollMsg{tunnels: tunnels, foreign: foreign, gen: gen}
+		// Vanish detection (audit item 4, kata nc1j W3b): a port that WAS
+		// owned/running before this poll (prev) and isn't in the fresh
+		// tunnels map now is either genuinely gone or unrecognizable.
+		var vanished []vanishedTunnel
+		for port, snap := range prev {
+			if _, ok := tunnels[port]; ok {
+				continue // still there
+			}
+			alive := cftunnel.Alive(snap.pid)
+			if alive {
+				// A just-exited child is briefly a zombie and still answers a
+				// signal-0 probe until something reaps it -- re-check once
+				// more after a short delay before believing "still running"
+				// (mirrors Start's own reaper-timing concern).
+				time.Sleep(250 * time.Millisecond)
+				alive = cftunnel.Alive(snap.pid)
+			}
+			vanished = append(vanished, vanishedTunnel{
+				port:  port,
+				pid:   snap.pid,
+				alive: alive,
+				tail:  cftunnel.ConsoleTail(snap.consolePath),
+			})
+		}
+		return tunnelPollMsg{tunnels: tunnels, foreign: foreign, vanished: vanished, gen: gen}
 	}
 }
 
