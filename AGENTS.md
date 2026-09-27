@@ -124,15 +124,32 @@ contract. The short version:
   tunnel create` writes `<UUID>.json`) or the tunnel fails to start, with
   cloudflared's own error text surfaced in the toast. **Token- and
   dashboard-managed tunnels are out of scope**: tailport
-  never passes `--token`, and the child's environment is scrubbed of
-  identity/account-mutating/origin-override `TUNNEL_*` vars (`TUNNEL_TOKEN`,
-  `TUNNEL_TOKEN_FILE`, `TUNNEL_NAME`, and others — see
-  `scrubbedIdentityEnvVars` in `internal/cftunnel/cftunnel.go`) before it's
-  spawned — this, not just tailport's own argv, is how "never mutates the
-  account" is enforced against an ambient `TUNNEL_TOKEN` (which takes
-  precedence over the tunnel name) or `TUNNEL_NAME` (which means "create,
-  route, and run"). `TUNNEL_ORIGIN_CERT`/`TUNNEL_CRED_*` are deliberately kept
-  (a credential mismatch fails closed, it doesn't mutate anything). Because
+  never passes `--token`, and the child's environment is scrubbed of EVERY
+  `TUNNEL_*` variable EXCEPT a small allowlist of connection/logging-only
+  settings (`TUNNEL_TRANSPORT_PROTOCOL`, `TUNNEL_EDGE_IP_VERSION`,
+  `TUNNEL_EDGE_BIND_ADDRESS`, `TUNNEL_REGION`, `TUNNEL_POST_QUANTUM`,
+  `TUNNEL_LOGLEVEL`, `TUNNEL_TRANSPORT_LOGLEVEL`, `TUNNEL_PROTO_LOGLEVEL`,
+  `TUNNEL_RETRIES`, `TUNNEL_GRACE_PERIOD` — see `tunnelEnvAllowlist` /
+  `scrubTunnelEnv` in `internal/cftunnel/cftunnel.go`) before it's spawned —
+  this, not just tailport's own argv, is how "never mutates the account" is
+  enforced against an ambient `TUNNEL_TOKEN` (which takes precedence over the
+  tunnel name) or `TUNNEL_NAME` (which means "create, route, and run"). This
+  is a default-DENY allowlist, not the narrower denylist an earlier version
+  of tailport shipped: a pre-release security audit (S1) verified that an
+  inherited `TUNNEL_CRED_FILE` makes cloudflared run a COMPLETELY DIFFERENT
+  tunnel than the one the positional name says — a tunnel named `foo` ran
+  some *other* tunnelID entirely, taken from the credentials file — so an
+  operator who merely had a production tunnel's credentials exported in
+  their shell would silently join THAT tunnel as a connector. **A previous
+  version of this bullet claimed `TUNNEL_ORIGIN_CERT`/`TUNNEL_CRED_*` were
+  deliberately kept because "a credential mismatch fails closed" — that
+  claim was FALSE and has been corrected; both are scrubbed now.**
+  Consequently, a named tunnel's credentials must sit at cloudflared's
+  DEFAULT location next to `cert.pem` (see `LoggedIn` in
+  `internal/cftunnel/cftunnel.go`, which now checks only that default
+  location too, for the same reason) — `TUNNEL_ORIGIN_CERT` no longer
+  reaches the child, so an override in tailport's own environment would not
+  matter to it anyway. Because
   cloudflared's own `--logfile` is a structured JSON log that can hold
   nothing useful for a fatal startup error — those print to stderr alone —
   tailport also captures the child's raw stdout+stderr to a sibling,

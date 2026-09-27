@@ -64,12 +64,20 @@
 // ConsolePath/ConsoleTail in console.go) so that text is always recoverable
 // for a toast, without ever parsing the JSON logfile.
 //
-// Start also scrubs a fixed set of identity/account-mutating/origin-override
-// TUNNEL_* environment variables from the child's environment before it
-// inherits anything (see scrubIdentityEnv) -- this, not any argv-level check
-// alone, is how "tailport never mutates the account" holds against an
-// ambient TUNNEL_TOKEN or TUNNEL_NAME. Token- and dashboard-managed tunnels
-// are out of scope for this feature entirely: tailport never passes --token.
+// Start also scrubs every TUNNEL_* environment variable except a small,
+// connection-only allowlist from the child's environment before it inherits
+// anything (see scrubTunnelEnv/tunnelEnvAllowlist) -- this, not any
+// argv-level check alone, is how "tailport never mutates the account" holds
+// against an ambient TUNNEL_TOKEN, TUNNEL_NAME, or TUNNEL_CRED_FILE (S1,
+// audit finding 1: an inherited TUNNEL_CRED_FILE was verified to make
+// cloudflared run a COMPLETELY DIFFERENT tunnel than the positional name
+// says, ignoring it outright -- a previous version of this comment claimed
+// TUNNEL_ORIGIN_CERT/TUNNEL_CRED_* "fail closed" and were deliberately kept;
+// that was false, and both are scrubbed now). Consequently a named tunnel's
+// credentials must sit at cloudflared's DEFAULT location next to cert.pem
+// (see LoggedIn) -- the child never sees an override any more. Token- and
+// dashboard-managed tunnels are out of scope for this feature entirely:
+// tailport never passes --token.
 package cftunnel
 
 import (
@@ -258,14 +266,19 @@ func (c *Client) Detect() (string, error) {
 }
 
 // LoggedIn reports whether a Cloudflare account credential is present, i.e.
-// whether the NAMED tunnel path is available. It checks cloudflared's default
-// cert location (~/.cloudflared/cert.pem), honoring the TUNNEL_ORIGIN_CERT
-// override cloudflared itself reads. It does not validate the cert -- only that
-// the operator has logged in at least once.
+// whether the NAMED tunnel path is available. It checks ONLY cloudflared's
+// default cert location (~/.cloudflared/cert.pem) -- it does NOT honor a
+// TUNNEL_ORIGIN_CERT override in tailport's own environment (a previous
+// version of this comment and function claimed it did): Start now scrubs
+// TUNNEL_ORIGIN_CERT from the CHILD's environment (S1, audit finding 1)
+// precisely because an inherited override can point cloudflared at a
+// DIFFERENT credential than the positional tunnel name would suggest, so
+// honoring that same override here would just be checking a file the child
+// will never actually see. Since the child only ever uses cloudflared's
+// default credential locations now, checking that same default location is
+// what actually matches what Start will do. It does not validate the cert --
+// only that the operator has logged in at least once.
 func LoggedIn() bool {
-	if p := os.Getenv("TUNNEL_ORIGIN_CERT"); p != "" {
-		return fileExists(p)
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
@@ -273,48 +286,57 @@ func LoggedIn() bool {
 	return fileExists(filepath.Join(home, ".cloudflared", "cert.pem"))
 }
 
-// scrubbedIdentityEnvVars are TUNNEL_* environment variables that could
-// change WHICH tunnel runs, or otherwise mutate the account, rather than
-// merely how it connects. Letting any of these leak from tailport's own
-// environment into the child would undermine "tailport never mutates the
-// user's Cloudflare account or DNS" (see the package doc and AGENTS.md's
-// Cloudflare Tunnel bullet): TUNNEL_TOKEN/TUNNEL_TOKEN_FILE in particular take
-// PRECEDENCE over a named tunnel's positional name, so an ambient token would
-// silently run a completely different (dashboard/token-managed) tunnel
-// instead of the one tailport was asked to run -- exactly the
-// token/dashboard-managed path this feature deliberately excludes.
-// TUNNEL_NAME means "create, route, and run a tunnel", which would mutate the
-// account outright.
-//
-// Deliberately NOT scrubbed: TUNNEL_ORIGIN_CERT and TUNNEL_CRED_* (a
-// credential mismatch fails closed, it doesn't mutate anything), transport
-// and edge settings, and NO_AUTOUPDATE.
-var scrubbedIdentityEnvVars = []string{
-	"TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE",
-	"TUNNEL_NAME", "TUNNEL_HOSTNAME", "TUNNEL_LB_POOL", "TUNNEL_FORCE_PROVISIONING_DNS",
-	"TUNNEL_URL", "TUNNEL_HELLO_WORLD", "TUNNEL_UNIX_SOCKET", "TUNNEL_SOCKS", "TUNNEL_BASTION",
-	"TUNNEL_LOG_OUTPUT", "TUNNEL_MANAGEMENT_OUTPUT",
+// tunnelEnvAllowlist is the ONLY `TUNNEL_*` environment variables the child
+// inherits; every other `TUNNEL_*` variable is dropped, whether tailport
+// recognizes it or not (S1, audit finding 1, MEDIUM -- verified: an inherited
+// TUNNEL_CRED_FILE overrides cloudflared's origin credential file
+// independently of the positional tunnel name -- a tunnel named "foo" was
+// observed running a completely different tunnelID from the credentials
+// file, so an operator who merely had production tunnel credentials exported
+// in their shell would silently join THAT tunnel as a connector. A previous
+// version of this file and AGENTS.md claimed TUNNEL_CRED_* "fails closed" --
+// that claim was FALSE; it does the opposite). A denylist of "the ones we
+// thought of" can never keep up with cloudflared's own env var surface (see
+// audit item: TUNNEL_ORIGIN_CERT, TUNNEL_CRED_FILE, TUNNEL_CRED_CONTENTS,
+// TUNNEL_EDGE were all missed by the previous denylist), so this is a
+// default-DENY allowlist instead: every var here affects only HOW the
+// connector talks to the edge or what it logs, never WHICH tunnel, origin,
+// edge, or account is used.
+var tunnelEnvAllowlist = map[string]bool{
+	"TUNNEL_TRANSPORT_PROTOCOL": true,
+	"TUNNEL_EDGE_IP_VERSION":    true,
+	"TUNNEL_EDGE_BIND_ADDRESS":  true,
+	"TUNNEL_REGION":             true,
+	"TUNNEL_POST_QUANTUM":       true,
+	"TUNNEL_LOGLEVEL":           true,
+	"TUNNEL_TRANSPORT_LOGLEVEL": true,
+	"TUNNEL_PROTO_LOGLEVEL":     true,
+	"TUNNEL_RETRIES":            true,
+	"TUNNEL_GRACE_PERIOD":       true,
 }
 
-// scrubIdentityEnv returns environ (as from os.Environ()) with every
-// scrubbedIdentityEnvVars entry removed, preserving relative order otherwise.
-func scrubIdentityEnv(environ []string) []string {
+// scrubTunnelEnv returns environ (as from os.Environ()) with every `TUNNEL_*`
+// variable removed EXCEPT tunnelEnvAllowlist, preserving relative order
+// otherwise. Every non-`TUNNEL_*` variable -- including NO_AUTOUPDATE -- is
+// always kept untouched.
+//
+// This is now the ONLY thing standing between tailport's own environment and
+// the child's: TUNNEL_ORIGIN_CERT/TUNNEL_CRED_FILE/TUNNEL_CRED_CONTENTS are
+// dropped too (S1) -- see the package doc and AGENTS.md's Cloudflare Tunnel
+// bullet for the consequence: a named tunnel's credentials must now sit at
+// cloudflared's DEFAULT location next to cert.pem (which matches LoggedIn's
+// gate above), since the child never sees an override any more.
+func scrubTunnelEnv(environ []string) []string {
 	out := make([]string, 0, len(environ))
 	for _, kv := range environ {
 		name := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			name = kv[:i]
 		}
-		scrub := false
-		for _, bad := range scrubbedIdentityEnvVars {
-			if name == bad {
-				scrub = true
-				break
-			}
+		if strings.HasPrefix(name, "TUNNEL_") && !tunnelEnvAllowlist[name] {
+			continue
 		}
-		if !scrub {
-			out = append(out, kv)
-		}
+		out = append(out, kv)
 	}
 	return out
 }
@@ -397,13 +419,15 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// -running detached child the next time it wrote.
 	cmd.Stdout = consoleFile
 	cmd.Stderr = consoleFile
-	// Scrub identity/account-mutating/origin-override TUNNEL_* env vars before
-	// the child inherits anything (see scrubIdentityEnv) -- an ambient
+	// Scrub every TUNNEL_* env var except a small allowlist before the child
+	// inherits anything (see scrubTunnelEnv/tunnelEnvAllowlist) -- an ambient
 	// TUNNEL_TOKEN, for instance, takes precedence over the tunnel name and
-	// would silently run a DIFFERENT tunnel than the one requested. This is
-	// how "tailport never mutates the account" holds against the environment,
+	// would silently run a DIFFERENT tunnel than the one requested, and an
+	// ambient TUNNEL_CRED_FILE overrides which tunnel's credentials get used
+	// regardless of the positional name (S1, audit finding 1). This is how
+	// "tailport never mutates the account" holds against the environment,
 	// not just against tailport's own argv.
-	cmd.Env = scrubIdentityEnv(os.Environ())
+	cmd.Env = scrubTunnelEnv(os.Environ())
 
 	err = cmd.Start()
 	// The child, once started, keeps its own OS-level reference to this fd;

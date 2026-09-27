@@ -1122,17 +1122,26 @@ func TestConsoleTail(t *testing.T) {
 	})
 }
 
-// TestStartScrubsIdentityEnv is the regression test for audit item 7 (kata
-// nc1j): an ambient TUNNEL_TOKEN takes PRECEDENCE over the tunnel name and
-// would run a completely different tunnel, and TUNNEL_NAME means "create,
-// route, and run", which would mutate the account -- both must never reach
-// the child. TUNNEL_ORIGIN_CERT is explicitly NOT scrubbed (a mismatch fails
-// closed, it doesn't mutate anything).
+// TestStartScrubsIdentityEnv is the regression test for audit item 7 / S1
+// (kata nc1j): an ambient TUNNEL_TOKEN takes PRECEDENCE over the tunnel name
+// and would run a completely different tunnel, TUNNEL_NAME means "create,
+// route, and run" (would mutate the account), and TUNNEL_CRED_FILE was
+// live-verified to make cloudflared run a DIFFERENT tunnel than the
+// positional name says -- none of these three may ever reach the child.
+// TUNNEL_ORIGIN_CERT is now ALSO scrubbed (S1 -- a previous version of this
+// test asserted the opposite, that it was deliberately preserved because "a
+// mismatch fails closed"; that reasoning was wrong, since TUNNEL_CRED_FILE
+// bypasses the positional name entirely rather than merely mismatching it).
+// An allowlisted var (TUNNEL_LOGLEVEL) and a non-TUNNEL_* var (NO_AUTOUPDATE)
+// must both survive untouched.
 func TestStartScrubsIdentityEnv(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("TUNNEL_TOKEN", "should-be-scrubbed")
 	t.Setenv("TUNNEL_NAME", "should-be-scrubbed-too")
-	t.Setenv("TUNNEL_ORIGIN_CERT", "/keep/this/cert.pem")
+	t.Setenv("TUNNEL_CRED_FILE", "should-be-scrubbed-as-well")
+	t.Setenv("TUNNEL_ORIGIN_CERT", "should-now-be-scrubbed-too")
+	t.Setenv("TUNNEL_LOGLEVEL", "debug")
+	t.Setenv("NO_AUTOUPDATE", "true")
 
 	envOut := filepath.Join(t.TempDir(), "env.out")
 	t.Setenv("FAKE_ENV_OUT", envOut)
@@ -1158,8 +1167,61 @@ func TestStartScrubsIdentityEnv(t *testing.T) {
 	if strings.Contains(env, "TUNNEL_NAME=") {
 		t.Error("TUNNEL_NAME leaked into the child environment")
 	}
-	if !strings.Contains(env, "TUNNEL_ORIGIN_CERT=/keep/this/cert.pem") {
-		t.Error("TUNNEL_ORIGIN_CERT should be preserved, not scrubbed")
+	if strings.Contains(env, "TUNNEL_CRED_FILE=") {
+		t.Error("TUNNEL_CRED_FILE leaked into the child environment (audit finding 1: overrides which tunnel runs)")
+	}
+	if strings.Contains(env, "TUNNEL_ORIGIN_CERT=") {
+		t.Error("TUNNEL_ORIGIN_CERT must now be scrubbed too (S1) -- it is no longer preserved")
+	}
+	if !strings.Contains(env, "TUNNEL_LOGLEVEL=debug") {
+		t.Error("allowlisted TUNNEL_LOGLEVEL should be preserved")
+	}
+	if !strings.Contains(env, "NO_AUTOUPDATE=true") {
+		t.Error("non-TUNNEL_* vars like NO_AUTOUPDATE should be preserved")
+	}
+}
+
+// TestScrubTunnelEnv is a table-driven, pure-function pin of the S1 allowlist
+// (audit finding 1, MEDIUM, verified): every TUNNEL_* var is dropped by
+// DEFAULT, and only the ten connection/logging-only vars below survive.
+// TUNNEL_CRED_FILE/TUNNEL_CRED_CONTENTS/TUNNEL_ORIGIN_CERT/TUNNEL_EDGE are
+// pinned dropped explicitly because a previous denylist-based version of
+// this file claimed (falsely) that they were safe to keep; TUNNEL_TOKEN and
+// an unrecognized future TUNNEL_* var must also be dropped by the
+// default-deny design, and non-TUNNEL_* vars must never be touched.
+func TestScrubTunnelEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		kv   string
+		keep bool
+	}{
+		{"TUNNEL_TRANSPORT_PROTOCOL allowlisted", "TUNNEL_TRANSPORT_PROTOCOL=quic", true},
+		{"TUNNEL_EDGE_IP_VERSION allowlisted", "TUNNEL_EDGE_IP_VERSION=4", true},
+		{"TUNNEL_EDGE_BIND_ADDRESS allowlisted", "TUNNEL_EDGE_BIND_ADDRESS=0.0.0.0", true},
+		{"TUNNEL_REGION allowlisted", "TUNNEL_REGION=us", true},
+		{"TUNNEL_POST_QUANTUM allowlisted", "TUNNEL_POST_QUANTUM=true", true},
+		{"TUNNEL_LOGLEVEL allowlisted", "TUNNEL_LOGLEVEL=debug", true},
+		{"TUNNEL_TRANSPORT_LOGLEVEL allowlisted", "TUNNEL_TRANSPORT_LOGLEVEL=debug", true},
+		{"TUNNEL_PROTO_LOGLEVEL allowlisted", "TUNNEL_PROTO_LOGLEVEL=debug", true},
+		{"TUNNEL_RETRIES allowlisted", "TUNNEL_RETRIES=5", true},
+		{"TUNNEL_GRACE_PERIOD allowlisted", "TUNNEL_GRACE_PERIOD=30s", true},
+		{"TUNNEL_CRED_FILE dropped (audit finding 1: overrides which tunnel/credentials run)", "TUNNEL_CRED_FILE=/tmp/x.json", false},
+		{"TUNNEL_CRED_CONTENTS dropped", "TUNNEL_CRED_CONTENTS={}", false},
+		{"TUNNEL_ORIGIN_CERT dropped (previously, falsely, kept)", "TUNNEL_ORIGIN_CERT=/tmp/cert.pem", false},
+		{"TUNNEL_EDGE dropped", "TUNNEL_EDGE=example.com:7844", false},
+		{"TUNNEL_TOKEN dropped", "TUNNEL_TOKEN=abc", false},
+		{"an unknown future TUNNEL_* var is dropped by default-deny", "TUNNEL_FUTURE_THING=x", false},
+		{"NO_AUTOUPDATE (non-TUNNEL_*) kept", "NO_AUTOUPDATE=true", true},
+		{"PATH (non-TUNNEL_*) kept", "PATH=/usr/bin", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := scrubTunnelEnv([]string{tc.kv})
+			got := len(out) == 1
+			if got != tc.keep {
+				t.Errorf("scrubTunnelEnv(%q): kept=%v, want %v", tc.kv, got, tc.keep)
+			}
+		})
 	}
 }
 
