@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,7 +71,15 @@ func TestPortGainsEntryWhenFavorited(t *testing.T) {
 func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
+	// kata 34km: Save now refuses an unset path (ErrNoPath), so a raw
+	// Default() literal must be rooted before it can save -- matching what
+	// Load/WriteDefault would already have done for a real caller.
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := Default()
+	cfg.path = path
 	cfg.Ports[3000] = PortMeta{Label: "dev server", Favorite: true, LastProcess: "vite"}
 	cfg.Ports[9000] = PortMeta{Favorite: false}
 
@@ -103,7 +112,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 func TestMarkersRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
+	// kata 34km: root the literal before saving (see TestSaveLoadRoundTrip).
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := Default()
+	cfg.path = path
 	cfg.Markers = "emoji"
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
@@ -246,7 +261,13 @@ func TestFreshSeedIncludesCaddyBlockAndComments(t *testing.T) {
 func TestCaddyRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
+	// kata 34km: root the literal before saving (see TestSaveLoadRoundTrip).
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := Default()
+	cfg.path = path
 	cfg.Caddy.Domain = "example.com"
 	cfg.Caddy.AuthUser = "mg"
 	cfg.Caddy.AuthHash = "$2a$10$examplebcrypthashvalueexamplebcrypthash"
@@ -284,7 +305,13 @@ func TestSilentRepublishRoundTrip(t *testing.T) {
 		t.Fatal("Default().Caddy.SilentRepublish = true, want false (safe default)")
 	}
 
+	// kata 34km: root the literal before saving (see TestSaveLoadRoundTrip).
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := Default()
+	cfg.path = path
 	cfg.Caddy.Domain = "example.com"
 	cfg.Caddy.SilentRepublish = true
 	if err := cfg.Save(); err != nil {
@@ -441,8 +468,11 @@ func TestSaveWritesOwnerOnlyMode(t *testing.T) {
 		t.Fatalf("Path(\"\") error: %v", err)
 	}
 
-	// Fresh create via Save.
-	if err := Default().Save(); err != nil {
+	// Fresh create via Save. kata 34km: root the literal first (see
+	// TestSaveLoadRoundTrip) -- Save now refuses an unset path.
+	fresh := Default()
+	fresh.path = path
+	if err := fresh.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
 	if info, err := os.Stat(path); err != nil {
@@ -1225,17 +1255,23 @@ func TestSaveCaddyDomainMainFileStays0600(t *testing.T) {
 
 // TestSaveAppliesCaddyDefaultsForLiteral covers roborev 4ejm finding #3: a
 // Config literal built directly (never through Default()/Load(), which apply
-// the defaults) must still write visible caddy defaults, not empty/zero values.
+// the defaults) must still write visible caddy defaults, not empty/zero
+// values -- once it has somewhere to save. kata 34km: Save now refuses an
+// unset path outright (see TestSaveRefusesUnsetPath) rather than silently
+// falling back to Path(""), so this test roots the literal via WithPath at
+// an explicit temp file, the same way a real caller (WriteDefault) would via
+// Load, instead of relying on the old empty-path fallback.
 func TestSaveAppliesCaddyDefaultsForLiteral(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.yaml")
 
-	// A bare literal: no caddy fields set, no Default()/Load() in the path.
-	cfg := Config{Ports: map[int]PortMeta{8080: {Favorite: true}}}
+	// A bare literal: no caddy fields set, no Default()/Load() in the path --
+	// only WithPath, so Save has somewhere to write.
+	cfg := Config{Ports: map[int]PortMeta{8080: {Favorite: true}}}.WithPath(path)
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
 
-	got, err := Load("")
+	got, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
@@ -1243,10 +1279,6 @@ func TestSaveAppliesCaddyDefaultsForLiteral(t *testing.T) {
 		t.Errorf("literal Save() then Load().Caddy = %+v, want visible defaults (caddy/tailport/2019)", got.Caddy)
 	}
 
-	path, err := Path("")
-	if err != nil {
-		t.Fatalf("Path(\"\") error: %v", err)
-	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading saved config: %v", err)
@@ -1393,13 +1425,15 @@ func TestStickyHeaderExplicitFalseRoundTrips(t *testing.T) {
 func TestStickyHeaderSaveWritesTrueAndComment(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	cfg := Default()
-	if err := cfg.Save(); err != nil {
-		t.Fatalf("Save() error: %v", err)
-	}
+	// kata 34km: root the literal before saving (see TestSaveLoadRoundTrip).
 	path, err := Path("")
 	if err != nil {
-		t.Fatalf("Path(\"\") error: %v", err)
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.path = path
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -1412,5 +1446,46 @@ func TestStickyHeaderSaveWritesTrueAndComment(t *testing.T) {
 	}
 	if !strings.Contains(text, "Pins the top-clipped service's header row") {
 		t.Errorf("expected saved config to contain the sticky_header explanatory comment, got:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Path-unset save guard (kata 34km): Save, SaveCaddyDomain, and
+// SaveCaddyHostname used to fall back to Path("") -- the real
+// ~/.config/tailport/config.yaml when XDG_CONFIG_HOME is unset -- whenever a
+// Config's path was never resolved by Load/WriteDefault. TestMain (see
+// testmain_test.go) already isolates XDG_CONFIG_HOME for this whole test
+// binary as defence in depth, but that only redirects the fallback to a
+// throwaway dir; it doesn't remove the footgun for a real, non-test caller.
+// This is the primary defence: the fallback is gone outright.
+// ---------------------------------------------------------------------------
+
+// TestSaveRefusesUnsetPath is 34km's core guard test: all three savers
+// refuse an unset-path Config with ErrNoPath (asserted via errors.Is, so
+// this can't pass for the wrong reason -- e.g. some unrelated error), and
+// nothing is ever written at what Path("") would have resolved to.
+// XDG_CONFIG_HOME is still set here (belt-and-suspenders with TestMain), so
+// that even if the guard regressed, this test would still fail loudly rather
+// than touching a real config.
+func TestSaveRefusesUnsetPath(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	fallback, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{Ports: map[int]PortMeta{8080: {Favorite: true}}}
+	if got := cfg.Save(); !errors.Is(got, ErrNoPath) {
+		t.Errorf("Save() with unset path = %v, want ErrNoPath", got)
+	}
+	if got := cfg.SaveCaddyDomain("example.com"); !errors.Is(got, ErrNoPath) {
+		t.Errorf("SaveCaddyDomain() with unset path = %v, want ErrNoPath", got)
+	}
+	if got := cfg.SaveCaddyHostname("caddy"); !errors.Is(got, ErrNoPath) {
+		t.Errorf("SaveCaddyHostname() with unset path = %v, want ErrNoPath", got)
+	}
+
+	if _, err := os.Stat(fallback); !os.IsNotExist(err) {
+		t.Errorf("Path(\"\") = %q must not have been written to; stat err = %v", fallback, err)
 	}
 }

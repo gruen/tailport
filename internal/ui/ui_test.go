@@ -652,7 +652,7 @@ func addPort(m model, digits string) model {
 // vanishing.
 func TestAddPortFavorites(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	m := New(config.Config{Ports: map[int]config.PortMeta{}})
+	m := New(rooted(t, config.Config{Ports: map[int]config.PortMeta{}}))
 	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}} // :3000 is NOT listening
 	m.active = map[int]bool{}
 	m.showAllPorts = false // Favorites view
@@ -683,7 +683,7 @@ func TestAddPortFavorites(t *testing.T) {
 	}
 
 	// (4) Persisted to disk so it survives a restart.
-	loaded, err := config.Load("")
+	loaded, err := config.Load(m.cfg.ResolvedPath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1097,7 +1097,7 @@ func TestAddPortAlreadyFavorited(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	// Already favorited -> info toast, still favorited, no success on a new one.
-	m := New(config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}})
+	m := New(rooted(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true}}}))
 	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
 	m.active = map[int]bool{}
 	m.showAllPorts = true
@@ -1119,8 +1119,11 @@ func TestAddPortAlreadyFavorited(t *testing.T) {
 		t.Error(":8080 should remain favorited")
 	}
 
-	// A brand-new add favorites silently (no toast).
-	m2 := New(config.Config{Ports: map[int]config.PortMeta{}})
+	// A brand-new add favorites silently (no toast). kata 34km: rooted, since
+	// this exercises the real "n" save path (m.favorite -> saveConfig) and a
+	// failed save would raise a toast, breaking the "must be silent" check
+	// below for the wrong reason.
+	m2 := New(rooted(t, config.Config{Ports: map[int]config.PortMeta{}}))
 	m2.active = map[int]bool{}
 	m2.rebuildItems()
 	m2 = addPort(m2, "3000")
@@ -1345,9 +1348,10 @@ func TestUnlockSSHConfirm(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	xKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}}
 
-	// A model with a locked, selected :22 in the All ports view.
+	// A model with a locked, selected :22 in the All ports view. Rooted (kata
+	// 34km): case (3) below reads the unlock back from disk.
 	lockedModel := func() model {
-		m := New(config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}})
+		m := New(rooted(t, config.Config{Ports: map[int]config.PortMeta{22: {Locked: true}}}))
 		m.allPorts = []portscan.Port{{Number: 22, Process: "sshd"}}
 		m.active = map[int]bool{}
 		m.showAllPorts = true
@@ -1398,7 +1402,7 @@ func TestUnlockSSHConfirm(t *testing.T) {
 	if m.mode != entryNone {
 		t.Errorf("mode should reset after unlock; got %v", m.mode)
 	}
-	if loaded, err := config.Load(""); err != nil {
+	if loaded, err := config.Load(m.cfg.ResolvedPath()); err != nil {
 		t.Fatal(err)
 	} else if loaded.Ports[22].Locked {
 		t.Error("the unlock should persist to disk")
@@ -2698,11 +2702,32 @@ func TestRenderSortIndicator(t *testing.T) {
 	}
 }
 
+// rooted binds cfg to the current config.Path("") (kata 34km): Save,
+// SaveCaddyDomain, and SaveCaddyHostname now refuse an unset path
+// (config.ErrNoPath) instead of silently falling back to the real
+// ~/.config/tailport/config.yaml, so any test whose purpose is to exercise
+// persistence -- checking a saved file or a toast-free save -- must give its
+// Config a path explicitly, exactly as config.Load/WriteDefault do in
+// production. The path is resolved ONCE, here, not re-derived by Save on
+// every call as the old fallback was -- callers that need Save to keep
+// following a LATER XDG_CONFIG_HOME change (e.g. to deliberately force a
+// save failure) must set m.cfg's path themselves instead of using this
+// helper. Callers must t.Setenv XDG_CONFIG_HOME (or otherwise fix
+// config.Path's resolution) BEFORE calling rooted.
+func rooted(t *testing.T, cfg config.Config) config.Config {
+	t.Helper()
+	p, err := config.Path("")
+	if err != nil {
+		t.Fatalf("config.Path(\"\"): %v", err)
+	}
+	return cfg.WithPath(p)
+}
+
 // buildHistoryModel is a model with one selected listening port, ready to
 // drive registry edits through Update.
 func buildHistoryModel(t *testing.T, cfg config.Config, ports []portscan.Port) model {
 	t.Helper()
-	m := New(cfg)
+	m := New(rooted(t, cfg))
 	m.allPorts = ports
 	m.active = map[int]bool{}
 	m.showAllPorts = true
@@ -6103,6 +6128,14 @@ func rkey(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []
 // srv is non-nil -- a caddyClientOverride pointed at that fake edge. serve is
 // already on for :8080 by default so publishEnableServe is false (a publish cmd
 // can then run without shelling out to tailscale).
+//
+// The returned model's cfg is rooted (kata 34km): the publish flow saves
+// credentials and hostname/domain captures via config.Config.Save/
+// SaveCaddyDomain/SaveCaddyHostname, which now refuse an unset path. A test
+// that needs to force one of those saves to actually FAIL (as opposed to
+// checking it succeeds) can no longer do so by swapping XDG_CONFIG_HOME
+// after this returns -- the path is already resolved -- see
+// TestPublishSaveFailureAbortsPublish for the replacement technique.
 func newPublishModel(t *testing.T, srv *httptest.Server) model {
 	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate saveConfig
@@ -6111,7 +6144,7 @@ func newPublishModel(t *testing.T, srv *httptest.Server) model {
 	cfg.Caddy.Hostname = "caddy"
 	cfg.Caddy.ServerName = "tailport"
 	cfg.Caddy.AdminPort = 2019
-	m := New(cfg)
+	m := New(rooted(t, cfg))
 	m.fqdn = "dev-box.tailnet.ts.net"
 	m.allPorts = []portscan.Port{{Number: 8080, Process: "web"}}
 	m.active = map[int]bool{8080: true}
@@ -6277,13 +6310,20 @@ func TestPublishSaveFailureAbortsPublish(t *testing.T) {
 	defer srv.Close()
 	m := newPublishModel(t, srv)
 
-	// Force the credential Save to fail: point XDG_CONFIG_HOME at a regular
-	// file so Save's MkdirAll(<file>/tailport) errors with ENOTDIR.
-	badXDG := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(badXDG, []byte("x"), 0o600); err != nil {
+	// Force the credential Save to fail: replace the parent directory of the
+	// model's ALREADY-ROOTED config path with a regular file, so Save's
+	// MkdirAll(dir) errors with ENOTDIR. kata 34km: newPublishModel now roots
+	// m.cfg to a fixed path at construction time (Save refuses an unset
+	// path), so this can no longer be forced by swapping XDG_CONFIG_HOME
+	// AFTER construction the way it used to -- Save no longer re-derives the
+	// path from the env on every call, it uses the resolved m.cfg.path.
+	badDir := filepath.Dir(m.cfg.ResolvedPath())
+	if err := os.RemoveAll(badDir); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_CONFIG_HOME", badXDG)
+	if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// Walk P -> host -> auth(y) -> user -> pass -> confirm, gathering a NEW
 	// shared credential (none stored yet, so confirm must Save).

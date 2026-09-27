@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -151,16 +152,56 @@ type Config struct {
 	// path is the file this Config was resolved against by Load/WriteDefault
 	// (see Path), and what Save writes back to. Unexported so it never
 	// round-trips into the YAML file itself. Zero value ("") means "not yet
-	// resolved" -- Save falls back to Path("") in that case, which preserves
-	// old behavior for callers (mainly tests) that build a Config literal
-	// directly instead of going through Load.
+	// resolved" -- kata 34km: Save, SaveCaddyDomain, and SaveCaddyHostname all
+	// now REFUSE to write in that case (ErrNoPath, via saveTarget) rather than
+	// falling back to Path(""), the real ~/.config/tailport/config.yaml. A
+	// caller (mainly tests) that builds a Config literal directly instead of
+	// going through Load/WriteDefault must call WithPath first if it needs a
+	// save to succeed.
 	path string
 }
 
 // ResolvedPath returns the file this Config is bound to: what Load resolved
 // it from, or what WriteDefault seeded it at. Empty if the Config was never
-// routed through either (e.g. a literal built directly by a test).
+// routed through either (e.g. a literal built directly by a test) and
+// WithPath was never called.
 func (c Config) ResolvedPath() string { return c.path }
+
+// WithPath returns a copy of c bound to path, as if it had been resolved
+// there by Load or WriteDefault (kata 34km). It exists for callers -- mainly
+// tests -- that build a Config literal directly but still need Save/
+// SaveCaddyDomain/SaveCaddyHostname to actually write: those now return
+// ErrNoPath for an unset path instead of silently falling back to the real
+// ~/.config/tailport/config.yaml (see the path field's doc comment and
+// saveTarget). No production caller needs this: main.go always routes cfg
+// through config.Load or config.WriteDefault first, both of which already
+// set path.
+func (c Config) WithPath(path string) Config {
+	c.path = path
+	return c
+}
+
+// ErrNoPath is returned by Save, SaveCaddyDomain, and SaveCaddyHostname when
+// the Config's path is unset (kata 34km). Before this guard, all three
+// silently fell back to Path(""), the real ~/.config/tailport/config.yaml,
+// for any Config whose path was never resolved by Load/WriteDefault -- a
+// footgun for a stray Config literal built directly (as most tests, and a
+// bug, would) that happens to call one of these. TestMain's per-package
+// XDG_CONFIG_HOME isolation (see each package's testmain_test.go) remains as
+// defence in depth, but this guard is the primary defence: it makes the
+// unsafe write impossible outright rather than merely redirecting it to a
+// throwaway directory. See saveTarget and TestSaveRefusesUnsetPath.
+var ErrNoPath = errors.New("config: no path set; call Load, WriteDefault, or WithPath first")
+
+// saveTarget returns the path Save, SaveCaddyDomain, and SaveCaddyHostname
+// should write to, or ErrNoPath if c.path is unset. See ErrNoPath's doc
+// comment for why this replaced the old Path("") fallback.
+func (c Config) saveTarget() (string, error) {
+	if c.path == "" {
+		return "", ErrNoPath
+	}
+	return c.path, nil
+}
 
 // StickyHeaderEnabled reports whether the sticky service header (kata k4cj)
 // is on: true when StickyHeader is unset (nil -- including a Config literal
@@ -243,12 +284,13 @@ func Load(override string) (Config, error) {
 
 // Save writes the config to disk, creating the parent directory if needed.
 // It writes to the path this Config was resolved against by Load or
-// WriteDefault (ResolvedPath); if the Config was never routed through
-// either (path is unset -- e.g. a literal built directly by a test), it
-// falls back to Path(""), matching the pre-override default. Called
-// immediately after any registry mutation (label set, favorite toggled,
-// port remembered) so changes survive restarts without requiring a clean
-// exit.
+// WriteDefault (ResolvedPath); if the Config was never routed through either
+// -- path is unset, e.g. a literal built directly by a test -- it now
+// REFUSES with ErrNoPath (kata 34km; see saveTarget) instead of the old
+// silent fallback to Path(""), the real ~/.config/tailport/config.yaml. Call
+// WithPath first if a literal needs to save. Called immediately after any
+// registry mutation (label set, favorite toggled, port remembered) so
+// changes survive restarts without requiring a clean exit.
 //
 // Save deliberately does NOT do plain yaml.Marshal(c): that discards
 // comments, and the caddy: block's explanatory comments are a UX
@@ -298,13 +340,9 @@ func (c Config) Save() error {
 		t := true
 		c.StickyHeader = &t
 	}
-	path := c.path
-	if path == "" {
-		var err error
-		path, err = Path("")
-		if err != nil {
-			return err
-		}
+	path, err := c.saveTarget()
+	if err != nil {
+		return err
 	}
 	target, err := resolveSaveTarget(path)
 	if err != nil {
@@ -401,9 +439,10 @@ func writeConfigAtomic(target string, data []byte) error {
 // the existing config is left byte-for-byte intact (the temp is removed).
 //
 // The target and its .bak resolve exactly as Save's write does: the Config's
-// resolved path (c.path) if set, else Path(""), run through resolveSaveTarget so
-// a symlinked config is written THROUGH to its real target and the .bak lands
-// next to that real target.
+// resolved path (c.path), run through resolveSaveTarget so a symlinked
+// config is written THROUGH to its real target and the .bak lands next to
+// that real target. Like Save, an unset c.path now REFUSES with ErrNoPath
+// (kata 34km; see saveTarget) instead of falling back to Path("").
 //
 // It persists to DISK ONLY. The caller must update its own in-memory
 // cfg.Caddy.Domain after a successful return -- this method intentionally does
@@ -413,13 +452,9 @@ func writeConfigAtomic(target string, data []byte) error {
 // pure persistence primitive, and the caller (w131) validates the domain string
 // before calling.
 func (c Config) SaveCaddyDomain(domain string) error {
-	path := c.path
-	if path == "" {
-		var err error
-		path, err = Path("")
-		if err != nil {
-			return err
-		}
+	path, err := c.saveTarget()
+	if err != nil {
+		return err
 	}
 	target, err := resolveSaveTarget(path)
 	if err != nil {
@@ -550,13 +585,9 @@ func setCaddyDomainNode(doc *yaml.Node, domain string) error {
 // step) validates the label (caddyedge.ValidLabel) before calling, and skips
 // the call entirely when the typed value is unchanged from the current one.
 func (c Config) SaveCaddyHostname(hostname string) error {
-	path := c.path
-	if path == "" {
-		var err error
-		path, err = Path("")
-		if err != nil {
-			return err
-		}
+	path, err := c.saveTarget()
+	if err != nil {
+		return err
 	}
 	target, err := resolveSaveTarget(path)
 	if err != nil {
