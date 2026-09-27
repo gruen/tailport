@@ -105,11 +105,11 @@ func parseRunning(pid, uid int, args []string) (Running, bool) {
 	if containsToken(args, "run") {
 		r.Mode = ModeNamed
 		rawName = namedTunnelName(args)
-		// sanitizeDisplay (S2(b)) is defense in depth on top of the
+		// SanitizeDisplay (S2(b)) is defense in depth on top of the
 		// ValidTunnelName ownership gate below: it guarantees this value can
 		// never carry a raw ESC/OSC byte into a toast or route row even in a
 		// context that didn't go through that gate.
-		r.TunnelName = sanitizeDisplay(rawName)
+		r.TunnelName = SanitizeDisplay(rawName)
 	}
 	if m, ok := flagValue(args, "--metrics"); ok {
 		r.MetricsPort = parseMetricsPort(m)

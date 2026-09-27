@@ -868,7 +868,7 @@ func writeTunnelConfig(path, content string) error {
 // starting with '-' (which cloudflared's own flag parser would otherwise try
 // to interpret as another flag rather than the positional tunnel name).
 // Start rejects any spec.TunnelName that fails this before ever shelling out
-// to cloudflared. See TestValidTunnelName and sanitizeDisplay (console.go),
+// to cloudflared. See TestValidTunnelName and SanitizeDisplay (console.go),
 // which strips the same Cf category from any string tailport did NOT itself
 // validate first (e.g. a name recovered from a foreign sentinel).
 func ValidTunnelName(s string) bool {
@@ -903,7 +903,7 @@ func ValidTunnelName(s string) bool {
 // a bogus string (a leading dot, an escape sequence) rendered as if it were
 // a genuine tailport-owned tunnel's hostname -- and must never be classified
 // Owned. Because the allowed charset excludes every control byte outright,
-// a string that passes this check needs no further sanitizeDisplay pass.
+// a string that passes this check needs no further SanitizeDisplay pass.
 func ValidHostname(s string) bool {
 	if s == "" || !strings.Contains(s, ".") {
 		return false

@@ -1,14 +1,26 @@
 package ui
 
-// Cloudflare Tunnel (the `o` key, kata nc1j; remapped from `t`, kata 7nss
-// BREAKING): a THIRD public-exposure path alongside funnel (`P`) and
-// Caddy-publish (`p`), modeled on publish but adapted to cloudflared's process
-// model. Unlike publish -- a stateless client of a remote edge -- a tunnel is a
+// Cloudflare Tunnel (kata nc1j; remapped from `t`, kata 7nss BREAKING): a
+// THIRD public-exposure path alongside funnel (`P`) and Caddy-publish (`p`),
+// modeled on publish but adapted to cloudflared's process model. Unlike
+// publish -- a stateless client of a remote edge -- a tunnel is a
 // LONG-RUNNING LOCAL process tailport supervises (internal/cftunnel). The
-// whole feature is gated on cfAvailable: when cloudflared isn't installed the
-// `o` key is inert (barGroups drops it) and the
-// poll never runs, mirroring how the Caddy poll stays dark until caddy.domain is
-// set.
+// whole feature is gated on cfAvailable: when cloudflared isn't installed
+// neither key does anything (barGroups drops `o`; `O` never appeared on the
+// bar in the first place) and the poll never runs, mirroring how the Caddy
+// poll stays dark until caddy.domain is set.
+//
+// Split in two (kata p7c5, owner's call: the old single `o` toggle's
+// q/n-mode-select-then-two-text-prompts flow was confusing): `o` now ONLY
+// ever runs a QUICK tunnel, straight to its confirm, no prompt. `O` ONLY ever
+// runs a NAMED tunnel, driven entirely by a per-port config.yaml binding
+// (config.CloudflareBinding, under PortMeta.Cloudflare) -- also straight to
+// its confirm, no prompt. There is no more session-only "remembered tunnel"
+// re-raise for EITHER key: the config file is `O`'s only memory, and a quick
+// tunnel never had settings worth remembering in the first place. Each key
+// only ever touches its OWN mode on a given port; pressing the other key on a
+// port whose running tunnel is the other mode refuses with a hint pointing at
+// the key that owns it (requestTunnel/requestTunnelNamed).
 //
 // State model (the "tunnels survive tailport" choice): tunnels are discovered
 // live from the process table each poll (never persisted), so a tunnel started
@@ -20,10 +32,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/gruen/tailport/internal/cftunnel"
@@ -48,15 +58,6 @@ type tunnelInfo struct {
 	name        string
 	consolePath string
 	ready       bool
-}
-
-// tunnelMemory is the session-only shortcut (mirrors publishInfo/lastPublish):
-// what a port was last tunnelled as, so `o` can re-raise a torn-down tunnel
-// without re-running the setup prompts. Never persisted.
-type tunnelMemory struct {
-	mode     cftunnel.Mode
-	hostname string
-	name     string
 }
 
 // tunnelDoneMsg reports a completed start/stop supervise op. Like
@@ -302,11 +303,15 @@ func tunnelStopCmd(client *cftunnel.Client, pid, port int) tea.Cmd {
 	}
 }
 
-// requestTunnel is the `o` key's up-front gate, mirroring requestPublish. Guards
-// run in order, then it toggles: an already-tunnelled port tears down
-// immediately (de-escalation, never gated); a port tunnelled earlier this
-// session re-raises from memory (still confirmed); otherwise it runs the full
-// setup (mode select for a logged-in user, else straight to a quick tunnel).
+// requestTunnel is the `o` key's up-front gate, mirroring requestPublish. `o`
+// ONLY ever touches a QUICK tunnel (kata p7c5 split the old single toggle in
+// two -- see requestTunnelNamed for `O`, its named sibling): guards run in
+// order, then either an already-running quick tunnel on this port tears down
+// immediately (de-escalation, never gated), or a fresh setup goes STRAIGHT to
+// the quick confirm -- no mode prompt, even when cftunnel.LoggedIn() is true.
+// A named tunnel already running on this port is the cross-key case: refuse
+// with a hint pointing at `O`, the key that owns it, rather than silently
+// tearing down the wrong mode or layering a second tunnel on the port.
 func (m *model) requestTunnel(port int) tea.Cmd {
 	// 1. busy: an exposure op is already in flight.
 	if m.pending != 0 {
@@ -316,9 +321,13 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 	if !m.cfAvailable {
 		return m.setFlash("cloudflared not found on PATH — install it to expose ports via Cloudflare", flashWarn)
 	}
-	// 3. already tunnelled on THIS port -> de-escalation: tear down now, no
-	// confirm (reducing exposure is never gated).
+	// 3. already tunnelled on THIS port: o only ever de-escalates a QUICK
+	// tunnel (no confirm -- reducing exposure is never gated); a NAMED one
+	// here belongs to `O`, so refuse and say so rather than acting on it.
 	if info, ok := m.tunnels[port]; ok {
+		if info.mode == cftunnel.ModeNamed {
+			return m.setErr(fmt.Sprintf("a named tunnel is running on :%d — press O to stop it", port))
+		}
 		m.pending = port
 		return tunnelStopCmd(m.cfClient(), info.pid, port)
 	}
@@ -342,54 +351,84 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
 	}
 
+	// 7. Fresh setup: straight to the quick confirm. No mode prompt (kata
+	// p7c5, owner's call) -- a named tunnel now lives entirely behind `O`.
 	m.tunnelPort = port
-
-	// 7. Session-remembered RE-raise (mirrors publish's lastPublish shortcut): a
-	// port tunnelled earlier this session skips the setup prompts and goes
-	// straight to the confirm with its remembered mode/host/name. A named
-	// re-raise needs BOTH the hostname and the tunnel name -- audit item 2
-	// (kata nc1j): a name-less memory used to reach the confirm anyway, and
-	// Start rejected the empty name at the last moment. If the name is
-	// somehow missing (defensive; every path that seeds lastTunnel now sets
-	// it), fall back to asking for just the name with the hostname already
-	// held, rather than confirming with none.
-	if mem, ok := m.lastTunnel[port]; ok {
-		if mem.mode == cftunnel.ModeNamed && mem.hostname != "" {
-			m.tunnelSetupMode = cftunnel.ModeNamed
-			m.tunnelHostname = mem.hostname
-			m.tunnelName = mem.name
-			if mem.name == "" {
-				m.tunnelInput.Reset()
-				m.tunnelInput.EchoMode = textinput.EchoNormal
-				m.tunnelInput.Placeholder = "my-tunnel"
-				m.tunnelInput.Focus()
-				m.mode = entryTunnelName
-				return nil
-			}
-			// Owned-only same-tunnel guard [R3]: this named tunnel might now be
-			// serving a DIFFERENT port (started fresh, or re-raised there, since
-			// this port last remembered it) -- refuse rather than let Start spawn
-			// a second cloudflared for the same pre-provisioned tunnel.
-			if other := m.tunnelNameInUse(mem.name, port); other != 0 {
-				m.clearTunnelFlow()
-				return m.setErr(tunnelNameRefusedMsg(mem.name, other))
-			}
-			m.mode = entryConfirmTunnelNamed
-			return nil
-		}
-		m.tunnelSetupMode = cftunnel.ModeQuick
-		m.mode = entryConfirmTunnelQuick
-		return nil
-	}
-
-	// 8. Fresh setup. A logged-in user chooses quick vs named; without an account
-	// only the quick path exists, so skip straight to its confirm.
-	if cftunnel.LoggedIn() {
-		m.mode = entryTunnelMode
-		return nil
-	}
-	m.tunnelSetupMode = cftunnel.ModeQuick
 	m.mode = entryConfirmTunnelQuick
+	return nil
+}
+
+// requestTunnelNamed is the `O` key's up-front gate (kata p7c5): the NAMED
+// sibling of requestTunnel, sharing the same busy/availability/foreign/:22/
+// locked guards, but resolving its tunnel/hostname from the port's
+// config.yaml binding (config.CloudflareBinding, PortMeta.Cloudflare)
+// instead of any prompt -- there is nothing left to type. `O` only ever
+// touches a NAMED tunnel; a QUICK one already running on this port is the
+// cross-key case, refused with a hint pointing at `o`.
+func (m *model) requestTunnelNamed(port int) tea.Cmd {
+	// 1. busy: an exposure op is already in flight.
+	if m.pending != 0 {
+		return nil
+	}
+	// 2. feature gate: cloudflared must actually be installed.
+	if !m.cfAvailable {
+		return m.setFlash("cloudflared not found on PATH — install it to expose ports via Cloudflare", flashWarn)
+	}
+	// 3. already tunnelled on THIS port: O only ever de-escalates a NAMED
+	// tunnel (no confirm); a QUICK one here belongs to `o`.
+	if info, ok := m.tunnels[port]; ok {
+		if info.mode == cftunnel.ModeQuick {
+			return m.setErr(fmt.Sprintf("a quick tunnel is running on :%d — press o to stop it", port))
+		}
+		m.pending = port
+		return tunnelStopCmd(m.cfClient(), info.pid, port)
+	}
+	// 3.5. a FOREIGN cloudflared already covers this port -- same guard as `o`.
+	if m.tunnelForeign[port] {
+		return m.setErr(fmt.Sprintf("port :%d already has a cloudflared tunnel tailport doesn't own — resolve it outside tailport first", port))
+	}
+	// 4. :22 (SSH) is hard-blocked from the public internet, same as `o`.
+	if port == 22 {
+		return m.setErr("refusing to tunnel :22 (SSH) to the public internet")
+	}
+	// 5. th05 RELAXED mutual exclusion: a funnelled or published port may ALSO
+	// be tunnelled now -- same as `o`.
+	// 6. locked port -- same guard as `o`.
+	if m.cfg.Ports[port].Locked {
+		return m.setErr(fmt.Sprintf("port :%d is locked — press x to unlock", port))
+	}
+
+	// 7. Resolve the binding. This IS the setup, and it's the ONLY memory `O`
+	// has -- there is no session re-raise any more, and no prompt: an
+	// incomplete or absent binding just refuses, naming the fix.
+	bind := m.cfg.Ports[port].Cloudflare
+	if bind == nil || bind.Tunnel == "" || bind.Hostname == "" {
+		return m.setErr(fmt.Sprintf(":%d has no named tunnel — add ports.%d.cloudflare {tunnel, hostname} to config.yaml", port, port))
+	}
+	if !cftunnel.LoggedIn() {
+		return m.setErr("named tunnels need `cloudflared tunnel login` first")
+	}
+	// The binding is a hand-editable file value, not something the user just
+	// typed into a confirm -- re-validate it exactly like Start would, and
+	// name which field is bad. SanitizeDisplay (S2(b)/N4, exported for this)
+	// guards the toast against a hostile or merely mangled config value.
+	if !cftunnel.ValidTunnelName(bind.Tunnel) {
+		return m.setErr(fmt.Sprintf("ports.%d.cloudflare.tunnel %q is not a valid tunnel name — fix config.yaml", port, cftunnel.SanitizeDisplay(bind.Tunnel)))
+	}
+	if !cftunnel.ValidHostname(bind.Hostname) {
+		return m.setErr(fmt.Sprintf("ports.%d.cloudflare.hostname %q is not a valid hostname — fix config.yaml", port, cftunnel.SanitizeDisplay(bind.Hostname)))
+	}
+	// Owned-only same-tunnel guard [R3]: this named tunnel might already be
+	// serving a DIFFERENT port -- refuse rather than let Start spawn a second
+	// cloudflared for the same pre-provisioned tunnel.
+	if other := m.tunnelNameInUse(bind.Tunnel, port); other != 0 {
+		return m.setErr(tunnelNameRefusedMsg(bind.Tunnel, other))
+	}
+
+	m.tunnelPort = port
+	m.tunnelHostname = bind.Hostname
+	m.tunnelName = bind.Tunnel
+	m.mode = entryConfirmTunnelNamed
 	return nil
 }
 
@@ -421,75 +460,23 @@ func (m *model) tunnelNameInUse(name string, exceptPort int) int {
 	return 0
 }
 
-// tunnelNameRefusedMsg is the shared refusal toast for tunnelNameInUse's three
-// call sites, kept in one place so the wording can't drift between them.
+// tunnelNameRefusedMsg is the shared refusal toast for tunnelNameInUse's two
+// call sites (requestTunnelNamed and confirmTunnelNamed's last-moment
+// recheck), kept in one place so the wording can't drift between them. Says
+// "press O", not "o" (kata p7c5): the port already running this name is
+// running it NAMED, and O -- not o -- is what tears down a named tunnel now.
 func tunnelNameRefusedMsg(name string, port int) string {
-	return fmt.Sprintf("tunnel %q is already running for :%d — a named tunnel serves one port; press o on :%d first", name, port, port)
-}
-
-// enterTunnelNamedHost opens the named-tunnel hostname prompt, prefilled from
-// cloudflared.domain when set.
-func (m *model) enterTunnelNamedHost() tea.Cmd {
-	m.tunnelSetupMode = cftunnel.ModeNamed
-	m.tunnelInput.Reset()
-	m.tunnelInput.EchoMode = textinput.EchoNormal
-	m.tunnelInput.Placeholder = "app.example.com"
-	if d := m.cfg.Cloudflared.Domain; d != "" {
-		m.tunnelInput.SetValue(d)
-		m.tunnelInput.CursorEnd()
-	}
-	m.tunnelInput.Focus()
-	m.mode = entryTunnelHost
-	return nil
-}
-
-// updateTunnelEntry drives the two TEXT steps of the named-tunnel flow
-// (hostname, then tunnel name). The y/n confirms and the mode select are handled
-// inline in Update's key switch, like funnel/publish.
-func (m *model) updateTunnelEntry(msg tea.KeyMsg) tea.Cmd {
-	switch msg.String() {
-	case "esc":
-		m.clearTunnelFlow()
-		return nil
-	case "enter":
-		switch m.mode {
-		case entryTunnelHost:
-			host := strings.TrimSpace(m.tunnelInput.Value())
-			if !validTunnelHostname(host) {
-				return m.setErr("enter a public hostname you've routed to a cloudflared tunnel, e.g. app.example.com")
-			}
-			m.tunnelHostname = host
-			m.tunnelInput.Reset()
-			m.tunnelInput.Placeholder = "my-tunnel"
-			m.tunnelInput.Focus()
-			m.mode = entryTunnelName
-			return nil
-		case entryTunnelName:
-			name := strings.TrimSpace(m.tunnelInput.Value())
-			if !cftunnel.ValidTunnelName(name) {
-				return m.setErr("enter the name of a cloudflared tunnel you created (cloudflared tunnel list)")
-			}
-			if other := m.tunnelNameInUse(name, m.tunnelPort); other != 0 {
-				return m.setErr(tunnelNameRefusedMsg(name, other))
-			}
-			m.tunnelName = name
-			m.mode = entryConfirmTunnelNamed
-			return nil
-		}
-	}
-	var cmd tea.Cmd
-	m.tunnelInput, cmd = m.tunnelInput.Update(msg)
-	return cmd
+	return fmt.Sprintf("tunnel %q is already running for :%d — a named tunnel serves one port; press O on :%d first", name, port, port)
 }
 
 // confirmTunnelQuick is the entryConfirmTunnelQuick "yes" path: spawn a quick
-// tunnel and remember the port as quick for re-raise. The URL isn't known yet
-// (it appears via the poll), so the confirm named nothing and the flash says
-// "starting…" -- and, since kata h2ef, the route row shows an animated
-// spinner in the URL's place until it resolves (startTunnelSpinner).
+// tunnel. The URL isn't known yet (it appears via the poll), so the confirm
+// named nothing and the flash says "starting…" -- and, since kata h2ef, the
+// route row shows an animated spinner in the URL's place until it resolves
+// (startTunnelSpinner). No memory to seed any more (kata p7c5): a repeat `o`
+// on this port just runs this same path again.
 func (m *model) confirmTunnelQuick() tea.Cmd {
 	port := m.tunnelPort
-	m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
 	spec := cftunnel.Spec{Port: port, Mode: cftunnel.ModeQuick}
 	m.clearTunnelFlow()
 	m.pending = port
@@ -504,8 +491,10 @@ func (m *model) confirmTunnelQuick() tea.Cmd {
 // operator's pre-provisioned named tunnel bound to the confirmed hostname.
 // Re-checks the owned-only same-tunnel guard [R3] one last time -- state can
 // have moved between the confirm opening and "y" landing (a poll, another
-// port's re-raise) -- before ever shelling out, and flashes the exact URL
-// (named tunnels know their host up front, unlike quick's spinner-then-URL).
+// port's O) -- before ever shelling out, and flashes the exact URL (named
+// tunnels know their host up front, unlike quick's spinner-then-URL). No
+// memory to seed any more (kata p7c5): config.yaml already IS the memory,
+// via requestTunnelNamed re-reading it on every `O` press.
 func (m *model) confirmTunnelNamed() tea.Cmd {
 	port := m.tunnelPort
 	host := m.tunnelHostname
@@ -514,7 +503,6 @@ func (m *model) confirmTunnelNamed() tea.Cmd {
 		m.clearTunnelFlow()
 		return m.setErr(tunnelNameRefusedMsg(name, other))
 	}
-	m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: host, name: name})
 	spec := cftunnel.Spec{Port: port, Mode: cftunnel.ModeNamed, TunnelName: name, Hostname: host}
 	m.clearTunnelFlow()
 	m.pending = port
@@ -524,24 +512,13 @@ func (m *model) confirmTunnelNamed() tea.Cmd {
 	)
 }
 
-// rememberTunnel records a port's tunnel config for the session-only re-raise
-// shortcut (see lastTunnel).
-func (m *model) rememberTunnel(port int, mem tunnelMemory) {
-	if m.lastTunnel == nil {
-		m.lastTunnel = map[int]tunnelMemory{}
-	}
-	m.lastTunnel[port] = mem
-}
-
-// clearTunnelFlow resets the tunnel-setup flow fields and input, so an aborted
-// or completed flow leaves nothing behind.
+// clearTunnelFlow resets the tunnel-setup flow fields, so an aborted or
+// completed flow leaves nothing behind.
 func (m *model) clearTunnelFlow() {
 	m.mode = entryNone
 	m.tunnelPort = 0
-	m.tunnelSetupMode = cftunnel.ModeQuick
 	m.tunnelHostname = ""
 	m.tunnelName = ""
-	m.tunnelInput.Reset()
 }
 
 // tunnelErrText maps a cftunnel op error to a user-facing toast, giving the
@@ -555,21 +532,4 @@ func tunnelErrText(err error) string {
 	default:
 		return "cloudflared: " + err.Error()
 	}
-}
-
-// validTunnelHostname is a light sanity check on a named-tunnel hostname: a
-// dotted DNS name restricted to [A-Za-z0-9.-], containing at least one dot,
-// and not starting with '-' or '.' (tightened, kata nc1j W3a -- the previous
-// version only blocked spaces/slashes/colons, which still let a leading dot
-// or hyphen or a stray control/unicode byte through). tailport can't verify
-// the DNS route exists (that's the operator's pre-provisioning job), so this
-// only catches obvious typos.
-//
-// This is now a thin wrapper around cftunnel.ValidHostname (S2(c), audit
-// finding 2): the rule moved there so internal/cftunnel's own Discover path
-// can apply the SAME check to a hostname recovered from a --logfile
-// sentinel, rather than the UI and cftunnel packages silently duplicating
-// (and risking drifting) two copies of it.
-func validTunnelHostname(s string) bool {
-	return cftunnel.ValidHostname(s)
 }

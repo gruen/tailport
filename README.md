@@ -170,7 +170,8 @@ session-only toggle that resets to port order on restart.
 | `p` | Funnel to the public internet — toggle, behind a confirm |
 | `d` | Publish via your Caddy edge — toggle, behind a confirm |
 | `e` | Edit a published port's auth in place (can't move it to a new hostname) |
-| `o` | Cloudflare tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
+| `o` | Cloudflare quick tunnel — toggle, behind a confirm (only when `cloudflared` is installed) |
+| `O` | Cloudflare named tunnel, from this port's config.yaml binding — toggle, behind a confirm (help-only; not shown in the bottom bar) |
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
 | `i` | Copy the selected **port's** bare PID (e.g. `12345`) — refuses if it can't be resolved |
 | `I` | Copy a ready-to-run `kill <pid>` command (SIGTERM) — same refusal as `i`, plus refuses on a locked port |
@@ -216,7 +217,7 @@ hard-blocked from all three public paths.
 | **Serve** | `t` | Your tailnet | `tailscale serve` (plain HTTP) |
 | **Funnel** | `p` | Public internet | `tailscale funnel` (HTTPS via `*.ts.net`) |
 | **Publish** | `d` | Public internet | Your own [Caddy edge](#publishing-to-the-public-internet-caddy-edge) — custom `https://` hostname |
-| **Tunnel** | `o` | Public internet | [Cloudflare Tunnel](#tunnelling-to-the-public-internet-cloudflare-tunnel) (`cloudflared`) |
+| **Tunnel** | `o`/`O` | Public internet | [Cloudflare Tunnel](#tunnelling-to-the-public-internet-cloudflare-tunnel) (`cloudflared`) |
 
 **Serve** is the default path and the reason tailport exists. Press `t` on a
 loopback-bound port and it's reachable at `http://<hostname>:<port>` across your
@@ -229,7 +230,7 @@ nothing to serve.) Two deliberate constraints:
 - **1:1 port mapping.** A served port always keeps its own number; serve never
   remaps.
 
-**The three public paths** (`p`, `d`, `o`) each expose a port to *anyone on the
+**The three public paths** (`p`, `d`, `o`/`O`) each expose a port to *anyone on the
 internet*, so each:
 
 - requires a strong y/n confirmation before going live, naming the resulting
@@ -460,7 +461,7 @@ run — Tailscale ACL and auth key, DNS) is a separate one-time operator task; s
 
 ### Tunnel (Cloudflare)
 
-*Advanced — only needed if you use the `o` Cloudflare tunnel path.*
+*Advanced — only needed if you use the `o`/`O` Cloudflare tunnel keys.*
 
 A `cloudflared` block configures the optional
 [tunnel-to-the-internet path](#tunnelling-to-the-public-internet-cloudflare-tunnel).
@@ -469,35 +470,46 @@ comments — the first time it saves the config.
 
 > **Upgraded from an older tailport?** A `config.yaml` from before this feature
 > has **no `cloudflared:` block yet** — expected. It appears on the next save,
-> or paste the block below in by hand. Unlike `caddy.domain`,
-> `cloudflared.domain` gates nothing: it's a pure convenience prefill.
+> or paste the block below in by hand.
 
 ```yaml
 cloudflared:
     # Optional path to the cloudflared executable. Blank means tailport
     # looks up `cloudflared` on $PATH.
     binary: ""
-
-    # Optional public base domain used to prefill the hostname prompt when
-    # starting a named (authenticated) tunnel. Blank by default; quick
-    # (unauthenticated) tunnels ignore it.
-    domain: ""
 ```
 
 - **`binary`** (default `""`) — path to the cloudflared executable. Blank means
-  tailport looks it up on `$PATH`; the whole `o` feature (key, discovery,
+  tailport looks it up on `$PATH`; the whole feature (both keys, discovery,
   polling) stays dormant unless it's found there (or at this path). A wrapper
   script works if it `exec`s cloudflared — discovery recognizes the process
   either as your configured `binary` or, after the wrapper's `exec` replaces
   it, as plain `cloudflared`.
-- **`domain`** (default `""`) — a public base domain used only to **prefill**
-  the hostname prompt when starting a **named** tunnel. Purely a convenience:
-  leaving it blank blocks nothing, and a **quick** tunnel ignores it entirely.
 
-None of this configures Cloudflare itself — for a named tunnel, logging in
-(`cloudflared tunnel login`), creating the tunnel, and routing its hostname
-(`cloudflared tunnel route dns`) are a separate, one-time operator task;
-tailport only ever *runs* an already-provisioned named tunnel.
+> **`cloudflared.domain` is ignored since v0.3.3** (kata p7c5). It used to
+> prefill a hostname prompt that no longer exists — `O` now reads a named
+> tunnel's hostname straight from its per-port binding below, with no prompt
+> at all. An old config's `domain: ...` still loads without error, but it's
+> dropped the next time tailport saves the file.
+
+**A named tunnel is bound per port**, not in the `cloudflared` block: add a
+`cloudflare` entry under that port in `ports:`, naming the pre-provisioned
+tunnel and the hostname you routed to it —
+
+```yaml
+ports:
+    3000:
+        cloudflare:
+            tunnel: tp-e2e
+            hostname: tunnel.gruen.work
+```
+
+— and `O` on `:3000` runs exactly that tunnel/hostname, no prompts. See
+[Tunnelling to the public internet](#tunnelling-to-the-public-internet-cloudflare-tunnel)
+for the one-time operator setup (`cloudflared tunnel login` / `create` /
+`route dns`) that has to happen before this binding means anything. None of
+that is configured here — tailport only ever *runs* an already-provisioned
+named tunnel.
 
 ## Publishing to the public internet (Caddy edge)
 
@@ -563,20 +575,31 @@ ingress slot (Funnel). The `cloudflared` binary *is* the connector; a tunnel is
 up only while its process stays alive.
 
 The whole feature exists only when `cloudflared` is installed: tailport detects
-it once at startup, and when it's absent the `o` key is dropped from the bar
-entirely — no key, no discovery, no polling, zero cost. There are two flavors,
-matching Cloudflare's two account scenarios:
+it once at startup, and when it's absent neither key does anything — `o` is
+dropped from the bar entirely (`O` never appears there regardless — see
+below) and there's no discovery, no polling, zero cost. There are two
+flavors, matching Cloudflare's two account scenarios, and (kata p7c5) each
+gets its **own key** rather than a menu to pick between them:
 
-- **Quick tunnel** — no Cloudflare account needed. tailport runs
+- **Quick tunnel (`o`)** — no Cloudflare account needed. tailport runs
   `cloudflared tunnel --url http://localhost:<port>`, which hands back a random
   `https://<name>.trycloudflare.com` hostname: unauthenticated, and ephemeral —
-  a new hostname every time you start one.
-- **Named tunnel** — for an authenticated account. You've already run
-  `cloudflared tunnel login`, created the tunnel with `cloudflared tunnel
-  create` (dashboard- or token-managed tunnels aren't supported — see below),
-  and routed a stable custom hostname to it (`cloudflared tunnel route dns`) —
-  a separate, one-time operator task, like standing up the Caddy edge, that
-  tailport never automates. tailport only *runs* that pre-provisioned tunnel:
+  a new hostname every time you start one. `o` goes straight to a confirm; there
+  is no setup to do first.
+- **Named tunnel (`O`)** — for an authenticated account, driven entirely by a
+  binding in `config.yaml` (see [Tunnel
+  (Cloudflare)](#tunnel-cloudflare) above). One-time operator setup, before the
+  binding means anything:
+  1. `cloudflared tunnel login` (once per account; dashboard- or
+     token-managed tunnels aren't supported — see below);
+  2. `cloudflared tunnel create <name>` — creates the named tunnel;
+  3. `cloudflared tunnel route dns <name> <hostname>` — routes a stable
+     custom hostname to it;
+  4. add `ports.<port>.cloudflare: {tunnel: <name>, hostname: <hostname>}`
+     to `config.yaml`.
+
+  tailport never automates any of that — it only *runs* the pre-provisioned
+  tunnel `O` is bound to:
   ```
   cloudflared tunnel --config <path> --metrics 127.0.0.1:<metrics-port> --logfile <path> --no-autoupdate run --url http://localhost:<port> <name>
   ```
@@ -638,9 +661,10 @@ own session, so quitting the TUI doesn't drop the tunnel — it keeps running
 until you tear it down or kill it yourself. tailport never persists tunnel state
 to disk; instead it reads the OS process table live on every poll, so a tunnel
 started in a previous session is re-discovered next launch and stays
-re-toggleable with `o`. Only **tailport-owned** tunnels — the ones carrying a
-sentinel `--logfile` flag tailport always passes — are tracked this way; a
-`cloudflared` process started outside tailport is left alone entirely.
+re-toggleable — with `o` if it's quick, `O` if it's named. Only
+**tailport-owned** tunnels — the ones carrying a sentinel `--logfile` flag
+tailport always passes — are tracked this way; a `cloudflared` process started
+outside tailport is left alone entirely.
 
 **If a tunnel stops on its own** — a named tunnel that can't authenticate,
 retries running out, a crash — tailport never lets it just vanish. The next
@@ -651,53 +675,69 @@ line is never presented as if it were the reason — if nothing more useful
 was logged, the toast just reads `Cloudflare tunnel on :3000 exited` with no
 fabricated cause. Full console output (not just that one line) is always in
 `~/.local/state/tailport/cftunnel-<port>[-<host>].console`. Tearing a tunnel
-down yourself with `o` never triggers this toast.
+down yourself — `o` on a quick one, `O` on a named one — never triggers this
+toast.
 
 Like the other public paths, Tunnel is independent and may coexist with Funnel
 and Publish on the same port, every path still requires its own per-service
 confirm, and `:22` stays hard-blocked. A tunnelled service shows its own
 `cloudflare` route row (marker `◈` / ☁️) with the exact public URL once known.
 
-### The tunnel toggle (`o`)
+### Two separate toggles: `o` (quick) and `O` (named)
 
-`o` behaves differently depending on the port's state:
+Cloudflare Tunnel was one key (`o`) through a q/n mode-select-then-two-prompts
+flow up to v0.3.2; kata p7c5 replaced that with two independent keys, each
+doing exactly one thing, with no prompts either way:
 
-- **Already tunnelled** — `o` tears it down immediately. No confirm.
-- **Tunnelled earlier this session, then torn down** — tailport remembers that
-  port's mode and, for a named tunnel, **both** its hostname **and its tunnel
-  name** in memory for as long as the process runs, and `o` re-raises it,
-  skipping setup — straight to the confirm.
-- **Never tunnelled this session** — `o` runs the full setup. If you're logged
-  in to Cloudflare, you pick quick or named; choosing named asks for the
-  hostname you've routed and the tunnel's name. Without an account, only the
-  quick path exists, so setup skips straight to its confirm.
+- **`o` — quick tunnel only.** On a port not currently running a quick
+  tunnel, `o` goes straight to the quick confirm — no mode prompt, even if
+  you're logged in to Cloudflare. On a port already running a quick tunnel,
+  `o` tears it down immediately, no confirm.
+- **`O` — named tunnel only, from config.yaml.** `O` reads
+  `ports.<port>.cloudflare.{tunnel, hostname}` (see [Tunnel
+  (Cloudflare)](#tunnel-cloudflare) above) and goes straight to the named
+  confirm, naming the exact hostname and the tunnel it will run — again, no
+  prompt. On a port already running its named tunnel, `O` tears it down
+  immediately, no confirm. `O` refuses (with a toast naming the fix) when the
+  port has no binding, when `cloudflared tunnel login` hasn't been run yet, or
+  when the bound tunnel name/hostname is invalid.
+- **Where `O` is shown:** not in the bottom bar — like `ctrl+r` (redo), it's
+  help-only, documented in the `?` overlay and `tailport quickstart` and the
+  [keybinding table](#keybindings) above, but never takes a bar slot.
+- **Cross-key behavior:** each key only ever touches its OWN mode on a given
+  port. Press `o` on a port whose running tunnel is *named*, and it refuses:
+  `a named tunnel is running on :<port> — press O to stop it`. Press `O` on a
+  port whose running tunnel is *quick*, and it refuses the mirror way:
+  `a quick tunnel is running on :<port> — press o to stop it`. Neither key
+  ever tears down or starts the other's mode.
 
-A named tunnel serves only **one local port at a time**: if you try to start
-or re-raise the same tunnel name on a second port while the first is still
-running, tailport refuses with a toast naming which port already has it.
-**The limit:** tailport only sees tunnels *it* started this session (or
-re-discovered from a prior one) — if the same named tunnel also runs somewhere
-else entirely (another machine, a system service, a dashboard connector),
-cloudflared just adds another connector to it, and Cloudflare may send
-requests to either. tailport can't see or guard against that.
+A named tunnel serves only **one local port at a time**: if two ports are
+bound to the same tunnel name and you press `O` on the second while the first
+is still running it, tailport refuses with a toast naming which port already
+has it. **The limit:** tailport only sees tunnels *it* started this session
+(or re-discovered from a prior one) — if the same named tunnel also runs
+somewhere else entirely (another machine, a system service, a dashboard
+connector), cloudflared just adds another connector to it, and Cloudflare may
+send requests to either. tailport can't see or guard against that.
 
-Every path ends in a y/n confirm before anything goes live, and `:22` is
-hard-blocked. The **quick** tunnel's confirm is the one deliberate exception to
-the "always name the exact public URL" rule: cloudflared assigns the
-`*.trycloudflare.com` hostname only after the tunnel starts, so there's no URL
-to name in advance. The confirm names the local port instead; tailport flashes
-`starting Cloudflare quick tunnel for :<port>…`, and the real `https://…`
-address appears in the row a few seconds later, once the next poll picks it up.
-A **named** tunnel's confirm has no such gap — it names the exact
-`https://<hostname>` up front (the same as Publish) plus the tunnel it will
-run, e.g. `via tunnel "web"` — but that hostname is simply the one *you*
-typed: tailport has no way to check it's actually routed to that tunnel. For
-a **locally-managed** tunnel it **does** now pin the tunnel's ingress to
-exactly that hostname (see the per-tunnel `--config` above), so if it's
-wrong or unrouted your service is simply unreachable at it — the tunnel no
-longer falls back to serving whatever *other* hostname happens to already
-be routed to it. (A tunnel switched to remotely-managed in the Cloudflare
-dashboard ignores this local pin — see above; that's out of scope.)
+Both keys end in a y/n confirm before anything goes live, and `:22` is
+hard-blocked either way. The **quick** tunnel's confirm is the one deliberate
+exception to the "always name the exact public URL" rule: cloudflared assigns
+the `*.trycloudflare.com` hostname only after the tunnel starts, so there's no
+URL to name in advance. The confirm names the local port instead; tailport
+flashes `starting Cloudflare quick tunnel for :<port>…`, and the real
+`https://…` address appears in the row a few seconds later, once the next
+poll picks it up. The **named** tunnel's confirm has no such gap — it names
+the exact `https://<hostname>` up front (the same as Publish) plus the tunnel
+it will run, e.g. `via tunnel "web" (from config.yaml)` — but that hostname is
+simply the one *config.yaml* says: tailport has no way to check it's actually
+routed to that tunnel. For a **locally-managed** tunnel it **does** now pin
+the tunnel's ingress to exactly that hostname (see the per-tunnel `--config`
+above), so if it's wrong or unrouted your service is simply unreachable at
+it — the tunnel no longer falls back to serving whatever *other* hostname
+happens to already be routed to it. (A tunnel switched to remotely-managed in
+the Cloudflare dashboard ignores this local pin — see above; that's out of
+scope.)
 
 ## How it works
 
@@ -713,7 +753,7 @@ dashboard ignores this local pin — see above; that's out of scope.)
   in-memory-only state to lose if tailport is killed rather than quit normally.
 
 tailport has no dependencies beyond the `tailscale` CLI and the OS tools above
-(and, only if you use the `o` tunnel feature, `cloudflared`) — no daemon,
+(and, only if you use the `o`/`O` tunnel keys, `cloudflared`) — no daemon,
 nothing installed or modified system-wide other than the `serve` mappings you
 toggle yourself.
 

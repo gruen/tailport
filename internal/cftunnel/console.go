@@ -46,11 +46,11 @@ func ConsolePath(logfile string) string {
 // ansiEscapeRe strips ANSI/VT escape sequences: cloudflared colorizes its
 // console output when it thinks it's attached to a terminal-ish stream, and a
 // toast must never show raw escape bytes. It only matches CSI sequences
-// (ESC '[' ... letter); sanitizeDisplay below is the backstop for anything
+// (ESC '[' ... letter); SanitizeDisplay below is the backstop for anything
 // this misses, e.g. an OSC sequence (ESC ']' ... BEL).
 var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
-// sanitizeDisplay strips every C0 control byte (0x00-0x1F), DEL (0x7F), C1
+// SanitizeDisplay strips every C0 control byte (0x00-0x1F), DEL (0x7F), C1
 // control byte (U+0080-U+009F) (S2(b), audit finding 2), and every Unicode
 // FORMAT character, category Cf (N4), from s. It is the backstop for any
 // string tailport did not itself construct -- cloudflared's own console
@@ -67,7 +67,12 @@ var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 // text (e.g. an IDN hostname) passes through untouched. ValidTunnelName
 // rejects Cf outright at input time, so this is defense in depth for a
 // string tailport did NOT validate itself.
-func sanitizeDisplay(s string) string {
+//
+// Exported (kata p7c5) so internal/ui can run the SAME pass over a
+// config.yaml-supplied tunnel name/hostname before naming it in a refusal
+// toast: that value comes from a hand-editable file too, not just a
+// recovered process argv, and is exactly as untrusted for display purposes.
+func SanitizeDisplay(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
@@ -137,7 +142,7 @@ const consoleTailMaxRunes = 160
 // dressed up as an explanation.
 //
 // The result is truncated to 160 runes with a trailing "…" and always passed
-// through sanitizeDisplay (S2(b)) before it is: cloudflared's console output
+// through SanitizeDisplay (S2(b)) before it is: cloudflared's console output
 // is not tailport's own text, so the returned string can never carry a raw
 // ESC or other control byte, even if ansiEscapeRe's CSI-only stripping above
 // missed something (an OSC 52 sequence, say). It returns "" if the file
@@ -154,13 +159,13 @@ func ConsoleTail(path string) string {
 
 	for i := len(lines) - 1; i >= 0; i-- {
 		if line := strings.TrimSpace(lines[i]); strings.HasPrefix(line, "Incorrect Usage:") {
-			return truncateRunes(sanitizeDisplay(line), consoleTailMaxRunes)
+			return truncateRunes(SanitizeDisplay(line), consoleTailMaxRunes)
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if m := consoleLevelLineRe.FindStringSubmatch(line); m != nil {
-			return truncateRunes(sanitizeDisplay(m[2]), consoleTailMaxRunes)
+			return truncateRunes(SanitizeDisplay(m[2]), consoleTailMaxRunes)
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -168,7 +173,7 @@ func ConsoleTail(path string) string {
 		if line == "" || consoleLeveledLineRe.MatchString(line) {
 			continue
 		}
-		return truncateRunes(sanitizeDisplay(line), consoleTailMaxRunes)
+		return truncateRunes(SanitizeDisplay(line), consoleTailMaxRunes)
 	}
 	return ""
 }

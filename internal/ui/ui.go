@@ -182,17 +182,26 @@ type keyMap struct {
 	// SECOND public path, sibling to Funnel -- never ranked above. Since kata
 	// th05 it may COEXIST with funnel/tunnel on one port (each its own route).
 	Publish key.Binding
-	// Tunnel exposes a port to the public internet through a Cloudflare Tunnel
-	// run by cloudflared (the `t` key, kata nc1j). A THIRD public path, sibling
-	// to Funnel and Publish, and since kata th05 freely coexisting with both.
-	// Only shown in the
-	// bottom bar when cloudflared is installed (barGroups gates it on
-	// cfAvailable); it stays in groups() so the "?" overlay documents it.
-	Tunnel   key.Binding
-	Filter   key.Binding
-	NewPort  key.Binding
-	Label    key.Binding
-	Favorite key.Binding
+	// Tunnel runs a Cloudflare quick tunnel, exposing a port to the public
+	// internet via cloudflared (the `o` key, kata nc1j). A THIRD public path,
+	// sibling to Funnel and Publish, and since kata th05 freely coexisting
+	// with both. Only shown in the bottom bar when cloudflared is installed
+	// (barGroups gates it on cfAvailable); it stays in groups() so the "?"
+	// overlay documents it. Split from the named tunnel (kata p7c5, owner's
+	// call): `o` ONLY ever runs a quick tunnel now -- see TunnelNamed.
+	Tunnel key.Binding
+	// TunnelNamed runs the NAMED Cloudflare tunnel bound to the selected port
+	// in config.yaml (the `O` key, kata p7c5): ports.<port>.cloudflare
+	// {tunnel, hostname}, no prompts. Help-only, like Redo: barGroups keeps it
+	// OFF the bottom bar UNCONDITIONALLY (never re-enabled by cfAvailable,
+	// since it's never shown there at all), but it stays in groups() so the
+	// "?" overlay and `tailport quickstart` document it, and it's gated on
+	// cfAvailable in the key handler exactly like Tunnel.
+	TunnelNamed key.Binding
+	Filter      key.Binding
+	NewPort     key.Binding
+	Label       key.Binding
+	Favorite    key.Binding
 	// Forget clears ★ -- what "u" did before 3cwx moved that key to Undo.
 	Forget key.Binding
 	Lock   key.Binding
@@ -255,10 +264,13 @@ type keyGroup struct {
 // d (publish) -> o (cloudflare tunnel) -- matching the key letters left to
 // right roughly, and putting funnel (the lighter-weight, easiest-to-drop
 // public path) ahead of publish/tunnel rather than the earlier
-// publish-tunnel-funnel order from the nc1j follow-up.
+// publish-tunnel-funnel order from the nc1j follow-up. TunnelNamed (`O`, kata
+// p7c5) sits right after Tunnel (`o`) -- its named sibling -- even though
+// barGroups keeps it off the bar entirely; the "?" overlay still shows it
+// there, next to the key it's a variant of.
 func (k keyMap) groups() []keyGroup {
 	return []keyGroup{
-		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Tunnel, k.Clean, k.Lock, k.Edit}},
+		{"Toggle Service Exposure", []key.Binding{k.Toggle, k.Funnel, k.Publish, k.Tunnel, k.TunnelNamed, k.Clean, k.Lock, k.Edit}},
 		{"Favorites", []key.Binding{k.Favorite, k.Forget, k.NewPort, k.Copy, k.CopyPid, k.CopyKill, k.Label}},
 		{"View", []key.Binding{k.Filter, k.ShowAll, k.Sort, k.Refresh}},
 		// Undo/Redo sit in App, not Favorites: they step through every registry
@@ -309,12 +321,21 @@ func newKeyMap() keyMap {
 		// (kata prp1): unpublish/republish/first-setup, see requestPublish.
 		// Moved from p to d under 58ws (freed p for funnel).
 		Publish: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "on caddy (public)")),
-		// "on cloudflare (public)": the third public path (kata nc1j), a
-		// cloudflared-tunnel sibling to funnel/publish in the Serve Toggles group.
-		// o is a TOGGLE: tear down / re-raise / first-setup, see requestTunnel.
-		// Remapped from t to o (kata 7nss, BREAKING) to free t for tailnet serve;
-		// o is the owner's explicit pick, not a mnemonic.
-		Tunnel: key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "on cloudflare (public)")),
+		// "on cloudflare quick (public)": the third public path (kata nc1j), a
+		// cloudflared-tunnel sibling to funnel/publish in the Serve Toggles
+		// group. o is a TOGGLE: tear down / first-setup, see requestTunnel.
+		// Remapped from t to o (kata 7nss, BREAKING) to free t for tailnet
+		// serve; o is the owner's explicit pick, not a mnemonic. Split from
+		// the named tunnel under kata p7c5 (owner's call): o now ONLY ever
+		// runs a QUICK tunnel, straight to its confirm -- no mode prompt any
+		// more, even when logged in. See TunnelNamed for the `O` sibling.
+		Tunnel: key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "on cloudflare quick (public)")),
+		// "on cloudflare named (public)": O's NAMED sibling to Tunnel (kata
+		// p7c5), sourced entirely from the selected port's config.yaml
+		// binding -- see requestTunnelNamed. Help-only: barGroups keeps it
+		// off the bottom bar unconditionally (mirrors Redo), but it's
+		// documented in the "?" overlay and `tailport quickstart`.
+		TunnelNamed: key.NewBinding(key.WithKeys("O"), key.WithHelp("O", "on cloudflare named (public)")),
 		// Filter is display-only (legend + help): the actual "/" handling lives
 		// in bubbles/list. Listed here so the feature is discoverable.
 		Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
@@ -825,18 +846,14 @@ const (
 	entryConfirmPurgeOwned       // y/n: force-purge an owned conflicting route, then take over
 	entryConfirmPurgeForeign     // y/n: scary drift warning before purging a foreign route
 	entryConfirmPurgeForeignType // typed-"purge" commit gate for a foreign route
-	// The cloudflared tunnel (`t`) flow (kata nc1j), handled inline in Update
-	// (the y/n gates) and updateTunnelEntry (the text steps). A logged-in user
-	// picks quick vs named first; quick jumps straight to its generic confirm
-	// (the random URL can't be named in advance); named gathers a hostname + a
-	// pre-provisioned tunnel name, then a confirm naming the exact https URL:
-	//   entryTunnelMode -> [ quick: entryConfirmTunnelQuick
-	//                      | named: entryTunnelHost -> entryTunnelName -> entryConfirmTunnelNamed ]
-	entryTunnelMode         // y/n-style: q quick / n named / esc cancel (logged-in only)
-	entryTunnelHost         // text: the public hostname the operator already routed (named)
-	entryTunnelName         // text: the pre-provisioned cloudflared tunnel name (named)
+	// The Cloudflare Tunnel confirms (kata nc1j; split into two keys under
+	// p7c5), handled inline in Update's y/n switch. There is no mode-select
+	// or text-entry step any more: `o` (requestTunnel) goes straight to
+	// entryConfirmTunnelQuick, and `O` (requestTunnelNamed) goes straight to
+	// entryConfirmTunnelNamed with tunnelHostname/tunnelName already read off
+	// the port's config.yaml binding.
 	entryConfirmTunnelQuick // generic y/n: expose to a random *.trycloudflare.com (URL unknown until it starts)
-	entryConfirmTunnelNamed // y/n naming the exact https://<hostname> (named)
+	entryConfirmTunnelNamed // y/n naming the exact https://<hostname> (named, from config.yaml)
 )
 
 type model struct {
@@ -1026,11 +1043,6 @@ type model struct {
 	// signalled -- so unlike tunnels this is populated (not discarded) and
 	// requestTunnel refuses to layer a second exposure on top of it (kata aprt).
 	tunnelForeign map[int]bool
-	// lastTunnel remembers, per port, what a port was last tunnelled as, so `o`
-	// can re-raise a torn-down tunnel without re-prompting. SESSION-ONLY, never
-	// persisted -- the process table stays the source of truth (mirrors
-	// lastPublish).
-	lastTunnel map[int]tunnelMemory
 	// tunnelStopping marks ports a user-initiated teardown is (or was, until
 	// a later poll confirms it's gone) in flight for -- set by the
 	// tunnelDoneMsg torndown branch BEFORE it deletes from m.tunnels, cleared
@@ -1048,14 +1060,14 @@ type model struct {
 	// cfClientOverride, when non-nil, replaces the client built from
 	// cfg.Cloudflared for tests (mirrors caddyClientOverride).
 	cfClientOverride *cftunnel.Client
-	// tunnel-setup (`o`) flow state, carried across the dialog steps and cleared
-	// by clearTunnelFlow. tunnelInput is the shared textinput for the named
-	// flow's hostname / tunnel-name steps.
-	tunnelInput     textinput.Model
-	tunnelPort      int           // local port being set up
-	tunnelSetupMode cftunnel.Mode // quick vs named for the in-flight setup
-	tunnelHostname  string        // named: the public hostname entered (held into the confirm)
-	tunnelName      string        // named: the pre-provisioned cloudflared tunnel name
+	// tunnel-setup flow state, carried from requestTunnel/requestTunnelNamed
+	// into the y/n confirm and cleared by clearTunnelFlow. No text-entry
+	// fields any more (kata p7c5): `o` needs none, and `O` reads
+	// tunnelHostname/tunnelName straight off the port's config.yaml binding
+	// rather than a typed prompt.
+	tunnelPort     int    // local port being set up
+	tunnelHostname string // named: the confirmed public hostname (from config.yaml)
+	tunnelName     string // named: the pre-provisioned cloudflared tunnel name (from config.yaml)
 
 	// tunnelSpinner* (kata h2ef) drives the animated "<glyph> starting…" label
 	// shown in place of a quick tunnel's still-empty URL (a named tunnel's
@@ -1436,12 +1448,6 @@ func New(cfg config.Config, markersOverride ...string) model {
 	pui.CharLimit = 8
 	pui.Width = 10
 
-	// The cloudflared-tunnel setup input (kata nc1j), reused for the named flow's
-	// hostname and tunnel-name steps.
-	tui := textinput.New()
-	tui.CharLimit = 253 // max DNS name length
-	tui.Width = 40
-
 	// Detect cloudflared ONCE, synchronously, at construction: cheap (a LookPath
 	// that fast-fails when absent, else one short `version` probe bounded by
 	// detectTimeout), and knowing availability up front lets barGroups decide
@@ -1489,14 +1495,12 @@ func New(cfg config.Config, markersOverride ...string) model {
 		// see the field doc).
 		lastPublish: map[int]publishInfo{},
 		// Cloudflare Tunnel state (kata nc1j): availability decided above; the
-		// live/memory maps start empty (the process-table poll fills tunnels).
+		// live maps start empty (the process-table poll fills tunnels).
 		cfAvailable:    cfAvailable,
 		cfVersion:      cfVersion,
 		tunnels:        map[int]tunnelInfo{},
 		tunnelForeign:  map[int]bool{},
-		lastTunnel:     map[int]tunnelMemory{},
 		tunnelStopping: map[int]bool{},
-		tunnelInput:    tui,
 		portInput:      ti, labelInput: li, sshInput: si, publishInput: pi, purgeInput: pui, configPath: configPath,
 		// Optimistic until the first edge poll actually fails (see the field
 		// doc), so a configured-but-not-yet-polled edge doesn't flash
@@ -4031,26 +4035,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.tunnelStopping, port)
 			}
 		}
-		// Every tunnel the poll reports is, by definition, re-raiseable -- so
-		// remember it (mirrors lastPublish), letting a tunnel from BEFORE this
-		// process started (across a restart) be re-toggled from memory too. A
-		// quick tunnel's ephemeral hostname isn't worth remembering (a re-raise
-		// gets a fresh URL), so only named tunnels seed a hostname/name. Audit
-		// item 2 (kata nc1j): a name-less poll must never overwrite an already
-		// -remembered non-empty name with "" -- namedTunnelName is normally
-		// reliable (tailport always puts the name last in its own argv), but a
-		// blank read here would otherwise silently break the next re-raise.
-		for port, info := range m.tunnels {
-			if info.mode == cftunnel.ModeNamed {
-				name := info.name
-				if name == "" {
-					name = m.lastTunnel[port].name
-				}
-				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeNamed, hostname: info.hostname, name: name})
-			} else if _, ok := m.lastTunnel[port]; !ok {
-				m.rememberTunnel(port, tunnelMemory{mode: cftunnel.ModeQuick})
-			}
-		}
+		// No memory to seed here any more (kata p7c5): `O` re-reads the
+		// port's config.yaml binding fresh on every press (requestTunnelNamed),
+		// and a quick tunnel never had a re-raise worth remembering.
 		return m, tea.Batch(toastCmd, m.rebuildItems())
 
 	case tunnelTickMsg:
@@ -4253,25 +4240,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			// The cloudflared tunnel (`t`) flow (kata nc1j): the mode select and
-			// the two confirms are y/n-style gates handled here like funnel; the
-			// text steps go through updateTunnelEntry via the switch below. The
-			// quick confirm names no URL (a *.trycloudflare.com host doesn't exist
-			// until cloudflared starts) -- the only public-path confirm that can't,
-			// by cloudflared's design.
-			if m.mode == entryTunnelMode {
-				switch msg.String() {
-				case "q", "Q":
-					m.tunnelSetupMode = cftunnel.ModeQuick
-					m.mode = entryConfirmTunnelQuick
-					return m, nil
-				case "n", "N":
-					return m, m.enterTunnelNamedHost()
-				default:
-					m.clearTunnelFlow()
-					return m, nil
-				}
-			}
+			// The Cloudflare Tunnel confirms (kata nc1j; split into `o`/`O`
+			// under p7c5): two independent y/n-style gates handled here like
+			// funnel, no mode select and no text-entry step any more. The
+			// quick confirm names no URL (a *.trycloudflare.com host doesn't
+			// exist until cloudflared starts) -- the only public-path
+			// confirm that can't, by cloudflared's design.
 			if m.mode == entryConfirmTunnelQuick {
 				if msg.String() == "y" || msg.String() == "Y" {
 					if m.pending != 0 {
@@ -4304,10 +4278,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case entryPublishHostname, entryPublishDomain, entryPublishHost, entryPublishAuth,
 				entryPublishCredUser, entryPublishCredPass, entryConfirmPublish:
 				return m, m.updatePublishEntry(msg)
-			case entryTunnelHost, entryTunnelName:
-				// The named-tunnel text steps (kata nc1j): keystrokes reach
-				// tunnelInput, never labelInput.
-				return m, m.updateTunnelEntry(msg)
 			case entryConfirmPurgeOwned, entryConfirmPurgeForeign, entryConfirmPurgeForeignType:
 				// The force-purge / take-over ladders (kata 6n15) are their own
 				// self-contained state machine, dispatched here for the same reason
@@ -4824,7 +4794,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// unpublishes -- it always runs the full setup flow so a
 			// published port's hostname/auth can be changed in place.
 			return m, m.requestEditPublish(sel.port.Number)
-		case "o": // cloudflared tunnel (kata nc1j; remapped from t, kata 7nss BREAKING)
+		case "o": // cloudflared QUICK tunnel (kata nc1j; remapped from t, kata
+			// 7nss BREAKING; split from the named tunnel under kata p7c5)
 			if m.pending != 0 {
 				return m, nil // a toggle/funnel/publish/tunnel is already in flight
 			}
@@ -4832,11 +4803,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
-			// requestTunnel runs the tunnel guards in order (busy, availability,
-			// de-escalation, :22, funnel/publish mutual-exclusion, lock) and
-			// otherwise opens the tunnel dialog. o is a TOGGLE: tear down /
-			// same-session re-raise / first-setup.
+			// requestTunnel runs the quick-tunnel guards in order (busy,
+			// availability, de-escalation/cross-key refusal, foreign, :22,
+			// locked) and otherwise opens the quick confirm directly. o is a
+			// TOGGLE: tear down / first-setup, no mode prompt (kata p7c5).
 			return m, m.requestTunnel(sel.port.Number)
+		case "O": // cloudflared NAMED tunnel, from the port's config.yaml
+			// binding (kata p7c5) -- help-only, see barGroups.
+			if m.pending != 0 {
+				return m, nil // a toggle/funnel/publish/tunnel is already in flight
+			}
+			sel, ok := m.list.SelectedItem().(portItem)
+			if !ok {
+				return m, nil
+			}
+			// requestTunnelNamed shares o's guards (busy, availability,
+			// cross-key refusal, foreign, :22, locked), then resolves the
+			// tunnel/hostname from ports.<port>.cloudflare instead of any
+			// prompt. O is a TOGGLE: tear down / first-setup.
+			return m, m.requestTunnelNamed(sel.port.Number)
 		case " ": // dropped in the remap (kata 7nss BREAKING): now a no-op, with
 			// a one-time-per-press transitional toast pointing at the new key.
 			return m, m.setFlash("serve is now 't'", flashInfo)
@@ -5158,10 +5143,17 @@ func (m model) barGroups(cleanEnabled bool) []keyGroup {
 	keys := m.keys
 	keys.ShowAll.SetHelp("a", "switch view")
 	keys.Clean.SetEnabled(cleanEnabled)
-	// The `t` tunnel key (kata nc1j) is dropped from the bottom bar unless
-	// cloudflared is installed -- no control for a feature the host can't use.
-	// It stays in groups() so the "?" overlay still documents it (like Redo).
+	// The `o` quick-tunnel key (kata nc1j) is dropped from the bottom bar
+	// unless cloudflared is installed -- no control for a feature the host
+	// can't use. It stays in groups() so the "?" overlay still documents it
+	// (like Redo).
 	keys.Tunnel.SetEnabled(m.cfAvailable)
+	// `O`, the named-tunnel sibling, stays OFF the bottom bar UNCONDITIONALLY
+	// (kata p7c5, owner's call: "Where O is shown" -- not the bar, only the
+	// "?" overlay and README table, exactly the Redo pattern below). Unlike
+	// Tunnel this is NOT re-enabled when cfAvailable -- O never belongs on
+	// the bar at all, available or not.
+	keys.TunnelNamed.SetEnabled(false)
 	// Redo is supported but stays OFF the bottom bar (3cwx, owner's call): it's
 	// the rarer half of the pair and the bar is already dense. It remains in
 	// groups(), so the "?" overlay and `tailport quickstart` still document it
@@ -6736,7 +6728,8 @@ func keyLegendDescs(emoji bool) map[string]string {
 		// moved to "d" (was "p" under vzj4).
 		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
 		"d":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). d is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
-		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nTunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j). Only offered\nwhen cloudflared is installed. Two flavours: a QUICK tunnel (no\nCloudflare account) gets a random https://<name>.trycloudflare.com\nURL, unauthenticated, that appears once it starts; a NAMED tunnel\n(logged in) runs a tunnel you already created with `cloudflared\ntunnel create` and routed a hostname to (tailport never creates,\nroutes, or otherwise provisions one) and serves your own stable\nhostname — tailport can't check the hostname is actually routed to\nthat tunnel, and a named tunnel serves only one local port at a time\n(a second port trying the same name is refused). o is a TOGGLE: on a\ntunnelled port it tears the tunnel down immediately, no confirm;\notherwise it confirms first (:22 refused). The tunnel survives\ntailport exiting. A THIRD public path, independent of funnel and\npublish — since kata th05 a port may carry all three at once (each is\nits own route sub-row and confirms separately).",
+		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nQUICK Tunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j; split\nfrom the named tunnel under kata p7c5). Only offered when cloudflared\nis installed. No Cloudflare account needed: gets a random\nhttps://<name>.trycloudflare.com URL, unauthenticated, that appears\nonce it starts. o is a TOGGLE: on a quick-tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first (:22\nrefused) -- no mode prompt any more, o ALWAYS runs quick. The tunnel\nsurvives tailport exiting. Press O to run this port's NAMED tunnel\ninstead (config.yaml-bound, its own key, shown only here and in\n`tailport quickstart` -- not the bottom bar); o never touches a named\ntunnel already running on this port, and O never touches a quick one.\nA THIRD public path, independent of funnel and publish — since kata\nth05 a port may carry all three at once (each is its own route\nsub-row and confirms separately).",
+		"O":      "Run the NAMED Cloudflare Tunnel bound to the selected port in\nconfig.yaml (" + tunnelled + ", kata p7c5): ports.<port>.cloudflare {tunnel,\nhostname}. No prompts -- an unbound port, a missing\n`cloudflared tunnel login`, or an invalid tunnel/hostname all refuse\nwith a toast naming the fix, rather than asking for one interactively.\nNeeds a tunnel you already created (`cloudflared tunnel create`) and\nrouted a hostname to (`cloudflared tunnel route dns`) -- tailport\nnever provisions either. O is a TOGGLE: on this port's named tunnel\nit tears it down immediately, no confirm; otherwise it confirms\nfirst, naming the exact https://<hostname> and the tunnel it will\nrun (:22 refused), and pins that tunnel's ingress to exactly this\nhostname. A named tunnel serves only ONE port at a time -- a second\nport bound to the same name is refused while the first is running.\nO never touches a QUICK tunnel already running on this port; press o\nto stop that one instead. Help-only: NOT shown in the bottom bar\n(like Redo) -- only here and in `tailport quickstart`.",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
 		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
@@ -7782,15 +7775,6 @@ func (m model) renderBottom() string {
 		}
 		lines = append(lines, helpStyle.Render("   (y: confirm, any other key: cancel)"))
 		return strings.Join(lines, "\n")
-	case entryTunnelMode:
-		return helpStyle.Render(fmt.Sprintf("cloudflare tunnel :%d — ", m.tunnelPort)) +
-			helpStyle.Render("(q: quick random url / n: named hostname / esc: cancel)")
-	case entryTunnelHost:
-		return m.promptLine(fmt.Sprintf("tunnel :%d — public hostname: ", m.tunnelPort),
-			m.fitField(m.tunnelInput, ""), "  (enter: next, esc: cancel)")
-	case entryTunnelName:
-		return m.promptLine(fmt.Sprintf("tunnel :%d — cloudflared tunnel name: ", m.tunnelPort),
-			m.fitField(m.tunnelInput, ""), "  (enter: confirm, esc: cancel)")
 	case entryConfirmTunnelQuick:
 		// The one public confirm that can't name its URL: a quick tunnel's
 		// *.trycloudflare.com host doesn't exist until cloudflared assigns it.
@@ -7806,20 +7790,21 @@ func (m model) renderBottom() string {
 		lines := []string{
 			warnStyle.Render(fmt.Sprintf("⚠ Publish :%d to the PUBLIC INTERNET via Cloudflare Tunnel?", m.tunnelPort)),
 			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
-			// One line, kept under 80 columns for a short name: a line wider than
-			// the terminal soft-wraps past what lipgloss.Height counts and shoves
-			// the header off-screen. This caveat is about the typed hostname
-			// itself (tailport can't verify the DNS route exists) -- it is
-			// still true even though S4 now pins the tunnel's ingress to this
-			// exact hostname (internal/cftunnel's per-tunnel --config), which
-			// only means a WRONG/unrouted hostname is simply unreachable, not
-			// that some OTHER hostname gets served instead. That pin only
-			// holds for a LOCALLY-managed tunnel (N2) -- a tunnel switched to
-			// remotely-managed in the Cloudflare dashboard has its ingress
-			// pushed by Cloudflare instead, overriding it; out of scope, see
-			// below. See the README's "Tunnelling to the public internet"
-			// section (kata nc1j).
-			helpStyle.Render(fmt.Sprintf("   via tunnel %q — tailport can't verify the hostname routes to it", m.tunnelName)),
+			// One line, kept under 80 columns for a short name (kata p7c5,
+			// TestNamedConfirmFitsEightyColumns): a line wider than the
+			// terminal soft-wraps past what lipgloss.Height counts and shoves
+			// the header off-screen. This caveat is about the config.yaml
+			// hostname itself (tailport can't verify the DNS route exists) --
+			// it is still true even though S4 now pins the tunnel's ingress to
+			// this exact hostname (internal/cftunnel's per-tunnel --config),
+			// which only means a WRONG/unrouted hostname is simply
+			// unreachable, not that some OTHER hostname gets served instead.
+			// That pin only holds for a LOCALLY-managed tunnel (N2) -- a
+			// tunnel switched to remotely-managed in the Cloudflare dashboard
+			// has its ingress pushed by Cloudflare instead, overriding it;
+			// out of scope, see below. See the README's "Tunnelling to the
+			// public internet" section (kata nc1j).
+			helpStyle.Render(fmt.Sprintf("   via tunnel %q (from config.yaml) — hostname unverified", m.tunnelName)),
 			helpStyle.Render("   (y: confirm, any other key: cancel)"),
 		}
 		return strings.Join(lines, "\n")

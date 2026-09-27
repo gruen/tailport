@@ -1582,7 +1582,7 @@ func TestConsoleTail(t *testing.T) {
 	})
 
 	// S2(b), audit finding 2: ansiEscapeRe only strips CSI sequences
-	// (ESC '[' ... letter); sanitizeDisplay is the backstop that guarantees
+	// (ESC '[' ... letter); SanitizeDisplay is the backstop that guarantees
 	// the result NEVER contains a raw ESC or BEL byte, regardless of shape --
 	// including an OSC 52 (clipboard-write) sequence, which ansiEscapeRe
 	// doesn't match at all.
@@ -1597,7 +1597,7 @@ func TestConsoleTail(t *testing.T) {
 		}
 	})
 
-	// N4: sanitizeDisplay must also strip Unicode FORMAT (Cf) characters --
+	// N4: SanitizeDisplay must also strip Unicode FORMAT (Cf) characters --
 	// neither a control byte nor an ANSI escape, so neither ansiEscapeRe nor
 	// the C0/C1 stripping above would catch them -- since cloudflared's
 	// console output is not tailport's own text and a hostile process could

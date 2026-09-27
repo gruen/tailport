@@ -106,8 +106,22 @@ func TestTunnelRouteForeign(t *testing.T) {
 	}
 }
 
-// TestRequestTunnelGuards exercises the refuse/de-escalation guards that don't
-// depend on the login state.
+// writeCertPem creates ~/.cloudflared/cert.pem under home, so
+// cftunnel.LoggedIn() (which checks only that default location) reports true.
+func writeCertPem(t *testing.T, home string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, ".cloudflared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cloudflared", "cert.pem"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRequestTunnelGuards exercises `o`'s refuse/de-escalation guards -- the
+// ones it shares with requestTunnelNamed (busy, availability, foreign, :22,
+// locked) plus its own quick-only de-escalation and the cross-key refusal
+// (kata p7c5: `o` never touches a named tunnel running on the port).
 func TestRequestTunnelGuards(t *testing.T) {
 	base := func() model {
 		m := New(config.Config{})
@@ -135,30 +149,25 @@ func TestRequestTunnelGuards(t *testing.T) {
 		}
 	})
 
-	// th05 RELAXED mutual exclusion: a funnelled port may ALSO be tunnelled now,
-	// so requestTunnel proceeds to its own setup/confirm instead of refusing.
-	// Pin the login state (not logged in -> quick confirm) so the branch is
-	// deterministic regardless of the host's ~/.cloudflared.
+	// th05 RELAXED mutual exclusion: a funnelled port may ALSO be tunnelled
+	// now, so requestTunnel proceeds straight to the quick confirm (kata
+	// p7c5: no mode prompt, regardless of login state) instead of refusing.
 	t.Run("funnel coexistence proceeds", func(t *testing.T) {
-		t.Setenv("TUNNEL_ORIGIN_CERT", "")
-		t.Setenv("HOME", t.TempDir())
 		m := base()
 		m.funnel = map[int]int{3000: 443}
 		m.requestTunnel(3000)
 		if m.mode != entryConfirmTunnelQuick {
-			t.Errorf("funnel coexistence should proceed to tunnel setup, not refuse; mode=%v", m.mode)
+			t.Errorf("funnel coexistence should proceed to the quick confirm, not refuse; mode=%v", m.mode)
 		}
 	})
 
 	// Likewise a published port may ALSO be tunnelled now.
 	t.Run("publish coexistence proceeds", func(t *testing.T) {
-		t.Setenv("TUNNEL_ORIGIN_CERT", "")
-		t.Setenv("HOME", t.TempDir())
 		m := base()
 		m.published = map[int]publishInfo{3000: {hostname: "x.example.com"}}
 		m.requestTunnel(3000)
 		if m.mode != entryConfirmTunnelQuick {
-			t.Errorf("publish coexistence should proceed to tunnel setup, not refuse; mode=%v", m.mode)
+			t.Errorf("publish coexistence should proceed to the quick confirm, not refuse; mode=%v", m.mode)
 		}
 	})
 
@@ -172,7 +181,7 @@ func TestRequestTunnelGuards(t *testing.T) {
 		}
 	})
 
-	// already tunnelled -> immediate teardown (pending set, no confirm)
+	// already tunnelled QUICK -> immediate teardown (pending set, no confirm)
 	t.Run("de-escalation", func(t *testing.T) {
 		m := base()
 		m.tunnels = map[int]tunnelInfo{3000: {pid: 4242, mode: cftunnel.ModeQuick}}
@@ -184,6 +193,25 @@ func TestRequestTunnelGuards(t *testing.T) {
 		}
 		if m.mode != entryNone {
 			t.Errorf("de-escalation should not open a modal; mode=%v", m.mode)
+		}
+	})
+
+	// cross-key refusal (kata p7c5): a NAMED tunnel running on this port
+	// belongs to `O` -- o must refuse it, exact wording, rather than tearing
+	// it down or acting on the wrong mode.
+	t.Run("named tunnel on this port refused, points at O", func(t *testing.T) {
+		m := base()
+		m.tunnels = map[int]tunnelInfo{3000: {pid: 4242, mode: cftunnel.ModeNamed, name: "web"}}
+		cmd := m.requestTunnel(3000)
+		if m.mode != entryNone || m.pending != 0 {
+			t.Errorf("cross-key refusal should not open a modal or start an op: mode=%v pending=%d", m.mode, m.pending)
+		}
+		if cmd == nil {
+			t.Fatal("requestTunnel should still return the error-toast cmd")
+		}
+		want := "a named tunnel is running on :3000 — press O to stop it"
+		if m.flash != want {
+			t.Errorf("flash = %q, want %q", m.flash, want)
 		}
 	})
 
@@ -201,162 +229,211 @@ func TestRequestTunnelGuards(t *testing.T) {
 	})
 }
 
-// TestRequestTunnelFreshSetup pins the login state via $HOME so the mode branch
-// is deterministic: no cert.pem -> straight to the quick confirm; a cert.pem
-// present -> the quick/named mode select.
-func TestRequestTunnelFreshSetup(t *testing.T) {
+// TestRequestTunnelAlwaysGoesStraightToQuickConfirm pins kata p7c5's core
+// claim for `o`: there is no more mode select, EVER -- not even for a
+// logged-in user (a cert.pem present). o always resolves straight to
+// entryConfirmTunnelQuick.
+func TestRequestTunnelAlwaysGoesStraightToQuickConfirm(t *testing.T) {
 	t.Setenv("TUNNEL_ORIGIN_CERT", "")
 
-	t.Run("not logged in -> quick confirm", func(t *testing.T) {
+	t.Run("not logged in", func(t *testing.T) {
 		t.Setenv("HOME", t.TempDir())
 		m := New(config.Config{})
 		m.cfAvailable = true
 		m.fqdn = "host.tailnet.ts.net"
 		m.requestTunnel(3000)
 		if m.mode != entryConfirmTunnelQuick {
-			t.Errorf("not-logged-in mode = %v, want entryConfirmTunnelQuick", m.mode)
+			t.Errorf("mode = %v, want entryConfirmTunnelQuick", m.mode)
 		}
 		if m.tunnelPort != 3000 {
 			t.Errorf("tunnelPort = %d, want 3000", m.tunnelPort)
 		}
 	})
 
-	t.Run("logged in -> mode select", func(t *testing.T) {
+	t.Run("logged in (cert.pem present)", func(t *testing.T) {
 		home := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(home, ".cloudflared"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(home, ".cloudflared", "cert.pem"), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeCertPem(t, home)
 		t.Setenv("HOME", home)
 		m := New(config.Config{})
 		m.cfAvailable = true
 		m.fqdn = "host.tailnet.ts.net"
 		m.requestTunnel(3000)
-		if m.mode != entryTunnelMode {
-			t.Errorf("logged-in mode = %v, want entryTunnelMode", m.mode)
+		if m.mode != entryConfirmTunnelQuick {
+			t.Errorf("mode = %v, want entryConfirmTunnelQuick (no mode prompt any more)", m.mode)
 		}
 	})
 }
 
-// TestRequestTunnelReraise: a port tunnelled earlier this session re-raises from
-// memory straight to the confirm, skipping the setup prompts.
-func TestRequestTunnelReraise(t *testing.T) {
-	m := New(config.Config{})
+// TestRequestTunnelNamedUnbound: O on a port with no cloudflare: binding (or
+// an incomplete one) refuses with a toast explaining how to add it -- never a
+// prompt (kata p7c5: config.yaml is the ONLY input `O` has).
+func TestRequestTunnelNamedUnbound(t *testing.T) {
+	t.Run("no binding at all", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		cmd := m.requestTunnelNamed(3000)
+		if m.mode != entryNone || m.pending != 0 {
+			t.Errorf("unbound should refuse without opening a modal: mode=%v pending=%d", m.mode, m.pending)
+		}
+		if cmd == nil {
+			t.Fatal("requestTunnelNamed should still return the error-toast cmd")
+		}
+		want := ":3000 has no named tunnel — add ports.3000.cloudflare {tunnel, hostname} to config.yaml"
+		if m.flash != want {
+			t.Errorf("flash = %q, want %q", m.flash, want)
+		}
+	})
+
+	t.Run("incomplete binding (empty hostname)", func(t *testing.T) {
+		m := New(config.Config{Ports: map[int]config.PortMeta{
+			3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web"}},
+		}})
+		m.cfAvailable = true
+		m.requestTunnelNamed(3000)
+		want := ":3000 has no named tunnel — add ports.3000.cloudflare {tunnel, hostname} to config.yaml"
+		if m.flash != want {
+			t.Errorf("flash = %q, want %q", m.flash, want)
+		}
+	})
+}
+
+// TestRequestTunnelNamedNoCertPem: O on a bound port refuses when
+// cftunnel.LoggedIn() is false (no ~/.cloudflared/cert.pem) -- a named tunnel
+// needs an authenticated account, and there is no fallback to a quick tunnel
+// under O (that's o's job).
+func TestRequestTunnelNamedNoCertPem(t *testing.T) {
+	t.Setenv("TUNNEL_ORIGIN_CERT", "")
+	t.Setenv("HOME", t.TempDir()) // no .cloudflared/cert.pem here
+
+	m := New(config.Config{Ports: map[int]config.PortMeta{
+		3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web", Hostname: "app.example.com"}},
+	}})
 	m.cfAvailable = true
-	m.fqdn = "host.tailnet.ts.net"
-	m.lastTunnel = map[int]tunnelMemory{
-		3000: {mode: cftunnel.ModeNamed, hostname: "app.example.com", name: "web"},
+	cmd := m.requestTunnelNamed(3000)
+	if m.mode != entryNone {
+		t.Errorf("no cert.pem should refuse without opening a modal; mode=%v", m.mode)
 	}
-	m.requestTunnel(3000)
-	if m.mode != entryConfirmTunnelNamed {
-		t.Errorf("named re-raise mode = %v, want entryConfirmTunnelNamed", m.mode)
+	if cmd == nil {
+		t.Fatal("requestTunnelNamed should still return the error-toast cmd")
 	}
-	if m.tunnelHostname != "app.example.com" || m.tunnelName != "web" {
-		t.Errorf("re-raise did not restore host/name: %q %q", m.tunnelHostname, m.tunnelName)
+	want := "named tunnels need `cloudflared tunnel login` first"
+	if m.flash != want {
+		t.Errorf("flash = %q, want %q", m.flash, want)
 	}
 }
 
-// TestNamedMemorySurvivesPoll is the regression test for audit item 2 (kata
-// nc1j): tunnelInfo used to carry no name field at all, so every poll
-// overwrote lastTunnel's remembered name with "" the moment it ran. It must
-// now survive a poll -- and even a poll that (defensively) reports an empty
-// name for an already-remembered port must not blank it out.
-func TestNamedMemorySurvivesPoll(t *testing.T) {
-	m := New(config.Config{})
+// TestRequestTunnelNamedInvalidBinding: a bound tunnel name or hostname that
+// fails cftunnel.ValidTunnelName/ValidHostname refuses -- the binding is a
+// hand-editable file value, not something just typed into a confirm, so it's
+// re-validated exactly like Start would validate it.
+func TestRequestTunnelNamedInvalidBinding(t *testing.T) {
+	home := t.TempDir()
+	writeCertPem(t, home)
+	t.Setenv("HOME", home)
+	t.Setenv("TUNNEL_ORIGIN_CERT", "")
+
+	t.Run("invalid tunnel name", func(t *testing.T) {
+		m := New(config.Config{Ports: map[int]config.PortMeta{
+			3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "-bad name", Hostname: "app.example.com"}},
+		}})
+		m.cfAvailable = true
+		m.requestTunnelNamed(3000)
+		if m.mode != entryNone {
+			t.Errorf("invalid tunnel name should refuse; mode=%v", m.mode)
+		}
+		if !strings.Contains(m.flash, "ports.3000.cloudflare.tunnel") || !strings.Contains(m.flash, "-bad name") {
+			t.Errorf("flash = %q, want it to name the field and the bad value", m.flash)
+		}
+	})
+
+	t.Run("invalid hostname", func(t *testing.T) {
+		m := New(config.Config{Ports: map[int]config.PortMeta{
+			3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web", Hostname: "not a host"}},
+		}})
+		m.cfAvailable = true
+		m.requestTunnelNamed(3000)
+		if m.mode != entryNone {
+			t.Errorf("invalid hostname should refuse; mode=%v", m.mode)
+		}
+		if !strings.Contains(m.flash, "ports.3000.cloudflare.hostname") || !strings.Contains(m.flash, "not a host") {
+			t.Errorf("flash = %q, want it to name the field and the bad value", m.flash)
+		}
+	})
+}
+
+// TestRequestTunnelNamedGoesToConfirmAndStarts covers the happy path: a
+// well-formed binding, plus a logged-in account, goes straight to
+// entryConfirmTunnelNamed with the config's tunnel/hostname (no prompt), and
+// "y" (confirmTunnelNamed) starts it -- checked via m.flash/m.pending, per
+// AGENTS.md rule A4, NEVER by invoking the returned tea.Cmd (that would exec
+// a real cloudflared).
+func TestRequestTunnelNamedGoesToConfirmAndStarts(t *testing.T) {
+	home := t.TempDir()
+	writeCertPem(t, home)
+	t.Setenv("HOME", home)
+	t.Setenv("TUNNEL_ORIGIN_CERT", "")
+
+	m := New(config.Config{Ports: map[int]config.PortMeta{
+		3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web", Hostname: "app.example.com"}},
+	}})
 	m.cfAvailable = true
-	m.tunnelPort = 3000
-	m.tunnelHostname = "app.example.com"
-	m.tunnelName = "web"
-	m.tunnelSetupMode = cftunnel.ModeNamed
+	m.fqdn = "host.tailnet.ts.net"
+
+	m.requestTunnelNamed(3000)
+	if m.mode != entryConfirmTunnelNamed {
+		t.Fatalf("mode = %v, want entryConfirmTunnelNamed", m.mode)
+	}
+	if m.tunnelPort != 3000 || m.tunnelHostname != "app.example.com" || m.tunnelName != "web" {
+		t.Errorf("tunnel flow state = port=%d host=%q name=%q, want 3000/app.example.com/web",
+			m.tunnelPort, m.tunnelHostname, m.tunnelName)
+	}
 
 	if cmd := m.confirmTunnelNamed(); cmd == nil {
 		t.Fatal("confirmTunnelNamed should return a non-nil cmd")
 	}
-	if got := m.lastTunnel[3000].name; got != "web" {
-		t.Fatalf("confirm should remember the name immediately; got %q", got)
+	if m.pending != 3000 {
+		t.Errorf("pending = %d, want 3000", m.pending)
 	}
-
-	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{
-		PID: 111, Port: 3000, Mode: cftunnel.ModeNamed, TunnelName: "web", Hostname: "app.example.com",
-	}})
-	if got := m.tunnels[3000].name; got != "web" {
-		t.Fatalf("tunnels[3000].name = %q, want web", got)
-	}
-
-	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
-		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "web", ready: true},
-	}})
-	if got := m.lastTunnel[3000].name; got != "web" {
-		t.Errorf("lastTunnel[3000].name after poll = %q, want web (must survive the poll)", got)
-	}
-
-	// Defensive: even a later poll that (somehow) reports an empty name for
-	// this still-named tunnel must not clobber the remembered name to "".
-	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
-		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "", ready: true},
-	}})
-	if got := m.lastTunnel[3000].name; got != "web" {
-		t.Errorf("lastTunnel[3000].name after empty-name poll = %q, want web preserved", got)
+	if !strings.Contains(m.flash, "starting Cloudflare tunnel https://app.example.com") {
+		t.Errorf("flash = %q, want it to name the confirmed URL (the spec's Hostname)", m.flash)
 	}
 }
 
-// TestNamedReraiseAfterPoll drives the full cycle audit item 2 broke: start a
-// named tunnel, let a poll re-derive it from the (simulated) process table,
-// tear it down, then re-raise with `o` -- the re-raise must reach the confirm
-// with the name intact, not fall back to entryTunnelName or entryNone.
-func TestNamedReraiseAfterPoll(t *testing.T) {
-	m := New(config.Config{})
-	m.cfAvailable = true
-	m.fqdn = "host.tailnet.ts.net"
-	m.tunnelPort = 3000
-	m.tunnelHostname = "app.example.com"
-	m.tunnelName = "web"
-	m.tunnelSetupMode = cftunnel.ModeNamed
-	m.confirmTunnelNamed()
+// TestRequestTunnelNamedDeEscalates: O on a port already running a NAMED
+// tunnel tears it down immediately, no confirm; O on a port running a QUICK
+// tunnel is the cross-key case and refuses, pointing at o.
+func TestRequestTunnelNamedDeEscalates(t *testing.T) {
+	t.Run("named -> teardown", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.tunnels = map[int]tunnelInfo{3000: {pid: 4242, mode: cftunnel.ModeNamed, name: "web"}}
+		if cmd := m.requestTunnelNamed(3000); cmd == nil {
+			t.Error("teardown should return a stop cmd")
+		}
+		if m.pending != 3000 {
+			t.Errorf("pending = %d, want 3000", m.pending)
+		}
+		if m.mode != entryNone {
+			t.Errorf("teardown should not open a modal; mode=%v", m.mode)
+		}
+	})
 
-	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{
-		PID: 111, Port: 3000, Mode: cftunnel.ModeNamed, TunnelName: "web", Hostname: "app.example.com",
-	}})
-	m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollGen, tunnels: map[int]tunnelInfo{
-		3000: {mode: cftunnel.ModeNamed, pid: 111, hostname: "app.example.com", name: "web", ready: true},
-	}})
-	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, torndown: true})
-	if _, ok := m.tunnels[3000]; ok {
-		t.Fatalf("setup: torn-down tunnel should be gone from m.tunnels")
-	}
-
-	m.requestTunnel(3000)
-	if m.mode != entryConfirmTunnelNamed {
-		t.Fatalf("re-raise mode = %v, want entryConfirmTunnelNamed", m.mode)
-	}
-	if m.tunnelName != "web" {
-		t.Errorf("re-raise tunnelName = %q, want web (audit item 2)", m.tunnelName)
-	}
-	if m.tunnelHostname != "app.example.com" {
-		t.Errorf("re-raise tunnelHostname = %q, want app.example.com", m.tunnelHostname)
-	}
-}
-
-// TestNamedReraiseWithoutNameAsksForName covers the defensive fallback: if a
-// named memory somehow has a hostname but no name, re-raise must not try to
-// confirm with an empty name (Start would reject it) -- it goes to
-// entryTunnelName instead, with the hostname already held.
-func TestNamedReraiseWithoutNameAsksForName(t *testing.T) {
-	m := New(config.Config{})
-	m.cfAvailable = true
-	m.fqdn = "host.tailnet.ts.net"
-	m.lastTunnel = map[int]tunnelMemory{
-		3000: {mode: cftunnel.ModeNamed, hostname: "app.example.com"},
-	}
-	m.requestTunnel(3000)
-	if m.mode != entryTunnelName {
-		t.Fatalf("re-raise without a name mode = %v, want entryTunnelName", m.mode)
-	}
-	if m.tunnelHostname != "app.example.com" {
-		t.Errorf("hostname should already be held going into the name prompt; got %q", m.tunnelHostname)
-	}
+	t.Run("quick -> refused, points at o", func(t *testing.T) {
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.tunnels = map[int]tunnelInfo{3000: {pid: 4242, mode: cftunnel.ModeQuick}}
+		cmd := m.requestTunnelNamed(3000)
+		if m.mode != entryNone || m.pending != 0 {
+			t.Errorf("cross-key refusal should not open a modal or start an op: mode=%v pending=%d", m.mode, m.pending)
+		}
+		if cmd == nil {
+			t.Fatal("requestTunnelNamed should still return the error-toast cmd")
+		}
+		want := "a quick tunnel is running on :3000 — press o to stop it"
+		if m.flash != want {
+			t.Errorf("flash = %q, want %q", m.flash, want)
+		}
+	})
 }
 
 // TestTunnelNameInUseRefused is the regression test for audit item 6 (kata
@@ -364,36 +441,32 @@ func TestNamedReraiseWithoutNameAsksForName(t *testing.T) {
 // tunnel. The owned-only same-tunnel guard must refuse at all three call
 // sites -- name entry, re-raise, and confirmTunnelNamed's last check.
 func TestTunnelNameInUseRefused(t *testing.T) {
-	base := func() model {
-		m := New(config.Config{})
+	const wantMsg = `tunnel "web" is already running for :4000`
+
+	// requestTunnelNamed: two ports bound to the SAME tunnel name in
+	// config.yaml, one already running it -- O on the OTHER port is refused
+	// (kata p7c5: config.yaml replaced the old name-entry prompt as the
+	// guard's call site, but the guard itself, tunnelNameInUse, is unchanged).
+	t.Run("requestTunnelNamed", func(t *testing.T) {
+		home := t.TempDir()
+		writeCertPem(t, home)
+		t.Setenv("HOME", home)
+		t.Setenv("TUNNEL_ORIGIN_CERT", "")
+
+		m := New(config.Config{Ports: map[int]config.PortMeta{
+			3000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web", Hostname: "other.example.com"}},
+			4000: {Cloudflare: &config.CloudflareBinding{Tunnel: "web", Hostname: "app.example.com"}},
+		}})
 		m.cfAvailable = true
 		m.fqdn = "host.tailnet.ts.net"
 		m.tunnels = map[int]tunnelInfo{4000: {mode: cftunnel.ModeNamed, pid: 222, name: "web", hostname: "app.example.com"}}
-		return m
-	}
-	const wantMsg = `tunnel "web" is already running for :4000`
 
-	t.Run("name entry", func(t *testing.T) {
-		m := base()
-		m.mode = entryTunnelName
-		m.tunnelPort = 3000
-		m.tunnelHostname = "other.example.com"
-		m.tunnelInput.SetValue("web")
-		m = mustUpdate(t, m, enterKey)
-		if m.mode != entryTunnelName {
-			t.Errorf("refused name entry should stay at entryTunnelName for retry; mode=%v", m.mode)
-		}
-		if !strings.Contains(m.flash, wantMsg) {
-			t.Errorf("flash = %q, want it to contain %q", m.flash, wantMsg)
-		}
-	})
-
-	t.Run("re-raise", func(t *testing.T) {
-		m := base()
-		m.lastTunnel = map[int]tunnelMemory{3000: {mode: cftunnel.ModeNamed, hostname: "other.example.com", name: "web"}}
-		m.requestTunnel(3000)
+		cmd := m.requestTunnelNamed(3000)
 		if m.mode != entryNone {
-			t.Errorf("refused re-raise should not open a modal; mode=%v", m.mode)
+			t.Errorf("refused O should not open a modal; mode=%v", m.mode)
+		}
+		if cmd == nil {
+			t.Fatal("requestTunnelNamed should still return the error-toast cmd")
 		}
 		if !strings.Contains(m.flash, wantMsg) {
 			t.Errorf("flash = %q, want it to contain %q", m.flash, wantMsg)
@@ -401,7 +474,10 @@ func TestTunnelNameInUseRefused(t *testing.T) {
 	})
 
 	t.Run("confirm", func(t *testing.T) {
-		m := base()
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.fqdn = "host.tailnet.ts.net"
+		m.tunnels = map[int]tunnelInfo{4000: {mode: cftunnel.ModeNamed, pid: 222, name: "web", hostname: "app.example.com"}}
 		m.tunnelPort = 3000
 		m.tunnelHostname = "other.example.com"
 		m.tunnelName = "web"
@@ -434,7 +510,10 @@ func TestNamedConfirmNamesTunnelAndCaveat(t *testing.T) {
 	if !strings.Contains(view, `via tunnel "web"`) {
 		t.Errorf("confirm should name the tunnel; view:\n%s", view)
 	}
-	if !strings.Contains(view, "can't verify the hostname routes to it") {
+	if !strings.Contains(view, "(from config.yaml)") {
+		t.Errorf("confirm should say the tunnel came from config.yaml (kata p7c5); view:\n%s", view)
+	}
+	if !strings.Contains(view, "hostname unverified") {
 		t.Errorf("confirm should carry the routing caveat; view:\n%s", view)
 	}
 	if !strings.Contains(view, "https://app.example.com") {
@@ -482,7 +561,6 @@ func TestNamedStartFlashNamesURL(t *testing.T) {
 	m.tunnelPort = 3000
 	m.tunnelHostname = "app.example.com"
 	m.tunnelName = "web"
-	m.tunnelSetupMode = cftunnel.ModeNamed
 
 	if cmd := m.confirmTunnelNamed(); cmd == nil {
 		t.Fatal("confirmTunnelNamed should return a non-nil cmd")
@@ -492,8 +570,9 @@ func TestNamedStartFlashNamesURL(t *testing.T) {
 	}
 }
 
-// TestBarGroupsTunnelGating: the `o` key shows in the bottom bar only when
-// cloudflared is available; it's always in the full groups() (documented in ?).
+// TestBarGroupsTunnelGating: `o` shows in the bottom bar only when
+// cloudflared is available; `O` NEVER shows there regardless (kata p7c5,
+// mirrors Redo); both are always in the full groups() (documented in ?).
 func TestBarGroupsTunnelGating(t *testing.T) {
 	m := New(config.Config{})
 
@@ -501,44 +580,47 @@ func TestBarGroupsTunnelGating(t *testing.T) {
 	if !hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "o") {
 		t.Error("cfAvailable=true: `o` should appear in the Serve Toggles bar group")
 	}
+	if hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "O") {
+		t.Error("`O` should never appear in the bar, even when cfAvailable=true")
+	}
 
 	m.cfAvailable = false
 	if hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "o") {
 		t.Error("cfAvailable=false: `o` should be dropped from the bar")
 	}
+	if hasKeyInGroup(m.barGroups(false), "Toggle Service Exposure", "O") {
+		t.Error("`O` should never appear in the bar, even when cfAvailable=false")
+	}
 	// still documented in the full grouping regardless
 	if !hasKeyInGroup(m.keys.groups(), "Toggle Service Exposure", "o") {
 		t.Error("`o` should always be in the full groups() for the ? overlay")
 	}
+	if !hasKeyInGroup(m.keys.groups(), "Toggle Service Exposure", "O") {
+		t.Error("`O` should always be in the full groups() for the ? overlay")
+	}
 }
 
-// TestValidTunnelHostname also pins the W3a tightening (kata nc1j): the
-// charset is restricted to [A-Za-z0-9.-] and a leading '-' or '.' is
-// refused, not just the space/slash/colon checks the original version had;
-// and (N5) a trailing '.', an empty label, or a label starting/ending with
-// '-' are refused too, since validTunnelHostname is a thin wrapper around
-// cftunnel.ValidHostname and must reject exactly what that does -- a pinned
-// ingress for e.g. "app.example.com." would silently 404 every request
-// (see cftunnel.ValidHostname's doc comment).
-func TestValidTunnelHostname(t *testing.T) {
-	ok := []string{"app.example.com", "api.corp.internal", "a-b.c-d.com"}
-	for _, s := range ok {
-		if !validTunnelHostname(s) {
-			t.Errorf("validTunnelHostname(%q) = false, want true", s)
+// TestHelpOverlayDocumentsTunnelNamed pins that `O`'s description is actually
+// reachable through the SAME source the "?" overlay and `tailport
+// quickstart` both render from (KeyLegendGroups/keyLegendDescs) -- not just
+// present in groups() with no prose to show for it.
+func TestHelpOverlayDocumentsTunnelNamed(t *testing.T) {
+	found := false
+	for _, g := range KeyLegendGroups(false) {
+		for _, r := range g.Rows {
+			if r.Key == "O" {
+				found = true
+				if r.Desc == "" {
+					t.Error(`the "?" overlay's O row has no description`)
+				}
+				if !strings.Contains(r.Desc, "NAMED Cloudflare Tunnel") {
+					t.Errorf("O's description should explain the named tunnel; got %q", r.Desc)
+				}
+			}
 		}
 	}
-	bad := []string{
-		"", "nodot", "has space.com", "http://app.example.com", "app.example.com:8080", "a/b.com",
-		"-app.example.com", ".app.example.com", "app_example.com", "app.example.com\x00", "café.example.com",
-		"app.example.com.",     // N5: trailing dot
-		"app..example.com",     // N5: empty label
-		"app.-sub.example.com", // N5: non-first label starts with '-'
-		"app.sub-.example.com", // N5: non-first label ends with '-'
-	}
-	for _, s := range bad {
-		if validTunnelHostname(s) {
-			t.Errorf("validTunnelHostname(%q) = true, want false", s)
-		}
+	if !found {
+		t.Error(`expected an "O" row in KeyLegendGroups (the "?" overlay / quickstart source)`)
 	}
 }
 
@@ -622,7 +704,6 @@ func TestTunnelSpinnerStartsTicksAndStops(t *testing.T) {
 	m.cfAvailable = true
 	m.fqdn = "host.tailnet.ts.net"
 	m.tunnelPort = 3000
-	m.tunnelSetupMode = cftunnel.ModeQuick
 
 	if cmd := m.confirmTunnelQuick(); cmd == nil {
 		t.Fatal("confirmTunnelQuick should return a non-nil batched cmd")

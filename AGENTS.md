@@ -74,9 +74,11 @@ contract. The short version:
   session-only `lastPublish` memory, and `caddy.silent_republish` were added
   under kata prp1. Re-lettered `p` -> `d` under kata 58ws, which also swapped
   Funnel back to the bare `p` — see that bullet above for the reversal.)
-- Cloudflare Tunnel is a THIRD public path (the `o` key, kata nc1j;
-  re-lettered from `t` under kata 7nss, which moved serve onto `t`),
-  **independent of both Funnel and Publish — never layered or ranked above
+- Cloudflare Tunnel is a THIRD public path (kata nc1j; re-lettered from `t`
+  under kata 7nss, which moved serve onto `t`; SPLIT into two keys under kata
+  p7c5 -- `o` (quick only) and `O` (named only), replacing the old single `o`
+  toggle's q/n-mode-select-then-two-text-prompts flow, which the owner found
+  confusing), **independent of both Funnel and Publish — never layered or ranked above
   either, and no longer mutually exclusive with them: kata th05 relaxed that
   rule (an owner-approved reversal)**. A local port may now carry all three
   public paths at once, each its own navigable route sub-row: `t` no longer
@@ -87,16 +89,22 @@ contract. The short version:
   flagged as drift for simply being plural. `:22` is hard-blocked, same as
   Funnel/Publish, and each of the three still requires its own strong
   per-service y/n confirm before going live. Two flavours, matching
-  Cloudflare's two account scenarios: a QUICK tunnel needs no account and
+  Cloudflare's two account scenarios, each its OWN key (kata p7c5): a QUICK
+  tunnel (`o`) needs no account and
   gets a random, ephemeral `*.trycloudflare.com` hostname assigned only
   after cloudflared actually starts — so its confirm CANNOT name the exact
   public URL in advance, a DOCUMENTED, DELIBERATE deviation from the
   always-name-the-URL rule the other public paths follow, forced by
   cloudflared's own design (there is no way to reserve or predict the
-  hostname before starting); a NAMED tunnel requires the operator to have
+  hostname before starting); a NAMED tunnel (`O`) requires the operator to have
   already run `cloudflared tunnel login`, created the tunnel, and routed its
   hostname (`cloudflared tunnel route dns`) — a separate, one-time operator
-  task, exactly like standing up the Caddy edge. tailport only ever RUNS a
+  task, exactly like standing up the Caddy edge — and then added a
+  `ports.<port>.cloudflare: {tunnel, hostname}` binding to config.yaml
+  (`config.CloudflareBinding`, kata p7c5): `O` reads that binding and goes
+  straight to its confirm, no prompt either way, and the config file IS its
+  only memory (there is no session-only re-raise for EITHER key any more --
+  the old `lastTunnel` map is gone). tailport only ever RUNS a
   named tunnel (`cloudflared tunnel --config PATH --metrics 127.0.0.1:MP
   --logfile PATH --no-autoupdate run --url http://localhost:PORT <name>`);
   tunnel-level flags, `--config` included, must come before `run` —
@@ -231,11 +239,15 @@ contract. The short version:
   `--config` files are all opened with `O_NOFOLLOW`, so a symlink planted at
   any of those paths makes `Start` fail outright instead of writing through
   it. The whole feature is gated on `cloudflared`
-  being installed — detected once at startup — so an absent binary drops
-  the `o` key from the bar entirely: no key, no discovery, no polling.
+  being installed — detected once at startup — so an absent binary means
+  NEITHER key does anything: an absent binary drops `o` from the bar
+  entirely, and `O` was never on the bar in the first place (see below) --
+  either way, no discovery, no polling. Both `o` and `O` refuse to do
+  anything (via the same `cfAvailable` gate) when cloudflared isn't
+  installed.
   A NAMED tunnel serves only ONE local port at a time — tailport's
   owned-only same-tunnel guard (`tunnelNameInUse` in `internal/ui/cftunnel.go`)
-  refuses to start or re-raise the same pre-provisioned tunnel name for a
+  refuses to start the same pre-provisioned tunnel name for a
   second port while tailport already has it running for a different one,
   naming which port to free first. This checks only tailport's own
   currently-discovered owned tunnels, never a foreign/process-table scan, so
@@ -260,7 +272,8 @@ contract. The short version:
   it found something worth showing, e.g. "Cloudflare tunnel on :PORT exited
   — <last error line>" (or just "Cloudflare tunnel on :PORT exited", with no
   fabricated cause, if the tail held nothing but routine leveled console
-  noise), UNLESS the user tore it down themselves with `o` (tracked
+  noise), UNLESS the user tore it down themselves -- `o` on a quick tunnel,
+  `O` on a named one (tracked
   session-only while the teardown is settling, so a draining process a poll
   transiently re-adds can't produce a false "exited" toast for an
   intentional stop). A pid that's still alive but no longer recognizable as
@@ -269,7 +282,9 @@ contract. The short version:
   serving traffic.
   (Implemented under kata nc1j: `internal/cftunnel`, the `cloudflared:`
   config block, and the `o` key / `requestTunnel` gate / tunnel-state poll
-  in `internal/ui`.)
+  in `internal/ui`. Split into `o`/`O` under kata p7c5: `requestTunnelNamed`
+  in `internal/ui/cftunnel.go`, and `config.CloudflareBinding` /
+  `PortMeta.Cloudflare` in `internal/config/config.go`.)
 - Serve (tailnet) is plain HTTP only (`--http=PORT`). No HTTPS/TLS serve
   mode — deliberate, see project history: Tailscale's WireGuard tunnel
   already encrypts peer-to-peer traffic, so app-layer TLS added no real
@@ -305,14 +320,14 @@ contract. The short version:
   primary clipboard path is OSC 52 (pure Go, no external binary), and a
   missing helper is silently skipped.
   Carve-out (nc1j): `cloudflared` is a SECOND optional, opt-in third-party
-  binary, required only if you use the `o` Cloudflare Tunnel feature (see
+  binary, required only if you use the `o`/`O` Cloudflare Tunnel keys (see
   the Cloudflare Tunnel design-constraints bullet above and
   `internal/cftunnel`). Unlike the clipboard helper's fire-and-forget
   shell-out, cloudflared is a **supervised local daemon** — the first
   long-running process tailport itself spawns and supervises, distinct
   from the remote Caddy edge tailport only ever talks to over HTTP. Like
   the clipboard carve-out, it is never required to build or run tailport:
-  absence just disables the `o` key (no key, no discovery, no polling) and
+  absence just disables both keys (no key, no discovery, no polling) and
   costs nothing.
 
 ### Docs stay honest (a claim is a test)

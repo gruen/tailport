@@ -4398,12 +4398,14 @@ func TestKeyGroupsAndFullHelp(t *testing.T) {
 	// also lives in App. 58ws: exposure column runs t/p/d/o (funnel, then
 	// publish, then the cloudflare tunnel) then C/x/e. (7nss BREAKING: toggle
 	// moved space->t, tunnel moved t->o. 58ws BREAKING: funnel P->p, publish
-	// p->d, reordered ahead of tunnel.) kata 4ref: i (copy PID) / I (copy kill
+	// p->d, reordered ahead of tunnel.) kata p7c5: O (named tunnel) sits
+	// right after o -- groups()-only, like ctrl+r, since barGroups keeps it
+	// off the bar unconditionally. kata 4ref: i (copy PID) / I (copy kill
 	// cmd) sit directly under c (copy URL) in Favorites -- same clip/OSC 52
 	// family, port-scoped rather than route-scoped. kata s93r: s (sort)
 	// joins View, right after a (switch view) and before r (refresh).
 	wantKeys := [][]string{
-		{"t", "p", "d", "o", "C", "x", "e"}, // Funnel=p, Publish=d, Tunnel=o (58ws order); Edit=e (kata prp1)
+		{"t", "p", "d", "o", "O", "C", "x", "e"}, // Funnel=p, Publish=d, Tunnel=o/O (58ws order + p7c5); Edit=e (kata prp1)
 		{"f", "F", "n", "c", "i", "I", "l"},
 		{"/", "a", "s", "r"},
 		{"u", "ctrl+r", "h", "?", "q"},
@@ -4862,7 +4864,7 @@ func TestBottomBarNarrowFallback(t *testing.T) {
 		"u undo", "h show/hide key bindings", "? help", "q quit",
 	}
 	if m.cfAvailable {
-		want = append(want, "o on cloudflare (public)")
+		want = append(want, "o on cloudflare quick (public)")
 	}
 	for _, hint := range want {
 		if !strings.Contains(bar, hint) {
