@@ -601,7 +601,7 @@ retries running out, a crash — tailport never lets it just vanish. The next
 poll (every few seconds) notices the port is gone and shows a toast with
 cloudflared's last error, e.g. `Cloudflare tunnel on :3000 exited — <error>`.
 Full console output (not just that one line) is always in
-`~/.local/state/tailport/cftunnel-<port>[-<host>]….console`. Tearing a tunnel
+`~/.local/state/tailport/cftunnel-<port>[-<host>].console`. Tearing a tunnel
 down yourself with `o` never triggers this toast.
 
 Like the other public paths, Tunnel is independent and may coexist with Funnel

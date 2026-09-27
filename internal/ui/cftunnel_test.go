@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
@@ -433,11 +434,41 @@ func TestNamedConfirmNamesTunnelAndCaveat(t *testing.T) {
 	if !strings.Contains(view, `via tunnel "web"`) {
 		t.Errorf("confirm should name the tunnel; view:\n%s", view)
 	}
-	if !strings.Contains(view, "can't check this hostname is routed to that tunnel") {
+	if !strings.Contains(view, "can't verify the hostname routes to it") {
 		t.Errorf("confirm should carry the routing caveat; view:\n%s", view)
 	}
 	if !strings.Contains(view, "https://app.example.com") {
 		t.Errorf("confirm should still name the exact URL; view:\n%s", view)
+	}
+}
+
+// TestNamedConfirmFitsEightyColumns: every confirm line must fit an 80-column
+// terminal for a typical host/name -- a wider line soft-wraps past what
+// lipgloss.Height counts and pushes the header off-screen (kata nc1j review).
+func TestNamedConfirmFitsEightyColumns(t *testing.T) {
+	m := New(config.Config{})
+	m.mode = entryConfirmTunnelNamed
+	m.tunnelPort = 3000
+	m.tunnelHostname = "app.example.com"
+	m.tunnelName = "web"
+	for _, line := range strings.Split(stripANSI(m.renderBottom()), "\n") {
+		if w := lipgloss.Width(line); w > 80 {
+			t.Errorf("confirm line is %d columns (> 80): %q", w, line)
+		}
+	}
+}
+
+// TestTunnelStartClearsStoppingMark: a fresh start on a port the user stopped
+// earlier must clear that stop's suppression mark, or the NEW tunnel's own
+// later exit would be swallowed silently (kata nc1j W3b review).
+func TestTunnelStartClearsStoppingMark(t *testing.T) {
+	m := New(config.Config{})
+	m.cfAvailable = true
+	m.tunnelStopping[3000] = true
+	running := &cftunnel.Running{Port: 3000, PID: 4242, Mode: cftunnel.ModeQuick, Owned: true}
+	next, _ := m.Update(tunnelDoneMsg{port: 3000, running: running})
+	if nm := next.(model); nm.tunnelStopping[3000] {
+		t.Error("tunnelStopping[3000] should be cleared by a successful start")
 	}
 }
 

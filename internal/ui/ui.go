@@ -3930,6 +3930,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// host is known up front, so name it and teach the `o` de-escalation.
 		if msg.running != nil {
 			m.invalidateTunnelPolls()
+			// A fresh start supersedes any earlier user-initiated stop on this
+			// port (kata nc1j W3b): leaving the mark would silently swallow the
+			// NEW tunnel's own later exit toast. Vanish detection is keyed by
+			// port presence, so an old process still draining underneath can't
+			// raise a false toast while the new one holds the port.
+			delete(m.tunnelStopping, msg.port)
 			m.tunnels[msg.port] = tunnelInfo{
 				mode:        msg.running.Mode,
 				pid:         msg.running.PID,
@@ -7790,8 +7796,11 @@ func (m model) renderBottom() string {
 		lines := []string{
 			warnStyle.Render(fmt.Sprintf("⚠ Publish :%d to the PUBLIC INTERNET via Cloudflare Tunnel?", m.tunnelPort)),
 			helpStyle.Render("   → ") + publicStyle.Render(url) + helpStyle.Render("   (reachable by anyone on the internet)"),
-			helpStyle.Render(fmt.Sprintf("   via tunnel %q", m.tunnelName)),
-			helpStyle.Render("   tailport can't check this hostname is routed to that tunnel; it also serves any other hostname routed to it"),
+			// One line, kept under 80 columns for a short name: a line wider than
+			// the terminal soft-wraps past what lipgloss.Height counts and shoves
+			// the header off-screen. The fuller caveat (it also serves any other
+			// hostname routed to the tunnel) lives in the README (kata nc1j).
+			helpStyle.Render(fmt.Sprintf("   via tunnel %q — tailport can't verify the hostname routes to it", m.tunnelName)),
 			helpStyle.Render("   (y: confirm, any other key: cancel)"),
 		}
 		return strings.Join(lines, "\n")
