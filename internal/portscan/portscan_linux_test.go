@@ -186,6 +186,62 @@ LISTEN 0      128           127.0.0.1:9092          0.0.0.0:*    users:(("loopon
 	}
 }
 
+// TestParseSSNo127 pins 2z0v(b): No127 must be true only when NOT ONE bind row
+// for a port accepts a dial to 127.0.0.1:PORT -- the address `tailscale serve`
+// always proxies to. Every port below classifies as ScopeLoopback or
+// ScopeWildcard under classifyBindScope's truth table (so BindScope/Loopback
+// alone can't be used to infer this), pinning that No127 is a genuinely
+// separate bit:
+//   - [::1] only (IPv6 loopback, a distinct address from 127.0.0.1) -> No127
+//   - [::] only (V6ONLY unspecified -- ss's "[::]", not "*") -> No127
+//   - 127.0.0.2 only (a non-.1 loopback address) -> No127
+//   - 127.0.0.1 + [::1] (the .1 row accepts) -> NOT No127
+//   - *:PORT (ss's dual-stack wildcard spelling, includes 127.0.0.1) -> NOT No127
+//   - 0.0.0.0 + [::] (the 0.0.0.0 row accepts even though [::] alone wouldn't) -> NOT No127
+//   - ::ffff:127.0.0.1 (the v4-mapped IPv6 form of 127.0.0.1) -> NOT No127
+func TestParseSSNo127(t *testing.T) {
+	const fixture = `LISTEN 0      128              [::1]:18791          [::]:*    users:(("python3",pid=1001,fd=3))
+LISTEN 0      128               [::]:18792           [::]:*    users:(("python3",pid=1002,fd=3))
+LISTEN 0      128         127.0.0.2:18793          0.0.0.0:*    users:(("python3",pid=1003,fd=3))
+LISTEN 0      128         127.0.0.1:18794          0.0.0.0:*    users:(("python3",pid=1004,fd=3))
+LISTEN 0      128              [::1]:18794           [::]:*    users:(("python3",pid=1004,fd=4))
+LISTEN 0      128                 *:18795          0.0.0.0:*    users:(("python3",pid=1005,fd=3))
+LISTEN 0      128           0.0.0.0:18796          0.0.0.0:*    users:(("python3",pid=1006,fd=3))
+LISTEN 0      128              [::]:18796           [::]:*    users:(("python3",pid=1006,fd=4))
+LISTEN 0      128 [::ffff:127.0.0.1]:18797          0.0.0.0:*    users:(("python3",pid=1007,fd=3))
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseSS error: %v", err)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		byPort[p.Number] = p
+	}
+
+	for _, tc := range []struct {
+		port      int
+		wantNo127 bool
+	}{
+		{18791, true},  // [::1] only
+		{18792, true},  // [::] only (V6ONLY)
+		{18793, true},  // 127.0.0.2 only
+		{18794, false}, // 127.0.0.1 + [::1]
+		{18795, false}, // *:PORT
+		{18796, false}, // 0.0.0.0 + [::]
+		{18797, false}, // ::ffff:127.0.0.1
+	} {
+		p, ok := byPort[tc.port]
+		if !ok {
+			t.Errorf("expected port %d in %+v", tc.port, ports)
+			continue
+		}
+		if p.No127 != tc.wantNo127 {
+			t.Errorf("port %d No127 = %v, want %v (%+v)", tc.port, p.No127, tc.wantNo127, p)
+		}
+	}
+}
+
 // TestParseSSEmpty: no listeners at all (a fresh/clean sandbox) -> no ports, no
 // error. The scanner (and everything downstream) must tolerate an empty world.
 func TestParseSSEmpty(t *testing.T) {

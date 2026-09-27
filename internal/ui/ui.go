@@ -6949,6 +6949,16 @@ func (m model) helpContent() string {
 			"off your LAN). Or unbind it: t on the row, or C to clear all stale\n" +
 			"forwards."))
 	b.WriteString("\n\n")
+	// 2z0v(b): `tailscale serve` always dials http://127.0.0.1:PORT specifically
+	// (tsserve.go:33) -- a listener bound only to ::1, a V6ONLY [::], or a
+	// non-.1 loopback like 127.0.0.2 shows serve-stale even though something is
+	// genuinely listening (pinned by TestRoutesServedNo127IsStale).
+	b.WriteString(helpTextStyle.Render(
+		"A served row can also show stale when something IS listening: serve\n" +
+			"always dials 127.0.0.1 specifically, not ::1 or any other loopback\n" +
+			"address (e.g. 127.0.0.2; \"localhost\" can resolve to ::1). Bind the\n" +
+			"app to 127.0.0.1."))
+	b.WriteString("\n\n")
 	for _, line := range configSaveLines(m.configPath) {
 		b.WriteString(helpTextStyle.Render(line) + "\n")
 	}

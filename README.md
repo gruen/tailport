@@ -693,6 +693,19 @@ the port. Two common cases:
   it's on `0.0.0.0` it's already reachable on the tailnet on its own (state
   `on tailnet`), so there's nothing left to serve.
 
+### Served row shows stale, but something IS listening
+
+`tailscale serve` always dials `http://127.0.0.1:PORT` — never anything else.
+If your app is listening only on an address serve doesn't dial — `::1`
+specifically (not `127.0.0.1`), a V6ONLY `[::]`, or a non-`.1` loopback
+address like `127.0.0.2` — tailport's served route correctly shows stale even
+though the port is genuinely listening (localhost still works from this
+machine, since that's a looser check). A common cause is a dev server told
+to listen on `localhost`, which can resolve to `::1` first. Bind the app to
+`127.0.0.1` instead, e.g. `python3 -m http.server 8791 --bind 127.0.0.1` (not
+`0.0.0.0` — on a served port that collides with serve's own tailnet listener,
+see above).
+
 ## Development
 
 Build and test locally with the standard Go toolchain:

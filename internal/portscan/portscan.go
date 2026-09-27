@@ -34,6 +34,49 @@ type Port struct {
 	// widening Port's shape into a full multi-bind list (see the aggregation
 	// comment in the scanners for why a fuller refactor wasn't taken).
 	Loopback bool
+	// No127 is true when the port is listening but NOT ONE of its bind rows
+	// accepts a dial to 127.0.0.1:PORT (see accepts127) -- computed across ALL
+	// bind rows for the port, before the widest-bind aggregation above
+	// discards any of them. `tailscale serve` always dials
+	// http://127.0.0.1:PORT as its loopback proxy target (tsserve.go:33,
+	// ActivePorts' doc comment), so a port bound only to ::1, a V6ONLY [::]
+	// (see classifyBindScope's ss/lsof note), or a non-.1 loopback address
+	// like 127.0.0.2 reads as listening -- even Loopback=true, since those are
+	// all ScopeLoopback -- but `serve` can never actually reach it (2z0v(b)).
+	//
+	// The polarity is deliberately INVERTED from Loopback/BindScope/etc: true
+	// means "NOT reachable via serve's dial", not "is". That is so the zero
+	// value (false) preserves today's behaviour for every `portscan.Port{}`
+	// literal already written (tests and callers alike) -- none of them need
+	// updating to stay correct after this field was added.
+	No127 bool
+}
+
+// accepts127 reports whether a bare bind host (no brackets, no port -- exactly
+// as the scanners extract it) is a row `tailscale serve` can actually reach:
+// serve always dials http://127.0.0.1:PORT (tsserve.go:33), so only a bind
+// that includes that literal address counts.
+//
+//   - "*" and "0.0.0.0": the wildcard/ANY spellings (lsof's literal "*"; ss's
+//     "0.0.0.0" for an IPv4, or dual-stack, ANY bind) -- both include
+//     127.0.0.1.
+//   - "127.0.0.1": the exact address.
+//   - "::ffff:127.0.0.1": the IPv4-mapped IPv6 form of the same address.
+//
+// Everything else -- "::1", a V6ONLY "::" (Linux ss prints "*" for a
+// dual-stack unspecified bind and "[::]" for V6ONLY -- see classifyBindScope's
+// note), a non-.1 loopback like "127.0.0.2", or any LAN/tailnet IP -- does
+// NOT accept a 127.0.0.1 dial, even though some of those classify as
+// ScopeLoopback/ScopeWildcard for BindScope purposes. accepts127 answers a
+// narrower, more literal question than classifyBindScope: not "how far does
+// this reach" but "does this specific dial land."
+func accepts127(host string) bool {
+	switch host {
+	case "*", "0.0.0.0", "127.0.0.1", "::ffff:127.0.0.1":
+		return true
+	default:
+		return false
+	}
 }
 
 // BindScope classifies how far a listening socket's bind address reaches. It

@@ -116,3 +116,39 @@ func TestWiderScope(t *testing.T) {
 		}
 	}
 }
+
+// TestAccepts127 pins the exact set of bind hosts `tailscale serve` can
+// actually reach (2z0v(b)): serve always dials the literal address
+// 127.0.0.1:PORT (tsserve.go:33), so this is a narrower, more literal
+// question than classifyBindScope's reachability-scope truth table -- several
+// hosts that classify as ScopeLoopback or ScopeWildcard still don't accept a
+// 127.0.0.1 dial. Runs on every platform; no live ss/lsof needed.
+func TestAccepts127(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		// Accepts a 127.0.0.1 dial.
+		{"*", true},                // lsof's / ss's wildcard spelling
+		{"0.0.0.0", true},          // IPv4 ANY
+		{"127.0.0.1", true},        // the exact address
+		{"::ffff:127.0.0.1", true}, // IPv4-mapped IPv6 form of the same address
+
+		// Loopback-scoped (or wildcard-adjacent) but does NOT accept.
+		{"::1", false},       // IPv6 loopback -- a distinct address, not 127.0.0.1
+		{"::", false},        // V6ONLY unspecified (Linux ss: "[::]", not "*") -- see classifyBindScope's note
+		{"127.0.0.2", false}, // non-.1 loopback: ScopeLoopback, but not THE address serve dials
+
+		// Never accepts.
+		{"192.168.1.5", false},
+		{"100.64.0.1", false},
+		{"fd7a:115c:a1e0::1", false},
+		{"", false},
+		{"garbage", false},
+	}
+	for _, c := range cases {
+		if got := accepts127(c.host); got != c.want {
+			t.Errorf("accepts127(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+}

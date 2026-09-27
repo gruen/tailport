@@ -49,6 +49,12 @@ func List() ([]Port, error) {
 // also sets Loopback=true regardless of what wins BindScope (t12m), so a port
 // bound on BOTH loopback and something wider (e.g. a specific LAN IP) doesn't
 // silently lose its localhost reachability.
+//
+// No127 is computed the same way, across every row seen for the port BEFORE
+// any of them is discarded by the widest-bind aggregation above: it starts
+// true (not accepted) on the port's first row and flips to false the moment
+// ANY row accepts a 127.0.0.1 dial (2z0v(b)), regardless of which row's scope
+// ends up winning BindScope.
 func parseSS(out []byte) ([]Port, error) {
 	agg := map[int]*Port{}
 	var order []int
@@ -93,7 +99,7 @@ func parseSS(out []byte) ([]Port, error) {
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host, Loopback: scope == ScopeLoopback}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host, Loopback: scope == ScopeLoopback, No127: !accepts127(host)}
 			order = append(order, port)
 			continue
 		}
@@ -103,6 +109,9 @@ func parseSS(out []byte) ([]Port, error) {
 		}
 		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
 			p.Loopback = true
+		}
+		if accepts127(host) { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
+			p.No127 = false
 		}
 		if p.Process == "" { // keep the first non-empty process name, paired with its pid
 			p.Process = proc

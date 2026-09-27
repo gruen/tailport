@@ -115,6 +115,56 @@ looponly    902   mg   13u  IPv4 0xdddddddddddddddd      0t0  TCP 127.0.0.1:9092
 	}
 }
 
+// TestParseLsofNo127 pins 2z0v(b) on darwin, mirroring Linux's
+// TestParseSSNo127: No127 must be true only when NOT ONE bind row for a port
+// accepts a dial to 127.0.0.1:PORT -- the address `tailscale serve` always
+// proxies to.
+//
+// UNVERIFIED (design doc "Remaining weak assumptions" #2): this fixture is
+// hand-written from documented lsof(8) output conventions, not captured on a
+// real Mac. In particular, whether lsof ever prints a distinct spelling for a
+// V6ONLY IPv6 wildcard bind (the way Linux ss prints "[::]" vs "*") is
+// unconfirmed here -- this test only exercises "*" as the dual-stack/wildcard
+// spelling, which accepts127 treats as accepting. It runs on darwin, so it is
+// exercised only by the opt-in `[ci darwin]` job, never on this (Linux) box.
+func TestParseLsofNo127(t *testing.T) {
+	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3    1001   mg    3u  IPv6 0x1111111111111111      0t0  TCP [::1]:18791 (LISTEN)
+python3    1002   mg    3u  IPv4 0x2222222222222222      0t0  TCP 127.0.0.2:18792 (LISTEN)
+python3    1003   mg    3u  IPv4 0x3333333333333333      0t0  TCP 127.0.0.1:18793 (LISTEN)
+python3    1003   mg    4u  IPv6 0x4444444444444444      0t0  TCP [::1]:18793 (LISTEN)
+python3    1004   mg    3u  IPv4 0x5555555555555555      0t0  TCP *:18794 (LISTEN)
+python3    1005   mg    3u  IPv6 0x6666666666666666      0t0  TCP *:18794 (LISTEN)
+`
+	ports, err := parseLsof([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseLsof error: %v", err)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		byPort[p.Number] = p
+	}
+
+	for _, tc := range []struct {
+		port      int
+		wantNo127 bool
+	}{
+		{18791, true},  // [::1] only
+		{18792, true},  // 127.0.0.2 only
+		{18793, false}, // 127.0.0.1 + [::1]
+		{18794, false}, // *:PORT (IPv4 row) + *:PORT (IPv6 row)
+	} {
+		p, ok := byPort[tc.port]
+		if !ok {
+			t.Errorf("expected port %d in %+v", tc.port, ports)
+			continue
+		}
+		if p.No127 != tc.wantNo127 {
+			t.Errorf("port %d No127 = %v, want %v (%+v)", tc.port, p.No127, tc.wantNo127, p)
+		}
+	}
+}
+
 // TestListDarwin is the native smoke test: it runs the real `lsof` binary on
 // the macOS runner (only reachable via the opt-in `[ci darwin]` job) and
 // confirms List() executes and parses without error. It deliberately does not

@@ -365,6 +365,54 @@ func TestRoutesFor(t *testing.T) {
 	}
 }
 
+// TestRoutesServedNo127IsStale pins 2z0v(b): `tailscale serve` always dials
+// the literal address 127.0.0.1:PORT (tsserve.go:33), so a served port whose
+// only listener is Loopback-scoped by classifyBindScope's wider truth table
+// (e.g. bound to ::1, a V6ONLY [::], or a non-.1 loopback like 127.0.0.2 --
+// see accepts127/portscan.Port.No127) is still NOT reachable via serve. The
+// no127 bit must flip the served tailnet route to stale even though
+// loopbackUp is true, while the localhost route -- which just answers "is
+// SOMETHING bound to a loopback-or-wider address", not "specifically
+// 127.0.0.1" -- must stay present and unaffected either way.
+func TestRoutesServedNo127IsStale(t *testing.T) {
+	base := serviceState{
+		port:      18791,
+		bindScope: portscan.ScopeLoopback,
+		listening: true,
+		served:    true,
+		host:      "myhost",
+	}
+
+	no127 := base
+	no127.no127 = true
+	got := routesFor(no127)
+	want := []route{
+		{kind: routeLocalhost, url: "http://localhost:18791"},
+		{kind: routeTailnet, served: true, stale: true, url: "http://myhost:18791"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("routesFor(no127=true) =\n  %#v\nwant\n  %#v", got, want)
+	}
+	if len(got) < 1 || got[0].kind != routeLocalhost {
+		t.Errorf("routesFor(no127=true): localhost route missing/moved: %#v", got)
+	}
+
+	// Companion: the SAME loopback bind with no127 false (the port is also
+	// reachable at 127.0.0.1, or is a plain 127.0.0.1-only bind) must keep the
+	// served route healthy -- no127 alone decides staleness here, nothing else
+	// in the scenario changed.
+	healthy := base
+	healthy.no127 = false
+	got = routesFor(healthy)
+	want = []route{
+		{kind: routeLocalhost, url: "http://localhost:18791"},
+		{kind: routeTailnet, served: true, stale: false, url: "http://myhost:18791"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("routesFor(no127=false) =\n  %#v\nwant\n  %#v", got, want)
+	}
+}
+
 func TestRouteLabel(t *testing.T) {
 	tests := []struct {
 		kind routeKind

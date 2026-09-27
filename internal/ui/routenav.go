@@ -47,6 +47,7 @@ func (i portItem) serviceState() serviceState {
 		bindScope:     i.port.BindScope,
 		bindHost:      i.port.BindHost,
 		bindLoopback:  i.port.Loopback,
+		no127:         i.port.No127,
 		listening:     i.listening,
 		served:        i.active,
 		funnelPub:     i.funnelPublic,

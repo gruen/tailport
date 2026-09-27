@@ -58,7 +58,15 @@ type serviceState struct {
 	// otherwise discard, so a loopback+LAN service still gets its localhost
 	// route (and its serve-route health still reflects the loopback proxy
 	// target `tailscale serve` actually dials).
-	bindLoopback  bool
+	bindLoopback bool
+	// no127 mirrors portscan.Port.No127 (2z0v(b)): true when the port is
+	// listening but no bind row accepts a dial to 127.0.0.1:PORT -- the
+	// address `tailscale serve` always proxies to (tsserve.go:33). A port
+	// bound only to ::1, a V6ONLY [::], or a non-.1 loopback like 127.0.0.2
+	// can be loopbackUp (see below) yet still be unreachable via serve, so
+	// this bit has to travel independently of bindLoopback/bindScope, exactly
+	// like bindLoopback itself travels independently of bindScope.
+	no127         bool
 	listening     bool         // a local process is bound
 	served        bool         // tailscale serve active for this port
 	funnelPub     int          // funnel public ingress port; 0 = not funnelled
@@ -110,10 +118,18 @@ func routesFor(s serviceState) []route {
 	// a dangling forward (nothing listening at all) AND a LAN-only listener
 	// (something is listening, but not where serve dials); a wide bind's route
 	// is never stale (it only exists while listening).
+	//
+	// loopbackUp alone isn't enough (2z0v(b)): `tailscale serve` always dials
+	// the literal address 127.0.0.1:PORT (tsserve.go:33), and loopbackUp only
+	// proves SOME loopback-or-wider bind exists -- a port bound only to ::1, a
+	// V6ONLY [::], or a non-.1 loopback like 127.0.0.2 is Loopback-scoped
+	// (loopbackUp is true) but serve's dial still lands nowhere. no127 carries
+	// that distinction across from the scanner, so the served route goes stale
+	// whenever loopbackUp is false OR no127 is true.
 	if s.host != "" {
 		tailnetURL := addressFor(s.host, s.port)
 		if s.served {
-			routes = append(routes, route{kind: routeTailnet, served: true, stale: !loopbackUp, url: tailnetURL})
+			routes = append(routes, route{kind: routeTailnet, served: true, stale: !(loopbackUp && !s.no127), url: tailnetURL})
 		} else if (s.bindScope == portscan.ScopeWildcard || s.bindScope == portscan.ScopeTailnet) && s.listening {
 			routes = append(routes, route{kind: routeTailnet, served: false, stale: false, url: tailnetURL})
 		}
