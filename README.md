@@ -572,9 +572,13 @@ matching Cloudflare's two account scenarios:
   `cloudflared tunnel login`, created a tunnel, and routed a stable custom
   hostname to it (`cloudflared tunnel route dns`) — a separate, one-time
   operator task, like standing up the Caddy edge, that tailport never automates.
-  tailport only *runs* that pre-provisioned tunnel
-  (`cloudflared tunnel run --url http://localhost:<port> <name>`); it never
-  mutates your Cloudflare account or DNS.
+  tailport only *runs* that pre-provisioned tunnel:
+  ```
+  cloudflared tunnel --metrics 127.0.0.1:<metrics-port> --logfile <path> --no-autoupdate run --url http://localhost:<port> <name>
+  ```
+  (the tunnel-level flags must come before `run` — cloudflared rejects them
+  after it with `Incorrect Usage` and exits 0); it never mutates your
+  Cloudflare account or DNS.
 
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running

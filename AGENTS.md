@@ -97,8 +97,11 @@ contract. The short version:
   already run `cloudflared tunnel login`, created the tunnel, and routed its
   hostname (`cloudflared tunnel route dns`) — a separate, one-time operator
   task, exactly like standing up the Caddy edge. tailport only ever RUNS a
-  named tunnel (`cloudflared tunnel run --url http://localhost:PORT
-  <name>`); it never mutates the user's Cloudflare account or DNS. Unlike
+  named tunnel (`cloudflared tunnel --metrics 127.0.0.1:MP --logfile PATH
+  --no-autoupdate run --url http://localhost:PORT <name>`); tunnel-level
+  flags must come before `run` — cloudflared rejects them after it
+  (`Incorrect Usage`, exit 0). It never mutates the user's Cloudflare account
+  or DNS. Unlike
   Publish (a stateless client of a remote edge) or Funnel (a
   Tailscale-managed ingress slot), cloudflared is a LONG-RUNNING LOCAL
   PROCESS tailport supervises directly — and by design TUNNELS SURVIVE

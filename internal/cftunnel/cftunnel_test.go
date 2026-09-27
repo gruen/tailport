@@ -27,18 +27,63 @@ func TestBuildArgs(t *testing.T) {
 		t.Errorf("quick args:\n got %q\nwant %q", quick, wantQuick)
 	}
 
+	// Named order (kata nc1j): the tunnel-level flags (--metrics, --logfile,
+	// --no-autoupdate) come BEFORE `run` -- real cloudflared 2026.9.1 rejects
+	// them after it ("Incorrect Usage: flag provided but not defined:
+	// -metrics", exit 0). --url and the trailing tunnel name come after `run`.
+	// This pins the exact shape README.md's "Tunnelling to the public
+	// internet (Cloudflare Tunnel)" section documents for a named tunnel. See
+	// TestNamedArgvAcceptedByRealCloudflared for the real-binary proof.
 	named := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log")
 	wantNamed := []string{
-		"tunnel", "run",
-		"--url", "http://localhost:8080",
+		"tunnel",
 		"--metrics", "127.0.0.1:20942",
 		"--logfile", "/state/cftunnel-8080.log",
 		"--no-autoupdate",
+		"run",
+		"--url", "http://localhost:8080",
 		"web", // trailing positional -- namedTunnelName relies on this
 	}
 	if !reflect.DeepEqual(named, wantNamed) {
 		t.Errorf("named args:\n got %q\nwant %q", named, wantNamed)
 	}
+}
+
+// TestBuildArgsNamedFlagPlacement pins the shape TestNamedArgvAcceptedByRealCloudflared
+// depends on: every tunnel-level flag must sit before `run`, --url must sit
+// after it, and the tunnel name must be the last element (kata nc1j).
+func TestBuildArgsNamedFlagPlacement(t *testing.T) {
+	args := buildArgs(Spec{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942}, "/state/cftunnel-8080.log")
+	runIdx := argIndex(args, "run")
+	if runIdx < 0 {
+		t.Fatal(`named argv must contain "run"`)
+	}
+	for _, flag := range []string{"--metrics", "--logfile", "--no-autoupdate"} {
+		i := argIndex(args, flag)
+		if i < 0 {
+			t.Errorf("named argv is missing tunnel-level flag %q", flag)
+			continue
+		}
+		if i > runIdx {
+			t.Errorf("tunnel-level flag %q at index %d must come before \"run\" at index %d -- real cloudflared rejects it after run", flag, i, runIdx)
+		}
+	}
+	if urlIdx := argIndex(args, "--url"); urlIdx < runIdx {
+		t.Errorf("--url at index %d must come after \"run\" at index %d", urlIdx, runIdx)
+	}
+	if got := args[len(args)-1]; got != "web" {
+		t.Errorf("tunnel name must be the last argv element, got %q", got)
+	}
+}
+
+// argIndex returns the index of the first exact match of tok in args, or -1.
+func argIndex(args []string, tok string) int {
+	for i, a := range args {
+		if a == tok {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestParseRunning(t *testing.T) {
@@ -59,7 +104,24 @@ func TestParseRunning(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "named owned (hostname recovered from logfile)",
+			// Current (kata nc1j) argv shape: tunnel-level flags before `run`.
+			name: "named owned, new flag order (hostname recovered from logfile)",
+			args: []string{"/usr/bin/cloudflared", "tunnel",
+				"--metrics", "127.0.0.1:20942",
+				"--logfile", "/home/u/.local/state/tailport/cftunnel-8080-app.example.com.log",
+				"--no-autoupdate", "run",
+				"--url", "http://localhost:8080", "web"},
+			want: Running{Port: 8080, Mode: ModeNamed, TunnelName: "web", MetricsPort: 20942, Hostname: "app.example.com", Owned: true},
+			ok:   true,
+		},
+		{
+			// parseRunning is order-independent (it scans for tokens/flags by
+			// name, not position). This pins that a tunnel started by a
+			// PRE-nc1j tailport build -- whose --metrics/--logfile/--no-autoupdate
+			// sat AFTER `run`, an argv real cloudflared actually rejects -- is
+			// still discoverable and re-toggleable across the upgrade rather than
+			// silently dropping out.
+			name: "named owned, old (pre-nc1j) flag order",
 			args: []string{"/usr/bin/cloudflared", "tunnel", "run",
 				"--url", "http://localhost:8080",
 				"--metrics", "127.0.0.1:20942",
@@ -516,6 +578,127 @@ func TestStartLivenessCheck(t *testing.T) {
 			t.Error("expected a positive pid")
 		}
 	})
+}
+
+// TestValidTunnelName pins ValidTunnelName's acceptance rules (kata nc1j):
+// non-empty, no whitespace or control characters, and no leading '-' (which
+// cloudflared's own flag parser would otherwise try to consume as a flag
+// rather than the positional tunnel name).
+func TestValidTunnelName(t *testing.T) {
+	yes := []string{"web", "prod-api", "a", "tunnel_1", "app.example.com", "192-168"}
+	for _, s := range yes {
+		if !ValidTunnelName(s) {
+			t.Errorf("ValidTunnelName(%q) = false, want true", s)
+		}
+	}
+	no := []string{
+		"",              // empty
+		" ",             // whitespace only
+		"web tunnel",    // internal space
+		"-web",          // leading '-'
+		"\tweb",         // leading control/whitespace
+		"web\n",         // trailing control
+		"web\x00tunnel", // embedded NUL (control)
+	}
+	for _, s := range no {
+		if ValidTunnelName(s) {
+			t.Errorf("ValidTunnelName(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestStartNamedReturnsHostname is the regression test for audit item 3
+// (kata nc1j): Start must hand back spec.Hostname on the Running it returns
+// for a named tunnel, so the caller can flash/display the URL immediately
+// instead of waiting for the next poll to re-derive it from the sentinel
+// logfile name.
+func TestStartNamedReturnsHostname(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".cloudflared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cloudflared", "cert.pem"), []byte("fake-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("TUNNEL_ORIGIN_CERT", "") // don't let an ambient override win
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3003, Mode: ModeNamed, TunnelName: "web", Hostname: "app.example.com"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+	if r.Hostname != "app.example.com" {
+		t.Errorf("Hostname = %q, want %q", r.Hostname, "app.example.com")
+	}
+	if r.TunnelName != "web" {
+		t.Errorf("TunnelName = %q, want %q", r.TunnelName, "web")
+	}
+}
+
+// TestNamedArgvAcceptedByRealCloudflared is the Tier 1 real-binary conformance
+// probe (design-v033-final.md, kata nc1j): it proves the CURRENT named argv
+// order actually parses under a real cloudflared, and that the OLD (broken)
+// order still would not -- so a regression back to the old order fails this
+// test, not just a fixture. It is --help-only and carries no positional
+// tunnel reference, so `run` just errors on a missing tunnel rather than ever
+// reaching the network (see design-v033-final.md's Tier 1 note). Per
+// coordinator amendment A1, it skips unless cloudflared is not just present
+// but actually usable, so a broken stand-in first on $PATH (as the CI
+// simulation puts there) makes it skip, not fail.
+func TestNamedArgvAcceptedByRealCloudflared(t *testing.T) {
+	bin, err := exec.LookPath("cloudflared")
+	if err != nil {
+		t.Skip("cloudflared not on $PATH")
+	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), detectTimeout)
+		out, verr := exec.CommandContext(ctx, bin, "version", "--short").Output()
+		cancel()
+		if verr != nil || strings.TrimSpace(string(out)) == "" {
+			t.Skip("cloudflared present but not usable (version --short failed or empty)")
+		}
+	}
+
+	home := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// The named argv's flags minus the trailing positional (there's no real
+	// tunnel to run against), plus --help so cloudflared parses the flags and
+	// prints usage without ever dialing out.
+	newArgs := []string{
+		"tunnel",
+		"--metrics", "127.0.0.1:0",
+		"--logfile", filepath.Join(home, "cftunnel-test.log"),
+		"--no-autoupdate",
+		"run",
+		"--url", "http://localhost:1",
+		"--help",
+	}
+	newCmd := exec.CommandContext(ctx, bin, newArgs...)
+	newCmd.Env = append(os.Environ(), "HOME="+home)
+	newOut, _ := newCmd.CombinedOutput()
+	if strings.Contains(string(newOut), "Incorrect Usage") {
+		t.Errorf("current named argv order rejected by real cloudflared:\n%s", newOut)
+	}
+
+	// Negative control: the OLD (pre-nc1j) order -- tunnel-level flags AFTER
+	// `run` -- must still be rejected, proving this test would actually catch
+	// a regression back to the broken order.
+	oldArgs := []string{"tunnel", "run", "--url", "http://localhost:1", "--metrics", "127.0.0.1:0", "--help"}
+	oldCmd := exec.CommandContext(ctx, bin, oldArgs...)
+	oldCmd.Env = append(os.Environ(), "HOME="+home)
+	oldOut, _ := oldCmd.CombinedOutput()
+	if !strings.Contains(string(oldOut), "Incorrect Usage") {
+		t.Fatalf("negative control: old flag order should be rejected by real cloudflared but wasn't:\n%s", oldOut)
+	}
 }
 
 // serverPort extracts the numeric port an httptest.Server is listening on, so a

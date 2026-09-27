@@ -16,8 +16,12 @@
 //   - Named (ModeNamed): an authenticated account whose operator has already
 //     run `cloudflared tunnel login`, created a tunnel, and routed a hostname
 //     to it (`route dns`). tailport only *runs* that pre-provisioned tunnel:
-//     `cloudflared tunnel run --url http://localhost:PORT <name>`. It never
-//     mutates the user's Cloudflare account or DNS.
+//     `cloudflared tunnel --metrics ADDR --logfile PATH --no-autoupdate run
+//     --url http://localhost:PORT <name>`. The tunnel-level flags (--metrics,
+//     --logfile, --no-autoupdate) MUST precede `run` -- cloudflared's flag
+//     parser rejects them after it ("Incorrect Usage: flag provided but not
+//     defined", exit 0; verified against cloudflared 2026.9.1, kata nc1j).
+//     tailport never mutates the user's Cloudflare account or DNS.
 //
 // Because the user chose "tunnels survive tailport", cloudflared is started
 // DETACHED (its own session via Setsid) so it outlives the TUI, and the
@@ -48,6 +52,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // Mode is the tunnel flavour (quick vs named); see the package doc.
@@ -242,11 +247,13 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	if spec.Port <= 0 {
 		return nil, fmt.Errorf("cftunnel: invalid port %d", spec.Port)
 	}
-	if spec.Mode == ModeNamed && spec.TunnelName == "" {
-		return nil, errors.New("cftunnel: named tunnel requires a tunnel name")
-	}
-	if spec.Mode == ModeNamed && !LoggedIn() {
-		return nil, ErrNotLoggedIn
+	if spec.Mode == ModeNamed {
+		if !ValidTunnelName(spec.TunnelName) {
+			return nil, fmt.Errorf("cftunnel: invalid tunnel name %q -- must be non-empty, contain no whitespace or control characters, and not start with '-'", spec.TunnelName)
+		}
+		if !LoggedIn() {
+			return nil, ErrNotLoggedIn
+		}
 	}
 
 	logfile, err := logfilePath(spec.Port, spec.Hostname)
@@ -296,14 +303,23 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		// buffered for the reaper goroutine's eventual send.
 	}
 
-	return &Running{
+	r := &Running{
 		Port:        spec.Port,
 		PID:         cmd.Process.Pid,
 		Mode:        spec.Mode,
 		TunnelName:  spec.TunnelName,
 		MetricsPort: metricsPort,
 		Owned:       true,
-	}, nil
+	}
+	if spec.Mode == ModeNamed {
+		// The named success flash and the route row's URL both key off
+		// Running.Hostname; without this, a just-started named tunnel showed no
+		// URL until the NEXT poll re-derived it from the sentinel logfile name
+		// (audit item 3, kata nc1j) -- Start already knows it from spec, so
+		// hand it back immediately.
+		r.Hostname = spec.Hostname
+	}
+	return r, nil
 }
 
 // Stop tears down the tunnel that was running at pid on port: it
@@ -411,21 +427,53 @@ func (c *Client) metricsGet(ctx context.Context, metricsPort int, path string) (
 }
 
 // buildArgs assembles the cloudflared argument vector for spec. It is pure (no
-// I/O) so it is unit-tested directly. All four flags are accepted under both
-// `tunnel` and `tunnel run` (verified against cloudflared 2026.8.2); the named
-// tunnel's name is the trailing positional, which Discover relies on when
-// recovering the name from a running process.
+// I/O) so it is unit-tested directly.
+//
+// The tunnel-level flags (--metrics, --logfile, --no-autoupdate) MUST precede
+// `run`: cloudflared's flag parser only registers them at the `tunnel`
+// level, not under the `run` subcommand, so passing them after `run` fails
+// with "Incorrect Usage: flag provided but not defined: -metrics" and exits 0
+// -- silently, since that's not a nonzero exit (verified against real
+// cloudflared 2026.9.1; the PREVIOUS comment here claiming all four flags
+// were "accepted under both `tunnel` and `tunnel run`" was false -- the named
+// path had been broken since v0.2.1, kata nc1j). `--url` and the trailing
+// tunnel-name positional come after `run`, since `run` is what accepts a
+// tunnel reference; Discover relies on the name staying the LAST element.
+// The quick argv is unaffected by any of this (no `run`, so ordering doesn't
+// matter to cloudflared) and stays byte-identical to before.
 func buildArgs(spec Spec, logfile string) []string {
-	base := []string{
-		"--url", fmt.Sprintf("http://localhost:%d", spec.Port),
+	urlArgs := []string{"--url", fmt.Sprintf("http://localhost:%d", spec.Port)}
+	tunnelFlags := []string{
 		"--metrics", fmt.Sprintf("127.0.0.1:%d", spec.MetricsPort),
 		"--logfile", logfile,
 		"--no-autoupdate",
 	}
 	if spec.Mode == ModeNamed {
-		return append(append([]string{"tunnel", "run"}, base...), spec.TunnelName)
+		args := append([]string{"tunnel"}, tunnelFlags...)
+		args = append(args, "run")
+		args = append(args, urlArgs...)
+		return append(args, spec.TunnelName)
 	}
-	return append([]string{"tunnel"}, base...)
+	return append(append([]string{"tunnel"}, urlArgs...), tunnelFlags...)
+}
+
+// ValidTunnelName reports whether s is an acceptable named-tunnel identifier:
+// non-empty, containing no whitespace or control characters (which would
+// either split across argv elements or corrupt the sentinel logfile name),
+// and not starting with '-' (which cloudflared's own flag parser would
+// otherwise try to interpret as another flag rather than the positional
+// tunnel name). Start rejects any spec.TunnelName that fails this before ever
+// shelling out to cloudflared.
+func ValidTunnelName(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // logfilePath is where a tunnel for port writes its log, AND the ownership
