@@ -438,8 +438,8 @@ func (m *model) requestTunnelNamed(port int) tea.Cmd {
 // nc1j]: a pre-provisioned named tunnel is a single Cloudflare-side connector
 // set, and tailport running it twice for two different local ports would
 // leave both routes pointed at the same tunnel with no way to tell which
-// serves which -- so name entry, re-raise, and confirmTunnelNamed all call
-// this before starting one. It checks ONLY tailport's own currently-discovered
+// serves which -- so requestTunnelNamed (the `O` key) and confirmTunnelNamed
+// both call this before starting one (kata p7c5). It checks ONLY tailport's own currently-discovered
 // m.tunnels (no foreign or process-table scan -- that's out of scope here,
 // same as the rest of this feature's ownership model): the same tunnel
 // running elsewhere entirely (another machine, a system service, a dashboard
