@@ -92,6 +92,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -171,9 +172,12 @@ type Running struct {
 	// restart -- see logfilePath). Empty for a quick tunnel (whose hostname
 	// comes from /quicktunnel instead) and for foreign processes.
 	Hostname string
-	// Owned reports whether tailport started this process, decided solely from
-	// the --logfile sentinel (see sentinelHost). A false value means a foreign
-	// cloudflared covers this port -- surfaced as drift, never signalled.
+	// Owned reports whether tailport started this process, decided from the
+	// --logfile sentinel (see sentinelHost), the process's real UID matching
+	// os.Getuid() (S2(a)), and -- for a named tunnel -- its recovered
+	// hostname/name both passing ValidHostname/ValidTunnelName (S2(c)). A
+	// false value means a foreign cloudflared covers this port -- surfaced as
+	// drift, never signalled.
 	Owned bool
 	// LogFile is the --logfile value (tailport's own sentinel path) for an
 	// OWNED process; empty for a foreign one. ConsolePath derives that
@@ -594,12 +598,23 @@ func (c *Client) Health(ctx context.Context, metricsPort int) Health {
 		var q struct {
 			Hostname string `json:"hostname"`
 		}
-		if json.Unmarshal(body, &q) == nil {
+		// quickTunnelHostnameRe (S2(c), audit finding 2) rejects anything
+		// that isn't shaped like a genuine *.trycloudflare.com hostname --
+		// cloudflared's metrics server is loopback-only, but a malicious
+		// same-host process could still bind the exact metrics port between
+		// polls (a metrics port is a freshly reserved, unauthenticated
+		// loopback listener) and hand back an arbitrary string tailport
+		// would otherwise render as-is in a route row/toast.
+		if json.Unmarshal(body, &q) == nil && quickTunnelHostnameRe.MatchString(q.Hostname) {
 			h.Hostname = q.Hostname
 		}
 	}
 	return h
 }
+
+// quickTunnelHostnameRe is the only shape /quicktunnel's "hostname" field may
+// take: a *.trycloudflare.com hostname, case-insensitive (S2(c)).
+var quickTunnelHostnameRe = regexp.MustCompile(`(?i)^[a-z0-9-]+\.trycloudflare\.com$`)
 
 // metricsGet performs one GET against cloudflared's loopback metrics server and
 // returns the status code and body. The endpoints only ever bind loopback.
@@ -725,6 +740,40 @@ func ValidTunnelName(s string) bool {
 	}
 	for _, r := range s {
 		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidHostname reports whether s is an acceptable named-tunnel public
+// hostname: a dotted DNS name restricted to [A-Za-z0-9.-], containing at
+// least one dot, and not starting with '-' or '.'. This is the single source
+// of truth for hostname syntax the UI's own validTunnelHostname used to
+// duplicate (kata nc1j W3a) -- moved/exported here (S2(c), audit finding 2)
+// so parseRunning can also apply it to a hostname RECOVERED from a
+// --logfile sentinel (see sentinelHost): tailport itself only ever writes a
+// sentinel whose embedded hostname already passed this exact check at Start
+// time (see Start and S4's tunnelConfigPath), so a sentinel that fails it now
+// was crafted by something else -- a hostile, same-UID process trying to get
+// a bogus string (a leading dot, an escape sequence) rendered as if it were
+// a genuine tailport-owned tunnel's hostname -- and must never be classified
+// Owned. Because the allowed charset excludes every control byte outright,
+// a string that passes this check needs no further sanitizeDisplay pass.
+func ValidHostname(s string) bool {
+	if s == "" || !strings.Contains(s, ".") {
+		return false
+	}
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-':
+		default:
 			return false
 		}
 	}

@@ -1,18 +1,25 @@
 package cftunnel
 
 import (
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-// procInfo is one enumerated cloudflared process: its pid and full argument
-// vector (argv, including argv[0]). The per-platform enumerateCloudflared
-// (discover_linux.go / discover_darwin.go) produces these; parseRunning
-// interprets them. Keeping the interpretation in this shared, pure file is what
-// lets it be unit-tested on any platform.
+// procInfo is one enumerated cloudflared process: its pid, its real UID, and
+// full argument vector (argv, including argv[0]). The per-platform
+// enumerateCloudflared (discover_linux.go / discover_darwin.go) produces
+// these; parseRunning interprets them. Keeping the interpretation in this
+// shared, pure file is what lets it be unit-tested on any platform.
+//
+// uid is the process's real UID (S2(a), audit finding 2): ownership now
+// requires it to equal os.Getuid(), in addition to the sentinel+port match
+// below -- a same-named sentinel started by a DIFFERENT user is never ours,
+// no matter how well it matches otherwise.
 type procInfo struct {
 	pid  int
+	uid  int
 	args []string
 }
 
@@ -48,7 +55,7 @@ func (c *Client) Discover() ([]Running, error) {
 	}
 	out := make([]Running, 0, len(procs))
 	for _, p := range procs {
-		if r, ok := parseRunning(p.pid, p.args); ok {
+		if r, ok := parseRunning(p.pid, p.uid, p.args); ok {
 			out = append(out, r)
 		}
 	}
@@ -57,15 +64,27 @@ func (c *Client) Discover() ([]Running, error) {
 
 // parseRunning interprets one cloudflared argv into a Running, or (,false) if
 // it isn't a tunnel invocation we can map to a local port. Pure and
-// exhaustively unit-tested. Ownership is decided by the --logfile sentinel
-// basename AND its embedded port matching THIS process's own --url port
-// (roborev carryover, kata aprt) -- without that port check, a foreign
-// cloudflared whose --logfile happens to collide with our basename pattern
-// for a DIFFERENT port would be misclassified as owned. So a foreign
-// cloudflared -- even one that happens to expose the same port, or carries a
-// coincidentally-matching sentinel name for another port -- is correctly
-// reported with Owned=false.
-func parseRunning(pid int, args []string) (Running, bool) {
+// exhaustively unit-tested. Ownership is decided by:
+//   - the --logfile sentinel basename AND its embedded port matching THIS
+//     process's own --url port (roborev carryover, kata aprt) -- without that
+//     port check, a foreign cloudflared whose --logfile happens to collide
+//     with our basename pattern for a DIFFERENT port would be misclassified
+//     as owned;
+//   - uid matching os.Getuid() (S2(a), audit finding 2) -- a process started
+//     by a DIFFERENT user can never be ours, however well its sentinel
+//     matches otherwise;
+//   - for a NAMED tunnel, the recovered hostname and tunnel name both passing
+//     ValidHostname/ValidTunnelName (S2(c)) -- tailport itself never writes a
+//     sentinel whose embedded hostname or positional name would fail either
+//     check, so one that does was crafted by something else (a hostile,
+//     same-UID process trying to get a bogus string -- a leading dot, an
+//     escape sequence -- rendered as if it were a genuine tailport-owned
+//     tunnel's hostname/name) and must never be trusted as owned.
+//
+// So a foreign cloudflared -- even one that happens to expose the same port,
+// run as a different user, or carry a coincidentally-matching but invalid
+// sentinel -- is correctly reported with Owned=false.
+func parseRunning(pid, uid int, args []string) (Running, bool) {
 	if !containsToken(args, "tunnel") {
 		return Running{}, false
 	}
@@ -78,26 +97,40 @@ func parseRunning(pid int, args []string) (Running, bool) {
 		return Running{}, false
 	}
 	r := Running{PID: pid, Port: port, Mode: ModeQuick}
+	var rawName string
 	if containsToken(args, "run") {
 		r.Mode = ModeNamed
-		r.TunnelName = namedTunnelName(args)
+		rawName = namedTunnelName(args)
+		// sanitizeDisplay (S2(b)) is defense in depth on top of the
+		// ValidTunnelName ownership gate below: it guarantees this value can
+		// never carry a raw ESC/OSC byte into a toast or route row even in a
+		// context that didn't go through that gate.
+		r.TunnelName = sanitizeDisplay(rawName)
 	}
 	if m, ok := flagValue(args, "--metrics"); ok {
 		r.MetricsPort = parseMetricsPort(m)
 	}
 	if lf, ok := flagValue(args, "--logfile"); ok {
-		if host, owned := sentinelHost(lf, port); owned {
-			r.Owned = true
-			// The --logfile value itself (not just its derived hostname) is
-			// what ConsolePath needs to find this tunnel's console-capture
-			// file after a tailport restart re-Discover()s it.
-			r.LogFile = lf
-			// A named tunnel's hostname is unrecoverable from the cmdline
-			// alone; the sentinel logfile carries it (see logfilePath). Quick
-			// tunnels leave it empty here (their hostname comes from
-			// /quicktunnel), so never overwrite an already-known value.
-			if r.Mode == ModeNamed && r.Hostname == "" {
-				r.Hostname = host
+		if host, sentinelOK := sentinelHost(lf, port); sentinelOK && uid == os.Getuid() {
+			owned := true
+			if r.Mode == ModeNamed && (!ValidHostname(host) || !ValidTunnelName(rawName)) {
+				owned = false
+			}
+			if owned {
+				r.Owned = true
+				// The --logfile value itself (not just its derived hostname)
+				// is what ConsolePath needs to find this tunnel's
+				// console-capture file after a tailport restart
+				// re-Discover()s it.
+				r.LogFile = lf
+				// A named tunnel's hostname is unrecoverable from the cmdline
+				// alone; the sentinel logfile carries it (see logfilePath).
+				// Quick tunnels leave it empty here (their hostname comes
+				// from /quicktunnel), so never overwrite an already-known
+				// value.
+				if r.Mode == ModeNamed && r.Hostname == "" {
+					r.Hostname = host
+				}
 			}
 		}
 	}

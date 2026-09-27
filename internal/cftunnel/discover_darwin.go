@@ -4,7 +4,6 @@ package cftunnel
 
 import (
 	"os/exec"
-	"strconv"
 	"strings"
 )
 
@@ -27,8 +26,15 @@ import (
 // A cloudflared installed under a DIFFERENT binary name (config Binary
 // override) IS enumerated here: isCloudflaredArgv0 matches against binName,
 // the configured Client.binary() (roborev carryover, kata aprt).
+//
+// The `uid=` column (S2(a), audit finding 2) is what lets ownership also
+// require the process's real UID to equal os.Getuid() -- macOS's ps has no
+// /proc-style out-of-band UID lookup, so it has to come from ps itself.
+// splitPidUidCommand (pscommand.go, build-tag-free so it's unit-tested on
+// Linux CI too) peels the pid and uid columns off before splitPSCommand ever
+// sees the command string.
 func enumerateCloudflared(binName string) ([]procInfo, error) {
-	out, err := exec.Command("ps", "-axww", "-o", "pid=,command=").Output()
+	out, err := exec.Command("ps", "-axww", "-o", "pid=,uid=,command=").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -38,19 +44,15 @@ func enumerateCloudflared(binName string) ([]procInfo, error) {
 		if line == "" {
 			continue
 		}
-		sp := strings.IndexByte(line, ' ')
-		if sp < 0 {
-			continue // a bare pid with no command -- shouldn't happen
+		pid, uid, command, ok := splitPidUidCommand(line)
+		if !ok {
+			continue // a bare pid with no uid/command -- shouldn't happen
 		}
-		pid, err := strconv.Atoi(line[:sp])
-		if err != nil {
-			continue
-		}
-		args := splitPSCommand(strings.TrimLeft(line[sp+1:], " "))
+		args := splitPSCommand(command)
 		if len(args) == 0 || !isCloudflaredArgv0(args[0], binName) {
 			continue
 		}
-		res = append(res, procInfo{pid: pid, args: args})
+		res = append(res, procInfo{pid: pid, uid: uid, args: args})
 	}
 	return res, nil
 }

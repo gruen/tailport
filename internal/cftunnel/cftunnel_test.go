@@ -2,6 +2,7 @@ package cftunnel
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -211,7 +212,7 @@ func TestParseRunning(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := parseRunning(42, tt.args)
+			got, ok := parseRunning(42, os.Getuid(), tt.args)
 			if ok != tt.ok {
 				t.Fatalf("ok = %v, want %v", ok, tt.ok)
 			}
@@ -221,6 +222,84 @@ func TestParseRunning(t *testing.T) {
 			tt.want.PID = 42
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("\n got %+v\nwant %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseRunningRequiresMatchingUID is the regression test for S2(a)
+// (audit finding 2): a process whose real UID differs from os.Getuid() must
+// never be classified Owned, no matter how well its --logfile sentinel and
+// port otherwise match. This needs no privilege to test -- parseRunning
+// takes the candidate's uid as a plain argument, so a fixture just supplies
+// one that differs from the test's own.
+func TestParseRunningRequiresMatchingUID(t *testing.T) {
+	logfile := filepath.Join(t.TempDir(), "cftunnel-3000.log")
+	args := []string{"cloudflared", "tunnel", "--url", "http://localhost:3000", "--logfile", logfile}
+
+	other := os.Getuid() + 1
+	r, ok := parseRunning(1234, other, args)
+	if !ok {
+		t.Fatal("parseRunning should still classify this as a tunnel invocation")
+	}
+	if r.Owned {
+		t.Error("a process owned by a DIFFERENT uid must never be Owned, even with a perfectly matching sentinel")
+	}
+
+	// Sanity check: the SAME sentinel with a matching uid IS owned, so the
+	// test above is actually exercising the uid check and not some other
+	// mismatch.
+	r2, ok := parseRunning(1234, os.Getuid(), args)
+	if !ok || !r2.Owned {
+		t.Fatalf("control case: expected Owned=true with a matching uid, got ok=%v Owned=%v", ok, r2.Owned)
+	}
+}
+
+// TestParseRunningRejectsHostileNamedSentinel is the regression test for
+// S2(c) (audit finding 2): tailport itself never writes a --logfile sentinel
+// whose embedded hostname or positional tunnel name would fail
+// ValidHostname/ValidTunnelName, so a same-UID process presenting one that
+// does was crafted by something else -- and must never be classified Owned,
+// even though its sentinel basename, port, and uid all otherwise match.
+func TestParseRunningRejectsHostileNamedSentinel(t *testing.T) {
+	uid := os.Getuid()
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "hostname contains an ESC byte",
+			args: []string{"cloudflared", "tunnel",
+				"--metrics", "127.0.0.1:20942",
+				"--logfile", filepath.Join(t.TempDir(), "cftunnel-3000-evil\x1b[31m.example.com.log"),
+				"--no-autoupdate", "run",
+				"--url", "http://localhost:3000", "web"},
+		},
+		{
+			name: "hostname has a leading dot",
+			args: []string{"cloudflared", "tunnel",
+				"--metrics", "127.0.0.1:20942",
+				"--logfile", filepath.Join(t.TempDir(), "cftunnel-3000-.evil.example.com.log"),
+				"--no-autoupdate", "run",
+				"--url", "http://localhost:3000", "web"},
+		},
+		{
+			name: "recovered tunnel name contains an ESC byte",
+			args: []string{"cloudflared", "tunnel",
+				"--metrics", "127.0.0.1:20942",
+				"--logfile", filepath.Join(t.TempDir(), "cftunnel-3000-app.example.com.log"),
+				"--no-autoupdate", "run",
+				"--url", "http://localhost:3000", "web\x1b[31mHACKED"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ok := parseRunning(1234, uid, tc.args)
+			if !ok {
+				t.Fatal("parseRunning should still classify this as a tunnel invocation")
+			}
+			if r.Owned {
+				t.Errorf("a hostile sentinel must never be classified Owned, got %+v", r)
 			}
 		})
 	}
@@ -382,6 +461,46 @@ func TestHealthZeroMetricsPort(t *testing.T) {
 	c := &Client{}
 	if h := c.Health(context.Background(), 0); h.Ready || h.Hostname != "" {
 		t.Errorf("zero metrics port should short-circuit: %+v", h)
+	}
+}
+
+// TestHealthRejectsMalformedQuickHostname is the regression test for S2(c)
+// (audit finding 2): /quicktunnel's "hostname" field is accepted ONLY when
+// it matches a genuine *.trycloudflare.com shape -- anything else (empty,
+// a different domain, an embedded control byte) must yield "", never get
+// rendered as-is.
+func TestHealthRejectsMalformedQuickHostname(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostname string
+		want     string
+	}{
+		{"valid lowercase", "foo-bar-baz.trycloudflare.com", "foo-bar-baz.trycloudflare.com"},
+		{"valid uppercase is still accepted (case-insensitive)", "Foo-Bar.TryCloudflare.Com", "Foo-Bar.TryCloudflare.Com"},
+		{"empty", "", ""},
+		{"wrong domain", "foo-bar.example.com", ""},
+		{"subdomain smuggling", "foo.trycloudflare.com.evil.example", ""},
+		{"embedded control byte", "foo\x1b[31mbar.trycloudflare.com", ""},
+		{"embedded slash", "foo/bar.trycloudflare.com", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/quicktunnel" {
+					body, _ := json.Marshal(map[string]string{"hostname": tc.hostname})
+					_, _ = w.Write(body)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+
+			c := &Client{HTTPClient: srv.Client()}
+			h := c.Health(context.Background(), serverPort(t, srv))
+			if h.Hostname != tc.want {
+				t.Errorf("Hostname = %q, want %q", h.Hostname, tc.want)
+			}
+		})
 	}
 }
 
@@ -944,6 +1063,33 @@ func TestStartConsoleMode0600(t *testing.T) {
 	}
 }
 
+// TestConsolePathIgnoresForeignDirectory is the regression test for S2(d)
+// (audit finding 2): ConsolePath must derive its directory from tailport's
+// OWN state dir, never from whatever directory component a --logfile value
+// happens to carry. A legitimately owned tunnel's logfile always already
+// lives in that same state dir, so this changes nothing for it -- the point
+// is a --logfile RECOVERED from a process's own argv (Running.LogFile) is
+// untrusted input, and only its BASENAME is validated as a sentinel
+// (sentinelHost), never its directory; without this, a crafted --logfile
+// pointing somewhere else entirely could redirect a toast's ConsoleTail into
+// reading an arbitrary file.
+func TestConsolePathIgnoresForeignDirectory(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	dir, err := stateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := ConsolePath("/etc/cftunnel-3000.log")
+	want := filepath.Join(dir, "cftunnel-3000.console")
+	if got != want {
+		t.Errorf("ConsolePath(%q) = %q, want %q (tailport's own state dir, not /etc)", "/etc/cftunnel-3000.log", got, want)
+	}
+	if strings.HasPrefix(got, "/etc") {
+		t.Errorf("ConsolePath must never resolve into a foreign directory, got %q", got)
+	}
+}
+
 // TestStartWritesHermeticConfig is the regression test for the hermetic
 // --config fix (kata nc1j): every Start (quick AND named) must (re)write
 // tailport's own --config file with "{}" content and mode 0600, even if the
@@ -1051,6 +1197,30 @@ func TestConsoleTail(t *testing.T) {
 		content := "\x1b[31m2026-09-27T01:00:00Z ERR colored error\x1b[0m\n"
 		if got := ConsoleTail(write(t, content)); got != "colored error" {
 			t.Errorf("got %q, want %q", got, "colored error")
+		}
+	})
+
+	// S2(b), audit finding 2: ansiEscapeRe only strips CSI sequences
+	// (ESC '[' ... letter); sanitizeDisplay is the backstop that guarantees
+	// the result NEVER contains a raw ESC or BEL byte, regardless of shape --
+	// including an OSC 52 (clipboard-write) sequence, which ansiEscapeRe
+	// doesn't match at all.
+	t.Run("an OSC 52 payload leaves no ESC or BEL in the result", func(t *testing.T) {
+		content := "2026-09-27T01:00:00Z ERR \x1b]52;c;aGVsbG8=\x07evil message\n"
+		got := ConsoleTail(write(t, content))
+		if strings.ContainsRune(got, '\x1b') || strings.ContainsRune(got, '\x07') {
+			t.Errorf("result must contain no ESC/BEL, got %q", got)
+		}
+		if !strings.Contains(got, "evil message") {
+			t.Errorf("the rest of the message should survive, got %q", got)
+		}
+	})
+
+	t.Run("a bare ESC byte outside any CSI sequence is stripped", func(t *testing.T) {
+		content := "\x1bnot a real escape sequence\n"
+		got := ConsoleTail(write(t, content))
+		if strings.ContainsRune(got, '\x1b') {
+			t.Errorf("result must contain no ESC, got %q", got)
 		}
 	})
 

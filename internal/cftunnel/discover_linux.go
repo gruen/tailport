@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // enumerateCloudflared finds running cloudflared processes by walking /proc and
@@ -16,6 +17,13 @@ import (
 // launches, AND a configured Binary override (roborev carryover, kata aprt).
 // Unreadable entries -- permission denied for another user's process, or a PID
 // that exits mid-scan -- are silently skipped.
+//
+// Each entry also carries the process's real UID (S2(a), audit finding 2),
+// read via os.Stat on the /proc/<pid> directory itself (owned by the
+// process's real UID) rather than any file inside it -- so it works
+// regardless of what the process's cmdline permissions happen to be. A PID
+// whose UID can't be read (raced past exit) is skipped, same as an unreadable
+// cmdline.
 func enumerateCloudflared(binName string) ([]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -35,9 +43,27 @@ func enumerateCloudflared(binName string) ([]procInfo, error) {
 		if len(args) == 0 || !isCloudflaredArgv0(args[0], binName) {
 			continue
 		}
-		out = append(out, procInfo{pid: pid, args: args})
+		uid, err := procUID(pid)
+		if err != nil {
+			continue
+		}
+		out = append(out, procInfo{pid: pid, uid: uid, args: args})
 	}
 	return out, nil
+}
+
+// procUID reads pid's real UID via os.Stat on its /proc/<pid> directory,
+// which the kernel always sets to the process's own real UID.
+func procUID(pid int) (int, error) {
+	info, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+	if err != nil {
+		return 0, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, os.ErrInvalid
+	}
+	return int(st.Uid), nil
 }
 
 // splitNUL splits /proc/<pid>/cmdline (argv joined and terminated by NUL bytes)

@@ -172,9 +172,20 @@ contract. The short version:
   the OS process table is the live source of truth, polled fresh every
   cycle and NEVER persisted, so a tunnel from a prior session is
   re-discovered and re-toggleable on the next launch. Only tailport-OWNED
-  tunnels (carrying a sentinel `--logfile` flag tailport always passes) are
-  tracked this way; a foreign `cloudflared` process is surfaced as drift,
-  never signalled or touched. The whole feature is gated on `cloudflared`
+  tunnels (carrying a sentinel `--logfile` flag tailport always passes, AND
+  whose real UID equals `os.Getuid()`, AND — for a named tunnel — whose
+  hostname/name recovered from that sentinel both pass `ValidHostname`/
+  `ValidTunnelName` — a pre-release security audit's finding 2 confirmed the
+  UID check was missing, so a same-named sentinel started by a different
+  user was previously trusted as owned) are tracked this way; a foreign
+  `cloudflared` process is surfaced as drift, never signalled or touched.
+  Every string tailport did not itself construct and might display —
+  `internal/cftunnel.ConsoleTail`'s output and a recovered tunnel name — is
+  passed through `sanitizeDisplay`, which strips C0/C1 control bytes and DEL
+  so a hostile console line or sentinel can never smuggle a raw
+  ESC/OSC escape sequence into a toast. `ConsolePath` also always resolves
+  under tailport's OWN state dir, never whatever directory a recovered
+  `--logfile` value happens to carry. The whole feature is gated on `cloudflared`
   being installed — detected once at startup — so an absent binary drops
   the `o` key from the bar entirely: no key, no discovery, no polling.
   A NAMED tunnel serves only ONE local port at a time — tailport's

@@ -564,22 +564,12 @@ func tunnelErrText(err error) string {
 // or hyphen or a stray control/unicode byte through). tailport can't verify
 // the DNS route exists (that's the operator's pre-provisioning job), so this
 // only catches obvious typos.
+//
+// This is now a thin wrapper around cftunnel.ValidHostname (S2(c), audit
+// finding 2): the rule moved there so internal/cftunnel's own Discover path
+// can apply the SAME check to a hostname recovered from a --logfile
+// sentinel, rather than the UI and cftunnel packages silently duplicating
+// (and risking drifting) two copies of it.
 func validTunnelHostname(s string) bool {
-	if s == "" || !strings.Contains(s, ".") {
-		return false
-	}
-	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '.' || r == '-':
-		default:
-			return false
-		}
-	}
-	return true
+	return cftunnel.ValidHostname(s)
 }

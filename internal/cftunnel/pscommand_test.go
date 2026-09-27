@@ -1,6 +1,7 @@
 package cftunnel
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -92,7 +93,7 @@ func TestSplitPSCommand(t *testing.T) {
 // CI too.
 func TestParseRunningSpacedLogfilePath(t *testing.T) {
 	args := splitPSCommand("cloudflared tunnel --url http://localhost:3000 --metrics 127.0.0.1:20941 --logfile /Users/Jane Doe/.local/state/tailport/cftunnel-3000.log --no-autoupdate")
-	r, ok := parseRunning(123, args)
+	r, ok := parseRunning(123, os.Getuid(), args)
 	if !ok {
 		t.Fatal("parseRunning should recognize a tunnel invocation")
 	}
@@ -170,6 +171,72 @@ func TestSplitPSCommandRoundTripsBuildArgs(t *testing.T) {
 			got := splitPSCommand(command)
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("splitPSCommand round trip:\n got %q\nwant %q", got, want)
+			}
+		})
+	}
+}
+
+// TestSplitPidUidCommand pins splitPidUidCommand's parsing of a
+// `ps -axww -o pid=,uid=,command=` line (S2(a), audit finding 2): ps
+// right-pads/aligns the two numeric columns with spaces, and this must
+// tolerate that padding on either column independently.
+func TestSplitPidUidCommand(t *testing.T) {
+	tests := []struct {
+		name        string
+		line        string
+		wantPid     int
+		wantUID     int
+		wantCommand string
+		wantOK      bool
+	}{
+		{
+			name:        "single-space separated",
+			line:        "1234 501 /usr/bin/cloudflared tunnel --url http://localhost:3000",
+			wantPid:     1234,
+			wantUID:     501,
+			wantCommand: "/usr/bin/cloudflared tunnel --url http://localhost:3000",
+			wantOK:      true,
+		},
+		{
+			name:        "ps-style right-aligned padding on both columns",
+			line:        "   1234    0 /usr/bin/cloudflared tunnel --url http://localhost:3000",
+			wantPid:     1234,
+			wantUID:     0,
+			wantCommand: "/usr/bin/cloudflared tunnel --url http://localhost:3000",
+			wantOK:      true,
+		},
+		{
+			name:   "no uid or command column",
+			line:   "1234",
+			wantOK: false,
+		},
+		{
+			name:   "no command column",
+			line:   "1234 501",
+			wantOK: false,
+		},
+		{
+			name:   "non-numeric pid",
+			line:   "abc 501 command",
+			wantOK: false,
+		},
+		{
+			name:   "non-numeric uid",
+			line:   "1234 abc command",
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pid, uid, command, ok := splitPidUidCommand(tt.line)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if pid != tt.wantPid || uid != tt.wantUID || command != tt.wantCommand {
+				t.Errorf("got (%d, %d, %q), want (%d, %d, %q)", pid, uid, command, tt.wantPid, tt.wantUID, tt.wantCommand)
 			}
 		})
 	}

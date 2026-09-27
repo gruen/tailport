@@ -3,30 +3,75 @@ package cftunnel
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
 
 // ConsolePath returns the console-capture file for a tunnel whose ownership
-// sentinel logfile is logfile (see logfilePath): the same basename with its
-// ".log" extension swapped for ".console", so it lands right next to it under
-// $XDG_STATE_HOME/tailport (default ~/.local/state/tailport). It can never
-// match sentinelLogRe (which requires a ".log" suffix), and Discover never
-// scans that directory anyway -- it only ever reads the --logfile VALUE off a
-// process's own argv -- so a console file is invisible to ownership detection
-// either way; it's purely for ConsoleTail to read.
+// sentinel logfile is logfile (see logfilePath): the same BASENAME with its
+// ".log" extension swapped for ".console", joined with tailport's OWN state
+// dir -- NEVER whatever directory component logfile itself carries (S2(d),
+// audit finding 2). logfile normally already lives in that same state dir
+// (Start only ever writes it there), so this changes nothing for a
+// legitimately owned tunnel; the point is defense in depth for the one
+// caller that passes in a RECOVERED, not self-generated, value: a
+// Running.LogFile from Discover()/parseRunning is read off a process's own
+// argv, and while parseRunning already requires that value's BASENAME to
+// match the sentinel pattern for ownership, it never validated the
+// directory -- so a hostile same-UID process could otherwise redirect a
+// toast's ConsoleTail into reading an arbitrary file elsewhere on disk by
+// crafting a --logfile whose basename merely matches. Forcing the directory
+// back to stateDir() closes that off regardless of what parseRunning ever
+// validates.
+//
+// The result can never match sentinelLogRe (which requires a ".log" suffix),
+// and Discover never scans that directory anyway -- it only ever reads the
+// --logfile VALUE off a process's own argv -- so a console file is invisible
+// to ownership detection either way; it's purely for ConsoleTail to read.
 //
 // See the package doc for why this file exists at all: cloudflared's
 // --logfile is a structured JSON log that can hold nothing useful for a
 // fatal startup error (R1), because those go to stderr alone.
 func ConsolePath(logfile string) string {
-	return strings.TrimSuffix(logfile, ".log") + ".console"
+	base := strings.TrimSuffix(filepath.Base(logfile), ".log") + ".console"
+	dir, err := stateDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, base)
 }
 
 // ansiEscapeRe strips ANSI/VT escape sequences: cloudflared colorizes its
 // console output when it thinks it's attached to a terminal-ish stream, and a
-// toast must never show raw escape bytes.
+// toast must never show raw escape bytes. It only matches CSI sequences
+// (ESC '[' ... letter); sanitizeDisplay below is the backstop for anything
+// this misses, e.g. an OSC sequence (ESC ']' ... BEL).
 var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+// sanitizeDisplay strips every C0 control byte (0x00-0x1F), DEL (0x7F), and
+// C1 control byte (U+0080-U+009F) from s (S2(b), audit finding 2). It is the
+// backstop for any string tailport did not itself construct -- cloudflared's
+// own console output, or a tunnel name/hostname recovered from a foreign or
+// hostile process's argv -- before it ever reaches a toast or route row
+// rendered directly to the terminal: without it, an embedded OSC 52
+// (clipboard-write) or bare CSI sequence ansiEscapeRe doesn't happen to
+// catch could be smuggled straight into the terminal. It is content-blind
+// otherwise -- printable non-ASCII text (e.g. an IDN hostname) passes
+// through untouched.
+func sanitizeDisplay(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r <= 0x1F, r == 0x7F, r >= 0x80 && r <= 0x9F:
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
 
 // consoleLevelLineRe matches one cloudflared console log line of the form
 // "<timestamp> LEVEL message", e.g.
@@ -81,9 +126,13 @@ const consoleTailMaxRunes = 160
 // "exited" fact with no fabricated reason, never a misleading INF/WRN line
 // dressed up as an explanation.
 //
-// The result is truncated to 160 runes with a trailing "…". It returns "" if
-// the file doesn't exist (a foreign, non-tailport-owned tunnel never had one)
-// or holds nothing usable. There is deliberately NO parsing of the JSON
+// The result is truncated to 160 runes with a trailing "…" and always passed
+// through sanitizeDisplay (S2(b)) before it is: cloudflared's console output
+// is not tailport's own text, so the returned string can never carry a raw
+// ESC or other control byte, even if ansiEscapeRe's CSI-only stripping above
+// missed something (an OSC 52 sequence, say). It returns "" if the file
+// doesn't exist (a foreign, non-tailport-owned tunnel never had one) or
+// holds nothing usable. There is deliberately NO parsing of the JSON
 // --logfile here -- see the package doc.
 func ConsoleTail(path string) string {
 	data, err := readTail(path, 16<<10)
@@ -95,13 +144,13 @@ func ConsoleTail(path string) string {
 
 	for i := len(lines) - 1; i >= 0; i-- {
 		if line := strings.TrimSpace(lines[i]); strings.HasPrefix(line, "Incorrect Usage:") {
-			return truncateRunes(line, consoleTailMaxRunes)
+			return truncateRunes(sanitizeDisplay(line), consoleTailMaxRunes)
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if m := consoleLevelLineRe.FindStringSubmatch(line); m != nil {
-			return truncateRunes(m[2], consoleTailMaxRunes)
+			return truncateRunes(sanitizeDisplay(m[2]), consoleTailMaxRunes)
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -109,7 +158,7 @@ func ConsoleTail(path string) string {
 		if line == "" || consoleLeveledLineRe.MatchString(line) {
 			continue
 		}
-		return truncateRunes(line, consoleTailMaxRunes)
+		return truncateRunes(sanitizeDisplay(line), consoleTailMaxRunes)
 	}
 	return ""
 }

@@ -9,6 +9,7 @@ package cftunnel
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -71,4 +72,34 @@ func splitPSCommand(command string) []string {
 		}
 	}
 	return fields
+}
+
+// splitPidUidCommand splits one `ps -axww -o pid=,uid=,command=` line into
+// (pid, uid, command), tolerating ps's whitespace-padded alignment of the two
+// numeric columns (S2(a), audit finding 2: ownership now additionally
+// requires the process's real UID to equal os.Getuid(), so Darwin's
+// enumerator needs a uid column alongside pid and command -- see
+// discover_darwin.go). Kept build-tag-free, like the rest of this file, so
+// this parsing logic is unit-tested on Linux CI too, not only exercised
+// indirectly on a darwin runner.
+func splitPidUidCommand(line string) (pid, uid int, command string, ok bool) {
+	line = strings.TrimLeft(line, " ")
+	sp := strings.IndexByte(line, ' ')
+	if sp < 0 {
+		return 0, 0, "", false
+	}
+	pid, err := strconv.Atoi(line[:sp])
+	if err != nil {
+		return 0, 0, "", false
+	}
+	rest := strings.TrimLeft(line[sp+1:], " ")
+	sp2 := strings.IndexByte(rest, ' ')
+	if sp2 < 0 {
+		return 0, 0, "", false
+	}
+	uid, err = strconv.Atoi(rest[:sp2])
+	if err != nil {
+		return 0, 0, "", false
+	}
+	return pid, uid, strings.TrimLeft(rest[sp2+1:], " "), true
 }
