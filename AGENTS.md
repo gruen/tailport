@@ -185,7 +185,16 @@ contract. The short version:
   so a hostile console line or sentinel can never smuggle a raw
   ESC/OSC escape sequence into a toast. `ConsolePath` also always resolves
   under tailport's OWN state dir, never whatever directory a recovered
-  `--logfile` value happens to carry. The whole feature is gated on `cloudflared`
+  `--logfile` value happens to carry. **File hygiene in the state dir** (S3,
+  audit findings 3/7, verified): the dir itself is created — and an
+  existing, self-owned one tightened — to `0700` (cloudflared's own
+  `--logfile` create call, and an old tailport version's dir create call,
+  were both world-readable); the `.log` file is pre-created by tailport at
+  `0600` before cloudflared ever touches it (which cloudflared then KEEPS
+  when it opens the existing file to append); and the `.log`/`.console`/
+  `--config` files are all opened with `O_NOFOLLOW`, so a symlink planted at
+  any of those paths makes `Start` fail outright instead of writing through
+  it. The whole feature is gated on `cloudflared`
   being installed — detected once at startup — so an absent binary drops
   the `o` key from the bar entirely: no key, no discovery, no polling.
   A NAMED tunnel serves only ONE local port at a time — tailport's

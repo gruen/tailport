@@ -374,9 +374,35 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
-		return nil, fmt.Errorf("cftunnel: preparing log dir: %w", err)
+	// State dir hygiene (S3, audit findings 3/7, verified): cloudflared itself
+	// creates a --logfile at 0644 and the dir it lives in was previously
+	// created at 0755 -- both readable by anyone on the box. ensureStateDir
+	// creates it 0700 and tightens an existing, self-owned dir back to 0700.
+	if err := ensureStateDir(filepath.Dir(logfile)); err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing state dir: %w", err)
 	}
+
+	// Pre-create the --logfile ourselves at 0600, O_NOFOLLOW, O_TRUNC (S3):
+	// the audit verified cloudflared KEEPS a pre-existing file's mode when it
+	// opens it to append, so this is what actually keeps the log non-world-
+	// readable (cloudflared's own O_CREATE would otherwise apply ITS default,
+	// 0644, only when the file doesn't already exist). This also bounds the
+	// log to one run per Start, which costs nothing: tailport never reads the
+	// JSON logfile (see the package doc). O_NOFOLLOW makes a symlink planted
+	// at this path a hard Start failure rather than a silent write-through.
+	logFD, err := os.OpenFile(logfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing log file: %w", err)
+	}
+	// The 0o600 above only applies when OpenFile actually CREATES the file;
+	// a stale, pre-existing log from an old tailport version (or a manually
+	// widened one) keeps ITS OWN mode otherwise -- Chmod explicitly so this
+	// is 0600 unconditionally, matching writeHermeticConfig's same pattern.
+	if err := logFD.Chmod(0o600); err != nil {
+		logFD.Close()
+		return nil, fmt.Errorf("cftunnel: preparing log file: %w", err)
+	}
+	logFD.Close()
 
 	// Hermetic --config [live-verified against cloudflared 2026.9.1, kata
 	// nc1j]: see the package doc for WHY this exists (a config.yml with
@@ -384,6 +410,8 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// overrides --url, with no error and no warning). Rewritten with
 	// O_TRUNC on EVERY Start -- for BOTH quick and named -- so a hand-edit
 	// (or a stale file from before this existed) can never take effect.
+	// O_NOFOLLOW (S3): a symlink planted at this path must fail Start, not
+	// get silently written through to wherever it points.
 	configPath, err := configFilePath()
 	if err != nil {
 		return nil, err
@@ -407,10 +435,18 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 	// --logfile (JSON, info level) can hold nothing useful, or nothing at all,
 	// for exactly the failures callers most need explained (see ConsoleTail).
 	// Opened O_TRUNC so a stale file from a previous Start never bleeds into
-	// this one.
+	// this one, and O_NOFOLLOW (S3) so a symlink planted at this path is a
+	// hard Start failure rather than a silent write-through to its target.
 	consolePath := ConsolePath(logfile)
-	consoleFile, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	consoleFile, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
+		return nil, fmt.Errorf("cftunnel: preparing console capture: %w", err)
+	}
+	// As with the log file above: the 0o600 in OpenFile only applies on
+	// actual creation, so Chmod explicitly in case a stale file from an old
+	// tailport version (or a manually widened one) already existed wider.
+	if err := consoleFile.Chmod(0o600); err != nil {
+		consoleFile.Close()
 		return nil, fmt.Errorf("cftunnel: preparing console capture: %w", err)
 	}
 
@@ -713,9 +749,11 @@ const hermeticConfigContent = "# tailport-managed (kata nc1j): keeps --url autho
 // truncating and fixing its mode to 0600 even if the file already existed
 // (e.g. pre-seeded with junk, or left over from a previous tailport
 // version): a hand-edit, or stale content from before this feature existed,
-// must never survive a Start. See TestStartWritesHermeticConfig.
+// must never survive a Start. See TestStartWritesHermeticConfig. O_NOFOLLOW
+// (S3, audit findings 3/7) makes a symlink planted at this path a hard error
+// instead of a silent write-through to wherever it points.
 func writeHermeticConfig(path string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
@@ -810,6 +848,33 @@ func stateDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".local", "state", "tailport"), nil
+}
+
+// ensureStateDir creates dir (tailport's state dir) at mode 0700 if it
+// doesn't exist yet, and tightens it back to 0700 if it already exists and
+// this UID owns it (S3, audit findings 3/7, verified: a previous version of
+// Start created it at 0755, world-readable). A directory owned by a
+// DIFFERENT uid is left untouched -- chmod would fail anyway, and the
+// per-file O_NOFOLLOW opens in Start are the actual defense against another
+// user planting a symlink inside it.
+func ensureStateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("cftunnel: state dir %s is not a directory", dir)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if ok && st.Uid == uint32(os.Getuid()) && info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // freeLoopbackPort reserves a free 127.0.0.1 TCP port by briefly binding :0 and

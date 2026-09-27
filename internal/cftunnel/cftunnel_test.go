@@ -1063,6 +1063,225 @@ func TestStartConsoleMode0600(t *testing.T) {
 	}
 }
 
+// TestStartConsoleFileModeTightened0600 pins that Start Chmod's the console
+// file to 0600 even when it already existed WIDER (0644) -- OpenFile's mode
+// argument only applies when it actually creates the file, so a stale file
+// from an old tailport version must be explicitly tightened, not just
+// created correctly going forward (S3, same class of fix as the log file
+// below).
+func TestStartConsoleFileModeTightened0600(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	logfile, err := logfilePath(3030, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	consolePath := ConsolePath(logfile)
+	if err := os.WriteFile(consolePath, []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3030})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+
+	info, err := os.Stat(consolePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("console file mode = %o, want 0600 (pre-existing was 0644)", perm)
+	}
+}
+
+// TestStartStateDirMode0700 is the regression test for S3 (audit findings
+// 3/7, verified): the state dir must be created 0700, and TIGHTENED back to
+// 0700 if it already exists at a looser mode (a previous tailport version
+// created it 0755, world-readable).
+func TestStartStateDirMode0700(t *testing.T) {
+	t.Run("fresh dir is created 0700", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+		r, err := c.Start(Spec{Port: 3016})
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer func() {
+			if p, e := os.FindProcess(r.PID); e == nil {
+				_ = p.Kill()
+			}
+		}()
+		dir, err := stateDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat state dir: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("fresh state dir mode = %o, want 0700", perm)
+		}
+	})
+
+	t.Run("pre-existing 0755 dir is tightened to 0700", func(t *testing.T) {
+		xdg := t.TempDir()
+		t.Setenv("XDG_STATE_HOME", xdg)
+		dir, err := stateDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+		r, err := c.Start(Spec{Port: 3017})
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer func() {
+			if p, e := os.FindProcess(r.PID); e == nil {
+				_ = p.Kill()
+			}
+		}()
+
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat state dir: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("pre-existing 0755 state dir was not tightened, mode = %o, want 0700", perm)
+		}
+	})
+}
+
+// TestStartLogFileMode0600Truncated is the regression test for S3 (audit
+// findings 3/7, verified): cloudflared itself creates --logfile at 0644 and
+// appends forever, so tailport must PRE-CREATE it at 0600 (which cloudflared
+// then keeps when it opens the existing file to append) and truncate any
+// stale content from a previous Start.
+func TestStartLogFileMode0600Truncated(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	logfile, err := logfilePath(3018, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logfile, []byte("stale log content from a previous run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	r, err := c.Start(Spec{Port: 3018})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if p, e := os.FindProcess(r.PID); e == nil {
+			_ = p.Kill()
+		}
+	}()
+
+	info, err := os.Stat(logfile)
+	if err != nil {
+		t.Fatalf("stat log file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("log file mode = %o, want 0600 (pre-existing was 0644)", perm)
+	}
+	data, err := os.ReadFile(logfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "stale log content") {
+		t.Errorf("log file should have been truncated on Start, still contains stale content: %q", data)
+	}
+}
+
+// TestStartRefusesSymlinkedConsolePath and TestStartRefusesSymlinkedConfigPath
+// are the regression tests for S3 (audit findings 3/7): Start opens the
+// .console and --config files with O_NOFOLLOW, so a symlink planted at
+// either path must make Start FAIL, never silently write through to
+// whatever the symlink points at.
+func TestStartRefusesSymlinkedConsolePath(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	logfile, err := logfilePath(3019, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(t.TempDir(), "target.txt")
+	const targetContent = "untouched target content\n"
+	if err := os.WriteFile(target, []byte(targetContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	consolePath := ConsolePath(logfile)
+	if err := os.Symlink(target, consolePath); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	if _, err := c.Start(Spec{Port: 3019}); err == nil {
+		t.Fatal("Start must fail when the .console path is a symlink, not follow it")
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != targetContent {
+		t.Errorf("symlink target was modified: got %q, want %q", data, targetContent)
+	}
+}
+
+func TestStartRefusesSymlinkedConfigPath(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	configPath, err := configFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(t.TempDir(), "target.txt")
+	const targetContent = "untouched target content\n"
+	if err := os.WriteFile(target, []byte(targetContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+	if _, err := c.Start(Spec{Port: 3020}); err == nil {
+		t.Fatal("Start must fail when the --config path is a symlink, not follow it")
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != targetContent {
+		t.Errorf("symlink target was modified: got %q, want %q", data, targetContent)
+	}
+}
+
 // TestConsolePathIgnoresForeignDirectory is the regression test for S2(d)
 // (audit finding 2): ConsolePath must derive its directory from tailport's
 // OWN state dir, never from whatever directory component a --logfile value
