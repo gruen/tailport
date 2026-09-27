@@ -617,6 +617,12 @@ stays the same hermetic `{}` it always was.) Two consequences either way:
   `<UUID>.json`. If they aren't there, the tunnel fails to start, and
   cloudflared's own error text appears in the toast.
 
+`~/.cloudflared/cert.pem` (written once by `cloudflared tunnel login`) is an
+**account-scoped credential**: whoever holds it can create and delete
+tunnels and DNS records in that account, so treat it like a secret.
+tailport only ever checks that it *exists* — it never opens or reads its
+contents.
+
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running
 until you tear it down or kill it yourself. tailport never persists tunnel state

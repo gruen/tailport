@@ -392,6 +392,25 @@ func (c *Client) Start(spec Spec) (*Running, error) {
 		}
 	}
 
+	// S5, audit finding 6: refuse a second owned tunnel on the same LOCAL
+	// PORT before ever spawning one -- regardless of mode or tunnel identity.
+	// This is a defense-in-depth safety net UNDERNEATH internal/ui's own
+	// guards (requestTunnel's already-tunnelled de-escalation, and
+	// tunnelNameInUse's owned-only same-NAME check): neither of those is
+	// this package's job to rely on, since Client.Start is also callable
+	// directly, outside the UI's cached m.tunnels state. A Discover error is
+	// NOT fatal here -- this is a best-effort guard, not the authoritative
+	// source of truth (Stop's re-validate-immediately-before-signalling
+	// remains that) -- so Start simply proceeds rather than blocking on a
+	// transient scan failure.
+	if running, derr := c.Discover(); derr == nil {
+		for _, r := range running {
+			if r.Owned && r.Port == spec.Port {
+				return nil, fmt.Errorf("a tailport tunnel is already running for :%d (pid %d)", spec.Port, r.PID)
+			}
+		}
+	}
+
 	logfile, err := logfilePath(spec.Port, spec.Hostname)
 	if err != nil {
 		return nil, err

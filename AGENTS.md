@@ -218,6 +218,13 @@ contract. The short version:
   it can't see the same tunnel running elsewhere entirely (another machine, a
   system service, a dashboard connector) — Cloudflare may then send requests
   to either connector, and tailport has no way to detect or prevent that.
+  Underneath that UI-level guard, `internal/cftunnel.Client.Start` itself
+  (S5, audit finding 6) ALSO refuses to spawn a second owned tunnel — quick
+  or named, any tunnel identity — for a LOCAL PORT that already has one
+  running, re-`Discover()`ing right before it would spawn; a `Discover`
+  error is not fatal to `Start` (best-effort, not authoritative -- `Stop`'s
+  re-validate-before-signal remains that). This is defense in depth for
+  `Start` being callable directly, outside the UI's own cached state.
   Because cloudflared is a supervised process rather than a remote control
   plane tailport polls for state, a tunnel that stops on ITS OWN — a named
   tunnel that can't authenticate, retries exhausted, a crash — must never

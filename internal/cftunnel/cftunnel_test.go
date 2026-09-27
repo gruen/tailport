@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -814,6 +815,34 @@ func TestStartLivenessCheck(t *testing.T) {
 			t.Error("expected a positive pid")
 		}
 	})
+}
+
+// TestStartRefusesSecondOwnedTunnelOnSamePort is the regression test for S5
+// (audit finding 6): Start must refuse to spawn a second cloudflared for a
+// LOCAL PORT that already has a tailport-owned tunnel running, before ever
+// exec'ing anything -- using the existing fake-process helpers (no real
+// cloudflared binary needed, since the refusal happens before Start would
+// even look at c.Binary).
+func TestStartRefusesSecondOwnedTunnelOnSamePort(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	logfile, err := logfilePath(3033, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logfile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fp := spawnFakeCloudflared(t, "tunnel", "--url", "http://localhost:3033", "--logfile", logfile)
+
+	c := &Client{}
+	if _, err := c.Start(Spec{Port: 3033}); err == nil {
+		t.Fatal("Start should refuse a second tunnel for a port that already has an owned tunnel running")
+	} else if !strings.Contains(err.Error(), "already running for :3033") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	// The refusal must happen BEFORE Start touches the existing tunnel in
+	// any way.
+	assertStillRunning(t, fp, 300*time.Millisecond)
 }
 
 // TestValidTunnelName pins ValidTunnelName's acceptance rules (kata nc1j):
@@ -1699,6 +1728,63 @@ func TestAlive(t *testing.T) {
 
 	if Alive(0) || Alive(-1) {
 		t.Error("Alive should reject a non-positive pid outright")
+	}
+}
+
+// TestLoggedInAndStartNeverOpenCertPem is the pinning test for S5's cert.pem
+// doc note: ~/.cloudflared/cert.pem is an ACCOUNT-SCOPED credential (from
+// `cloudflared tunnel login`) that can create/delete tunnels and DNS records
+// in that account, so tailport must only ever check that it EXISTS
+// (LoggedIn/fileExists use os.Stat) and never open/read its contents.
+//
+// This is proven, not just asserted, by making cert.pem a FIFO: a FIFO
+// BLOCKS on open(O_RDONLY) until a writer connects, but os.Stat never opens
+// it at all. If LoggedIn (or Start, via LoggedIn's gate) ever tried to READ
+// cert.pem rather than merely stat it, opening this FIFO would hang --
+// deterministically turning a silent behavioral regression into a test
+// timeout instead of something that could pass by accident.
+func TestLoggedInAndStartNeverOpenCertPem(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	dir := filepath.Join(home, ".cloudflared")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	certPath := filepath.Join(dir, "cert.pem")
+	if err := syscall.Mkfifo(certPath, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	loggedInDone := make(chan bool, 1)
+	go func() { loggedInDone <- LoggedIn() }()
+	select {
+	case ok := <-loggedInDone:
+		if !ok {
+			t.Error("LoggedIn() should report true once cert.pem exists, regardless of its content")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("LoggedIn() blocked -- it must only stat cert.pem, never open/read it")
+	}
+
+	startDone := make(chan error, 1)
+	go func() {
+		c := &Client{Binary: fakeCloudflaredBin(t, "sleep 5\n")}
+		r, err := c.Start(Spec{Port: 3099, Mode: ModeNamed, TunnelName: "web", Hostname: "app.example.com"})
+		if err == nil && r != nil {
+			if p, e := os.FindProcess(r.PID); e == nil {
+				_ = p.Kill()
+			}
+		}
+		startDone <- err
+	}()
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Errorf("Start: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start blocked -- it (via LoggedIn) must never open/read cert.pem's contents")
 	}
 }
 
