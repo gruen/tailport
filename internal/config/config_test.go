@@ -1489,3 +1489,164 @@ func TestSaveRefusesUnsetPath(t *testing.T) {
 		t.Errorf("Path(\"\") = %q must not have been written to; stat err = %v", fallback, err)
 	}
 }
+
+// TestCloudflareBindingRoundTrip pins kata p7c5: a port's named-tunnel
+// binding (ports.<port>.cloudflare.{tunnel,hostname}) survives a Save/Load
+// cycle like any other PortMeta field. The `O` key's ONLY memory of a named
+// tunnel is this config -- there is no session re-raise any more -- so a
+// binding that failed to round-trip would silently break it.
+func TestCloudflareBindingRoundTrip(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.path = path
+	cfg.Ports[3000] = PortMeta{Cloudflare: &CloudflareBinding{Tunnel: "tp-e2e", Hostname: "tunnel.gruen.work"}}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	meta, ok := got.Ports[3000]
+	if !ok || meta.Cloudflare == nil {
+		t.Fatalf("Load().Ports[3000] = %+v (ok=%v), want a Cloudflare binding", meta, ok)
+	}
+	if meta.Cloudflare.Tunnel != "tp-e2e" || meta.Cloudflare.Hostname != "tunnel.gruen.work" {
+		t.Errorf("Load().Ports[3000].Cloudflare = %+v, want {tp-e2e tunnel.gruen.work}", meta.Cloudflare)
+	}
+}
+
+// TestCloudflareBindingSurvivesRegistryEditSave pins the brief's "must never
+// be dropped by [label/lock/favorite/remember] edits" requirement directly:
+// Save is always a full re-encode of the in-memory Config (see Save's doc
+// comment), so a registry edit to a DIFFERENT port (favoriting :9000, as the
+// `f` key's handler would) must not drop an existing binding on :3000.
+func TestCloudflareBindingSurvivesRegistryEditSave(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := Default()
+	seed.path = path
+	seed.Ports[3000] = PortMeta{Cloudflare: &CloudflareBinding{Tunnel: "web", Hostname: "app.example.com"}}
+	if err := seed.Save(); err != nil {
+		t.Fatalf("seed Save() error: %v", err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	meta := cfg.Ports[9000]
+	meta.Favorite = true
+	cfg.Ports[9000] = meta // an UNRELATED registry edit, mirroring the `f` key
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("registry-edit Save() error: %v", err)
+	}
+
+	got, err := Load("")
+	if err != nil {
+		t.Fatalf("reload Load() error: %v", err)
+	}
+	reloaded, ok := got.Ports[3000]
+	if !ok || reloaded.Cloudflare == nil || reloaded.Cloudflare.Tunnel != "web" || reloaded.Cloudflare.Hostname != "app.example.com" {
+		t.Errorf("after an unrelated registry-edit Save(), Ports[3000].Cloudflare = %+v (ok=%v), want {web app.example.com}", reloaded.Cloudflare, ok)
+	}
+	if !got.Ports[9000].Favorite {
+		t.Errorf("the registry edit itself didn't survive: Ports[9000].Favorite = %v, want true", got.Ports[9000].Favorite)
+	}
+}
+
+// TestCloudflaredDomainIgnoredAndOmittedOnSave pins two kata p7c5 claims: an
+// OLD config.yaml with a cloudflared.domain key still loads without error
+// (it's parsed, never fatal), and the key is dropped -- not perpetuated --
+// on the very next Save (CloudflaredConfig.Domain's omitempty tag; it also
+// gets no default/comment any more, see applyCloudflaredComments).
+func TestCloudflaredDomainIgnoredAndOmittedOnSave(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("cloudflared:\n    domain: x.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() of an old cloudflared.domain config errored: %v", err)
+	}
+	if cfg.Cloudflared.Domain != "x.example" {
+		t.Errorf("Load().Cloudflared.Domain = %q, want %q (still parsed)", cfg.Cloudflared.Domain, "x.example")
+	}
+
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk only the cloudflared: block (stop at the next top-level key) so a
+	// coincidental "domain" substring elsewhere in the file can't mask this.
+	inBlock := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "cloudflared:" {
+			inBlock = true
+			continue
+		}
+		if !inBlock {
+			continue
+		}
+		if line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			break // dedented back to a sibling top-level key; block is over
+		}
+		if strings.Contains(line, "domain:") {
+			t.Errorf("Save() should have omitted cloudflared.domain, but found %q in:\n%s", line, raw)
+		}
+	}
+
+	reloaded, err := Load("")
+	if err != nil {
+		t.Fatalf("reload Load() error: %v", err)
+	}
+	if reloaded.Cloudflared.Domain != "" {
+		t.Errorf("reloaded Cloudflared.Domain = %q, want \"\" after the omitted-key Save()", reloaded.Cloudflared.Domain)
+	}
+}
+
+// TestCloudflaredHeadCommentPointsAtNamedTunnelBinding pins the config
+// package's self-documenting comment (kata p7c5): a NAMED tunnel's setup
+// lives entirely under ports.<port>.cloudflare, not in the cloudflared:
+// block, so a fresh config's head comment on cloudflared: must say so --
+// otherwise a user reading their config.yaml has nowhere to learn that.
+func TestCloudflaredHeadCommentPointsAtNamedTunnelBinding(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := WriteDefault(""); err != nil {
+		t.Fatalf("WriteDefault() error: %v", err)
+	}
+	path, err := Path("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "cloudflare: {tunnel, hostname}") {
+		t.Errorf("expected the cloudflared: head comment to point at the per-port cloudflare binding, got:\n%s", raw)
+	}
+}

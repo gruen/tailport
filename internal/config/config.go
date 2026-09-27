@@ -27,6 +27,33 @@ type PortMeta struct {
 	// It's remembered so a favorite that goes down can still show what used to
 	// run there ("was mailpit") instead of an anonymous "?".
 	LastProcess string `yaml:"last_process,omitempty"`
+	// Cloudflare optionally binds this port to a pre-provisioned, NAMED
+	// Cloudflare Tunnel (the `O` key, kata p7c5): see CloudflareBinding. Nil
+	// (the default -- no cloudflare: sub-block) means the port has no named-
+	// tunnel binding, so `O` refuses with a toast explaining how to add one
+	// rather than prompting for it interactively. This is the ONLY memory
+	// `O` has: unlike the removed prompt flow, there is no session-only
+	// re-raise -- the config file itself is the source of truth every time.
+	Cloudflare *CloudflareBinding `yaml:"cloudflare,omitempty"`
+}
+
+// CloudflareBinding pins a port to one pre-provisioned, named Cloudflare
+// Tunnel (kata p7c5): pressing `O` on the port runs exactly this
+// tunnel/hostname pair, with no prompts. Both fields are required -- a
+// binding missing either one is treated the same as no binding at all (see
+// requestTunnelNamed in internal/ui/cftunnel.go) -- and both are re-validated
+// against cftunnel.ValidTunnelName/ValidHostname before `O` will run them,
+// since this value comes from a hand-editable file, not a confirm the user
+// just typed. See the README's "Tunnelling to the public internet
+// (Cloudflare Tunnel)" section for how to provision Tunnel/Hostname.
+type CloudflareBinding struct {
+	// Tunnel is the pre-provisioned cloudflared tunnel name, created with
+	// `cloudflared tunnel create <name>`. tailport never creates one itself.
+	Tunnel string `yaml:"tunnel"`
+	// Hostname is the public hostname already routed to Tunnel via
+	// `cloudflared tunnel route dns <name> <hostname>`. tailport never routes
+	// one itself, and can't verify this hostname actually reaches Tunnel.
+	Hostname string `yaml:"hostname"`
 }
 
 // CaddyConfig holds the settings for publishing a tailnet-served port to a
@@ -75,23 +102,27 @@ type CaddyConfig struct {
 
 // CloudflaredConfig holds the settings for exposing a local port to the
 // public internet through a Cloudflare Tunnel run by the `cloudflared` CLI
-// (the `t` key, kata nc1j). Like CaddyConfig -- and unlike PortMeta entries --
-// this block is ALWAYS present in the saved config (see Save and
+// (the `o`/`O` keys, kata nc1j/p7c5). Like CaddyConfig -- and unlike PortMeta
+// entries -- this block is ALWAYS present in the saved config (see Save and
 // applyCloudflaredComments) so the knobs are discoverable without reading
-// docs. Both fields are optional: a quick (unauthenticated) tunnel needs no
+// docs. Binary is optional: a quick (unauthenticated) tunnel needs no
 // configuration at all, and the whole feature stays dormant unless the
-// `cloudflared` binary is actually installed.
+// `cloudflared` binary is actually installed. A NAMED tunnel is configured
+// per-port instead -- see PortMeta.Cloudflare/CloudflareBinding -- not here.
 type CloudflaredConfig struct {
 	// Binary is an optional path to the cloudflared executable. Blank (the
 	// default) means tailport looks up `cloudflared` on $PATH.
 	Binary string `yaml:"binary"`
-	// Domain is an optional public base domain used only to PREFILL the
-	// hostname prompt when starting a NAMED (authenticated) tunnel. Blank by
-	// default. It is a convenience only: quick (unauthenticated) tunnels
-	// ignore it entirely, and the named path still lets you type any hostname
-	// you have already routed to a pre-provisioned tunnel via
-	// `cloudflared tunnel route dns`.
-	Domain string `yaml:"domain"`
+	// Domain is IGNORED since v0.3.3 (kata p7c5): the old `o`-only design
+	// used it to prefill a hostname-entry prompt, but that prompt (and the
+	// mode-select flow around it) is gone -- a NAMED tunnel is now driven
+	// entirely by the per-port ports.<port>.cloudflare binding
+	// (CloudflareBinding), never by a domain prefix. Still PARSED, so a
+	// config.yaml written by an older tailport keeps loading without error,
+	// but omitempty means it's silently dropped on the very next Save (no
+	// default value, no comment -- see applyCloudflaredComments) rather than
+	// perpetuated as a stale, misleading knob.
+	Domain string `yaml:"domain,omitempty"`
 }
 
 // applyDefaults fills any zero-value field that has a sensible default,
@@ -332,6 +363,14 @@ func Load(override string) (Config, error) {
 // Default()/Load().
 func (c Config) Save() error {
 	c.Caddy.applyDefaults()
+	// Cloudflared.Domain is IGNORED (kata p7c5) -- see its doc comment. c is
+	// a value receiver, so clearing it here is local to THIS copy: an old
+	// config's on-disk `cloudflared.domain: <anything>` still loads fine
+	// into the caller's in-memory Config (Load never touches it), but it is
+	// NEVER written back, regardless of what value it held, the moment
+	// anything saves -- combined with its omitempty tag, that drops the key
+	// outright rather than perpetuating a knob nothing reads any more.
+	c.Cloudflared.Domain = ""
 	// Defensive nil->true normalization (mirrors Load), so a raw Config
 	// literal built directly (never routed through Default()/Load()) never
 	// marshals a bare `sticky_header: null` -- it always writes an explicit
@@ -795,21 +834,26 @@ func applyCaddyComments(root *yaml.Node) {
 }
 
 // applyCloudflaredComments sets the explanatory head comments on the
-// cloudflared: block's keys. Like applyCaddyComments, these strings are
-// constants tailport owns (not user data), so Save re-applies them on every
-// write, which is what makes them durable across saves that touch fields
-// outside the cloudflared block.
+// cloudflared: key itself and its block's keys. Like applyCaddyComments,
+// these strings are constants tailport owns (not user data), so Save
+// re-applies them on every write, which is what makes them durable across
+// saves that touch fields outside the cloudflared block. Domain gets no
+// comment here (kata p7c5): it's ignored now, and omitempty means Save just
+// drops it -- see CloudflaredConfig.Domain's doc comment.
 func applyCloudflaredComments(root *yaml.Node) {
+	// A short pointer to where a NAMED tunnel is actually configured, since
+	// that isn't in this block at all -- see PortMeta.Cloudflare.
+	setKeyHeadComment(root, "cloudflared",
+		"\nCloudflare Tunnel settings for the o/O keys. To bind a NAMED tunnel to\n"+
+			"a port, add its own cloudflare: {tunnel, hostname} under that port in\n"+
+			"the ports: block above -- see the README's \"Tunnelling to the public\n"+
+			"internet (Cloudflare Tunnel)\" section.")
 	cf := mappingValueNode(root, "cloudflared")
 	if cf == nil {
 		return
 	}
 	setKeyHeadComment(cf, "binary",
 		"Optional path to the cloudflared executable. Blank means tailport\nlooks up `cloudflared` on $PATH.")
-	setKeyHeadComment(cf, "domain",
-		"\nOptional public base domain used to prefill the hostname prompt when\n"+
-			"starting a named (authenticated) tunnel. Blank by default; quick\n"+
-			"(unauthenticated) tunnels ignore it.")
 }
 
 // applyStickyHeaderComment sets the explanatory head comment on the
