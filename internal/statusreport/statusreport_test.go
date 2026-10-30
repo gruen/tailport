@@ -3,6 +3,7 @@ package statusreport
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -628,13 +629,13 @@ func TestGatherPublishedDegradesOnUnreachableEdge(t *testing.T) {
 func TestBuildTunnel(t *testing.T) {
 	cases := []struct {
 		name    string
-		tunnels map[int]Tunnel
+		tunnels []Tunnel
 		port    int
 		wantURL string
 	}{
-		{"named", map[int]Tunnel{8080: {Hostname: "app.example.com"}}, 8080, "https://app.example.com"},
-		{"quick host known", map[int]Tunnel{3000: {Hostname: "fake-3000.trycloudflare.com"}}, 3000, "https://fake-3000.trycloudflare.com"},
-		{"quick host pending", map[int]Tunnel{3001: {}}, 3001, ""},
+		{"named", []Tunnel{{Port: 8080, Hostname: "app.example.com"}}, 8080, "https://app.example.com"},
+		{"quick host known", []Tunnel{{Port: 3000, Hostname: "fake-3000.trycloudflare.com"}}, 3000, "https://fake-3000.trycloudflare.com"},
+		{"quick host pending", []Tunnel{{Port: 3001}}, 3001, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -663,7 +664,7 @@ func TestBuildTunnel(t *testing.T) {
 // per path (never collapsed to a single winner), exactly like the existing
 // funnel+publish case.
 func TestBuildTunnelAndFunnelBothObserved(t *testing.T) {
-	got := Build(nil, nil, map[int]int{3000: 443}, nil, map[int]Tunnel{3000: {Hostname: "fake-3000.trycloudflare.com"}}, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, nil, map[int]int{3000: 443}, nil, []Tunnel{{Port: 3000, Hostname: "fake-3000.trycloudflare.com"}}, "host-a", "host-a.tailnet.ts.net")
 	if len(got) != 2 {
 		t.Fatalf("Build() returned %d rows for a port with both funnel and tunnel, want 2 (one per public path); got %+v", len(got), got)
 	}
@@ -798,6 +799,15 @@ func TestReadmeDocumentsStatusTunnels(t *testing.T) {
 			t.Errorf("README's `tailport status` bullet does not mention %q; got:\n%s", want, bullet)
 		}
 	}
+	// roborev 5416's two visible behaviors must stay documented: one row per
+	// tunnel (two on one port are not collapsed) and tunnels still reported
+	// when tailscaled is down, with a non-zero exit. TestBuildTwoTunnelsOnePort
+	// and TestRunStatusGatherErrorWithRows pin the behavior itself.
+	for _, want := range []string{"one row each", "tailscaled is down", "non-zero"} {
+		if !strings.Contains(bullet, want) {
+			t.Errorf("README's `tailport status` bullet does not document %q; got:\n%s", want, bullet)
+		}
+	}
 }
 
 // mustCwd mirrors internal/ui's docs_consistency_test helper: the working
@@ -809,4 +819,56 @@ func mustCwd(t *testing.T) string {
 		return "<unknown>"
 	}
 	return wd
+}
+
+// TestBuildTwoTunnelsOnePort is the regression test for roborev 5416(a): two
+// owned tunnels can share one local port (two tailport instances racing).
+// Build used to key tunnels by port, silently overwriting one public URL, so
+// the report hid an exposure. Every owned tunnel must get its own row.
+func TestBuildTwoTunnelsOnePort(t *testing.T) {
+	got := Build(nil, nil, nil, nil, []Tunnel{
+		{Port: 3000, Hostname: "a.trycloudflare.com"},
+		{Port: 3000, Hostname: "b.trycloudflare.com"},
+	}, "host-a", "host-a.tailnet.ts.net")
+	if len(got) != 2 {
+		t.Fatalf("Build() returned %d rows, want 2 (one per tunnel); got %+v", len(got), got)
+	}
+	urls := make(map[string]bool, 2)
+	for _, r := range got {
+		if r.Mode != ModeTunnel || r.Port != 3000 {
+			t.Errorf("row %+v, want Mode=%q Port=3000", r, ModeTunnel)
+		}
+		urls[r.URL] = true
+	}
+	for _, want := range []string{"https://a.trycloudflare.com", "https://b.trycloudflare.com"} {
+		if !urls[want] {
+			t.Errorf("Build() = %+v, want a row with URL %q", got, want)
+		}
+	}
+}
+
+// TestGatherTunnelsIndependentOfTailscale is the regression test for roborev
+// 5416(b): Gather used to return immediately on a tailscale status error,
+// before discovering tunnels. A detached cloudflared tunnel stays public when
+// tailscaled is down, so the report must still carry its row -- with the
+// tailscale failure surfaced alongside it, not instead of it.
+func TestGatherTunnelsIndependentOfTailscale(t *testing.T) {
+	wantErr := errors.New("tailscaled is down")
+	status := func() ([]int, map[int]int, error) { return nil, nil, wantErr }
+	tunnels := func(config.Config) []Tunnel {
+		return []Tunnel{{Port: 3000, Hostname: "fake-3000.trycloudflare.com"}}
+	}
+	rows, err := gatherFrom(config.Config{}, status, tunnels)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("gatherFrom error = %v, want it to wrap %v", err, wantErr)
+	}
+	if !strings.Contains(err.Error(), "reading tailscale serve status") {
+		t.Errorf("gatherFrom error = %q, want the tailscale diagnostic", err)
+	}
+	for _, r := range rows {
+		if r.Mode == ModeTunnel && r.Port == 3000 && r.URL == "https://fake-3000.trycloudflare.com" {
+			return
+		}
+	}
+	t.Errorf("gatherFrom rows = %+v, want the tunnel row even though tailscale failed", rows)
 }

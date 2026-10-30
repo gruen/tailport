@@ -297,8 +297,11 @@ useful for finding something new to serve, label, or favorite.
 - **`tailport status`** — a headless, read-only report of how each port is
   currently exposed: tailnet `serve`, public `FUNNEL`, a Caddy-edge `PUBLISH`,
   and a Cloudflare `TUNNEL` (quick or named). The three public paths are
-  independent, so a port carrying several of them gets one row per path. Add
-  `--json` for machine-readable output. Changes nothing.
+  independent, so a port carrying several of them gets one row per path, and
+  two tunnels on one port get one row each. Add `--json` for
+  machine-readable output. Cloudflare tunnel rows are still reported when
+  tailscaled is down (a detached tunnel stays public); the tailscale error
+  goes to stderr and the exit code is non-zero. Changes nothing.
 - **`tailport update`** — self-update to the latest release (sha256-verified).
   `--check` reports whether an update is available without installing it;
   `-y`/`--yes` skips the confirmation prompt; `--force` overrides its refusal to

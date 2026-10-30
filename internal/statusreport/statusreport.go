@@ -119,11 +119,16 @@ type Published struct {
 }
 
 // Tunnel is the small, statusreport-local shape of one tailport-owned
-// Cloudflare tunnel relevant to this machine, keyed by local port in Build's
-// tunnels parameter. Deliberately not cftunnel.Running: as with Published,
-// statusreport stays decoupled from the owning package's types and carries
-// only the one field a row needs.
+// Cloudflare tunnel relevant to this machine. Deliberately not
+// cftunnel.Running: as with Published, statusreport stays decoupled from the
+// owning package's types and carries only what a row needs. Tunnels are a
+// SLICE, not a map keyed by port: two owned tunnels can share one local port
+// (two tailport instances racing), and each is a distinct public exposure
+// that must get its own row rather than silently overwriting the other
+// (roborev 5416).
 type Tunnel struct {
+	// Port is the local TCP port this tunnel exposes.
+	Port int
 	// Hostname is the tunnel's public hostname -- for a named tunnel the
 	// hostname recovered from tailport's sentinel logfile, for a quick tunnel
 	// the *.trycloudflare.com host cloudflared reported (empty until it has
@@ -165,35 +170,59 @@ const tunnelHealthTimeout = 3 * time.Second
 // depends on cfg.Cloudflared.Binary; this is also why `tailport status` now
 // honors -c/--config (see cmd/tailport's newStatusFlagSet).
 func Gather(cfg config.Config) ([]Row, error) {
+	return gatherFrom(cfg, tsserve.Status, gatherTunnels)
+}
+
+// gatherFrom is Gather with its two live, environment-dependent reads
+// injectable -- tsserve.Status (tailscaled) and the owned-tunnel discovery
+// (cloudflared) -- so tests can exercise the tailscaled-down path
+// deterministically, without a live tailscaled or cloudflared. Production
+// calls it only through Gather with the real functions.
+//
+// Tunnel discovery runs INDEPENDENTLY of tailscale (roborev 5416): a
+// cloudflared tunnel tailport started is detached and stays public even when
+// tailscaled is down, so a tailscale failure must not stop `tailport status`
+// from reporting it. In that case gatherFrom still returns the tunnel rows
+// alongside the error; runStatus prints them to stdout and the error to
+// stderr, preserving the non-zero exit code.
+func gatherFrom(cfg config.Config, tailscaleStatus func() ([]int, map[int]int, error), discoverTunnels func(config.Config) []Tunnel) ([]Row, error) {
 	ports, err := portscan.List()
 	if err != nil {
 		return nil, fmt.Errorf("listing local ports: %w", err)
-	}
-	active, funnel, err := tsserve.Status()
-	if err != nil {
-		return nil, fmt.Errorf("reading tailscale serve status: %w", err)
 	}
 	// Best-effort, mirroring ui.New/fetchFQDN: an unresolved hostname or FQDN
 	// degrades the URL rather than failing the whole report.
 	host, _ := os.Hostname()
 	fqdn, _ := tsserve.FQDN()
+	tunnels := discoverTunnels(cfg)
 	published := gatherPublished(cfg, fqdn)
-	tunnels := gatherTunnels(cfg)
+	active, funnel, err := tailscaleStatus()
+	if err != nil {
+		// Tailscale state is unavailable, but the tunnels (and any published
+		// rows the edge still knows about) are real exposures right now.
+		// Report those rows and surface the tailscale failure alongside them.
+		return Build(ports, nil, nil, published, tunnels, host, fqdn), fmt.Errorf("reading tailscale serve status: %w", err)
+	}
 	return Build(ports, active, funnel, published, tunnels, host, fqdn), nil
 }
 
 // gatherTunnels discovers this machine's tailport-OWNED Cloudflare tunnels, or
-// nil when the feature is unavailable -- cloudflared not installed
-// (Detect fails, exactly the gate internal/ui uses for its `o`/`O` keys) or a
+// nil when the feature is unavailable -- cloudflared not installed (Detect
+// fails, exactly the gate internal/ui uses for its `o`/`O` keys) or a
 // Discover error. Either way it degrades quietly to nil rather than failing
 // Gather: a status report must still show serve/funnel/publish rows when
 // cloudflared is missing or the process table can't be read.
+//
+// One Tunnel per owned process, not one per local port: two tailport
+// instances racing can run two owned tunnels on the same port, and each is a
+// distinct public URL (roborev 5416). Sorted by (port, hostname) so the
+// report is deterministic regardless of process-table order.
 //
 // Read-only by construction: only Detect, Discover, and Health -- never
 // Start/Stop. Foreign cloudflared processes (Owned false) are skipped: they
 // are not a tailport exposure (internal/ui surfaces them as drift; a status
 // report of tailport's own exposure has nothing to say about them).
-func gatherTunnels(cfg config.Config) map[int]Tunnel {
+func gatherTunnels(cfg config.Config) []Tunnel {
 	client := &cftunnel.Client{Binary: cfg.Cloudflared.Binary}
 	if _, err := client.Detect(); err != nil {
 		return nil
@@ -204,7 +233,7 @@ func gatherTunnels(cfg config.Config) map[int]Tunnel {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), tunnelHealthTimeout)
 	defer cancel()
-	tunnels := make(map[int]Tunnel, len(running))
+	tunnels := make([]Tunnel, 0, len(running))
 	for _, r := range running {
 		if !r.Owned {
 			continue
@@ -213,8 +242,14 @@ func gatherTunnels(cfg config.Config) map[int]Tunnel {
 		if hostname == "" {
 			hostname = client.Health(ctx, r.MetricsPort).Hostname // quick: from /quicktunnel
 		}
-		tunnels[r.Port] = Tunnel{Hostname: hostname}
+		tunnels = append(tunnels, Tunnel{Port: r.Port, Hostname: hostname})
 	}
+	sort.Slice(tunnels, func(i, j int) bool {
+		if tunnels[i].Port != tunnels[j].Port {
+			return tunnels[i].Port < tunnels[j].Port
+		}
+		return tunnels[i].Hostname < tunnels[j].Hostname
+	})
 	return tunnels
 }
 
@@ -297,18 +332,26 @@ func shortLabel(fqdn string) string {
 // The three public paths -- funnel, publish, tunnel -- are INDEPENDENT, not
 // alternatives: since kata th05 the UI permits any combination of them on one
 // port, so Build emits one row per path a port actually carries (in funnel,
-// publish, tunnel order). Plain serve is emitted only when the port carries no
-// public path at all: any public exposure outranks serve for display
-// (mirroring portItem.reach() in internal/ui), since it is what actually
-// governs reachability. Nothing is ranked above anything else; multiple
-// public rows for one port are the expected, legitimate shape.
-func Build(ports []portscan.Port, active []int, funnel map[int]int, published map[int]Published, tunnels map[int]Tunnel, host, fqdn string) []Row {
+// publish, tunnel order). A tunnel is emitted per TUNNEL, not per port: two
+// owned tunnels on the same local port (two tailport instances racing) are
+// two distinct public URLs and each gets its own row (roborev 5416). Plain
+// serve is emitted only when the port carries no public path at all: any
+// public exposure outranks serve for display (mirroring portItem.reach() in
+// internal/ui), since it is what actually governs reachability. Nothing is
+// ranked above anything else; multiple public rows for one port are the
+// expected, legitimate shape.
+func Build(ports []portscan.Port, active []int, funnel map[int]int, published map[int]Published, tunnels []Tunnel, host, fqdn string) []Row {
 	processByPort := make(map[int]string, len(ports))
 	for _, p := range ports {
 		processByPort[p.Number] = p.Process
 	}
 
-	exposed := make(map[int]bool, len(active)+len(funnel)+len(published)+len(tunnels))
+	tunnelsByPort := make(map[int][]Tunnel, len(tunnels))
+	for _, t := range tunnels {
+		tunnelsByPort[t.Port] = append(tunnelsByPort[t.Port], t)
+	}
+
+	exposed := make(map[int]bool, len(active)+len(funnel)+len(published)+len(tunnelsByPort))
 	for _, p := range active {
 		exposed[p] = true
 	}
@@ -318,7 +361,7 @@ func Build(ports []portscan.Port, active []int, funnel map[int]int, published ma
 	for p := range published {
 		exposed[p] = true
 	}
-	for p := range tunnels {
+	for p := range tunnelsByPort {
 		exposed[p] = true
 	}
 
@@ -333,7 +376,7 @@ func Build(ports []portscan.Port, active []int, funnel map[int]int, published ma
 		process := processByPort[n]
 		pubPort, isFunnel := funnel[n]
 		pub, isPublished := published[n]
-		tun, isTunnel := tunnels[n]
+		portTunnels := tunnelsByPort[n]
 
 		if isFunnel {
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModeFunnel, URL: tsserve.PublicURL(fqdn, pubPort)})
@@ -341,10 +384,10 @@ func Build(ports []portscan.Port, active []int, funnel map[int]int, published ma
 		if isPublished {
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModePublish, URL: publishURL(pub), Auth: pub.Auth})
 		}
-		if isTunnel {
+		for _, tun := range portTunnels {
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModeTunnel, URL: tunnelURL(tun)})
 		}
-		if !isFunnel && !isPublished && !isTunnel {
+		if !isFunnel && !isPublished && len(portTunnels) == 0 {
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModeServe, URL: fmt.Sprintf("http://%s:%d", host, n)})
 		}
 	}

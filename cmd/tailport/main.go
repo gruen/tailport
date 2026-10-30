@@ -453,7 +453,9 @@ func printStatusUsage(w io.Writer) {
 // package doc for why that matters (drift prevention between the TUI and
 // this report). Loading config here (honoring -c/--config, same as every
 // other subcommand) is what lets statusGather reach cfg.Caddy.* to query the
-// edge and cfg.Cloudflared.Binary to find tunnel processes.
+// edge and cfg.Cloudflared.Binary to find tunnel processes. A gather error
+// that still produced rows (a tailscaled failure with a live tunnel) prints
+// those rows and the error, and exits 1 (roborev 5416).
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs, jsonOut, noColor, configPath := newStatusFlagSet()
 	if err := fs.Parse(args); err != nil {
@@ -473,20 +475,29 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	rows, err := statusGather(cfg)
-	if err != nil {
-		fmt.Fprintln(stderr, "tailport status:", err)
-		return 1
+	rows, gatherErr := statusGather(cfg)
+	if gatherErr != nil {
+		fmt.Fprintln(stderr, "tailport status:", gatherErr)
 	}
 
-	if *jsonOut {
-		if err := statusreport.WriteJSON(stdout, rows); err != nil {
-			fmt.Fprintln(stderr, "tailport status:", err)
-			return 1
+	// A gather error does not always mean there is nothing worth reporting: a
+	// tailscale failure still leaves Cloudflare tunnel rows (and any reachable
+	// publish rows) real and public, so print them and keep the non-zero exit
+	// code (roborev 5416). With no rows this is exactly the old behavior --
+	// stderr only, nothing on stdout.
+	if len(rows) > 0 || gatherErr == nil {
+		if *jsonOut {
+			if err := statusreport.WriteJSON(stdout, rows); err != nil {
+				fmt.Fprintln(stderr, "tailport status:", err)
+				return 1
+			}
+		} else {
+			statusreport.WriteTable(stdout, rows)
 		}
-		return 0
 	}
-	statusreport.WriteTable(stdout, rows)
+	if gatherErr != nil {
+		return 1
+	}
 	return 0
 }
 

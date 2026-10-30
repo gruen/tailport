@@ -596,6 +596,41 @@ func TestRunStatusGatherError(t *testing.T) {
 	}
 }
 
+// TestRunStatusGatherErrorWithRows covers roborev 5416(b)'s CLI contract: a
+// Gather error that still produced rows (tailscaled unreachable while a
+// detached Cloudflare tunnel is live) prints those rows on stdout, the error
+// on stderr, and keeps the non-zero exit code. The README states this
+// behavior; TestReadmeDocumentsStatusTunnels pins the prose.
+func TestRunStatusGatherErrorWithRows(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	rows := []statusreport.Row{
+		{Port: 3000, Process: "node", Mode: statusreport.ModeTunnel, URL: "https://fake-3000.trycloudflare.com"},
+	}
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"table", []string{"status"}},
+		{"json", []string{"status", "--json"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stubStatusGather(t, rows, errors.New("reading tailscale serve status: exit status 1"))
+			var out, errOut bytes.Buffer
+			code := run(c.args, &out, &errOut)
+			if code != 1 {
+				t.Errorf("run(%v) code = %d, want 1 (the tailscale failure still fails the command)", c.args, code)
+			}
+			if !strings.Contains(out.String(), "https://fake-3000.trycloudflare.com") {
+				t.Errorf("run(%v) stdout = %q, want the tunnel row even though tailscale failed", c.args, out.String())
+			}
+			if !strings.Contains(errOut.String(), "reading tailscale serve status") {
+				t.Errorf("run(%v) stderr = %q, want the tailscale diagnostic", c.args, errOut.String())
+			}
+		})
+	}
+}
+
 // TestRunStatusHelp covers -h/--help for the status subcommand: usage on
 // stdout, exit 0, empty stderr -- and never touches statusGather (a bogus
 // gather that would panic on GatherError proves --help returns before any
