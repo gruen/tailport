@@ -5397,7 +5397,7 @@ func TestHelpOverlayScrolls(t *testing.T) {
 	// At the top: the title shows, the tail (config path) is clipped off, and
 	// the footer advertises more below.
 	top := fits("top")
-	if !strings.Contains(top, "expose local ports across your tailnet") {
+	if !strings.Contains(top, "expose local ports to your tailnet or the public internet") {
 		t.Errorf("top of overlay should show the title:\n%s", top)
 	}
 	if strings.Contains(top, "saved to:") {
@@ -10422,5 +10422,50 @@ func TestTtfhUndoHelpPointsToRestore(t *testing.T) {
 	}
 	if !strings.Contains(desc, "does NOT touch what's exposed") {
 		t.Errorf("`u` help should keep its exposure promise; got %q", desc)
+	}
+}
+
+// TestMarkerLegendCoversEveryRouteMarker: the legend must explain every glyph
+// route.marker can emit, in BOTH marker modes, and no legend line may exceed 80
+// columns. The glyph set is derived from route.marker itself (each routeKind,
+// plus the stale/foreign override), so adding a marker without a legend entry
+// fails here -- the Cloudflare tunnel marker was once missing (kata jhvm).
+func TestMarkerLegendCoversEveryRouteMarker(t *testing.T) {
+	routes := []route{{stale: true}, {foreign: true}, {kind: routeTailnet, served: true}}
+	for k := routeLocalhost; k <= routeOffline; k++ {
+		routes = append(routes, route{kind: k})
+	}
+	for _, emoji := range []bool{false, true} {
+		m := model{markerEmoji: emoji}
+		leg := m.markerLegend()
+		for _, r := range routes {
+			g := strings.TrimSpace(r.marker(emoji))
+			if g == "" {
+				t.Errorf("emoji=%v: route %+v produced an empty marker", emoji, r)
+				continue
+			}
+			if !strings.Contains(leg, g) {
+				t.Errorf("emoji=%v: legend lacks marker %q for route %+v; got:\n%s", emoji, g, r, leg)
+			}
+		}
+		for i, line := range strings.Split(leg, "\n") {
+			if w := lipgloss.Width(line); w > 80 {
+				t.Errorf("emoji=%v: legend line %d is %d columns (> 80): %q", emoji, i, w, line)
+			}
+		}
+	}
+}
+
+// TestHelpIntroNamesAllPublicPaths: the "?" overlay must describe the three
+// independent, coexisting public paths, not the old two mutually-exclusive ones.
+func TestHelpIntroNamesAllPublicPaths(t *testing.T) {
+	got := (model{}).helpContent()
+	for _, want := range []string{"to your tailnet or the public internet", "THREE", "side by side", "Cloudflare Tunnel", "docs/caddy-edge.md"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("helpContent missing %q", want)
+		}
+	}
+	if strings.Contains(got, "mutually-exclusive") {
+		t.Error("helpContent still claims the public paths are mutually exclusive")
 	}
 }

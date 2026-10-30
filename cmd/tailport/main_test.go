@@ -130,7 +130,7 @@ func TestRunHelpFlag(t *testing.T) {
 			t.Errorf("run(%v) stderr = %q, want empty", args, errOut.String())
 		}
 		got := out.String()
-		for _, want := range []string{"tailport --", "Usage:", "--config", "--no-color", "--markers", "--theme", "quickstart", "status", "update", "Config path:"} {
+		for _, want := range []string{"tailport --", "Tailscale\nFunnel", "Caddy edge", "Cloudflare Tunnel", "Usage:", "--config", "--no-color", "--markers", "--theme", "quickstart", "status", "update", "Config path:"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("run(%v) stdout missing %q; got:\n%s", args, want, got)
 			}
@@ -211,7 +211,7 @@ func TestRunQuickstart(t *testing.T) {
 		"Prerequisites:", "operator", "sudo tailscale set --operator=",
 		// Safety model wording (AGENTS.md's design constraints).
 		"tailnet-only", "tailscale funnel", "public", "deliberate",
-		"P` key", "y/n confirm", ":22", "hard-blocked",
+		"`p`", "`d`", "`o`", "Cloudflare Tunnel", "y/n confirm", ":22", "hard-blocked",
 		// Resolved config path.
 		"Config path:", filepath.Join(xdg, "tailport", "config.yaml"),
 		// The keybinding legend (spot-check a few rows). The serve-toggle key

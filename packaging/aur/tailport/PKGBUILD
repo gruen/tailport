@@ -2,7 +2,7 @@
 pkgname=tailport
 pkgver=0.3.3
 pkgrel=1
-pkgdesc="TUI to expose local ports across your tailnet via tailscale serve"
+pkgdesc="TUI to share local ports on your tailnet or publicly (Funnel, Caddy, Cloudflare)"
 arch=('x86_64' 'aarch64')
 url='https://github.com/gruen/tailport'
 license=('MIT')

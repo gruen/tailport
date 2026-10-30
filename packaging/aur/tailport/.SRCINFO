@@ -1,5 +1,5 @@
 pkgbase = tailport
-	pkgdesc = TUI to expose local ports across your tailnet via tailscale serve
+	pkgdesc = TUI to share local ports on your tailnet or publicly (Funnel, Caddy, Cloudflare)
 	pkgver = 0.3.3
 	pkgrel = 1
 	url = https://github.com/gruen/tailport

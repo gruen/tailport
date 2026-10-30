@@ -6843,17 +6843,20 @@ func configSaveLines(path string) []string {
 // markerLegend describes the exposure-state glyph column: the 7-state
 // moon-phase reach ramp (1exs/79xb), using whichever marker set (emoji or
 // ASCII) is active, plus the always-present lock/favorite. Wrapped onto three
-// lines -- the ramp states, the two off-ramp broken states, then the
-// decorations -- so it stays readable rather than one very long line.
+// lines, each at most 80 columns -- the private reach states, the three public
+// paths, then the off-ramp broken states and decorations. Every glyph
+// route.marker can emit must appear here (TestMarkerLegendCoversEveryRouteMarker).
 func (m model) markerLegend() string {
 	if m.markerEmoji {
-		return "🌕 localhost   🌔 local network   🌒 on tailnet (served or bound wide)\n" +
-			"🌑 internet (funnel)   🌐 internet (published)   🌫️ stale   ✕ offline\n" +
-			"🔒 locked   ★ favorite   " + authGlyphEmoji + " basic auth (published)"
+		return "🌕 localhost   🌔 local network   🌒 tailnet (served)   🌓 tailnet (bound wide)\n" +
+			"🌑 internet (funnel)   🌐 internet (published)   ☁️ internet (cloudflare tunnel)\n" +
+			"🌫️ stale   ✕ offline   🔒 locked   ★ favorite   " + authGlyphEmoji + " basic auth (published)"
 	}
-	return "○ localhost   ◔ local network   ◉ on tailnet (served or bound wide)\n" +
-		"● internet (funnel)   ◆ internet (published)   ▲ stale   ✕ offline\n" +
-		"🔒 locked   ★ favorite   " + authGlyphMono + " basic auth (published)"
+	// The tunnel glyph goes last on its line: its style's trailing reset would
+	// otherwise drop helpTextStyle's color for whatever followed it.
+	return "○ localhost   ◔ local network   ◉ tailnet (served)   ◑ tailnet (bound wide)\n" +
+		"● internet (funnel)   ◆ internet (published)   " + tunnelMarkerStyle.Render("◈") + " internet (cloudflare tunnel)\n" +
+		"▲ stale   ✕ offline   🔒 locked   ★ favorite   " + authGlyphMono + " basic auth (published)"
 }
 
 // OperatorSetupText is the prerequisites prose shared by the "?" overlay's
@@ -6887,7 +6890,7 @@ func (m model) operatorSetupText() string {
 func (m model) helpContent() string {
 	var b strings.Builder
 
-	b.WriteString(helpTitleStyle.Render("tailport — expose local ports across your tailnet"))
+	b.WriteString(helpTitleStyle.Render("tailport — expose local ports to your tailnet or the public internet"))
 	b.WriteString("\n\n")
 	b.WriteString(helpTextStyle.Render(
 		"tailport lists the TCP ports listening on this machine. A served port\n" +
@@ -6896,11 +6899,15 @@ func (m model) helpContent() string {
 			"and out). `tailscale serve` only matters for a LOOPBACK-bound app: a\n" +
 			"wildcard-bound port (0.0.0.0) is already reachable on the tailnet\n" +
 			"without serving — see the marker legend and each row's description.\n" +
-			"A port can also be exposed to the PUBLIC internet two independent,\n" +
-			"mutually-exclusive ways (opt-in, see below): `p` funnels it via\n" +
-			"tailscale, and `d` publishes it at a custom hostname through your own\n" +
-			"Caddy edge (first publish prompts for caddy.hostname/domain if\n" +
-			"unset — see docs/caddy-edge.md)."))
+			"A port can also be exposed to the PUBLIC internet, through THREE\n" +
+			"independent paths. Each is its own opt-in with its own y/n confirm,\n" +
+			"and they can run side by side on one port:\n" +
+			"  p    funnels it via Tailscale;\n" +
+			"  d    publishes it at a custom hostname through your own Caddy\n" +
+			"       edge (first publish prompts for caddy.hostname/domain if\n" +
+			"       unset — see docs/caddy-edge.md);\n" +
+			"  o/O  run a Cloudflare Tunnel (quick, or a named tunnel bound\n" +
+			"       in config.yaml)."))
 	b.WriteString("\n\n")
 	b.WriteString(helpTitleStyle.Render("Markers"))
 	b.WriteString("\n")

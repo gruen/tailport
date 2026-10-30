@@ -160,9 +160,9 @@ func parseFlags(args []string, stdout, stderr io.Writer) (cf *cliFlags, code int
 // already known). It deliberately excludes the in-TUI keybinding legend --
 // that belongs to `tailport quickstart` (kata x4cg), not --help.
 func printUsage(w io.Writer, configOverride string) {
-	fmt.Fprintln(w, "tailport -- expose locally listening ports across your tailnet via")
-	fmt.Fprintln(w, "`tailscale serve` (tailnet-only, the default) or, as a deliberate")
-	fmt.Fprintln(w, "per-port opt-in, publicly via `tailscale funnel`.")
+	fmt.Fprintln(w, "tailport -- share local ports on your tailnet (`tailscale serve`, the")
+	fmt.Fprintln(w, "default) or, as a deliberate per-port opt-in, publicly via Tailscale")
+	fmt.Fprintln(w, "Funnel, your own Caddy edge, or a Cloudflare Tunnel.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  tailport [flags]              launch the interactive TUI")
@@ -338,8 +338,9 @@ func runQuickstart(args []string, stdout, stderr io.Writer) int {
 // paragraph on what tailport does, a prerequisites note (tailscale's own
 // operator requirement -- kata tapv), its safety model (serve is
 // tailnet-only and the only automatic path; funnel is public and opt-in
-// ONLY via the `P` key (swapped from `p` under vzj4) behind a strong confirm; :22 is hard-blocked from
-// funnel -- see AGENTS.md's "Design constraints" section, which this
+// ONLY through three independent per-port paths (`p` funnel, `d` Caddy edge,
+// `o`/`O` Cloudflare Tunnel), each behind its own strong confirm; :22 is
+// hard-blocked from all three -- see AGENTS.md's "Design constraints" section, which this
 // wording tracks closely), the resolved config path, and the full
 // keybinding legend.
 //
@@ -361,9 +362,10 @@ func quickstartText(configPath string, emoji bool) string {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, "tailport exposes your machine's locally listening TCP ports across your")
-	fmt.Fprintln(&b, "tailnet. It discovers what's listening with `ss` (Linux) / `lsof` (macOS)")
-	fmt.Fprintln(&b, "and toggles `tailscale serve` on and off per port -- from an interactive")
-	fmt.Fprintln(&b, "list (run `tailport` with no arguments) or headlessly via its subcommands.")
+	fmt.Fprintln(&b, "tailnet -- or, as a deliberate per-port opt-in, to the public internet. It")
+	fmt.Fprintln(&b, "discovers what's listening with `ss` (Linux) / `lsof` (macOS) and toggles")
+	fmt.Fprintln(&b, "`tailscale serve` on and off per port -- from an interactive list (run")
+	fmt.Fprintln(&b, "`tailport` with no arguments) or headlessly via its subcommands.")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Prerequisites:")
 	for _, line := range strings.Split(ui.OperatorSetupText(), "\n") {
@@ -375,11 +377,12 @@ func quickstartText(configPath string, emoji bool) string {
 	fmt.Fprintln(&b, "  path for every port you expose: plain HTTP, reachable only by your other")
 	fmt.Fprintln(&b, "  tailnet devices at http://<host>:<port>, always a 1:1 port mapping (same")
 	fmt.Fprintln(&b, "  port in and out).")
-	fmt.Fprintln(&b, "  `tailscale funnel` (public internet exposure) IS supported, but only as")
-	fmt.Fprintln(&b, "  a deliberate, per-service opt-in via the `P` key behind a strong y/n")
-	fmt.Fprintln(&b, "  confirm that names the port and shows the resulting public URL. tailport")
-	fmt.Fprintln(&b, "  never funnels implicitly, in bulk, or without that confirm.")
-	fmt.Fprintln(&b, "  `:22` (SSH) is hard-blocked from funnel.")
+	fmt.Fprintln(&b, "  Public internet exposure IS supported, but only through three independent")
+	fmt.Fprintln(&b, "  paths, each a deliberate, per-port opt-in behind its own strong y/n")
+	fmt.Fprintln(&b, "  confirm, and they can run side by side on one port: `tailscale funnel` (`p`),")
+	fmt.Fprintln(&b, "  your own Caddy edge (`d`), and a Cloudflare Tunnel (`o` quick, `O` named).")
+	fmt.Fprintln(&b, "  tailport never exposes publicly implicitly or in bulk. `:22` (SSH) is")
+	fmt.Fprintln(&b, "  hard-blocked from all three.")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Config path:", configPath)
 	fmt.Fprintln(&b)

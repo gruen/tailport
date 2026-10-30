@@ -1,15 +1,15 @@
 # tailport
 
-A terminal UI for exposing your machine's local dev servers across your
-[Tailscale](https://tailscale.com) tailnet. It lists every locally listening
-TCP port and lets you flip `tailscale serve` on or off for each one with a
-keypress — so a server on `localhost:3000` becomes reachable at
+A terminal UI that lists every TCP port your machine is listening on and
+exposes any of them with a keypress — privately across your
+[Tailscale](https://tailscale.com) tailnet by default, or to the public internet
+through three independent, opt-in paths: Tailscale Funnel, your own Caddy edge,
+or a Cloudflare Tunnel. A server on `localhost:3000` becomes reachable at
 `http://<hostname>:3000` from your other tailnet devices, without memorizing
 `tailscale serve` syntax.
 
-By default nothing leaves your tailnet — your private WireGuard network. When
-you want it to, tailport can also expose a port to the **public internet**, but
-only as a deliberate, per-port, confirmed opt-in — see
+Nothing leaves your tailnet by default; each public path is a deliberate,
+per-port, confirmed opt-in, and they can run side by side on one port — see
 [Exposing a port](#exposing-a-port).
 
 > This is a personal tool built for one specific home tailnet — a handful of

@@ -1,5 +1,5 @@
 class Tailport < Formula
-  desc "TUI to expose local ports across your tailnet via tailscale serve"
+  desc "TUI to share local ports on your tailnet or publicly (Funnel, Caddy, Cloudflare)"
   homepage "https://github.com/gruen/tailport"
   url "https://github.com/gruen/tailport/archive/refs/tags/v0.3.3.tar.gz"
   sha256 "6d9c819d80e575c29d456e61f6979d7f1590b63493f944163fa7ce22c953910c"
