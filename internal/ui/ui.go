@@ -2423,6 +2423,20 @@ func (m *model) requestToggle(port int, turnOn bool) tea.Cmd {
 // it. Callers must have already cleared the lock and :22 guards (see
 // requestToggle and the entryConfirm22 handler).
 func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
+	// Last-moment recheck of the cloudflared metrics guard (kata cn3a,
+	// roborev 5415): requestToggle's check can be stale by the time a
+	// deferred toggle actually starts. At startup the port scan can beat the
+	// first tunnel poll, so :22's confirm (or a slow keypress) can be answered
+	// AFTER the poll has identified this port as a tunnel's metrics endpoint.
+	// Turn-OFF is de-escalation and is never blocked.
+	if turnOn {
+		if msg, ok := m.metricsRefusal(port); ok {
+			m.mode = entryNone
+			m.confirmPort = 0
+			m.confirmTurnOn = false
+			return m.setErr(msg)
+		}
+	}
 	var saveCmd tea.Cmd
 	if turnOn {
 		saveCmd = m.remember(port)
@@ -2472,6 +2486,20 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 // it. Turning on remembers the port (so it stays visible once toggled back
 // down), mirroring beginToggle.
 func (m *model) beginFunnel(localPort, publicPort int, turnOn bool) tea.Cmd {
+	// Last-moment recheck of the cloudflared metrics guard (kata cn3a,
+	// roborev 5415): requestFunnel's check runs BEFORE the y/n confirm opens,
+	// and the tunnel poll can land while the user is deciding -- identifying
+	// this port as a running tunnel's metrics endpoint. Never expose it.
+	// Turn-OFF is de-escalation and is never blocked.
+	if turnOn {
+		if msg, ok := m.metricsRefusal(localPort); ok {
+			m.mode = entryNone
+			m.funnelPort = 0
+			m.funnelPublic = 0
+			m.funnelTurnOn = false
+			return m.setErr(msg)
+		}
+	}
 	var saveCmd tea.Cmd
 	if turnOn {
 		saveCmd = m.remember(localPort)
@@ -3063,11 +3091,21 @@ func (m *model) enterConfirmPublish() tea.Cmd {
 // cmd (serve-then-publish). The plaintext password is dropped by clearPublishFlow
 // before the op runs.
 func (m *model) confirmPublish() tea.Cmd {
+	port := m.publishPort
+	// Last-moment recheck of the cloudflared metrics guard (kata cn3a,
+	// roborev 5415): requestPublish/requestEditPublish check it before the
+	// confirm (or the silent-republish fast path) acts, but the tunnel poll
+	// can land in between and identify this port as a metrics endpoint.
+	// Checked BEFORE hashing or persisting any credential, so an aborted
+	// publish leaves no half-set state behind.
+	if msg, ok := m.metricsRefusal(port); ok {
+		m.clearPublishFlow()
+		return m.setErr(msg)
+	}
 	// A NEW user-initiated publish clears any armed restore affordance (kata ttfh;
 	// design §3.6). The in-transaction take-over resume publishes via publishCmd
 	// directly (never through here), so it is inherently exempt from this trigger.
 	m.clearLastPurge()
-	port := m.publishPort
 	hostname := m.publishHostname
 	enableServe := m.publishEnableServe
 

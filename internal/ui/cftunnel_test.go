@@ -1195,3 +1195,112 @@ func TestTunnelMetricsPortDocumented(t *testing.T) {
 		t.Errorf(`the o help text should say the metrics port can't be exposed; got %q`, desc)
 	}
 }
+
+// TestMetricsPortRefusedAtConfirmTime is the regression test for roborev 5415
+// (kata cn3a): metricsRefusal used to run only BEFORE a confirm opened. At
+// startup the port scan can complete before the first tunnel poll, so the
+// confirm opens on a port that the poll then identifies as a running tunnel's
+// metrics endpoint -- and "y" used to expose it anyway. Every confirmed
+// exposure path must recheck at the moment it acts: the :22 serve confirm,
+// funnel, publish, and both tunnel confirms.
+func TestMetricsPortRefusedAtConfirmTime(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := func() model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.cfAvailable = true
+		m.fqdn = "host.tailnet.ts.net"
+		return m
+	}
+	// The tunnel poll that lands after the confirm opened, identifying target
+	// as the metrics endpoint of an owned tunnel on another port.
+	poll := func(t *testing.T, m model, target int) model {
+		t.Helper()
+		return mustUpdate(t, m, tunnelPollMsg{
+			gen: m.tunnelPollApplied + 1,
+			tunnels: map[int]tunnelInfo{
+				18850: {pid: 4242, mode: cftunnel.ModeQuick, metricsPort: target},
+			},
+		})
+	}
+	cases := []struct {
+		name   string
+		target int
+		open   func(m *model)
+	}{
+		{
+			name:   "t serve (:22 confirm)",
+			target: 22,
+			open: func(m *model) {
+				if cmd := m.requestToggle(22, true); cmd != nil {
+					t.Errorf("opening the :22 confirm returned a cmd, want nil")
+				}
+			},
+		},
+		{
+			name:   "p funnel",
+			target: 18851,
+			open: func(m *model) {
+				if cmd := m.requestFunnel(18851); cmd != nil {
+					t.Errorf("opening the funnel confirm returned a cmd, want nil")
+				}
+			},
+		},
+		{
+			name:   "d publish",
+			target: 18851,
+			open: func(m *model) {
+				m.publishPort = 18851
+				m.publishHostname = "app.example.com"
+				m.enterConfirmPublish()
+			},
+		},
+		{
+			name:   "o quick tunnel",
+			target: 18851,
+			open: func(m *model) {
+				if cmd := m.requestTunnel(18851); cmd != nil {
+					t.Errorf("opening the quick-tunnel confirm returned a cmd, want nil")
+				}
+			},
+		},
+		{
+			name:   "O named tunnel",
+			target: 18851,
+			open: func(m *model) {
+				m.tunnelPort = 18851
+				m.tunnelHostname = "app.example.com"
+				m.tunnelName = "my-tunnel"
+				m.mode = entryConfirmTunnelNamed
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := base()
+			c.open(&m)
+			if m.mode == entryNone {
+				t.Fatalf("confirm did not open: mode = %v", m.mode)
+			}
+			m = poll(t, m, c.target)
+			if _, ok := m.metricsPortOwner(c.target); !ok {
+				t.Fatalf("the poll did not mark :%d as a metrics port", c.target)
+			}
+
+			m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+
+			want := ":18851 is cloudflared's local metrics endpoint for the :18850 tunnel — not exposable"
+			if c.target == 22 {
+				want = ":22 is cloudflared's local metrics endpoint for the :18850 tunnel — not exposable"
+			}
+			if m.flash != want || m.flashLevel != flashError {
+				t.Errorf("flash = %q (level %v), want the metrics refusal %q (flashError)", m.flash, m.flashLevel, want)
+			}
+			if m.pending != 0 {
+				t.Errorf("confirmed exposure still started: pending = %d, want 0", m.pending)
+			}
+			if m.mode != entryNone {
+				t.Errorf("modal flow not cleared: mode = %v, want entryNone", m.mode)
+			}
+		})
+	}
+}

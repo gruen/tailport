@@ -528,6 +528,14 @@ func tunnelNameRefusedMsg(name string, port int) string {
 // on this port just runs this same path again.
 func (m *model) confirmTunnelQuick() tea.Cmd {
 	port := m.tunnelPort
+	// Last-moment recheck of the cloudflared metrics guard (kata cn3a,
+	// roborev 5415): requestTunnel's check runs before the confirm opens, and
+	// another tunnel's poll can land while the user is deciding -- marking
+	// this port as that tunnel's metrics endpoint.
+	if msg, ok := m.metricsRefusal(port); ok {
+		m.clearTunnelFlow()
+		return m.setErr(msg)
+	}
 	spec := cftunnel.Spec{Port: port, Mode: cftunnel.ModeQuick}
 	m.clearTunnelFlow()
 	m.pending = port
@@ -550,6 +558,13 @@ func (m *model) confirmTunnelNamed() tea.Cmd {
 	port := m.tunnelPort
 	host := m.tunnelHostname
 	name := m.tunnelName
+	// Last-moment recheck of the cloudflared metrics guard (kata cn3a,
+	// roborev 5415) -- same window as confirmTunnelQuick: a poll can land
+	// between requestTunnelNamed's check and this "y".
+	if msg, ok := m.metricsRefusal(port); ok {
+		m.clearTunnelFlow()
+		return m.setErr(msg)
+	}
 	if other := m.tunnelNameInUse(name, port); other != 0 {
 		m.clearTunnelFlow()
 		return m.setErr(tunnelNameRefusedMsg(name, other))
