@@ -1,0 +1,10 @@
+#!/bin/sh
+# post-rewrite: tell roborev a rebase/amend rewrote commits, so its existing
+# reviews follow them to their new SHAs (roborev remap). Optional tooling: a
+# no-op when roborev isn't installed, and never fails the rewrite.
+#
+# Same reason as .githooks/post-commit: core.hooksPath=.githooks makes git
+# ignore roborev's own .git/hooks/post-rewrite (kata nrnp).
+command -v roborev >/dev/null 2>&1 || exit 0
+roborev remap --quiet >/dev/null 2>&1 || true
+exit 0
