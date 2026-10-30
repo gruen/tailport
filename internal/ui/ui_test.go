@@ -10431,26 +10431,38 @@ func TestTtfhUndoHelpPointsToRestore(t *testing.T) {
 // plus the stale/foreign override), so adding a marker without a legend entry
 // fails here -- the Cloudflare tunnel marker was once missing (kata jhvm).
 func TestMarkerLegendCoversEveryRouteMarker(t *testing.T) {
+	// route.marker and markerLegend both emit lipgloss styling, and the two
+	// don't style the same glyphs identically (the legend only styles the
+	// tunnel glyph). Compare the underlying text with ANSI stripped, exactly
+	// as TestRouteMarker does, and force a color profile so this test also
+	// exercises the styled path rather than passing vacuously under go test's
+	// non-tty Ascii fallback (roborev 5413).
+	origProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(origProfile) })
+
 	routes := []route{{stale: true}, {foreign: true}, {kind: routeTailnet, served: true}}
 	for k := routeLocalhost; k <= routeOffline; k++ {
 		routes = append(routes, route{kind: k})
 	}
-	for _, emoji := range []bool{false, true} {
-		m := model{markerEmoji: emoji}
-		leg := m.markerLegend()
-		for _, r := range routes {
-			g := strings.TrimSpace(r.marker(emoji))
-			if g == "" {
-				t.Errorf("emoji=%v: route %+v produced an empty marker", emoji, r)
-				continue
+	for _, profile := range []termenv.Profile{termenv.Ascii, termenv.ANSI, termenv.TrueColor} {
+		lipgloss.SetColorProfile(profile)
+		for _, emoji := range []bool{false, true} {
+			m := model{markerEmoji: emoji}
+			leg := stripANSI(m.markerLegend())
+			for _, r := range routes {
+				g := strings.TrimSpace(stripANSI(r.marker(emoji)))
+				if g == "" {
+					t.Errorf("profile=%v emoji=%v: route %+v produced an empty marker", profile, emoji, r)
+					continue
+				}
+				if !strings.Contains(leg, g) {
+					t.Errorf("profile=%v emoji=%v: legend lacks marker %q for route %+v; got:\n%s", profile, emoji, g, r, leg)
+				}
 			}
-			if !strings.Contains(leg, g) {
-				t.Errorf("emoji=%v: legend lacks marker %q for route %+v; got:\n%s", emoji, g, r, leg)
-			}
-		}
-		for i, line := range strings.Split(leg, "\n") {
-			if w := lipgloss.Width(line); w > 80 {
-				t.Errorf("emoji=%v: legend line %d is %d columns (> 80): %q", emoji, i, w, line)
+			for i, line := range strings.Split(leg, "\n") {
+				if w := lipgloss.Width(line); w > 80 {
+					t.Errorf("profile=%v emoji=%v: legend line %d is %d columns (> 80): %q", profile, emoji, i, w, line)
+				}
 			}
 		}
 	}
