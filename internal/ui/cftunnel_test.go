@@ -836,6 +836,19 @@ func nonexistentCFClient() *cftunnel.Client {
 	return &cftunnel.Client{Binary: "tailport-test-nonexistent-cloudflared"}
 }
 
+// hermeticTunnelPoll makes every pollTunnelsCmd in this test see an EMPTY
+// process table. A nonexistent Binary alone no longer isolates a poll: since
+// 2z0v(a), Discover also matches any process named "cloudflared", so a real
+// scan picks up fake tunnels that internal/cftunnel's tests start -- often on
+// :3000 -- when `go test ./...` runs both packages in parallel. That made
+// TestTunnelPollExitStopsSpinner flaky on CI (run 41064252292).
+func hermeticTunnelPoll(t *testing.T) {
+	t.Helper()
+	orig := tunnelDiscover
+	tunnelDiscover = func(*cftunnel.Client) ([]cftunnel.Running, error) { return nil, nil }
+	t.Cleanup(func() { tunnelDiscover = orig })
+}
+
 // reapedChildPid runs a trivial child to completion and returns its pid --
 // by the time Run() returns, Wait() has already reaped it, so Alive(pid)
 // reads false immediately (no zombie window to wait out). Mirrors
@@ -869,6 +882,7 @@ func TestTunnelPollReportsExitedTunnel(t *testing.T) {
 	}
 	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: pid, consolePath: consolePath}}
 
+	hermeticTunnelPoll(t)
 	cmd := m.pollTunnelsCmd()
 	if cmd == nil {
 		t.Fatal("pollTunnelsCmd should be non-nil when cfAvailable")
@@ -904,6 +918,7 @@ func TestTunnelPollExitSuppressedAfterUserStop(t *testing.T) {
 	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: reapedChildPid(t)}}
 	m.tunnelStopping = map[int]bool{3000: true}
 
+	hermeticTunnelPoll(t)
 	cmd := m.pollTunnelsCmd()
 	msg, ok := cmd().(tunnelPollMsg)
 	if !ok || len(msg.vanished) != 1 {
@@ -932,6 +947,7 @@ func TestTunnelPollExitStopsSpinner(t *testing.T) {
 	m.tunnelSpinnerID = 1
 	m.tunnels = map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: reapedChildPid(t)}}
 
+	hermeticTunnelPoll(t)
 	cmd := m.pollTunnelsCmd()
 	msg, ok := cmd().(tunnelPollMsg)
 	if !ok || len(msg.vanished) != 1 {

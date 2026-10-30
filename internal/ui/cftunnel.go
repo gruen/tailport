@@ -212,6 +212,15 @@ func (m model) cfClient() *cftunnel.Client {
 // prev but missing from this poll's fresh Discover has either exited on its
 // own or become otherwise unrecognizable, and either way must never just
 // disappear (see tunnelPollMsg's handler).
+// tunnelDiscover is the process-table scan pollTunnelsCmd runs, as a
+// package var so tests can make a poll hermetic. A real Discover() reads the
+// WHOLE process table, and since 2z0v(a) it accepts any process named
+// "cloudflared" -- so a test poll would otherwise also "see" fake tunnels
+// that parallel test packages (internal/cftunnel) or a developer's real
+// tunnels are running, on whatever ports they happen to use. Production never
+// reassigns it.
+var tunnelDiscover = func(c *cftunnel.Client) ([]cftunnel.Running, error) { return c.Discover() }
+
 func (m *model) pollTunnelsCmd() tea.Cmd {
 	if !m.cfAvailable {
 		return nil
@@ -224,7 +233,7 @@ func (m *model) pollTunnelsCmd() tea.Cmd {
 		prev[port] = tunnelSnapshot{pid: info.pid, consolePath: info.consolePath}
 	}
 	return func() tea.Msg {
-		running, err := client.Discover()
+		running, err := tunnelDiscover(client)
 		if err != nil {
 			return tunnelPollMsg{gen: gen, err: err}
 		}
