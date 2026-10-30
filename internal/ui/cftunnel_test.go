@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gruen/tailport/internal/cftunnel"
@@ -800,32 +801,98 @@ func TestTunnelSpinnerStopsOnErrorOrTeardown(t *testing.T) {
 // when a tunnel start succeeds, the selection moves to that port's NEW
 // cloudflare route sub-row (not just the service), via selectRoute, so the
 // user watches the URL -- or, for a quick tunnel, the spinner then the URL --
-// resolve right where they're already looking.
+// resolve right where they're already looking. kata 4hcg adds the shared
+// don't-yank guard: the start is async, so a user who moved to another service
+// while it ran keeps their place.
 func TestTunnelStartMovesSelectionToNewRoute(t *testing.T) {
-	m := New(config.Config{})
-	m.cfAvailable = true
-	m.allPorts = []portscan.Port{
-		{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
-		{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
-	}
-	m.showAllPorts = true
-	m.rebuildItems()
-	// Selection starts on the FIRST service (index 0, port :2000) -- unrelated
-	// to the port that's about to get a tunnel.
-	if m.list.Index() != 0 {
-		t.Fatalf("setup: expected the initial selection on index 0; got %d", m.list.Index())
+	build := func(t *testing.T) model {
+		t.Helper()
+		m := New(config.Config{})
+		m.cfAvailable = true
+		m.allPorts = []portscan.Port{
+			{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
+			{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
+		}
+		m.showAllPorts = true
+		m.rebuildItems()
+		m.selectPort(3000)
+		m.routeIdx = 0
+		return m
 	}
 
-	m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
+	t.Run("lands on the new cloudflare route", func(t *testing.T) {
+		m := build(t)
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
 
-	pi, _, ok := m.currentService()
-	if !ok || pi.port.Number != 3000 {
-		t.Fatalf("selection should move to port :3000's service; ok=%v port=%+v", ok, pi.port)
-	}
-	routes := pi.routes()
-	if m.routeIdx < 0 || m.routeIdx >= len(routes) || routes[m.routeIdx].kind != routeTunnel {
-		t.Fatalf("routeIdx = %d should select the routeTunnel sub-row; routes=%+v", m.routeIdx, routes)
-	}
+		pi, _, ok := m.currentService()
+		if !ok || pi.port.Number != 3000 {
+			t.Fatalf("selection should stay on port :3000; ok=%v port=%+v", ok, pi.port)
+		}
+		routes := pi.routes()
+		if m.routeIdx < 0 || m.routeIdx >= len(routes) || routes[m.routeIdx].kind != routeTunnel {
+			t.Fatalf("routeIdx = %d should select the routeTunnel sub-row; routes=%+v", m.routeIdx, routes)
+		}
+	})
+
+	t.Run("lands with an active filter, whose async re-match clears the visible set", func(t *testing.T) {
+		m := build(t)
+		// An APPLIED "/" filter matching just :3000; SetFilterText runs the
+		// normally-async match synchronously, SetFilterState restores
+		// FilterApplied.
+		m.list.SetFilterText("3000")
+		m.list.SetFilterState(list.FilterApplied)
+		m.filtering = true
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
+
+		// The handler's rebuildItems cleared the visible set until bubbles'
+		// async re-match lands, so resolve the target from the full item set.
+		var routes []route
+		for _, it := range m.list.Items() {
+			if pi, ok := it.(portItem); ok && pi.port.Number == 3000 {
+				routes = pi.routes()
+			}
+		}
+		want := -1
+		for i, r := range routes {
+			if r.kind == routeTunnel {
+				want = i
+			}
+		}
+		if want < 0 || m.routeIdx != want {
+			t.Fatalf("routeIdx = %d, want the routeTunnel row %d (routes=%+v)", m.routeIdx, want, routes)
+		}
+
+		// A routine tunnel poll rebuild must not wipe the landing while the
+		// filter re-match is in flight.
+		m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollApplied + 1, tunnels: map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: 111}}, foreign: map[int]bool{}})
+		m.list.SetFilterText("3000")
+		m.list.SetFilterState(list.FilterApplied)
+
+		var after []route
+		for _, it := range m.list.Items() {
+			if pi, ok := it.(portItem); ok && pi.port.Number == 3000 {
+				after = pi.routes()
+			}
+		}
+		if m.routeIdx < 0 || m.routeIdx >= len(after) || after[m.routeIdx].kind != routeTunnel {
+			t.Fatalf("routeIdx = %d should still select the routeTunnel row; routes=%+v", m.routeIdx, after)
+		}
+	})
+
+	t.Run("does not yank a cursor that moved to another service", func(t *testing.T) {
+		m := build(t)
+		m.selectPort(2000)
+		m.routeIdx = 0
+		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
+
+		pi, _, ok := m.currentService()
+		if !ok || pi.port.Number != 2000 {
+			t.Fatalf("the selection must stay on :2000 while :3000's tunnel starts; ok=%v port=%+v", ok, pi.port)
+		}
+		if m.routeIdx != 0 {
+			t.Errorf("routeIdx should stay at 0; got %d", m.routeIdx)
+		}
+	})
 }
 
 // nonexistentCFClient returns a client whose Binary matches no real process

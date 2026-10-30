@@ -640,6 +640,15 @@ const lastPurgeTTL = 60 * time.Second
 type toggleDoneMsg struct {
 	port int
 	err  error
+	// kind and turnOn identify a successful ESCALATION, so its handler can
+	// land the cursor on the route the op just created (kata 4hcg):
+	// routeTailnet for a serve toggle, routeFunnel for a funnel toggle.
+	// publicPort is the funnel's public ingress port, used to make the new
+	// route exist in the list before the confirming refresh arrives. All of
+	// them are ignored on error and on a turn-OFF (which creates nothing).
+	kind       routeKind
+	turnOn     bool
+	publicPort int
 }
 
 // publishInfo is the live per-port publish state the edge poll returns: the
@@ -1738,7 +1747,7 @@ func toggle(port int, turnOn bool) tea.Cmd {
 		} else {
 			err = tsserve.Off(port)
 		}
-		return toggleDoneMsg{port: port, err: err}
+		return toggleDoneMsg{port: port, err: err, kind: routeTailnet, turnOn: turnOn}
 	}
 }
 
@@ -1755,7 +1764,7 @@ func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
 		} else {
 			err = tsserve.FunnelOff(localPort, publicPort)
 		}
-		return toggleDoneMsg{port: localPort, err: err}
+		return toggleDoneMsg{port: localPort, err: err, kind: routeFunnel, turnOn: turnOn, publicPort: publicPort}
 	}
 }
 
@@ -3554,6 +3563,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// is resolved -- clear the sticky banner without waiting for a "r"
 		// re-check.
 		m.operatorNotSet = false
+		// kata 4hcg: a successful escalation lands both cursors on the route it
+		// just created, so c/y copies the new URL immediately (the promise the
+		// c help text and the README's copy section make). Only a turn-ON has a
+		// new route; a turn-OFF creates nothing. The route isn't in the list
+		// until served/funnel state reflects the op -- that arrives with the
+		// refresh below -- so record the known-good outcome, rebuild, then land.
+		// cursorOnPort is the don't-yank guard: the toggle is async, and a user
+		// who moved to another service in the meantime keeps their place.
+		if msg.turnOn && m.cursorOnPort(msg.port) {
+			switch msg.kind {
+			case routeTailnet:
+				if m.active == nil {
+					m.active = map[int]bool{}
+				}
+				m.active[msg.port] = true
+			case routeFunnel:
+				if m.funnel == nil {
+					m.funnel = map[int]int{}
+				}
+				m.funnel[msg.port] = msg.publicPort
+			}
+			rebuild := m.rebuildItems()
+			m.selectRoute(msg.port, msg.kind)
+			return m, tea.Batch(rebuild, refresh)
+		}
 		return m, refresh
 
 	case publishDoneMsg:
@@ -3676,20 +3710,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.lastPublish[msg.port] = publishInfo{hostname: publishedHost, auth: publishedAuth}
 		}
+		// kata 4hcg: a successful publish lands both cursors on the new
+		// routePublish row -- NOT the tailnet row it may have auto-enabled --
+		// so c/y copies the public URL immediately. The optimistic entry makes
+		// the row exist before the edge poll confirms it (the poll then
+		// replaces m.published wholesale); without a known hostname there is no
+		// URL to land on, so a bare publishDoneMsg skips this. cursorOnPort is
+		// the same don't-yank guard as serve/funnel/tunnel.
+		var land tea.Cmd
+		if !msg.unpublish && publishedHost != "" && m.cursorOnPort(msg.port) {
+			if m.published == nil {
+				m.published = map[int]publishInfo{}
+			}
+			m.published[msg.port] = publishInfo{hostname: publishedHost, auth: publishedAuth}
+			land = m.rebuildItems()
+			m.selectRoute(msg.port, routePublish)
+		}
 		if tookOver != "" {
 			// This publish resumed a force-purge take-over (kata 6n15): a plain
 			// success toast naming the host we took over. armTimer (ttfh) starts the
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
 			// take-over, which arms nothing). "press d to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd(), land)
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd(), land)
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
@@ -4020,13 +4070,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.running != nil && msg.running.Hostname != "" {
 			flash = m.setFlash(fmt.Sprintf("tunnelled https://%s — press o to unpublish", msg.running.Hostname), flashInfo)
 		}
+		// kata 4hcg: evaluate the don't-yank guard BEFORE rebuildItems -- with
+		// an active "/" filter, the rebuild clears the visible set until its
+		// async re-match lands, so currentService() would see nothing.
+		land := msg.running != nil && m.cursorOnPort(msg.port)
 		rebuild := m.rebuildItems()
-		if msg.running != nil {
+		if land {
 			// kata h2ef: land the selection on the new cloudflare route (not
 			// just the service) so the user watches the URL -- or, for a quick
 			// tunnel, the spinner then the URL -- resolve right where they're
 			// looking. rebuildItems just ran, so routes() reflects m.tunnels
-			// as set above.
+			// as set above. The guard above is the shared don't-yank rule: the
+			// start is async, so a user who moved to another service in the
+			// meantime keeps their place.
 			m.selectRoute(msg.port, routeTunnel)
 		}
 		return m, tea.Batch(save, flash, m.pollTunnelsCmd(), rebuild)
@@ -4930,6 +4986,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.Select(len(vis) - 1)
 		m.routeIdx = 0 // landed on a different service; start at its first route
 	}
+	// kata 4hcg: once the visible set is readable again (notably when a
+	// filter's async re-match lands, but harmless on every other routed
+	// message), reconcile the route cursor against the now-current service.
+	// setItems deliberately skips that clamp while the re-match is in flight,
+	// so this is where a landing made in that window survives -- and a route
+	// list that shrank underneath it is still clamped.
+	if len(m.list.VisibleItems()) > 0 {
+		m.clampRouteIdx()
+	}
 	m.ensureRouteVisible()
 	return m, cmd
 }
@@ -5089,8 +5154,16 @@ func (m *model) setItems(items []list.Item) tea.Cmd {
 	}
 	// The route cursor (kata th05) must also survive a rebuild: a service whose
 	// route list shrank (an exposure torn down between polls) could otherwise
-	// leave m.routeIdx dangling past the end.
-	m.clampRouteIdx()
+	// leave m.routeIdx dangling past the end. An ACTIVE "/" filter makes
+	// SetItems clear the visible set until bubbles' async re-match lands, and
+	// currentService() then reports nothing -- clamping there would reset
+	// routeIdx to 0, silently undoing a landing (kata 4hcg's tunnel/serve/
+	// funnel/publish landings) that happened in the same Update. Skip the clamp
+	// for that window only: the re-match reconciles the route cursor once the
+	// visible set is readable again (Update's fallback below).
+	if len(m.list.VisibleItems()) > 0 || len(items) == 0 {
+		m.clampRouteIdx()
+	}
 	// z6yf: every rebuildItems() caller funnels through here, so reconciling
 	// scrollOff at this single choke point covers them all (a poll dropping a
 	// route/service, a view toggle, a tunnel/publish result, ...) without
@@ -5107,9 +5180,11 @@ func (m *model) setItems(items []list.Item) tea.Cmd {
 // anchoring selection to the port rather than the row index across a view
 // switch. If that port isn't present in the current list, it falls back to
 // the nearest remaining port (see selectIndexForPort). No-op on an empty
-// list.
+// list. Works over VisibleItems, not Items: with an active "/" filter the
+// cursor indexes the FILTERED rows, so a full-list index would select the
+// wrong row (kata 4hcg's live check hit this via selectRoute).
 func (m *model) selectPort(number int) {
-	items := m.list.Items()
+	items := m.list.VisibleItems()
 	if len(items) == 0 {
 		return
 	}
@@ -6797,7 +6872,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nQUICK Tunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j; split\nfrom the named tunnel under kata p7c5). Only offered when cloudflared\nis installed. No Cloudflare account needed: gets a random\nhttps://<name>.trycloudflare.com URL, unauthenticated, that appears\nonce it starts. o is a TOGGLE: on a quick-tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first (:22\nrefused) -- no mode prompt any more, o ALWAYS runs quick. The tunnel\nsurvives tailport exiting. Press O to run this port's NAMED tunnel\ninstead (config.yaml-bound, its own key, shown only here and in\n`tailport quickstart` -- not the bottom bar); o never touches a named\ntunnel already running on this port, and O never touches a quick one.\nA THIRD public path, independent of funnel and publish — since kata\nth05 a port may carry all three at once (each is its own route\nsub-row and confirms separately). While a tunnel runs, its cloudflared\nmetrics port is labelled in the list (cloudflared metrics for :<port>)\nand can't be exposed by t/p/d/e/o/O.",
 		"O":      "Run the NAMED Cloudflare Tunnel bound to the selected port in\nconfig.yaml (" + tunnelled + ", kata p7c5): ports.<port>.cloudflare {tunnel,\nhostname}. No prompts -- an unbound port, a missing\n`cloudflared tunnel login`, or an invalid tunnel/hostname all refuse\nwith a toast naming the fix, rather than asking for one interactively.\nNeeds a tunnel you already created (`cloudflared tunnel create`) and\nrouted a hostname to (`cloudflared tunnel route dns`) -- tailport\nnever provisions either. O is a TOGGLE: on this port's named tunnel\nit tears it down immediately, no confirm; otherwise it confirms\nfirst, naming the exact https://<hostname> and the tunnel it will\nrun (:22 refused), and pins that tunnel's ingress to exactly this\nhostname. A named tunnel serves only ONE port at a time -- a second\nport bound to the same name is refused while the first is running.\nO never touches a QUICK tunnel already running on this port; press o\nto stop that one instead. Help-only: NOT shown in the bottom bar\n(like Redo) -- only here and in `tailport quickstart`.",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
-		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",
+		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied. Turning an exposure on (t, p,\nd, o or O) lands the cursor on the route it just created, so c (or its\nalias y) copies that new URL right away.",
 		"i":      "Copy the selected port's bare PID (e.g. 12345) to the clipboard,\nvia the same OSC 52 path as c. PID is a property of the PORT, not the\nroute you're navigated to, so this always resolves to the port even\nwhen a route sub-row is selected. Refuses with a toast and copies\nnothing when the PID can't be resolved (0) -- a foreign-owned port, or\na favorite that's currently down.",
 		"I":      "Copy a ready-to-run kill command for the selected port's PID\n(e.g. \"kill 12345\", SIGTERM -- no signal flag), via the same path as\ni. A safe manual stand-in until an in-app kill exists. Refuses on a\nlocked port (press x to unlock first); that lock check runs before\nthe Pid==0 refusal below. Same Pid==0 refusal as i: no command is\ncopied for an unresolved PID.",
 		"f":      "Favorite the selected port (marks it ★). Favorites are a durable\nshortlist — one of the two `a` views — that survives restarts and\nstays visible even when the process isn't running.",

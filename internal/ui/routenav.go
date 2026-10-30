@@ -155,6 +155,16 @@ func (m *model) moveRoute(delta int) {
 	m.routeIdx = idx
 }
 
+// cursorOnPort reports whether the service cursor is currently on port. The
+// exposure ops' done handlers use it as their "don't yank" guard (kata 4hcg):
+// an op is async, and a user who has navigated to another service while it was
+// in flight must keep their place rather than being dragged to a route they
+// aren't looking at.
+func (m model) cursorOnPort(port int) bool {
+	pi, _, ok := m.currentService()
+	return ok && pi.port.Number == port
+}
+
 // selectRoute points BOTH cursors -- the service (m.list, via selectPort) and
 // the route sub-row (m.routeIdx) -- at port's route of the given kind, so a
 // caller can steer the user at a SPECIFIC route rather than just the service
@@ -162,22 +172,46 @@ func (m *model) moveRoute(delta int) {
 // its spinner, then its resolved URL, is what's on screen without the user
 // having to navigate there themselves). No-op if port isn't present in the
 // current list; if kind isn't found among the port's current routes, the
-// service cursor still moves but the route cursor is left to clampRouteIdx's
-// existing safety net (selectPort already calls ensureRouteVisible, which
-// itself relies on m.routeIdx staying in range).
+// service cursor still moves but the route cursor is only clamped into the
+// port's route range.
 func (m *model) selectRoute(port int, kind routeKind) {
-	m.selectPort(port)
-	pi, _, ok := m.currentService()
-	if !ok || pi.port.Number != port {
+	// Resolve the port's item from the FULL item set. Every caller rewrites
+	// the set first (rebuildItems), and with an active "/" filter that also
+	// clears bubbles/list's visible set until its ASYNC re-match lands -- so
+	// the port can be momentarily absent from VisibleItems even though the
+	// item, and the cursor SetItems preserved for it, are right here.
+	items := m.list.Items()
+	var pi portItem
+	found := false
+	for _, it := range items {
+		if p, ok := it.(portItem); ok && p.port.Number == port {
+			pi, found = p, true
+			break
+		}
+	}
+	if !found {
 		return
 	}
+	if len(m.list.VisibleItems()) > 0 {
+		m.selectPort(port)
+		if cur, _, ok := m.currentService(); !ok || cur.port.Number != port {
+			return
+		}
+	}
+	// An empty visible set means a filter re-match is in flight; the cursor
+	// is preserved across SetItems and the caller's don't-yank guard already
+	// vouched for this port (kata 4hcg), so only the route cursor moves now.
 	for i, r := range pi.routes() {
 		if r.kind == kind {
 			m.routeIdx = i
 			break
 		}
 	}
-	m.clampRouteIdx()
+	// Clamp against THIS item's routes, not via clampRouteIdx: with the
+	// visible set momentarily empty (the filter re-match above),
+	// clampRouteIdx's currentService() reports nothing and would reset
+	// routeIdx to 0, undoing the landing.
+	m.routeIdx = clampInt(m.routeIdx, 0, len(pi.routes())-1)
 	m.ensureRouteVisible()
 }
 

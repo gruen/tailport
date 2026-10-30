@@ -64,6 +64,30 @@ func TestReadmeKeybindingsMatchKeymap(t *testing.T) {
 	}
 }
 
+// TestNewRouteLandingDocumented pins kata 4hcg's user-facing doc claims: after
+// an exposure is turned on, the cursor lands on the route it just created, so
+// `c` (or its alias `y`) copies that new URL immediately. Both the `c` help
+// text (keyLegendDescs, shared by the "?" overlay and `tailport quickstart`)
+// and the README's copy section state it; the behavior itself is pinned by
+// TestExposureTurnOnLandsOnNewRoute and TestTunnelStartMovesSelectionToNewRoute.
+func TestNewRouteLandingDocumented(t *testing.T) {
+	desc := keyLegendDescs(false)["c"]
+	if !strings.Contains(desc, "lands the cursor on the route it just created") {
+		t.Errorf("c help should say a turned-on exposure lands the cursor on its new route; got %q", desc)
+	}
+	if !strings.Contains(desc, "copies that new URL right away") {
+		t.Errorf("c help should say the copy then picks that new URL up right away; got %q", desc)
+	}
+
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	if !strings.Contains(string(readme), "lands the cursor on the route it\njust created") {
+		t.Error("README.md's copy section should say a turned-on exposure lands the cursor on its new route")
+	}
+}
+
 func mustCwd(t *testing.T) string {
 	t.Helper()
 	cwd, _ := os.Getwd()

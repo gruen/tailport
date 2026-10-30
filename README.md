@@ -196,6 +196,10 @@ exact route row you've navigated to. A copy is confirmed inline with a ✓ on th
 route's line, or by a toast when the route has no URL yet (e.g. an `offline`
 route or a still-starting quick tunnel).
 
+Turning an exposure on (`t`, `p`, `d`, `o`/`O`) lands the cursor on the route it
+just created — so `c` (or its alias `y`) copies that new URL immediately,
+without navigating to the new sub-row first.
+
 `i` and `I` copy a property of the **port**, not the route, so they resolve to
 the port even when a route sub-row is selected, and always confirm by toast
 (there's no per-route line to annotate). Both refuse — a toast naming the
