@@ -1,0 +1,13 @@
+#!/bin/sh
+# post-commit: hand every commit to roborev for automatic review, when roborev
+# is installed (a clone without it just skips this -- it is optional tooling,
+# never required to build, test or commit).
+#
+# It lives here, not in .git/hooks, because this repo sets
+# core.hooksPath=.githooks for the pre-push test gate (kata 9w45) -- and that
+# makes git IGNORE .git/hooks entirely. roborev's own installed hook
+# (.git/hooks/post-commit) was silently disabled that way from 2026-09-18 until
+# this file restored it (kata nrnp). Never fails the commit.
+command -v roborev >/dev/null 2>&1 || exit 0
+roborev post-commit >/dev/null 2>&1 || true
+exit 0

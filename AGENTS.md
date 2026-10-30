@@ -408,6 +408,11 @@ assistant's private memory or a single tool's settings. It is a repo mechanism:
   report success off a local pass alone.
 - `git push --no-verify` (skipping the hook) is for a genuine emergency only and
   needs the same explicit, per-action authorization as force-push (see below).
+- `.githooks/post-commit` hands every commit to roborev for automatic review
+  when roborev is installed (a no-op otherwise). It has to live in `.githooks/`:
+  `core.hooksPath` makes git ignore `.git/hooks/`, which silently disabled
+  roborev's own installed hook from 2026-09-18 until kata nrnp. Don't
+  "re-install" roborev's hook into `.git/hooks/` — it won't fire there.
 
 ### Workflow
 
