@@ -2022,50 +2022,77 @@ func TestSelectRoute(t *testing.T) {
 	}
 }
 
+// landingModel builds the fixture the 4hcg landing tests share: two loopback
+// services (:2000 and :3000) in the All ports view, the cursor on :3000's
+// first route, a known tailnet identity, and bubbles' "/" filter idle.
+func landingModel(t *testing.T) model {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := New(config.Config{})
+	m.host = "dev-box"
+	m.fqdn = "dev-box.tailnet.ts.net"
+	m.allPorts = []portscan.Port{
+		{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
+		{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
+	}
+	m.showAllPorts = true
+	m.rebuildItems()
+	m.selectPort(3000)
+	m.routeIdx = 0
+	m.syncSelKey()
+	return m
+}
+
+// confirmRefresh is the status refresh that follows a serve/funnel op: it is
+// what makes the new route exist (the done handlers synthesize nothing).
+func confirmRefresh(t *testing.T, m model, active map[int]bool, funnel map[int]int) model {
+	t.Helper()
+	return mustUpdate(t, m, refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: active, funnel: funnel})
+}
+
+// confirmPublishPoll is the edge poll that follows a publish: it is what makes
+// the routePublish row exist.
+func confirmPublishPoll(t *testing.T, m model, port int, host string) model {
+	t.Helper()
+	return mustUpdate(t, m, publishPollMsg{published: map[int]publishInfo{port: {hostname: host}}, gen: m.publishPollApplied + 1})
+}
+
+// selectedRoute returns the service port and route kind the cursor is on, and
+// fails the test if routeIdx is out of range for that service's routes.
+func selectedRoute(t *testing.T, m model) (int, routeKind) {
+	t.Helper()
+	pi, _, ok := m.currentService()
+	if !ok {
+		t.Fatal("no service is selected")
+	}
+	routes := pi.routes()
+	if m.routeIdx < 0 || m.routeIdx >= len(routes) {
+		t.Fatalf("routeIdx %d out of range for :%d routes=%+v", m.routeIdx, pi.port.Number, routes)
+	}
+	return pi.port.Number, routes[m.routeIdx].kind
+}
+
+// copiedBy presses `c` and reports what it copied.
+func copiedBy(t *testing.T, m model) (routeKind, string) {
+	t.Helper()
+	m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	return m.copiedRouteKind, m.copiedRouteURL
+}
+
 // TestExposureTurnOnLandsOnNewRoute pins kata 4hcg's promise -- the one the `c`
 // help text and the README's copy section now make: after a successful serve,
 // funnel or publish turn-ON, the cursor lands on the route just created, so
-// `c` (or its alias `y`) copies that new URL immediately. Publish must land on
-// routePublish even though it auto-enables serve. Nothing moves on a turn-OFF
-// or a failure, and a user who moved to another service while the op was in
-// flight keeps their place (the don't-yank guard).
+// `c` (or its alias `y`) copies that new URL immediately. The route only
+// exists once the confirming refresh/poll arrives (nothing is synthesized
+// optimistically), so each case sends it. Publish must land on routePublish
+// even though it auto-enables serve. Nothing moves on a turn-OFF or a failure,
+// and a user who moved to another service while the op was in flight keeps
+// their place (the don't-yank guard).
 func TestExposureTurnOnLandsOnNewRoute(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-
-	build := func(t *testing.T) model {
-		t.Helper()
-		m := New(config.Config{})
-		m.host = "dev-box"
-		m.fqdn = "dev-box.tailnet.ts.net"
-		m.allPorts = []portscan.Port{
-			{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback},
-			{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback},
-		}
-		m.showAllPorts = true
-		m.rebuildItems()
-		m.selectPort(3000)
-		m.routeIdx = 0
-		return m
-	}
-	// copied resolves what `c` copies for the CURRENT cursors: the route kind
-	// and URL the inline ✓ / clipboard write use.
-	copied := func(t *testing.T, m model) (routeKind, string) {
-		t.Helper()
-		m = mustUpdate(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-		return m.copiedRouteKind, m.copiedRouteURL
-	}
 	onRoute := func(t *testing.T, m model, port int, want routeKind) {
 		t.Helper()
-		pi, _, ok := m.currentService()
-		if !ok || pi.port.Number != port {
-			t.Fatalf("cursor should be on :%d's service; ok=%v port=%+v", port, ok, pi.port)
-		}
-		routes := pi.routes()
-		if m.routeIdx < 0 || m.routeIdx >= len(routes) {
-			t.Fatalf("routeIdx %d out of range for routes=%+v", m.routeIdx, routes)
-		}
-		if got := routes[m.routeIdx].kind; got != want {
-			t.Fatalf("routeIdx %d should land on kind %v; got %v (routes=%+v)", m.routeIdx, want, got, routes)
+		if p, k := selectedRoute(t, m); p != port || k != want {
+			t.Fatalf("cursor on (:%d, %v), want (:%d, %v)", p, k, port, want)
 		}
 	}
 	stayPut := func(t *testing.T, m model, port, routeIdx int) {
@@ -2077,118 +2104,86 @@ func TestExposureTurnOnLandsOnNewRoute(t *testing.T) {
 	}
 
 	t.Run("serve lands on the tailnet route", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
+		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
 		onRoute(t, m, 3000, routeTailnet)
-		if kind, url := copied(t, m); kind != routeTailnet || url != "http://dev-box:3000" {
+		if kind, url := copiedBy(t, m); kind != routeTailnet || url != "http://dev-box:3000" {
 			t.Errorf("c after serve-on copied (%v, %q), want (routeTailnet, http://dev-box:3000)", kind, url)
 		}
 	})
 
 	t.Run("funnel lands on the ts.net route", func(t *testing.T) {
-		m := build(t)
-		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeFunnel, turnOn: true, publicPort: 443})
+		m := landingModel(t)
+		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeFunnel, turnOn: true})
+		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{3000: 443})
 		onRoute(t, m, 3000, routeFunnel)
 		want := tsserve.PublicURL("dev-box.tailnet.ts.net", 443)
-		if kind, url := copied(t, m); kind != routeFunnel || url != want {
+		if kind, url := copiedBy(t, m); kind != routeFunnel || url != want {
 			t.Errorf("c after funnel-on copied (%v, %q), want (routeFunnel, %q)", kind, url, want)
 		}
 	})
 
 	t.Run("publish lands on the publish route, not the serve route it auto-enabled", func(t *testing.T) {
-		m := build(t)
-		// Publish auto-enables serve, so the tailnet route is present too;
-		// the landing must pick routePublish, not the route it was last on.
+		m := landingModel(t)
 		m.active[3000] = true
 		m.rebuildItems()
 		m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 3000}
 		m = mustUpdate(t, m, publishDoneMsg{port: 3000})
+		m = confirmPublishPoll(t, m, 3000, "app.example.com")
 		onRoute(t, m, 3000, routePublish)
-		if kind, url := copied(t, m); kind != routePublish || url != "https://app.example.com" {
+		if kind, url := copiedBy(t, m); kind != routePublish || url != "https://app.example.com" {
 			t.Errorf("c after publish copied (%v, %q), want (routePublish, https://app.example.com)", kind, url)
 		}
 	})
 
-	t.Run("lands with an active filter, whose async re-match clears the visible set", func(t *testing.T) {
-		m := build(t)
-		// Model an APPLIED "/" filter matching just :3000. SetFilterText runs
-		// bubbles/list's normally-async match synchronously; SetFilterState
-		// puts the list back in FilterApplied (SetFilterText leaves it in
-		// Filtering, where every key would go to the filter input).
-		m.list.SetFilterText("3000")
-		m.list.SetFilterState(list.FilterApplied)
-		m.filtering = true
-
-		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
-
-		// The handler's rebuildItems literally clears the visible set until the
-		// async re-match lands, so resolve the expectation from the full item
-		// set: the landing must not have depended on readable VisibleItems.
-		var routes []route
-		for _, it := range m.list.Items() {
-			if pi, ok := it.(portItem); ok && pi.port.Number == 3000 {
-				routes = pi.routes()
-			}
-		}
-		want := -1
-		for i, r := range routes {
-			if r.kind == routeTailnet {
-				want = i
-			}
-		}
-		if want < 0 || m.routeIdx != want {
-			t.Fatalf("routeIdx = %d, want the routeTailnet row %d (routes=%+v)", m.routeIdx, want, routes)
-		}
-
-		// A routine background refresh (the same rebuild the start batch also
-		// fires) must not wipe the landing while the filter re-match is in
-		// flight -- the regression this subtest exists for.
-		m = mustUpdate(t, m, refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: map[int]bool{3000: true}, funnel: map[int]int{}})
-
-		// Re-run the match synchronously to model the async re-match landing,
-		// then the promise holds end to end: c copies the new URL.
-		m.list.SetFilterText("3000")
-		m.list.SetFilterState(list.FilterApplied)
-		onRoute(t, m, 3000, routeTailnet)
-		if kind, url := copied(t, m); kind != routeTailnet || url != "http://dev-box:3000" {
-			t.Errorf("c under an active filter copied (%v, %q), want (routeTailnet, http://dev-box:3000)", kind, url)
-		}
-	})
-
 	t.Run("turn-off leaves the cursor where it was", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: false})
+		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
+		if m.pendingLand.set {
+			t.Fatal("a turn-OFF must not arm a landing")
+		}
 		stayPut(t, m, 3000, 0)
 	})
 
 	t.Run("serve failure leaves the cursor where it was", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true, err: errors.New("boom")})
+		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
 		stayPut(t, m, 3000, 0)
 	})
 
 	t.Run("unpublish leaves the cursor where it was", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m.pendingPublish = pendingPublish{hostname: "app.example.com", port: 3000}
 		m = mustUpdate(t, m, publishDoneMsg{port: 3000, unpublish: true})
+		if m.pendingLand.set {
+			t.Fatal("an unpublish must not arm a landing")
+		}
 		stayPut(t, m, 3000, 0)
 	})
 
 	t.Run("publish failure leaves the cursor where it was", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m.pendingPublish = pendingPublish{hostname: "app.example.com", port: 3000}
 		m = mustUpdate(t, m, publishDoneMsg{port: 3000, err: errors.New("boom")})
+		if m.pendingLand.set {
+			t.Fatal("a failed publish must not arm a landing")
+		}
 		stayPut(t, m, 3000, 0)
 	})
 
 	t.Run("a cursor on another service is never yanked", func(t *testing.T) {
-		m := build(t)
+		m := landingModel(t)
 		m.selectPort(2000)
 		m.routeIdx = 0
 		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
+		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
 		stayPut(t, m, 2000, 0)
 		m.pendingPublish = pendingPublish{hostname: "app.example.com", port: 3000}
 		m = mustUpdate(t, m, publishDoneMsg{port: 3000})
+		m = confirmPublishPoll(t, m, 3000, "app.example.com")
 		stayPut(t, m, 2000, 0)
 	})
 }

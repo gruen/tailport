@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -153,66 +154,149 @@ func (m *model) moveRoute(delta int) {
 	}
 	m.list.Select(svc)
 	m.routeIdx = idx
+	m.noteNav()
 }
 
-// cursorOnPort reports whether the service cursor is currently on port. The
-// exposure ops' done handlers use it as their "don't yank" guard (kata 4hcg):
-// an op is async, and a user who has navigated to another service while it was
-// in flight must keep their place rather than being dragged to a route they
-// aren't looking at.
-func (m model) cursorOnPort(port int) bool {
+// selKey is the user's selected route by IDENTITY -- (port, route kind) -- not
+// by position (kata 4hcg). The cursor proper is an index pair (m.list's service
+// row + m.routeIdx), but a service's route list shifts and gains rows across
+// refreshes (a publish on an unserved port inserts routeTailnet above
+// routePublish; a failed status refresh hides the tailnet route and the next
+// good one restores it), so an index alone drifts onto a different route.
+// reconcileSelection re-points the index pair at selKey after every rebuild.
+type selKey struct {
+	port int
+	kind routeKind
+	set  bool
+}
+
+// pendingLand is a requested landing on a route that may not exist yet (kata
+// 4hcg): an exposure op succeeded, but the route it creates only appears once
+// the confirming refresh/poll reflects it. reconcileSelection retries it after
+// every rebuild until the route shows up, the user navigates, or the deadline
+// passes (checked lazily there -- no ticker).
+type pendingLand struct {
+	port     int
+	kind     routeKind
+	deadline time.Time
+	set      bool
+}
+
+// landTTL bounds how long a pendingLand waits for its route to appear.
+const landTTL = 10 * time.Second
+
+// syncSelKey records the cursor's current (service, route kind) as selKey and
+// pins routeIdx into range. Called wherever the selection changes for a real
+// reason (navigation, selectPort). No-op when no service is readable, so a
+// filter re-match's momentarily empty visible set never overwrites selKey.
+func (m *model) syncSelKey() {
 	pi, _, ok := m.currentService()
-	return ok && pi.port.Number == port
-}
-
-// selectRoute points BOTH cursors -- the service (m.list, via selectPort) and
-// the route sub-row (m.routeIdx) -- at port's route of the given kind, so a
-// caller can steer the user at a SPECIFIC route rather than just the service
-// (kata h2ef: landing on a freshly-started cloudflare tunnel's own sub-row so
-// its spinner, then its resolved URL, is what's on screen without the user
-// having to navigate there themselves). No-op if port isn't present in the
-// current list; if kind isn't found among the port's current routes, the
-// service cursor still moves but the route cursor is only clamped into the
-// port's route range.
-func (m *model) selectRoute(port int, kind routeKind) {
-	// Resolve the port's item from the FULL item set. Every caller rewrites
-	// the set first (rebuildItems), and with an active "/" filter that also
-	// clears bubbles/list's visible set until its ASYNC re-match lands -- so
-	// the port can be momentarily absent from VisibleItems even though the
-	// item, and the cursor SetItems preserved for it, are right here.
-	items := m.list.Items()
-	var pi portItem
-	found := false
-	for _, it := range items {
-		if p, ok := it.(portItem); ok && p.port.Number == port {
-			pi, found = p, true
-			break
-		}
-	}
-	if !found {
+	if !ok {
 		return
 	}
-	if len(m.list.VisibleItems()) > 0 {
-		m.selectPort(port)
-		if cur, _, ok := m.currentService(); !ok || cur.port.Number != port {
-			return
+	rs := pi.routes()
+	m.routeIdx = clampInt(m.routeIdx, 0, len(rs)-1)
+	m.selKey = selKey{port: pi.port.Number, kind: rs[m.routeIdx].kind, set: true}
+}
+
+// noteNav is the user-navigation hook: the new cursor becomes the selection
+// identity, and any pending landing is cancelled (the user has moved on).
+func (m *model) noteNav() {
+	m.pendingLand = pendingLand{}
+	m.syncSelKey()
+}
+
+// reconcileSelection re-points the cursors at selKey after anything that can
+// shift rows underneath them: every items rebuild (setItems) and the async
+// "/" filter result (Update). It also retries a pendingLand. While the visible
+// set is empty (a filter re-match in flight) it changes nothing -- selKey and
+// pendingLand survive until the result lands. While the user is TYPING a
+// filter the cursor is index-driven as bubbles/list has always done it, so
+// reconcile adopts the cursor instead of fighting it. If selKey's service is
+// gone, or has no route of selKey.kind, the cursor falls back to the plain
+// clamp and selKey follows what is actually selected.
+func (m *model) reconcileSelection() {
+	vis := m.list.VisibleItems()
+	if len(vis) == 0 {
+		if len(m.list.Items()) == 0 {
+			m.routeIdx = 0
+		}
+		return
+	}
+	if p := m.pendingLand; p.set {
+		if time.Now().After(p.deadline) || !m.selKey.set || m.selKey.port != p.port {
+			m.pendingLand = pendingLand{}
+		} else if m.hasRoute(vis, p.port, p.kind) {
+			m.selKey = selKey{port: p.port, kind: p.kind, set: true}
+			m.pendingLand = pendingLand{}
 		}
 	}
-	// An empty visible set means a filter re-match is in flight; the cursor
-	// is preserved across SetItems and the caller's don't-yank guard already
-	// vouched for this port (kata 4hcg), so only the route cursor moves now.
-	for i, r := range pi.routes() {
-		if r.kind == kind {
-			m.routeIdx = i
-			break
+	if m.selKey.set && m.list.FilterState() != list.Filtering {
+		for i, it := range vis {
+			pi, ok := it.(portItem)
+			if !ok || pi.port.Number != m.selKey.port {
+				continue
+			}
+			rs := pi.routes()
+			m.list.Select(i)
+			for ri, r := range rs {
+				if r.kind == m.selKey.kind {
+					m.routeIdx = ri
+					m.ensureRouteVisible()
+					return
+				}
+			}
+			break // service kept, its route is gone: clamp below and adopt
 		}
 	}
-	// Clamp against THIS item's routes, not via clampRouteIdx: with the
-	// visible set momentarily empty (the filter re-match above),
-	// clampRouteIdx's currentService() reports nothing and would reset
-	// routeIdx to 0, undoing the landing.
-	m.routeIdx = clampInt(m.routeIdx, 0, len(pi.routes())-1)
+	if m.list.Index() >= len(vis) || m.list.Index() < 0 {
+		m.list.Select(len(vis) - 1)
+	}
+	m.syncSelKey()
 	m.ensureRouteVisible()
+}
+
+// hasRoute reports whether items holds port with a route of the given kind.
+func (m model) hasRoute(items []list.Item, port int, kind routeKind) bool {
+	for _, it := range items {
+		if pi, ok := it.(portItem); ok && pi.port.Number == port {
+			for _, r := range pi.routes() {
+				if r.kind == kind {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// landOn requests that the cursor land on port's route of the given kind once
+// it exists (kata 4hcg): the exposure ops' done handlers call it after a
+// successful turn-ON. The "don't yank" guard is selection identity -- an op is
+// async, and a user who has navigated to another service while it was in
+// flight keeps their place. selKey (not the visible rows) is what is compared,
+// so the guard still holds while a filter re-match has emptied VisibleItems.
+// The landing is resolved immediately when the route already exists, else on
+// the first rebuild that brings it (reconcileSelection).
+func (m *model) landOn(port int, kind routeKind) {
+	m.syncSelKey() // no-op while the visible set is empty; selKey stays authoritative
+	if !m.selKey.set || m.selKey.port != port {
+		return
+	}
+	m.pendingLand = pendingLand{port: port, kind: kind, deadline: time.Now().Add(landTTL), set: true}
+	m.reconcileSelection()
+}
+
+// selectRoute points BOTH cursors -- the service (m.list) and the route
+// sub-row (m.routeIdx) -- at port's route of the given kind, by recording it
+// as the selection identity and reconciling, so a caller can steer the user at
+// a SPECIFIC route rather than just the service (kata h2ef). If kind isn't
+// found among the port's current routes the service cursor still moves and the
+// route cursor is only clamped into range; if port isn't visible the selection
+// is left where it is.
+func (m *model) selectRoute(port int, kind routeKind) {
+	m.selKey = selKey{port: port, kind: kind, set: true}
+	m.reconcileSelection()
 }
 
 // jumpService moves the SERVICE cursor by delta (Shift+arrows / J,K), landing on
@@ -224,6 +308,7 @@ func (m *model) jumpService(delta int) {
 	}
 	m.list.Select(clampInt(m.list.Index()+delta, 0, len(items)-1))
 	m.routeIdx = 0
+	m.noteNav()
 }
 
 // bodyLines renders every visible service block into one flat line slice (blocks

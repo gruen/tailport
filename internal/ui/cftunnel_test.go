@@ -845,37 +845,18 @@ func TestTunnelStartMovesSelectionToNewRoute(t *testing.T) {
 		m = mustUpdate(t, m, tunnelDoneMsg{port: 3000, running: &cftunnel.Running{PID: 111, Port: 3000, Mode: cftunnel.ModeQuick}})
 
 		// The handler's rebuildItems cleared the visible set until bubbles'
-		// async re-match lands, so resolve the target from the full item set.
-		var routes []route
-		for _, it := range m.list.Items() {
-			if pi, ok := it.(portItem); ok && pi.port.Number == 3000 {
-				routes = pi.routes()
-			}
-		}
-		want := -1
-		for i, r := range routes {
-			if r.kind == routeTunnel {
-				want = i
-			}
-		}
-		if want < 0 || m.routeIdx != want {
-			t.Fatalf("routeIdx = %d, want the routeTunnel row %d (routes=%+v)", m.routeIdx, want, routes)
+		// async re-match lands; the landing waits for it (selKey survives).
+		if len(m.list.VisibleItems()) != 0 {
+			t.Fatal("setup: the rebuild under an applied filter should clear the visible set")
 		}
 
-		// A routine tunnel poll rebuild must not wipe the landing while the
+		// A routine tunnel poll rebuild must not lose the landing while the
 		// filter re-match is in flight.
 		m = mustUpdate(t, m, tunnelPollMsg{gen: m.tunnelPollApplied + 1, tunnels: map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: 111}}, foreign: map[int]bool{}})
-		m.list.SetFilterText("3000")
-		m.list.SetFilterState(list.FilterApplied)
+		m = filterLanding(t, m)
 
-		var after []route
-		for _, it := range m.list.Items() {
-			if pi, ok := it.(portItem); ok && pi.port.Number == 3000 {
-				after = pi.routes()
-			}
-		}
-		if m.routeIdx < 0 || m.routeIdx >= len(after) || after[m.routeIdx].kind != routeTunnel {
-			t.Fatalf("routeIdx = %d should still select the routeTunnel row; routes=%+v", m.routeIdx, after)
+		if p, k := selectedRoute(t, m); p != 3000 || k != routeTunnel {
+			t.Fatalf("cursor on (:%d, %v), want (:3000, routeTunnel)", p, k)
 		}
 	})
 
