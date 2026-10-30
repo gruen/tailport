@@ -2106,6 +2106,7 @@ func TestExposureTurnOnLandsOnNewRoute(t *testing.T) {
 	t.Run("serve lands on the tailnet route", func(t *testing.T) {
 		m := landingModel(t)
 		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
+		onRoute(t, m, 3000, routeTailnet) // authoritative on success: no refresh needed
 		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
 		onRoute(t, m, 3000, routeTailnet)
 		if kind, url := copiedBy(t, m); kind != routeTailnet || url != "http://dev-box:3000" {
@@ -2115,7 +2116,8 @@ func TestExposureTurnOnLandsOnNewRoute(t *testing.T) {
 
 	t.Run("funnel lands on the ts.net route", func(t *testing.T) {
 		m := landingModel(t)
-		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeFunnel, turnOn: true})
+		m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeFunnel, turnOn: true, publicPort: 443})
+		onRoute(t, m, 3000, routeFunnel) // authoritative on success: no refresh needed
 		m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{3000: 443})
 		onRoute(t, m, 3000, routeFunnel)
 		want := tsserve.PublicURL("dev-box.tailnet.ts.net", 443)

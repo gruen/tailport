@@ -157,7 +157,7 @@ func (m *model) moveRoute(delta int) {
 	m.noteNav()
 }
 
-// selKey is the user's selected route by IDENTITY -- (port, route kind) -- not
+// selKey is the user's selected route by IDENTITY -- (port, routeID) -- not
 // by position (kata 4hcg). The cursor proper is an index pair (m.list's service
 // row + m.routeIdx), but a service's route list shifts and gains rows across
 // refreshes (a publish on an unserved port inserts routeTailnet above
@@ -166,9 +166,20 @@ func (m *model) moveRoute(delta int) {
 // reconcileSelection re-points the index pair at selKey after every rebuild.
 type selKey struct {
 	port int
-	kind routeKind
+	id   routeID
 	set  bool
 }
+
+// routeID identifies a route within one service: its kind plus the one
+// discriminator routesFor needs. Kinds are unique per service EXCEPT
+// routeTunnel, where an owned and a foreign cloudflared can cover the same
+// port at once, each its own row; foreign tells them apart.
+type routeID struct {
+	kind    routeKind
+	foreign bool
+}
+
+func (r route) id() routeID { return routeID{kind: r.kind, foreign: r.foreign} }
 
 // pendingLand is a requested landing on a route that may not exist yet (kata
 // 4hcg): an exposure op succeeded, but the route it creates only appears once
@@ -177,7 +188,7 @@ type selKey struct {
 // passes (checked lazily there -- no ticker).
 type pendingLand struct {
 	port     int
-	kind     routeKind
+	id       routeID
 	deadline time.Time
 	set      bool
 }
@@ -196,7 +207,7 @@ func (m *model) syncSelKey() {
 	}
 	rs := pi.routes()
 	m.routeIdx = clampInt(m.routeIdx, 0, len(rs)-1)
-	m.selKey = selKey{port: pi.port.Number, kind: rs[m.routeIdx].kind, set: true}
+	m.selKey = selKey{port: pi.port.Number, id: rs[m.routeIdx].id(), set: true}
 }
 
 // noteNav is the user-navigation hook: the new cursor becomes the selection
@@ -213,7 +224,7 @@ func (m *model) noteNav() {
 // pendingLand survive until the result lands. While the user is TYPING a
 // filter the cursor is index-driven as bubbles/list has always done it, so
 // reconcile adopts the cursor instead of fighting it. If selKey's service is
-// gone, or has no route of selKey.kind, the cursor falls back to the plain
+// gone, or has no route with selKey.id, the cursor falls back to the plain
 // clamp and selKey follows what is actually selected.
 func (m *model) reconcileSelection() {
 	vis := m.list.VisibleItems()
@@ -226,8 +237,8 @@ func (m *model) reconcileSelection() {
 	if p := m.pendingLand; p.set {
 		if time.Now().After(p.deadline) || !m.selKey.set || m.selKey.port != p.port {
 			m.pendingLand = pendingLand{}
-		} else if m.hasRoute(vis, p.port, p.kind) {
-			m.selKey = selKey{port: p.port, kind: p.kind, set: true}
+		} else if m.hasRoute(vis, p.port, p.id) {
+			m.selKey = selKey{port: p.port, id: p.id, set: true}
 			m.pendingLand = pendingLand{}
 		}
 	}
@@ -240,7 +251,7 @@ func (m *model) reconcileSelection() {
 			rs := pi.routes()
 			m.list.Select(i)
 			for ri, r := range rs {
-				if r.kind == m.selKey.kind {
+				if r.id() == m.selKey.id {
 					m.routeIdx = ri
 					m.ensureRouteVisible()
 					return
@@ -257,11 +268,11 @@ func (m *model) reconcileSelection() {
 }
 
 // hasRoute reports whether items holds port with a route of the given kind.
-func (m model) hasRoute(items []list.Item, port int, kind routeKind) bool {
+func (m model) hasRoute(items []list.Item, port int, id routeID) bool {
 	for _, it := range items {
 		if pi, ok := it.(portItem); ok && pi.port.Number == port {
 			for _, r := range pi.routes() {
-				if r.kind == kind {
+				if r.id() == id {
 					return true
 				}
 			}
@@ -283,7 +294,7 @@ func (m *model) landOn(port int, kind routeKind) {
 	if !m.selKey.set || m.selKey.port != port {
 		return
 	}
-	m.pendingLand = pendingLand{port: port, kind: kind, deadline: time.Now().Add(landTTL), set: true}
+	m.pendingLand = pendingLand{port: port, id: routeID{kind: kind}, deadline: time.Now().Add(landTTL), set: true}
 	m.reconcileSelection()
 }
 
@@ -295,7 +306,7 @@ func (m *model) landOn(port int, kind routeKind) {
 // route cursor is only clamped into range; if port isn't visible the selection
 // is left where it is.
 func (m *model) selectRoute(port int, kind routeKind) {
-	m.selKey = selKey{port: port, kind: kind, set: true}
+	m.selKey = selKey{port: port, id: routeID{kind: kind}, set: true}
 	m.reconcileSelection()
 }
 

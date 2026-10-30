@@ -132,6 +132,8 @@ func TestPendingLandCancelledByNavigation(t *testing.T) {
 	for _, key := range []string{"j", "k", "J", "K", "down", "up", "home", "end", "pgdown", "pgup"} {
 		t.Run(key, func(t *testing.T) {
 			m := landingModel(t)
+			m.tailnetUnavailable = true // the tailnet route is not displayable yet
+			m.rebuildItems()
 			m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
 			if !m.pendingLand.set {
 				t.Fatal("setup: a landing should be pending")
@@ -152,6 +154,8 @@ func TestPendingLandCancelledByNavigation(t *testing.T) {
 
 func TestPendingLandCancelledByDeadline(t *testing.T) {
 	m := landingModel(t)
+	m.tailnetUnavailable = true // the tailnet route is not displayable yet
+	m.rebuildItems()
 	m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
 	m.pendingLand.deadline = time.Now().Add(-time.Second)
 	m = confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
@@ -343,6 +347,10 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 					tun[n] = tunnelInfo{mode: cftunnel.ModeQuick, pid: 100 + n, ready: rng.Intn(2) == 0, hostname: "q.trycloudflare.com"}
 				case 1:
 					foreign[n] = true
+				case 2:
+					// owned AND foreign on one port: two routeTunnel rows
+					tun[n] = tunnelInfo{mode: cftunnel.ModeQuick, pid: 100 + n, ready: true, hostname: "q.trycloudflare.com"}
+					foreign[n] = true
 				}
 			}
 			step("tunnel poll", tunnelPollMsg{tunnels: tun, foreign: foreign, gen: m.tunnelPollApplied + 1})
@@ -387,5 +395,58 @@ func TestFilterStartKeepsRouteIdxInRange(t *testing.T) {
 	}
 	if m.routeIdx != 0 {
 		t.Errorf("routeIdx = %d, want 0 on the new service", m.routeIdx)
+	}
+}
+
+// A successful publish is authoritative: with NO edge poll delivered (or a
+// failed one), c copies the public URL at once rather than the previously
+// selected localhost URL.
+func TestPublishSuccessLandsWithoutPoll(t *testing.T) {
+	m := landingModel(t)
+	m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 3000, withAuth: true}
+	m = mustUpdate(t, m, publishDoneMsg{port: 3000})
+	if p, k := selectedRoute(t, m); p != 3000 || k != routePublish {
+		t.Fatalf("cursor on (:%d, %v), want (:3000, routePublish)", p, k)
+	}
+	if kind, url := copiedBy(t, m); kind != routePublish || url != "https://app.example.com" {
+		t.Errorf("c copied (%v, %q), want the public URL", kind, url)
+	}
+	// A failed poll leaves it be.
+	m = mustUpdate(t, m, publishPollMsg{err: errors.New("edge down"), gen: m.publishPollApplied + 1})
+	if _, k := selectedRoute(t, m); k != routePublish {
+		t.Errorf("a failed poll moved the cursor to %v", k)
+	}
+}
+
+// routeTunnel is the one kind that can appear twice on a port (owned plus
+// foreign cloudflared). The selection must stay on the row the user chose.
+func TestSelectionIdentityDistinguishesOwnedAndForeignTunnel(t *testing.T) {
+	m := landingModel(t)
+	tun := map[int]tunnelInfo{3000: {mode: cftunnel.ModeQuick, pid: 111, hostname: "q.trycloudflare.com", ready: true}}
+	m = mustUpdate(t, m, tunnelPollMsg{tunnels: tun, foreign: map[int]bool{3000: true}, gen: m.tunnelPollApplied + 1})
+	pi, _, _ := m.currentService()
+	var n, foreignIdx int
+	for i, r := range pi.routes() {
+		if r.kind == routeTunnel {
+			n++
+			if r.foreign {
+				foreignIdx = i
+			}
+		}
+	}
+	if n != 2 {
+		t.Fatalf("setup: want an owned and a foreign tunnel row, got %d tunnel rows in %+v", n, pi.routes())
+	}
+	m.routeIdx = foreignIdx
+	m.syncSelKey()
+	m = mustUpdate(t, m, tunnelPollMsg{tunnels: tun, foreign: map[int]bool{3000: true}, gen: m.tunnelPollApplied + 1})
+	pi, _, _ = m.currentService()
+	if !pi.routes()[m.routeIdx].foreign {
+		t.Fatalf("selection moved off the foreign tunnel row to %+v", pi.routes()[m.routeIdx])
+	}
+	// c on the foreign row has no URL (surfaced as drift), so it must NOT
+	// copy the owned row's URL.
+	if kind, url := copiedBy(t, m); url == "https://q.trycloudflare.com" {
+		t.Errorf("c copied the owned tunnel URL (%v, %q) from the foreign row", kind, url)
 	}
 }

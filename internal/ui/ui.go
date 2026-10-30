@@ -646,6 +646,9 @@ type toggleDoneMsg struct {
 	// are ignored on error and on a turn-OFF (which creates nothing).
 	kind   routeKind
 	turnOn bool
+	// publicPort is the funnel's public ingress port; a successful funnel
+	// turn-ON records it in m.funnel at once (see the toggleDoneMsg handler).
+	publicPort int
 }
 
 // publishInfo is the live per-port publish state the edge poll returns: the
@@ -1765,7 +1768,7 @@ func funnelCmd(localPort, publicPort int, turnOn bool) tea.Cmd {
 		} else {
 			err = tsserve.FunnelOff(localPort, publicPort)
 		}
-		return toggleDoneMsg{port: localPort, err: err, kind: routeFunnel, turnOn: turnOn}
+		return toggleDoneMsg{port: localPort, err: err, kind: routeFunnel, turnOn: turnOn, publicPort: publicPort}
 	}
 }
 
@@ -3567,12 +3570,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// kata 4hcg: a successful escalation lands the cursor on the route it
 		// just created, so c/y copies the new URL immediately (the promise the
 		// c help text and the README's copy section make). Only a turn-ON has a
-		// new route; a turn-OFF creates nothing. The route isn't in the list
-		// until the refresh below reflects the op, so this registers a pending
-		// landing that the rebuild bringing the route resolves (landOn also
-		// applies the don't-yank guard: the toggle is async).
+		// new route; a turn-OFF creates nothing. A successful mutating call is
+		// authoritative (as the tunnel Start handler treats its own), so record
+		// the outcome now: the route exists at once and c/y never sees a window
+		// with the old URL. The refresh below reconciles as usual. landOn
+		// resolves the landing immediately when the route is displayable, else
+		// on the rebuild that brings it (tailnetUnavailable hides routeTailnet),
+		// and applies the don't-yank guard: the toggle is async.
 		if msg.turnOn {
+			switch msg.kind {
+			case routeTailnet:
+				if m.active == nil {
+					m.active = map[int]bool{}
+				}
+				m.active[msg.port] = true
+			case routeFunnel:
+				if m.funnel == nil {
+					m.funnel = map[int]int{}
+				}
+				m.funnel[msg.port] = msg.publicPort
+			}
+			rebuild := m.rebuildItems()
 			m.landOn(msg.port, msg.kind)
+			return m, tea.Batch(rebuild, refresh)
 		}
 		return m, refresh
 
@@ -3698,10 +3718,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// kata 4hcg: a successful publish lands the cursor on the new
 		// routePublish row -- NOT the tailnet row it may have auto-enabled --
-		// so c/y copies the public URL immediately. The route appears when the
-		// edge poll below confirms it; without a known hostname there is no URL
-		// to land on, so a bare publishDoneMsg skips this.
+		// so c/y copies the public URL immediately. The edge accepted the route,
+		// so record it now from the carry rather than leaving a window until the
+		// poll below returns (the poll then replaces m.published wholesale);
+		// without a known hostname there is no URL to land on, so a bare
+		// publishDoneMsg skips this.
+		var land tea.Cmd
 		if !msg.unpublish && publishedHost != "" {
+			if m.published == nil {
+				m.published = map[int]publishInfo{}
+			}
+			m.published[msg.port] = publishInfo{hostname: publishedHost, auth: publishedAuth}
+			land = m.rebuildItems()
 			m.landOn(msg.port, routePublish)
 		}
 		if tookOver != "" {
@@ -3710,14 +3738,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
 			// take-over, which arms nothing). "press d to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd(), land)
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd(), land)
 		}
 		return m, tea.Batch(refresh, m.pollPublishedCmd())
 
