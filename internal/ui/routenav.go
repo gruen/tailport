@@ -157,7 +157,7 @@ func (m *model) moveRoute(delta int) {
 	m.noteNav()
 }
 
-// selKey is the user's selected route by IDENTITY -- (port, routeID) -- not
+// selKey is the user's INTENDED route by IDENTITY -- (port, routeID) -- not
 // by position (kata 4hcg). The cursor proper is an index pair (m.list's service
 // row + m.routeIdx), but a service's route list shifts and gains rows across
 // refreshes (a publish on an unserved port inserts routeTailnet above
@@ -217,15 +217,21 @@ func (m *model) noteNav() {
 	m.syncSelKey()
 }
 
-// reconcileSelection re-points the cursors at selKey after anything that can
+// reconcileSelection re-points the cursors at the intent after anything that can
 // shift rows underneath them: every items rebuild (setItems) and the async
 // "/" filter result (Update). It also retries a pendingLand. While the visible
 // set is empty (a filter re-match in flight) it changes nothing -- selKey and
 // pendingLand survive until the result lands. While the user is TYPING a
 // filter the cursor is index-driven as bubbles/list has always done it, so
-// reconcile adopts the cursor instead of fighting it. If selKey's service is
-// gone, or has no route with selKey.id, the cursor falls back to the plain
-// clamp and selKey follows what is actually selected.
+// reconcile adopts the cursor instead of fighting it.
+//
+// selKey is STICKY intent: it changes only on user navigation, an explicit
+// programmatic select (selectPort/selectRoute/landOn), or when its SERVICE
+// vanishes from the list (nothing to return to, so the actual selection is
+// adopted). If the service is present but the intended route is transiently
+// absent (a stale snapshot, tailnetUnavailable, ...), the cursor falls back
+// to a clamped row for DISPLAY only and selKey is left alone, so the cursor
+// returns the moment the route reappears.
 func (m *model) reconcileSelection() {
 	vis := m.list.VisibleItems()
 	if len(vis) == 0 {
@@ -250,14 +256,15 @@ func (m *model) reconcileSelection() {
 			}
 			rs := pi.routes()
 			m.list.Select(i)
+			m.routeIdx = clampInt(m.routeIdx, 0, len(rs)-1) // display fallback
 			for ri, r := range rs {
 				if r.id() == m.selKey.id {
 					m.routeIdx = ri
-					m.ensureRouteVisible()
-					return
+					break
 				}
 			}
-			break // service kept, its route is gone: clamp below and adopt
+			m.ensureRouteVisible()
+			return // intent kept, found or not
 		}
 	}
 	if m.list.Index() >= len(vis) || m.list.Index() < 0 {
@@ -290,7 +297,9 @@ func (m model) hasRoute(items []list.Item, port int, id routeID) bool {
 // The landing is resolved immediately when the route already exists, else on
 // the first rebuild that brings it (reconcileSelection).
 func (m *model) landOn(port int, kind routeKind) {
-	m.syncSelKey() // no-op while the visible set is empty; selKey stays authoritative
+	if !m.selKey.set {
+		m.syncSelKey() // no intent yet: the cursor is the intent
+	}
 	if !m.selKey.set || m.selKey.port != port {
 		return
 	}

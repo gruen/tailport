@@ -268,8 +268,14 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 			if n := len(pi.routes()); m.routeIdx < 0 || m.routeIdx >= n {
 				t.Fatalf("routeIdx %d out of range [0,%d) for :%d\n%s", m.routeIdx, n, pi.port.Number, strings.Join(trace, "\n"))
 			}
-			if m.list.FilterState() != list.Filtering && (!m.selKey.set || m.selKey.port != pi.port.Number) {
-				t.Fatalf("selKey %+v disagrees with the cursor on :%d\n%s", m.selKey, pi.port.Number, strings.Join(trace, "\n"))
+			if m.list.FilterState() != list.Filtering && m.selKey.set && m.selKey.port == pi.port.Number {
+				// Intent is sticky: if its route exists in the selected service
+				// the cursor must be on it.
+				for ri, r := range pi.routes() {
+					if r.id() == m.selKey.id && ri != m.routeIdx {
+						t.Fatalf("intended route %+v is at %d but the cursor is on %d of :%d\n%s", m.selKey.id, ri, m.routeIdx, pi.port.Number, strings.Join(trace, "\n"))
+					}
+				}
 			}
 		}
 		if v := m.View(); strings.TrimSpace(v) == "" {
@@ -327,7 +333,10 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 					funnel[n] = 443
 				}
 			}
-			msg := refreshMsg{ports: ports, active: active, funnel: funnel, auto: rng.Intn(2) == 0}
+			msg := refreshMsg{ports: ports, active: active, funnel: funnel, auto: rng.Intn(2) == 0, gen: m.refreshGen - rng.Intn(2)}
+			if msg.gen < 0 {
+				msg.gen = 0
+			}
 			if rng.Intn(6) == 0 {
 				msg.statusErr = errors.New("status failed")
 			}
@@ -546,9 +555,143 @@ func TestDroppedStaleRefreshDoesNotStallCycle(t *testing.T) {
 	if len(m.allPorts) != 2 {
 		t.Fatalf("the fresh refresh should apply; allPorts=%v", m.allPorts)
 	}
-	// An unstamped (startup) refresh always applies.
-	m = mustUpdate(t, m, refreshMsg{ports: next.ports[:1], active: map[int]bool{}, funnel: map[int]int{}})
-	if len(m.allPorts) != 1 {
-		t.Fatalf("an unstamped refresh should apply; allPorts=%v", m.allPorts)
+}
+
+// The STARTUP refresh (Init stamps it with the initial generation) is just the
+// oldest refresh: a delayed one arriving after a successful toggle must be
+// dropped like any other pre-mutation snapshot, leaving the cursor and c on the
+// new route.
+func TestDelayedStartupRefreshIsDropped(t *testing.T) {
+	m := landingModel(t)
+	startupGen := 0 // what Init stamps on a fresh model
+	m.refreshGen++  // a faster manual refresh
+	m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
+	m = mustUpdate(t, m, refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: map[int]bool{}, funnel: map[int]int{}, gen: startupGen})
+	if p, k := selectedRoute(t, m); p != 3000 || k != routeTailnet {
+		t.Fatalf("cursor on (:%d, %v), want (:3000, routeTailnet)", p, k)
+	}
+	if kind, url := copiedBy(t, m); kind != routeTailnet || url != "http://dev-box:3000" {
+		t.Errorf("c copied (%v, %q), want the tailnet URL", kind, url)
+	}
+	if got := New(config.Config{}).refreshGen; got != startupGen {
+		t.Errorf("a fresh model's refreshGen = %d; Init stamps this value, test assumes %d", got, startupGen)
+	}
+}
+
+// intentCases are the routes the sticky-intent tests select, each with a way to
+// make it present and absent.
+type intentCase struct {
+	name    string
+	kind    routeKind
+	url     string
+	with    func(t *testing.T, m model) model
+	without func(t *testing.T, m model) model
+}
+
+func intentCases() []intentCase {
+	return []intentCase{
+		{
+			name: "tailnet", kind: routeTailnet, url: "http://dev-box:3000",
+			with: func(t *testing.T, m model) model {
+				return confirmRefresh(t, m, map[int]bool{3000: true}, map[int]int{})
+			},
+			without: func(t *testing.T, m model) model { return confirmRefresh(t, m, map[int]bool{}, map[int]int{}) },
+		},
+		{
+			name: "publish", kind: routePublish, url: "https://app.example.com",
+			with: func(t *testing.T, m model) model { return confirmPublishPoll(t, m, 3000, "app.example.com") },
+			without: func(t *testing.T, m model) model {
+				return mustUpdate(t, m, publishPollMsg{published: map[int]publishInfo{}, gen: m.publishPollApplied + 1})
+			},
+		},
+	}
+}
+
+// selectIntended makes tc's route present and moves the cursor onto it by
+// navigation (so it is the user's intent), returning the model.
+func selectIntended(t *testing.T, m model, tc intentCase) model {
+	t.Helper()
+	m = tc.with(t, m)
+	for i := 0; i < 8; i++ {
+		if _, k := selectedRoute(t, m); k == tc.kind {
+			return m
+		}
+		m = mustUpdate(t, m, keyMsg("j"))
+	}
+	t.Fatalf("could not navigate to %v", tc.kind)
+	return m
+}
+
+// Generic self-heal: a transient snapshot WITHOUT the intended route drops the
+// cursor to a fallback row, but the intent is kept, so the cursor returns when
+// a snapshot WITH the route arrives.
+func TestSelectionSelfHealsWhenRouteReappears(t *testing.T) {
+	for _, tc := range intentCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			m := selectIntended(t, landingModel(t), tc)
+			m = tc.without(t, m)
+			if _, k := selectedRoute(t, m); k == tc.kind {
+				t.Fatal("setup: the route should be absent")
+			}
+			m = tc.with(t, m)
+			if p, k := selectedRoute(t, m); p != 3000 || k != tc.kind {
+				t.Fatalf("cursor on (:%d, %v), want it back on %v", p, k, tc.kind)
+			}
+			if kind, url := copiedBy(t, m); kind != tc.kind || url != tc.url {
+				t.Errorf("c copied (%v, %q), want (%v, %q)", kind, url, tc.kind, tc.url)
+			}
+		})
+	}
+}
+
+// The intent survives a filter re-match window (empty VisibleItems) that also
+// contains the route's absence.
+func TestIntentSurvivesFilterRematchWindow(t *testing.T) {
+	for _, tc := range intentCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			m := selectIntended(t, landingModel(t), tc)
+			applyFilter(&m, "3000")
+			m = filterLanding(t, m)
+			m = tc.without(t, m) // rebuild: visible set empty, route absent
+			m = tc.with(t, m)    // rebuild again, route back, still empty
+			m = filterLanding(t, m)
+			if p, k := selectedRoute(t, m); p != 3000 || k != tc.kind {
+				t.Fatalf("cursor on (:%d, %v), want (:3000, %v)", p, k, tc.kind)
+			}
+		})
+	}
+}
+
+// Navigating while the route is absent changes the intent, so the cursor does
+// NOT jump back when the route reappears.
+func TestNavigationDuringAbsenceUpdatesIntent(t *testing.T) {
+	for _, tc := range intentCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			m := selectIntended(t, landingModel(t), tc)
+			m = tc.without(t, m)
+			m = mustUpdate(t, m, keyMsg("k")) // user moves on
+			p0, k0 := selectedRoute(t, m)
+			m = tc.with(t, m)
+			if p, k := selectedRoute(t, m); p != p0 || k != k0 {
+				t.Fatalf("cursor jumped back: (:%d,%v) -> (:%d,%v)", p0, k0, p, k)
+			}
+		})
+	}
+}
+
+// When the intended SERVICE vanishes there is nothing to return to: the actual
+// selection is adopted, and the service reappearing doesn't yank the cursor.
+func TestIntentAdoptsSelectionWhenServiceVanishes(t *testing.T) {
+	m := landingModel(t) // cursor on :3000
+	m = mustUpdate(t, m, refreshMsg{ports: []portscan.Port{{Number: 2000, Process: "other", BindScope: portscan.ScopeLoopback}}, active: map[int]bool{}, funnel: map[int]int{}, gen: m.refreshGen})
+	if p, _ := selectedRoute(t, m); p != 2000 {
+		t.Fatalf("cursor on :%d, want :2000", p)
+	}
+	if m.selKey.port != 2000 {
+		t.Errorf("intent = %+v, want it adopted onto :2000", m.selKey)
+	}
+	m = confirmRefresh(t, m, map[int]bool{}, map[int]int{}) // :3000 is back
+	if p, _ := selectedRoute(t, m); p != 2000 {
+		t.Errorf("cursor on :%d, want it to stay on :2000", p)
 	}
 }

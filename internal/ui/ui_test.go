@@ -2047,7 +2047,7 @@ func landingModel(t *testing.T) model {
 // what makes the new route exist (the done handlers synthesize nothing).
 func confirmRefresh(t *testing.T, m model, active map[int]bool, funnel map[int]int) model {
 	t.Helper()
-	return mustUpdate(t, m, refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: active, funnel: funnel})
+	return mustUpdate(t, m, refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: active, funnel: funnel, gen: m.refreshGen})
 }
 
 // confirmPublishPoll is the edge poll that follows a publish: it is what makes

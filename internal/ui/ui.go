@@ -550,7 +550,7 @@ type refreshMsg struct {
 	// m.allPorts and surfaces this as a quiet, persistent status-line note
 	// (m.tailnetUnavailable / statusText's suffix), never a blanking toast.
 	statusErr error
-	// gen is the issue-time stamp from refreshCmd (0 = unstamped); see
+	// gen is the issue-time stamp from refreshCmd/refreshAt; see
 	// model.refreshFloor.
 	gen int
 }
@@ -1022,11 +1022,12 @@ type model struct {
 	// refreshGen / refreshFloor version the status refreshes (serve + funnel
 	// state, kata 4hcg) the way publishPollGen/Applied version the edge polls:
 	// refreshCmd stamps each refresh with an incrementing refreshGen at ISSUE
-	// time, and a successful mutating op raises refreshFloor to the newest
-	// gen issued so far (supersedeRefreshes). The refreshMsg handler drops any
-	// stamped refresh at or below the floor: its snapshot predates the
-	// mutation and would erase the state the op just recorded. Unstamped
-	// (gen 0) refreshes -- the startup one -- always apply.
+	// time, and a successful mutating op raises refreshFloor to the first gen
+	// issued AFTER it (supersedeRefreshes). The refreshMsg handler drops any
+	// refresh below the floor: its snapshot predates the mutation and would
+	// erase the state the op just recorded. Every refresh is stamped, the
+	// startup one included (Init reads refreshGen, which starts at 0, so it is
+	// the oldest and the first to be superseded); there is no exemption.
 	refreshGen   int
 	refreshFloor int
 	// caddyClientOverride, when non-nil, replaces the client built from
@@ -1587,7 +1588,7 @@ func (m model) Init() tea.Cmd {
 	// local process-table scan, unlike the remote edge poll): tunnelStartupCmd
 	// is nil entirely -- not even the ticker -- when cloudflared is unavailable,
 	// so an uninstalled host pays nothing at all (kata aprt).
-	return tea.Batch(refresh, fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.tunnelStartupCmd(), tea.SetWindowTitle(title))
+	return tea.Batch(refreshAt(m.refreshGen, false), fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.tunnelStartupCmd(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -1740,7 +1741,12 @@ func (m *model) autoRefreshCmd() tea.Cmd { return m.stampedRefresh(true) }
 
 func (m *model) stampedRefresh(auto bool) tea.Cmd {
 	m.refreshGen++
-	gen := m.refreshGen
+	return refreshAt(m.refreshGen, auto)
+}
+
+// refreshAt is a status refresh carrying the given generation stamp. Init (a
+// value receiver, so it can't bump refreshGen) uses it with the current value.
+func refreshAt(gen int, auto bool) tea.Cmd {
 	return func() tea.Msg {
 		msg, _ := refresh().(refreshMsg)
 		msg.gen, msg.auto = gen, auto
@@ -1753,7 +1759,7 @@ func (m *model) stampedRefresh(auto bool) tea.Cmd {
 // the op must never overwrite what the op just wrote (kata 4hcg). Dropping one
 // is safe -- the handler issues a fresh refresh right after, and the periodic
 // tick reschedules itself independently of refresh results.
-func (m *model) supersedeRefreshes() { m.refreshFloor = m.refreshGen }
+func (m *model) supersedeRefreshes() { m.refreshFloor = m.refreshGen + 1 }
 
 // autoRefresh is the periodic-poll variant: same read as refresh, but its
 // result is flagged so a transient poll failure fades silently instead of
@@ -3447,7 +3453,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case refreshMsg:
-		if msg.gen != 0 && msg.gen <= m.refreshFloor {
+		if msg.gen < m.refreshFloor {
 			return m, nil // issued before a mutation that has since succeeded
 		}
 		if msg.err != nil {
