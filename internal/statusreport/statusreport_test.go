@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,7 +43,7 @@ func TestBuild(t *testing.T) {
 	active := []int{3000, 22, 5000} // 5000 is a dangling forward: active, not listening
 	funnel := map[int]int{8080: 8443}
 
-	got := Build(ports, active, funnel, nil, "host-a", "host-a.tailnet.ts.net")
+	got := Build(ports, active, funnel, nil, nil, "host-a", "host-a.tailnet.ts.net")
 
 	want := []Row{
 		{Port: 22, Process: "sshd", Mode: ModeServe, URL: "http://host-a:22"},
@@ -74,7 +76,7 @@ func TestBuild(t *testing.T) {
 // tailnet-served and funnelled reports as funnel, since that's what
 // actually governs reachability (public internet).
 func TestBuildFunnelOutranksServe(t *testing.T) {
-	got := Build(nil, []int{3000}, map[int]int{3000: 443}, nil, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, []int{3000}, map[int]int{3000: 443}, nil, nil, "host-a", "host-a.tailnet.ts.net")
 	if len(got) != 1 {
 		t.Fatalf("Build() returned %d rows, want 1; got %+v", len(got), got)
 	}
@@ -90,22 +92,22 @@ func TestBuildFunnelOutranksServe(t *testing.T) {
 // (WriteJSON depends on this to emit [] rather than null; this pins Build's
 // half of that contract).
 func TestBuildEmpty(t *testing.T) {
-	got := Build(nil, nil, nil, nil, "host-a", "")
+	got := Build(nil, nil, nil, nil, nil, "host-a", "")
 	if got == nil {
-		t.Fatal("Build(nil, nil, nil, nil, ...) = nil, want a non-nil empty slice")
+		t.Fatal("Build(nil, nil, nil, nil, nil, ...) = nil, want a non-nil empty slice")
 	}
 	if len(got) != 0 {
-		t.Errorf("Build(nil, nil, nil, nil, ...) = %+v, want empty", got)
+		t.Errorf("Build(nil, nil, nil, nil, nil, ...) = %+v, want empty", got)
 	}
 }
 
-// TestBuildPublishOnly covers the plain publish case (funnel XOR publish):
-// a port that's ONLY published (no funnel observed on it) reports a single
-// ModePublish row, with the public https://<hostname> URL (no port) and the
-// route's Auth flag carried through.
+// TestBuildPublishOnly covers the plain publish case: a port that carries
+// ONLY a publish path (no funnel, no tunnel) reports a single ModePublish
+// row, with the public https://<hostname> URL (no port) and the route's Auth
+// flag carried through.
 func TestBuildPublishOnly(t *testing.T) {
 	published := map[int]Published{3000: {Hostname: "myapp.example.com", Auth: true}}
-	got := Build(nil, []int{3000}, nil, published, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, []int{3000}, nil, published, nil, "host-a", "host-a.tailnet.ts.net")
 
 	want := []Row{
 		{Port: 3000, Process: "", Mode: ModePublish, URL: "https://myapp.example.com", Auth: true},
@@ -124,7 +126,7 @@ func TestBuildPublishOnly(t *testing.T) {
 // mirroring how funnel outranks serve for display (TestBuildFunnelOutranksServe).
 func TestBuildPublishOutranksServe(t *testing.T) {
 	published := map[int]Published{3000: {Hostname: "myapp.example.com"}}
-	got := Build(nil, []int{3000}, nil, published, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, []int{3000}, nil, published, nil, "host-a", "host-a.tailnet.ts.net")
 
 	if len(got) != 1 {
 		t.Fatalf("Build() returned %d rows, want 1; got %+v", len(got), got)
@@ -134,16 +136,15 @@ func TestBuildPublishOutranksServe(t *testing.T) {
 	}
 }
 
-// TestBuildFunnelAndPublishBothObserved covers the external-mutation drift
-// case: a port carrying BOTH a funnel and a Caddy-owned publish route (only
-// possible via exposure created outside tailport, since tailport's own UI
-// guards make the two mutually exclusive). Build must emit BOTH rows for
-// that port -- the duplicate exposure is itself the signal -- rather than
-// picking a winner, and must add no new field to encode it.
+// TestBuildFunnelAndPublishBothObserved covers a port carrying BOTH a funnel
+// and a Caddy-owned publish route -- a legitimate, expected state since kata
+// th05 relaxed the old mutual exclusion. Build must emit BOTH rows for that
+// port rather than ranking one over the other, and must add no new field to
+// encode it.
 func TestBuildFunnelAndPublishBothObserved(t *testing.T) {
 	funnel := map[int]int{3000: 443}
 	published := map[int]Published{3000: {Hostname: "myapp.example.com", Auth: true}}
-	got := Build(nil, []int{3000}, funnel, published, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, []int{3000}, funnel, published, nil, "host-a", "host-a.tailnet.ts.net")
 
 	if len(got) != 2 {
 		t.Fatalf("Build() returned %d rows for a port with both funnel and publish, want 2 (both rows); got %+v", len(got), got)
@@ -180,7 +181,7 @@ func TestBuildFunnelAndPublishBothObserved(t *testing.T) {
 // the worst dangling-forward state, so that drift must stay visible.
 func TestBuildPublishedButNotServed(t *testing.T) {
 	published := map[int]Published{9999: {Hostname: "gone.example.com"}}
-	got := Build(nil, nil, nil, published, "host-a", "host-a.tailnet.ts.net")
+	got := Build(nil, nil, nil, published, nil, "host-a", "host-a.tailnet.ts.net")
 
 	if len(got) != 1 {
 		t.Fatalf("Build() returned %d rows, want 1; got %+v", len(got), got)
@@ -367,7 +368,7 @@ func TestWriteTableEmpty(t *testing.T) {
 	var buf bytes.Buffer
 	WriteTable(&buf, nil)
 	got := buf.String()
-	if !strings.Contains(got, "No ports are currently served, funnelled, or published") {
+	if !strings.Contains(got, "No ports are currently served, funnelled, published, or tunnelled") {
 		t.Errorf("WriteTable(nil) = %q, want a no-ports-served message", got)
 	}
 	if strings.Contains(got, "MODE") {
@@ -612,4 +613,200 @@ func TestGatherPublishedDegradesOnUnreachableEdge(t *testing.T) {
 	if got != nil {
 		t.Errorf("gatherPublished() = %+v, want nil (quiet degrade) when the edge is unreachable", got)
 	}
+}
+
+// --- Cloudflare tunnel tests (kata afk4) -----------------------------------
+
+// TestBuildTunnel covers the tunnel row shapes this package must emit:
+//   - a named tunnel, whose hostname is recovered from tailport's sentinel
+//     logfile, gets its public https URL;
+//   - a quick tunnel, whose hostname cloudflared only assigns after it
+//     connects, gets the URL once known;
+//   - a quick tunnel still waiting for that assignment gets an EMPTY URL
+//     (Row.URL's doc comment: the machine-readable schema stays URL-or-empty;
+//     WriteTable supplies the pending note).
+func TestBuildTunnel(t *testing.T) {
+	cases := []struct {
+		name    string
+		tunnels map[int]Tunnel
+		port    int
+		wantURL string
+	}{
+		{"named", map[int]Tunnel{8080: {Hostname: "app.example.com"}}, 8080, "https://app.example.com"},
+		{"quick host known", map[int]Tunnel{3000: {Hostname: "fake-3000.trycloudflare.com"}}, 3000, "https://fake-3000.trycloudflare.com"},
+		{"quick host pending", map[int]Tunnel{3001: {}}, 3001, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Build(nil, nil, nil, nil, tc.tunnels, "host-a", "host-a.tailnet.ts.net")
+			if len(got) != 1 {
+				t.Fatalf("Build() returned %d rows, want 1; got %+v", len(got), got)
+			}
+			if got[0].Mode != ModeTunnel {
+				t.Errorf("Build()[0].Mode = %q, want %q", got[0].Mode, ModeTunnel)
+			}
+			if got[0].Port != tc.port {
+				t.Errorf("Build()[0].Port = %d, want %d", got[0].Port, tc.port)
+			}
+			if got[0].URL != tc.wantURL {
+				t.Errorf("Build()[0].URL = %q, want %q", got[0].URL, tc.wantURL)
+			}
+			if got[0].Auth {
+				t.Errorf("Build()[0].Auth = true, want false (auth is a publish-only concept)")
+			}
+		})
+	}
+}
+
+// TestBuildTunnelAndFunnelBothObserved pins the th05 shape: public paths
+// COEXIST, so a port carrying a funnel and a Cloudflare tunnel gets one row
+// per path (never collapsed to a single winner), exactly like the existing
+// funnel+publish case.
+func TestBuildTunnelAndFunnelBothObserved(t *testing.T) {
+	got := Build(nil, nil, map[int]int{3000: 443}, nil, map[int]Tunnel{3000: {Hostname: "fake-3000.trycloudflare.com"}}, "host-a", "host-a.tailnet.ts.net")
+	if len(got) != 2 {
+		t.Fatalf("Build() returned %d rows for a port with both funnel and tunnel, want 2 (one per public path); got %+v", len(got), got)
+	}
+	var sawFunnel, sawTunnel bool
+	for _, r := range got {
+		switch r.Mode {
+		case ModeFunnel:
+			sawFunnel = true
+			if r.URL != "https://host-a.tailnet.ts.net" {
+				t.Errorf("funnel row URL = %q, want the public funnel URL", r.URL)
+			}
+		case ModeTunnel:
+			sawTunnel = true
+			if r.URL != "https://fake-3000.trycloudflare.com" {
+				t.Errorf("tunnel row URL = %q, want https://fake-3000.trycloudflare.com", r.URL)
+			}
+		default:
+			t.Errorf("unexpected row %+v (Mode %q); want one funnel and one tunnel row", r, r.Mode)
+		}
+	}
+	if !sawFunnel || !sawTunnel {
+		t.Errorf("Build() = %+v, want one ModeFunnel row AND one ModeTunnel row", got)
+	}
+}
+
+// TestWriteJSONTunnel covers the tunnel row in the stable JSON schema: mode
+// "tunnel", the public URL, and no auth field (omitempty keeps a non-publish
+// row free of it).
+func TestWriteJSONTunnel(t *testing.T) {
+	rows := []Row{
+		{Port: 3000, Process: "python3", Mode: ModeTunnel, URL: "https://fake-3000.trycloudflare.com"},
+		{Port: 3001, Process: "", Mode: ModeTunnel, URL: ""},
+	}
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, rows); err != nil {
+		t.Fatalf("WriteJSON() error: %v", err)
+	}
+	var doc struct {
+		Ports []map[string]any `json:"ports"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("WriteJSON() output did not parse: %v; got:\n%s", err, buf.String())
+	}
+	if len(doc.Ports) != 2 {
+		t.Fatalf("JSON ports has %d entries, want 2; got:\n%s", len(doc.Ports), buf.String())
+	}
+	if got := doc.Ports[0]["mode"]; got != "tunnel" {
+		t.Errorf("ports[0].mode = %v, want \"tunnel\"", got)
+	}
+	if got := doc.Ports[0]["url"]; got != "https://fake-3000.trycloudflare.com" {
+		t.Errorf("ports[0].url = %v, want the tunnel's public URL", got)
+	}
+	if _, ok := doc.Ports[0]["auth"]; ok {
+		t.Errorf("ports[0] carries an auth field, want it omitted for a tunnel row:\n%s", buf.String())
+	}
+	// A pending hostname stays an empty URL, never prose -- the note is
+	// display-only (see pendingHostnameNote).
+	if got, ok := doc.Ports[1]["url"]; !ok || got != "" {
+		t.Errorf("ports[1].url = %v (present=%v), want \"\" for a tunnel with no hostname yet", got, ok)
+	}
+}
+
+// TestWriteTableTunnel covers the TUNNEL mode label and the pending-hostname
+// note: a known hostname renders its https URL; an unknown one renders
+// pendingHostnameNote in the URL cell instead of a blank column.
+func TestWriteTableTunnel(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.Ascii)
+
+	rows := []Row{
+		{Port: 3000, Process: "python3", Mode: ModeTunnel, URL: "https://fake-3000.trycloudflare.com"},
+		{Port: 3001, Process: "", Mode: ModeTunnel, URL: ""},
+	}
+	var buf bytes.Buffer
+	WriteTable(&buf, rows)
+	got := buf.String()
+
+	for _, want := range []string{"TUNNEL (cloudflare, public)", "3000", "python3", "https://fake-3000.trycloudflare.com", "3001", pendingHostnameNote} {
+		if !strings.Contains(got, want) {
+			t.Errorf("WriteTable() missing %q; got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "\x1b[") {
+		t.Errorf("WriteTable() under the forced Ascii profile contains ANSI escapes; got:\n%q", got)
+	}
+	if strings.Contains(strings.ToLower(got), "tunnel") && !strings.Contains(got, "TUNNEL") {
+		t.Errorf("WriteTable() renders tunnel without the upper-case TUNNEL marker; got:\n%s", got)
+	}
+	// The three public labels must stay textually distinct with color off.
+	out := stripANSI(got)
+	if !strings.Contains(out, "FUNNEL (public)") && strings.Contains(out, "TUNNEL (public)") {
+		t.Errorf("TUNNEL's label collides with FUNNEL's; got:\n%s", out)
+	}
+}
+
+// TestGatherTunnelsAbsentCloudflared pins the degrade contract from the
+// ticket: when the configured cloudflared binary doesn't exist, tunnel
+// gathering is a no-op -- nil, no rows, no panic -- so `tailport status`
+// still reports serve/funnel/publish instead of failing. Deterministic and
+// CI-safe: it points the client at a path that cannot exist rather than
+// depending on cloudflared's presence on the test box.
+func TestGatherTunnelsAbsentCloudflared(t *testing.T) {
+	cfg := config.Config{Cloudflared: config.CloudflaredConfig{Binary: "/nonexistent/cloudflared-for-afk4"}}
+	got := gatherTunnels(cfg)
+	if got != nil {
+		t.Errorf("gatherTunnels() = %+v, want nil when cloudflared is absent", got)
+	}
+}
+
+// TestReadmeDocumentsStatusTunnels pins the README claim that `tailport
+// status` reports Cloudflare tunnels (kata afk4's docs-honesty requirement):
+// the subcommand's bullet must name all four exposure paths this package can
+// emit, so a future README edit that drops one fails here rather than
+// shipping drift.
+func TestReadmeDocumentsStatusTunnels(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		// Cross-compiled/out-of-tree build: README isn't in the source tree.
+		t.Skipf("README.md not readable from %q: %v", mustCwd(t), err)
+	}
+	body := string(readme)
+	const marker = "- **`tailport status`**"
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("README has no %q subcommand bullet; the docs moved or the marker changed", marker)
+	}
+	bullet := body[start:]
+	if end := strings.Index(bullet[len(marker):], "\n- **"); end >= 0 {
+		bullet = bullet[:len(marker)+end]
+	}
+	for _, want := range []string{"serve", "funnel", "publish", "tunnel"} {
+		if !strings.Contains(strings.ToLower(bullet), want) {
+			t.Errorf("README's `tailport status` bullet does not mention %q; got:\n%s", want, bullet)
+		}
+	}
+}
+
+// mustCwd mirrors internal/ui's docs_consistency_test helper: the working
+// directory, for a useful skip message.
+func mustCwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		return "<unknown>"
+	}
+	return wd
 }

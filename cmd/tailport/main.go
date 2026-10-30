@@ -398,12 +398,12 @@ func quickstartText(configPath string, emoji bool) string {
 
 // statusGather is the data source runStatus reads from. It's a package-level
 // var -- not a hardcoded statusreport.Gather() call -- purely so tests can
-// substitute a fake without touching live tailscaled/portscan/a Caddy edge;
-// see main_test.go's TestRunStatus*. Production code never reassigns it. Its
-// type follows statusreport.Gather's signature, which now takes a
-// config.Config (kata v1z5 step 6: status needs cfg.Caddy.* to query
-// published state) -- see runStatus, which loads that config honoring
-// -c/--config.
+// substitute a fake without touching live tailscaled/portscan/a Caddy edge/
+// cloudflared; see main_test.go's TestRunStatus*. Production code never
+// reassigns it. Its type follows statusreport.Gather's signature, which now
+// takes a config.Config (kata v1z5 step 6: status needs cfg.Caddy.* to query
+// published state; kata afk4 adds cfg.Cloudflared.Binary for tunnel state) --
+// see runStatus, which loads that config honoring -c/--config.
 var statusGather = statusreport.Gather
 
 // newStatusFlagSet builds the flag.FlagSet for `tailport status`: --json,
@@ -429,9 +429,10 @@ func newStatusFlagSet() (fs *flag.FlagSet, jsonOut, noColor *bool, configPath *s
 // printStatusUsage writes `tailport status`'s help text.
 func printStatusUsage(w io.Writer) {
 	fmt.Fprintln(w, "tailport status -- headless, READ-ONLY report of ports currently exposed")
-	fmt.Fprintln(w, "via tailscale serve (tailnet), funnel (public internet), or a Caddy-edge")
-	fmt.Fprintln(w, "publish (public internet at a custom hostname). Never launches the TUI")
-	fmt.Fprintln(w, "and never mutates serve/funnel/publish state.")
+	fmt.Fprintln(w, "via tailscale serve (tailnet), funnel (public internet), a Caddy-edge")
+	fmt.Fprintln(w, "publish (public internet at a custom hostname), or a Cloudflare tunnel")
+	fmt.Fprintln(w, "(public internet at a trycloudflare.com or custom hostname). Never")
+	fmt.Fprintln(w, "launches the TUI and never mutates serve/funnel/publish/tunnel state.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  tailport status [flags]")
@@ -444,14 +445,15 @@ func printStatusUsage(w io.Writer) {
 
 // runStatus implements `tailport status [--json] [-c/--config <path>]`: kata
 // m7jc, tailport's first non-interactive mode, extended by v1z5 step 6 to
-// also report Caddy-edge publish state. It is strictly READ-ONLY (it never
-// calls tsserve.On/Off/FunnelOn/FunnelOff or caddyedge's
-// Publish/Unpublish) and reuses the exact same status functions the TUI's
+// also report Caddy-edge publish state and by kata afk4 to report Cloudflare
+// tunnel state. It is strictly READ-ONLY (it never calls
+// tsserve.On/Off/FunnelOn/FunnelOff, caddyedge's Publish/Unpublish, or
+// cftunnel's Start/Stop) and reuses the exact same status functions the TUI's
 // own refresh reads, via statusGather -- see internal/statusreport's
 // package doc for why that matters (drift prevention between the TUI and
 // this report). Loading config here (honoring -c/--config, same as every
 // other subcommand) is what lets statusGather reach cfg.Caddy.* to query the
-// edge.
+// edge and cfg.Cloudflared.Binary to find tunnel processes.
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs, jsonOut, noColor, configPath := newStatusFlagSet()
 	if err := fs.Parse(args); err != nil {

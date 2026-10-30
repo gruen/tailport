@@ -295,7 +295,10 @@ useful for finding something new to serve, label, or favorite.
   legend, printed to stdout. A first look, or a cheat sheet, without entering
   the TUI.
 - **`tailport status`** — a headless, read-only report of how each port is
-  currently exposed. Add `--json` for machine-readable output. Changes nothing.
+  currently exposed: tailnet `serve`, public `FUNNEL`, a Caddy-edge `PUBLISH`,
+  and a Cloudflare `TUNNEL` (quick or named). The three public paths are
+  independent, so a port carrying several of them gets one row per path. Add
+  `--json` for machine-readable output. Changes nothing.
 - **`tailport update`** — self-update to the latest release (sha256-verified).
   `--check` reports whether an update is available without installing it;
   `-y`/`--yes` skips the confirmation prompt; `--force` overrides its refusal to
