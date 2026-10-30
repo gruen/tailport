@@ -550,6 +550,9 @@ type refreshMsg struct {
 	// m.allPorts and surfaces this as a quiet, persistent status-line note
 	// (m.tailnetUnavailable / statusText's suffix), never a blanking toast.
 	statusErr error
+	// gen is the issue-time stamp from refreshCmd (0 = unstamped); see
+	// model.refreshFloor.
+	gen int
 }
 
 // fqdnMsg carries the node's MagicDNS name, fetched once at startup and cached
@@ -1016,6 +1019,16 @@ type model struct {
 	// bypassing the funnel/publish mutual-exclusion guards.
 	publishPollGen     int
 	publishPollApplied int
+	// refreshGen / refreshFloor version the status refreshes (serve + funnel
+	// state, kata 4hcg) the way publishPollGen/Applied version the edge polls:
+	// refreshCmd stamps each refresh with an incrementing refreshGen at ISSUE
+	// time, and a successful mutating op raises refreshFloor to the newest
+	// gen issued so far (supersedeRefreshes). The refreshMsg handler drops any
+	// stamped refresh at or below the floor: its snapshot predates the
+	// mutation and would erase the state the op just recorded. Unstamped
+	// (gen 0) refreshes -- the startup one -- always apply.
+	refreshGen   int
+	refreshFloor int
 	// caddyClientOverride, when non-nil, replaces the client built from
 	// cfg.Caddy for every edge call. Production leaves it nil (caddyClient builds
 	// AdminURL/ServerName from config); tests inject a client pointed at an
@@ -1715,6 +1728,32 @@ func refresh() tea.Msg {
 	}
 	return refreshMsg{ports: ports, active: active, funnel: funnel}
 }
+
+// refreshCmd issues a status refresh stamped with a fresh generation, so a
+// mutation that completes while it is in flight can supersede it
+// (supersedeRefreshes). Pointer receiver: the bump must persist, as with
+// pollPublishedCmd.
+func (m *model) refreshCmd() tea.Cmd { return m.stampedRefresh(false) }
+
+// autoRefreshCmd is refreshCmd's periodic-poll variant (see autoRefresh).
+func (m *model) autoRefreshCmd() tea.Cmd { return m.stampedRefresh(true) }
+
+func (m *model) stampedRefresh(auto bool) tea.Cmd {
+	m.refreshGen++
+	gen := m.refreshGen
+	return func() tea.Msg {
+		msg, _ := refresh().(refreshMsg)
+		msg.gen, msg.auto = gen, auto
+		return msg
+	}
+}
+
+// supersedeRefreshes marks every status refresh issued so far as stale. Called
+// when a mutating op succeeds and records its outcome: a snapshot taken BEFORE
+// the op must never overwrite what the op just wrote (kata 4hcg). Dropping one
+// is safe -- the handler issues a fresh refresh right after, and the periodic
+// tick reschedules itself independently of refresh results.
+func (m *model) supersedeRefreshes() { m.refreshFloor = m.refreshGen }
 
 // autoRefresh is the periodic-poll variant: same read as refresh, but its
 // result is flagged so a transient poll failure fades silently instead of
@@ -3264,7 +3303,7 @@ func (m *model) cancelPurgeFlow() tea.Cmd {
 	}
 	return tea.Batch(
 		m.setFlash(fmt.Sprintf("serve left on for :%d — t to stop", port), flashWarn),
-		rebuild, refresh,
+		rebuild, m.refreshCmd(),
 	)
 }
 
@@ -3288,7 +3327,7 @@ func (m *model) refuseConflict(port int, msg string) tea.Cmd {
 		rebuild = m.rebuildItems()
 		full = fmt.Sprintf("%s (serve left on for :%d — t to stop)", msg, port)
 	}
-	return tea.Batch(m.setErr(full), rebuild, refresh, m.pollPublishedCmd())
+	return tea.Batch(m.setErr(full), rebuild, m.refreshCmd(), m.pollPublishedCmd())
 }
 
 // purgeBlastRadiusLines renders the extra exposure a foreign purge would remove
@@ -3408,6 +3447,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case refreshMsg:
+		if msg.gen != 0 && msg.gen <= m.refreshFloor {
+			return m, nil // issued before a mutation that has since succeeded
+		}
 		if msg.err != nil {
 			if msg.auto {
 				return m, nil // periodic poll: fail silently, don't nag
@@ -3477,7 +3519,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pending != 0 || m.cleaning != 0 {
 			return m, refreshTick()
 		}
-		return m, tea.Batch(autoRefresh, refreshTick())
+		return m, tea.Batch(m.autoRefreshCmd(), refreshTick())
 
 	case eggTickMsg:
 		// Advance the animation only while the overlay is open; once closed we
@@ -3556,12 +3598,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// that would just flash the same information and vanish.
 				m.operatorNotSet = true
 				m.reconcileViewport() // a raised banner shrinks the list (roborev 2190)
-				return m, refresh
+				return m, m.refreshCmd()
 			}
 			// The error toast auto-dismisses (q89g); still refresh to reconcile
 			// state -- the toast survives a refresh now that notifications no
 			// longer live in a field the refresh clears.
-			return m, tea.Batch(m.setErr(msg.err.Error()), refresh)
+			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd())
 		}
 		// A successful serve/funnel toggle proves the operator issue, if any,
 		// is resolved -- clear the sticky banner without waiting for a "r"
@@ -3577,6 +3619,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resolves the landing immediately when the route is displayable, else
 		// on the rebuild that brings it (tailnetUnavailable hides routeTailnet),
 		// and applies the don't-yank guard: the toggle is async.
+		m.supersedeRefreshes() // an in-flight pre-toggle refresh must not undo this
 		if msg.turnOn {
 			switch msg.kind {
 			case routeTailnet:
@@ -3592,9 +3635,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			rebuild := m.rebuildItems()
 			m.landOn(msg.port, msg.kind)
-			return m, tea.Batch(rebuild, refresh)
+			return m, tea.Batch(rebuild, m.refreshCmd())
 		}
-		return m, refresh
+		return m, m.refreshCmd()
 
 	case publishDoneMsg:
 		// Mirrors toggleDoneMsg (kata v1z5): clear pending, and rather than
@@ -3657,14 +3700,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(
 					m.setErr(fmt.Sprintf("purged the old route for %s, but the take-over publish failed: %s — %s's state on the edge is now uncertain; resolve it in Caddy",
 						tookOver, publishErrText(msg.err), tookOver)),
-					armTimer, refresh, m.pollPublishedCmd())
+					armTimer, m.refreshCmd(), m.pollPublishedCmd())
 			}
 			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
 				// The auto-enable-serve step hit tailscale's operator gate --
 				// same sticky guidance banner a serve toggle would raise.
 				m.operatorNotSet = true
 				m.reconcileViewport() // a raised banner shrinks the list (roborev 2190)
-				return m, tea.Batch(refresh, m.pollPublishedCmd())
+				return m, tea.Batch(m.refreshCmd(), m.pollPublishedCmd())
 			}
 			if !msg.unpublish && errors.Is(msg.err, caddyedge.ErrHostnameConflict) {
 				// The publish collided with a hostname the shared edge already
@@ -3688,16 +3731,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pending = msg.port
 					return m, inspectConflictCmd(m.caddyClient(), msg.port, m.pendingPublish.hostname, shortLabel(m.fqdn), msg.port)
 				}
-				return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+				return m, tea.Batch(m.setErr(publishErrText(msg.err)), m.refreshCmd(), m.pollPublishedCmd())
 			}
 			// Terminal, non-conflict outcome (kata vsx4 #1): clear the carry so a
 			// stale pendingPublish from THIS attempt can't be read by some later,
 			// unrelated op.
 			m.pendingPublish = pendingPublish{}
-			return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setErr(publishErrText(msg.err)), m.refreshCmd(), m.pollPublishedCmd())
 		}
 		// A publish that auto-enabled serve proves the operator is set.
 		m.operatorNotSet = false
+		// The op succeeded and records its outcome below, so any status refresh
+		// or edge poll ISSUED before it carries a pre-mutation snapshot that
+		// would erase that outcome (kata 4hcg). Supersede them; the fresh ones
+		// this handler issues carry later generations.
+		m.supersedeRefreshes()
+		m.publishPollGen++
+		m.publishPollApplied = m.publishPollGen
 		// A successful publish means the edge accepted the route -- the domain
 		// setup (DNS + a deployed edge) is demonstrably working, so retire the
 		// sticky setup reminder (kata w131).
@@ -3738,16 +3788,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ~60s idle timeout for the restore slot armed above (nil for a foreign
 			// take-over, which arms nothing). "press d to unpublish" (71ga) teaches
 			// the de-escalation path same as the plain publish toast below.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, refresh, m.pollPublishedCmd(), land)
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("took over %s — press d to unpublish", tookOver), flashInfo), armTimer, m.refreshCmd(), m.pollPublishedCmd(), land)
 		}
 		if !msg.unpublish {
 			// A plain publish success (71ga): teach the de-escalation path --
 			// requestPublish's own key, pressed again on an already-published
 			// port, unpublishes immediately (2643, unchanged behavior). Scoped to
 			// !msg.unpublish only: an unpublish success stays silent, as before.
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), refresh, m.pollPublishedCmd(), land)
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("published %s — press d to unpublish", publishedHost), flashInfo), m.refreshCmd(), m.pollPublishedCmd(), land)
 		}
-		return m, tea.Batch(refresh, m.pollPublishedCmd())
+		return m, tea.Batch(m.refreshCmd(), m.pollPublishedCmd())
 
 	case inspectConflictMsg:
 		// The read-only classification of a hostname conflict is back (kata qfbf).
@@ -3841,7 +3891,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// ErrUnreachable / ErrConcurrentUpdate / any other: a toast, nothing
 				// half-done. The (possibly) deleted route, if any, is reflected by the
 				// re-fetch; on these errors PurgeConflict deletes nothing.
-				return m, tea.Batch(m.setErr(publishErrText(msg.err)), refresh, m.pollPublishedCmd())
+				return m, tea.Batch(m.setErr(publishErrText(msg.err)), m.refreshCmd(), m.pollPublishedCmd())
 			}
 		}
 
@@ -3903,22 +3953,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.result {
 		case restoreRestored:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored %s", msg.hostname), flashInfo), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored %s", msg.hostname), flashInfo), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreUnclaimed:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("couldn't restore %s — it's now unclaimed", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("couldn't restore %s — it's now unclaimed", msg.hostname), flashWarn), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreClaimedByOther:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("another route now claims %s — resolve the drift in Caddy", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("another route now claims %s — resolve the drift in Caddy", msg.hostname), flashWarn), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreContentMismatch:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but its config changed", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but its config changed", msg.hostname), flashWarn), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreUnverified:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but couldn't verify the final state", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("restored a route for %s but couldn't verify the final state", msg.hostname), flashWarn), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreTakeoverChanged:
 			m.clearLastPurge()
-			return m, tea.Batch(m.setFlash(fmt.Sprintf("your take-over of %s changed under you — resolve in Caddy; not restoring", msg.hostname), flashWarn), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setFlash(fmt.Sprintf("your take-over of %s changed under you — resolve in Caddy; not restoring", msg.hostname), flashWarn), m.refreshCmd(), m.pollPublishedCmd())
 		case restoreUnreachable:
 			// Retryable (design F11): KEEP the slot armed and re-arm the idle timer.
 			// No poll here — a poll could read the take-over teardown as a re-take and
@@ -3930,7 +3980,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.setFlash(fmt.Sprintf("couldn't restore %s — edge unreachable; press R to retry", msg.hostname), flashWarn), reArm)
 		default: // restoreError
 			m.clearLastPurge()
-			return m, tea.Batch(m.setErr(fmt.Sprintf("couldn't restore %s: %s", msg.hostname, publishErrText(msg.err))), refresh, m.pollPublishedCmd())
+			return m, tea.Batch(m.setErr(fmt.Sprintf("couldn't restore %s: %s", msg.hostname, publishErrText(msg.err))), m.refreshCmd(), m.pollPublishedCmd())
 		}
 
 	case lastPurgeExpireMsg:
@@ -4205,9 +4255,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case cleanupDoneMsg:
 		m.cleaning = 0
 		if msg.err != nil {
-			return m, tea.Batch(m.setErr(msg.err.Error()), refresh)
+			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd())
 		}
-		return m, refresh
+		return m, m.refreshCmd()
 
 	case flashExpireMsg:
 		// Only clear if no newer toast has replaced this one (see flashID).
@@ -4681,7 +4731,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Also re-run the proactive operator check (kata tapv): pressing r
 			// after fixing it (`sudo tailscale set --operator=...`) clears the
 			// sticky banner even without another serve attempt.
-			return m, tea.Batch(refresh, detectOperator)
+			return m, tea.Batch(m.refreshCmd(), detectOperator)
 		case "c", "y":
 			// Route-scoped copy (kata th05 P5): copy the SELECTED route sub-row's
 			// exact URL (m.routeIdx into the current service's routes) -- so

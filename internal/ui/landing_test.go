@@ -13,6 +13,7 @@ import (
 	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/tsserve"
 )
 
 // Tests for kata 4hcg's selection-by-identity redesign: the cursor is an index
@@ -448,5 +449,106 @@ func TestSelectionIdentityDistinguishesOwnedAndForeignTunnel(t *testing.T) {
 	// copy the owned row's URL.
 	if kind, url := copiedBy(t, m); url == "https://q.trycloudflare.com" {
 		t.Errorf("c copied the owned tunnel URL (%v, %q) from the foreign row", kind, url)
+	}
+}
+
+// A snapshot ISSUED before a successful mutation must never overwrite the
+// state that mutation just wrote (kata 4hcg): the stale one is dropped, the
+// cursor stays on the new route throughout, and a fresh snapshot applies.
+func TestStaleSnapshotDoesNotEraseLanding(t *testing.T) {
+	cases := []struct {
+		name string
+		kind routeKind
+		url  string
+		done tea.Msg
+	}{
+		{
+			name: "serve", kind: routeTailnet, url: "http://dev-box:3000",
+			done: toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true},
+		},
+		{
+			name: "funnel", kind: routeFunnel, url: "https://dev-box.tailnet.ts.net",
+			done: toggleDoneMsg{port: 3000, kind: routeFunnel, turnOn: true, publicPort: 443},
+		},
+		{
+			name: "publish", kind: routePublish, url: "https://app.example.com",
+			done: publishDoneMsg{port: 3000},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := landingModel(t)
+			m.pendingPublish = pendingPublish{hostname: "app.example.com", label: "dev-box", port: 3000}
+			// Snapshots issued BEFORE the mutation.
+			m.refreshGen++
+			staleRefresh := refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: map[int]bool{}, funnel: map[int]int{}, gen: m.refreshGen}
+			m.publishPollGen++
+			stalePoll := publishPollMsg{published: map[int]publishInfo{}, gen: m.publishPollGen}
+
+			m = mustUpdate(t, m, tc.done)
+			wantURL := tc.url
+			if tc.kind == routeFunnel {
+				wantURL = tsserve.PublicURL("dev-box.tailnet.ts.net", 443)
+			}
+			check := func(stage string) {
+				t.Helper()
+				if p, k := selectedRoute(t, m); p != 3000 || k != tc.kind {
+					t.Fatalf("%s: cursor on (:%d, %v), want (:3000, %v)", stage, p, k, tc.kind)
+				}
+				if kind, url := copiedBy(t, m); kind != tc.kind || url != wantURL {
+					t.Fatalf("%s: c copied (%v, %q), want (%v, %q)", stage, kind, url, tc.kind, wantURL)
+				}
+			}
+			check("after the done message")
+
+			m = mustUpdate(t, m, staleRefresh)
+			m = mustUpdate(t, m, stalePoll)
+			check("after the stale snapshots")
+
+			// Fresh snapshots, issued after the mutation, include the route.
+			fresh := refreshMsg{ports: append([]portscan.Port(nil), m.allPorts...), active: map[int]bool{3000: true}, funnel: map[int]int{}, gen: m.refreshGen}
+			pub := map[int]publishInfo{}
+			if tc.kind == routeFunnel {
+				fresh.funnel = map[int]int{3000: 443}
+			}
+			if tc.kind == routePublish {
+				pub[3000] = publishInfo{hostname: "app.example.com"}
+			}
+			m = mustUpdate(t, m, fresh)
+			m = mustUpdate(t, m, publishPollMsg{published: pub, gen: m.publishPollApplied + 1})
+			check("after the fresh snapshots")
+		})
+	}
+}
+
+// Dropping a stale refresh must not break the refresh cycle: the next refresh
+// still applies, and the periodic tick is not part of the dropped message.
+func TestDroppedStaleRefreshDoesNotStallCycle(t *testing.T) {
+	m := landingModel(t)
+	m.refreshGen++
+	stale := refreshMsg{ports: []portscan.Port{{Number: 4000, Process: "gone-by-now", BindScope: portscan.ScopeLoopback}}, active: map[int]bool{}, funnel: map[int]int{}, gen: m.refreshGen}
+	m = mustUpdate(t, m, toggleDoneMsg{port: 3000, kind: routeTailnet, turnOn: true})
+	before := len(m.allPorts)
+	m = mustUpdate(t, m, stale)
+	if len(m.allPorts) != before {
+		t.Fatal("the stale refresh should have been dropped")
+	}
+	// The periodic tick still issues a refresh (stamped after the floor)...
+	m.pending = 0
+	res, cmd := m.Update(refreshTickMsg{})
+	m = res.(model)
+	if cmd == nil || m.refreshGen <= m.refreshFloor {
+		t.Fatalf("the tick should issue a fresh refresh above the floor; gen=%d floor=%d", m.refreshGen, m.refreshFloor)
+	}
+	// ...and its result applies.
+	next := refreshMsg{ports: []portscan.Port{{Number: 3000, Process: "app", BindScope: portscan.ScopeLoopback}, {Number: 4000, Process: "new", BindScope: portscan.ScopeLoopback}}, active: map[int]bool{3000: true}, funnel: map[int]int{}, gen: m.refreshGen}
+	m = mustUpdate(t, m, next)
+	if len(m.allPorts) != 2 {
+		t.Fatalf("the fresh refresh should apply; allPorts=%v", m.allPorts)
+	}
+	// An unstamped (startup) refresh always applies.
+	m = mustUpdate(t, m, refreshMsg{ports: next.ports[:1], active: map[int]bool{}, funnel: map[int]int{}})
+	if len(m.allPorts) != 1 {
+		t.Fatalf("an unstamped refresh should apply; allPorts=%v", m.allPorts)
 	}
 }
