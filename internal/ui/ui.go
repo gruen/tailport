@@ -6752,6 +6752,18 @@ func keyLegendDescs(emoji bool) map[string]string {
 	}
 }
 
+// TunnelKeys returns the display keys that run and tear down the two Cloudflare
+// tunnel flavours -- quick and named -- read from keyMap's own Tunnel and
+// TunnelNamed bindings instead of being restated as literals. This is what keeps
+// the "still public:" reminder `tailport` prints for each surviving tunnel at
+// exit (kata wj0x) pointing at a live key: p7c5 already split the two onto
+// different letters (`o`/`O`), and any future rebind must not leave that hint
+// naming a key that no longer does anything.
+func TunnelKeys() (quick, named string) {
+	k := newKeyMap()
+	return k.Tunnel.Help().Key, k.TunnelNamed.Help().Key
+}
+
 // KeyLegendGroups returns the full keybinding legend grouped into the same four
 // sections, in the same order, as the bottom-bar grid -- Serve Toggles, Favorites,
 // View, App -- each row carrying the RICH prose (keyLegendDescs), not the terse

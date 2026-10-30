@@ -658,10 +658,15 @@ symlink, isn't owned by you, or is group- or world-writable.
 
 **Tunnels survive tailport exiting.** cloudflared is started detached, in its
 own session, so quitting the TUI doesn't drop the tunnel — it keeps running
-until you tear it down or kill it yourself. tailport never persists tunnel state
-to disk; instead it reads the OS process table live on every poll, so a tunnel
-started in a previous session is re-discovered next launch and stays
-re-toggleable — with `o` if it's quick, `O` if it's named. Only
+until you tear it down or kill it yourself. **On quit**, tailport prints a
+`still public:` line for each tunnel it still owns — the public URL (or
+`https://… (URL pending)` while a quick tunnel's hostname isn't assigned yet),
+the local port, and the key that stops it (`o` quick, `O` named) — so an
+unauthenticated quick tunnel can't quietly stay public. Nothing is printed when
+no tunnel is live, and it never asks you to confirm. tailport never persists
+tunnel state to disk; instead it reads the OS process table live on every poll,
+so a tunnel started in a previous session is re-discovered next launch and
+stays re-toggleable — with `o` if it's quick, `O` if it's named. Only
 **tailport-owned** tunnels — the ones carrying a sentinel `--logfile` flag
 tailport always passes — are tracked this way; a `cloudflared` process started
 outside tailport is left alone entirely.

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,11 +11,14 @@ import (
 	"os"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/selfupdate"
 	"github.com/gruen/tailport/internal/statusreport"
@@ -484,6 +488,123 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// liveTunnelDetect / liveTunnelDiscover / liveTunnelHealth are the data
+// sources printLiveTunnelReminders reads, package-level vars purely so tests
+// can substitute fakes without a real cloudflared binary or a running tunnel
+// -- the same injectable-var pattern statusGather uses. Production code never
+// reassigns them.
+var (
+	liveTunnelDetect = func(c *cftunnel.Client) (string, error) { return c.Detect() }
+	// liveTunnelDiscover lists cloudflared processes from the OS process table.
+	liveTunnelDiscover = func(c *cftunnel.Client) ([]cftunnel.Running, error) { return c.Discover() }
+	// liveTunnelHealth polls a tunnel's loopback metrics endpoint.
+	liveTunnelHealth = func(ctx context.Context, c *cftunnel.Client, metricsPort int) cftunnel.Health {
+		return c.Health(ctx, metricsPort)
+	}
+)
+
+// liveTunnelTimeout bounds the whole post-exit discovery (one Health poll per
+// quick tunnel, all sharing this deadline). Quitting must never hang: a wedged
+// metrics endpoint just yields "URL pending" instead of a URL.
+const liveTunnelTimeout = 2 * time.Second
+
+// liveTunnel is one still-live, tailport-OWNED public tunnel as the quit
+// reminder needs it: the local port it exposes, its flavour, and its public
+// hostname (empty when a quick tunnel hasn't been assigned one yet).
+type liveTunnel struct {
+	Port     int
+	Mode     cftunnel.Mode
+	Hostname string
+}
+
+// liveTunnelPendingURL stands in for a quick tunnel's not-yet-assigned public
+// URL. cloudflared assigns *.trycloudflare.com only once the tunnel is up, so a
+// tunnel that just started can legitimately still be public with an unknown
+// URL.
+const liveTunnelPendingURL = "https://… (URL pending)"
+
+// formatLiveTunnels renders one reminder line per still-live public tunnel,
+// sorted by local port, so quitting tailport names exactly what is still
+// reachable from the internet and which key stops it (kata wj0x). Pure, so it
+// is unit-tested directly; the key letters come from ui.TunnelKeys() (keyMap's
+// own Tunnel/TunnelNamed bindings), never literals, so a rebind can't drift
+// the hint. An empty/nil input yields no lines: quitting silently is correct
+// when nothing is public.
+func formatLiveTunnels(ts []liveTunnel) []string {
+	if len(ts) == 0 {
+		return nil
+	}
+	quickKey, namedKey := ui.TunnelKeys()
+	sorted := append([]liveTunnel(nil), ts...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Port < sorted[j].Port })
+	out := make([]string, 0, len(sorted))
+	for _, t := range sorted {
+		url := liveTunnelPendingURL
+		if t.Hostname != "" {
+			url = "https://" + t.Hostname
+		}
+		key := quickKey
+		if t.Mode == cftunnel.ModeNamed {
+			key = namedKey
+		}
+		out = append(out, fmt.Sprintf(
+			"still public: %s → :%d (cloudflare %s) — run tailport and press %s on :%d to stop it",
+			url, t.Port, t.Mode, key, t.Port))
+	}
+	return out
+}
+
+// printLiveTunnelReminders writes the post-exit reminder for every tunnel
+// tailport still owns after its TUI has closed (kata wj0x). Tunnels are
+// spawned detached and deliberately SURVIVE tailport exiting (see the
+// Cloudflare Tunnel bullet in AGENTS.md and README.md's "Tunnels survive
+// tailport exiting" paragraph), so an unauthenticated quick tunnel can
+// otherwise stay public, with no notice, indefinitely.
+//
+// It reads the process table FRESH rather than any TUI state -- the TUI is
+// gone, and the process table is the live source of truth -- and is strictly
+// best-effort and silent: cloudflared absent, a discovery error, or no owned
+// tunnels all print nothing, and nothing here ever prompts or blocks the exit
+// beyond liveTunnelTimeout.
+func printLiveTunnelReminders(cfg config.Config, stdout io.Writer) {
+	client := &cftunnel.Client{Binary: cfg.Cloudflared.Binary}
+	// Gate on cloudflared being installed at all, matching the TUI's own
+	// cfAvailable gate: an absent binary means this feature never ran, so there
+	// is nothing to remind about and no process scan to pay for.
+	if _, err := liveTunnelDetect(client); err != nil {
+		return
+	}
+	running, err := liveTunnelDiscover(client)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), liveTunnelTimeout)
+	defer cancel()
+	tunnels := make([]liveTunnel, 0, len(running))
+	for _, r := range running {
+		// Foreign tunnels are deliberately left alone everywhere in tailport;
+		// they're not ours to report, and we never signal or touch them.
+		if !r.Owned {
+			continue
+		}
+		t := liveTunnel{Port: r.Port, Mode: r.Mode}
+		if r.Mode == cftunnel.ModeNamed {
+			// A named tunnel's public hostname was bound by DNS, never passed
+			// to cloudflared; it comes back from the --logfile sentinel.
+			t.Hostname = r.Hostname
+		} else {
+			// A quick tunnel's hostname lives only in cloudflared's metrics
+			// server, and Health itself rejects anything that isn't shaped like
+			// *.trycloudflare.com.
+			t.Hostname = liveTunnelHealth(ctx, client, r.MetricsPort).Hostname
+		}
+		tunnels = append(tunnels, t)
+	}
+	for _, line := range formatLiveTunnels(tunnels) {
+		fmt.Fprintln(stdout, line)
+	}
+}
+
 // run implements tailport's entire CLI behavior, returning the process exit
 // code rather than calling os.Exit directly so it -- and every branch below
 // -- is unit-testable against plain io.Writers.
@@ -554,7 +675,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// config on the next unrelated save. ui.Run/ui.New apply the override to
 	// rendering only. See internal/ui/ui.go's New doc comment for the full
 	// reasoning.
-	if err := ui.Run(cfg, cf.markers, buildVersion()); err != nil {
+	err = ui.Run(cfg, cf.markers, buildVersion())
+	// The TUI has exited and the alt screen is gone: a tunnel spawned detached
+	// earlier is still public, so name it on the normal terminal before
+	// returning (kata wj0x). Silent when nothing is live, and never a prompt.
+	printLiveTunnelReminders(cfg, stdout)
+	if err != nil {
 		fmt.Fprintln(stderr, "tailport:", err)
 		return 1
 	}

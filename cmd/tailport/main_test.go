@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/statusreport"
 	"github.com/gruen/tailport/internal/ui"
@@ -702,5 +704,161 @@ func TestRunStatusConfigOverride(t *testing.T) {
 		if gotCfg.ResolvedPath() != cfgPath {
 			t.Errorf("run(%v): statusGather received cfg.ResolvedPath() = %q, want %q", flagArgs, gotCfg.ResolvedPath(), cfgPath)
 		}
+	}
+}
+
+// TestFormatLiveTunnels covers kata wj0x's post-exit reminder lines. The claim
+// pinned here is README.md's "Tunnels survive tailport exiting" paragraph: on
+// quit, tailport prints a `still public:` line naming the URL, local port,
+// flavour, and the per-mode key that stops it -- one line per surviving tunnel,
+// sorted by port. The key letters are taken from ui.TunnelKeys() so this test
+// never has to restate `o`/`O`, and a rebind cannot leave the hint stale.
+func TestFormatLiveTunnels(t *testing.T) {
+	quickKey, namedKey := ui.TunnelKeys()
+
+	got := formatLiveTunnels([]liveTunnel{
+		{Port: 8080, Mode: cftunnel.ModeNamed, Hostname: "web.example.com"},
+		{Port: 3000, Mode: cftunnel.ModeQuick, Hostname: "calm-fox-1234.trycloudflare.com"},
+	})
+	want := []string{
+		"still public: https://calm-fox-1234.trycloudflare.com → :3000 (cloudflare quick) — run tailport and press " + quickKey + " on :3000 to stop it",
+		"still public: https://web.example.com → :8080 (cloudflare named) — run tailport and press " + namedKey + " on :8080 to stop it",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("formatLiveTunnels returned %d lines, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d:\n got %q\nwant %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestFormatLiveTunnelsPendingURL covers a quick tunnel whose hostname
+// cloudflared hasn't assigned yet: still public, URL unknown, so the line says
+// so instead of printing a bare "https://".
+func TestFormatLiveTunnelsPendingURL(t *testing.T) {
+	quickKey, _ := ui.TunnelKeys()
+	got := formatLiveTunnels([]liveTunnel{{Port: 3000, Mode: cftunnel.ModeQuick}})
+	want := "still public: https://… (URL pending) → :3000 (cloudflare quick) — run tailport and press " + quickKey + " on :3000 to stop it"
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("formatLiveTunnels = %q, want [%q]", got, want)
+	}
+}
+
+// TestFormatLiveTunnelsEmpty covers the silent case: quitting with nothing
+// public must print nothing at all (no header, no reassurance line).
+func TestFormatLiveTunnelsEmpty(t *testing.T) {
+	for name, in := range map[string][]liveTunnel{"nil": nil, "empty": {}} {
+		if got := formatLiveTunnels(in); len(got) != 0 {
+			t.Errorf("formatLiveTunnels(%s) = %q, want no lines", name, got)
+		}
+	}
+}
+
+// TestPrintLiveTunnelReminders covers the glue between a fresh process-table
+// discovery and the printed reminder: only OWNED tunnels are reported, a named
+// tunnel's hostname comes from its sentinel, a quick tunnel's from its metrics
+// endpoint (the stub Health), foreign tunnels are skipped rather than reported,
+// and the configured cloudflared binary reaches Detect/Discover.
+func TestPrintLiveTunnelReminders(t *testing.T) {
+	stubLiveTunnelSources(t, []cftunnel.Running{
+		// Discovery order deliberately not port order: output must sort.
+		{Port: 8080, Mode: cftunnel.ModeNamed, Owned: true, Hostname: "web.example.com"},
+		{Port: 3000, Mode: cftunnel.ModeQuick, Owned: true, MetricsPort: 20941},
+		{Port: 9999, Mode: cftunnel.ModeQuick, Owned: false, MetricsPort: 20942},
+	}, func(metricsPort int) cftunnel.Health {
+		if metricsPort != 20941 {
+			t.Errorf("Health called for metrics port %d, want only the owned quick tunnel's 20941", metricsPort)
+		}
+		return cftunnel.Health{Hostname: "calm-fox-1234.trycloudflare.com"}
+	})
+
+	cfg := config.Config{Cloudflared: config.CloudflaredConfig{Binary: "/opt/fake/cloudflared"}}
+	var gotBin string
+	origDetect := liveTunnelDetect
+	t.Cleanup(func() { liveTunnelDetect = origDetect })
+	liveTunnelDetect = func(c *cftunnel.Client) (string, error) {
+		gotBin = c.Binary
+		return "2026.9.1", nil
+	}
+
+	var out bytes.Buffer
+	printLiveTunnelReminders(cfg, &out)
+	if gotBin != "/opt/fake/cloudflared" {
+		t.Errorf("Detect received Binary = %q, want the configured %q", gotBin, "/opt/fake/cloudflared")
+	}
+	quickKey, namedKey := ui.TunnelKeys()
+	want := "still public: https://calm-fox-1234.trycloudflare.com → :3000 (cloudflare quick) — run tailport and press " + quickKey + " on :3000 to stop it\n" +
+		"still public: https://web.example.com → :8080 (cloudflare named) — run tailport and press " + namedKey + " on :8080 to stop it\n"
+	if out.String() != want {
+		t.Errorf("printLiveTunnelReminders stdout =\n%q\nwant\n%q", out.String(), want)
+	}
+}
+
+// TestPrintLiveTunnelRemindersSilent covers the three ways the reminder must
+// stay quiet: cloudflared not installed (no discovery attempted at all), a
+// discovery error, and a discovery that finds no tunnels (or only foreign
+// ones). Every case: empty output, no panic, no prompt.
+func TestPrintLiveTunnelRemindersSilent(t *testing.T) {
+	t.Run("cloudflared absent", func(t *testing.T) {
+		stubLiveTunnelSources(t, nil, nil)
+		liveTunnelDiscover = func(*cftunnel.Client) ([]cftunnel.Running, error) {
+			t.Fatal("Discover must not run when Detect fails")
+			return nil, nil
+		}
+		origDetect := liveTunnelDetect
+		t.Cleanup(func() { liveTunnelDetect = origDetect })
+		liveTunnelDetect = func(*cftunnel.Client) (string, error) { return "", cftunnel.ErrNotInstalled }
+
+		var out bytes.Buffer
+		printLiveTunnelReminders(config.Config{}, &out)
+		if out.Len() != 0 {
+			t.Errorf("stdout = %q, want empty", out.String())
+		}
+	})
+
+	t.Run("discovery error", func(t *testing.T) {
+		stubLiveTunnelSources(t, nil, nil)
+		origDiscover := liveTunnelDiscover
+		t.Cleanup(func() { liveTunnelDiscover = origDiscover })
+		liveTunnelDiscover = func(*cftunnel.Client) ([]cftunnel.Running, error) {
+			return nil, errors.New("reading process table")
+		}
+
+		var out bytes.Buffer
+		printLiveTunnelReminders(config.Config{}, &out)
+		if out.Len() != 0 {
+			t.Errorf("stdout = %q, want empty", out.String())
+		}
+	})
+
+	t.Run("no owned tunnels", func(t *testing.T) {
+		stubLiveTunnelSources(t, []cftunnel.Running{
+			{Port: 9000, Mode: cftunnel.ModeQuick, Owned: false, MetricsPort: 20943},
+		}, nil)
+		var out bytes.Buffer
+		printLiveTunnelReminders(config.Config{}, &out)
+		if out.Len() != 0 {
+			t.Errorf("stdout = %q, want empty (foreign tunnels are never reported)", out.String())
+		}
+	})
+}
+
+// stubLiveTunnelSources installs a working Detect plus the given Discover
+// result and Health stub, restoring all three at cleanup.
+func stubLiveTunnelSources(t *testing.T, running []cftunnel.Running, health func(metricsPort int) cftunnel.Health) {
+	t.Helper()
+	origDetect, origDiscover, origHealth := liveTunnelDetect, liveTunnelDiscover, liveTunnelHealth
+	t.Cleanup(func() {
+		liveTunnelDetect, liveTunnelDiscover, liveTunnelHealth = origDetect, origDiscover, origHealth
+	})
+	liveTunnelDetect = func(*cftunnel.Client) (string, error) { return "2026.9.1", nil }
+	liveTunnelDiscover = func(*cftunnel.Client) ([]cftunnel.Running, error) { return running, nil }
+	liveTunnelHealth = func(_ context.Context, _ *cftunnel.Client, metricsPort int) cftunnel.Health {
+		if health == nil {
+			return cftunnel.Health{}
+		}
+		return health(metricsPort)
 	}
 }
