@@ -238,6 +238,15 @@ func (m model) bodyLinesFull() (lines []string, owners []int, headerLine, selLin
 		}
 		routes := pi.routes()
 		name, was := pi.displayName()
+		// A port that is some owned tunnel's cloudflared metrics listener is
+		// labelled in place of its process/label name (kata cn3a): the row
+		// stays otherwise normal, but nobody should mistake this loopback
+		// endpoint -- which serves /config, /debug/pprof/ and /diag/* -- for an
+		// app, or wonder why it can't be exposed. Computed from the live poll
+		// state, so the label disappears with the tunnel.
+		if tp, ok := m.metricsPortOwner(pi.port.Number); ok {
+			name, was = fmt.Sprintf("cloudflared metrics for :%d", tp), false
+		}
 		b := blockInput{
 			port:                     pi.port.Number,
 			name:                     name,

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
@@ -1039,4 +1040,158 @@ func hasKeyInGroup(groups []keyGroup, gname, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestMetricsPortLabel pins kata cn3a's list claim: a port that is some
+// tailport-owned tunnel's cloudflared metrics listener is labelled
+// "cloudflared metrics for :<tunnelPort>" in the row's name area, in place of
+// the process name, while every other row is untouched. The label is computed
+// from the live poll state (m.tunnels), so the poll that drops a stopped
+// tunnel removes it again -- the same state the refusal guards read.
+func TestMetricsPortLabel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	newModel := func(tunnels map[int]tunnelInfo) model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.host = "host"
+		m.width = 120
+		m.allPorts = []portscan.Port{
+			{Number: 18821, Process: "python3"},
+			{Number: 18822, Process: "cloudflared"},
+		}
+		m.active = map[int]bool{}
+		m.showAllPorts = true
+		m.tunnels = tunnels
+		m.rebuildItems()
+		return m
+	}
+	body := func(m model) string {
+		lines, _, _ := m.bodyLines()
+		return stripANSI(strings.Join(lines, "\n"))
+	}
+
+	m := newModel(map[int]tunnelInfo{18821: {pid: 4242, mode: cftunnel.ModeQuick, metricsPort: 18822}})
+	got := body(m)
+	if !strings.Contains(got, "cloudflared metrics for :18821") {
+		t.Errorf("body = %q, want the metrics port row labelled %q", got, "cloudflared metrics for :18821")
+	}
+	// The tunnel's own port keeps its normal process name, and the metrics
+	// port's row is not mislabelled as belonging to itself.
+	if !strings.Contains(got, "python3") {
+		t.Errorf("body = %q, want :18821 to keep its process name", got)
+	}
+	if strings.Contains(got, "cloudflared metrics for :18822") {
+		t.Errorf("body = %q, :18822 must be labelled with its OWNER's port, not itself", got)
+	}
+
+	// A tunnel with no known metrics port (metricsPort 0) never matches.
+	if got := body(newModel(map[int]tunnelInfo{18821: {pid: 4242, mode: cftunnel.ModeQuick}})); strings.Contains(got, "cloudflared metrics for") {
+		t.Errorf("body = %q, a metricsPort of 0 must not label anything", got)
+	}
+
+	// Once a poll drops the tunnel, the label goes away and the plain process
+	// name is shown again.
+	got = body(newModel(map[int]tunnelInfo{}))
+	if strings.Contains(got, "cloudflared metrics for") {
+		t.Errorf("body = %q, the label must disappear when the tunnel is gone", got)
+	}
+	if !strings.Contains(got, "cloudflared") {
+		t.Errorf("body = %q, want the plain process name back", got)
+	}
+}
+
+// TestMetricsPortExposureRefused pins kata cn3a's refusal claim: every expose
+// path -- t, p, d, e, o and O -- refuses a cloudflared metrics port with the
+// exact shared toast, starting nothing. A normal port is unaffected, and the
+// turn-OFF de-escalation branches are never blocked (an exposure that somehow
+// exists must always be tearable-down).
+func TestMetricsPortExposureRefused(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const (
+		metricsPort = 18822
+		tunnelPort  = 18821
+	)
+	want := ":18822 is cloudflared's local metrics endpoint for the :18821 tunnel — not exposable"
+	newModel := func() model {
+		m := New(config.Config{Ports: map[int]config.PortMeta{}})
+		m.cfAvailable = true
+		m.fqdn = "host.tailnet.ts.net"
+		m.tunnels = map[int]tunnelInfo{tunnelPort: {pid: 4242, mode: cftunnel.ModeQuick, metricsPort: metricsPort}}
+		return m
+	}
+
+	cases := []struct {
+		name string
+		run  func(m *model) tea.Cmd
+	}{
+		{"t serve", func(m *model) tea.Cmd { return m.requestToggle(metricsPort, true) }},
+		{"p funnel", func(m *model) tea.Cmd { return m.requestFunnel(metricsPort) }},
+		{"d publish", func(m *model) tea.Cmd { return m.requestPublish(metricsPort) }},
+		{"e edit publish", func(m *model) tea.Cmd { return m.requestEditPublish(metricsPort) }},
+		{"o quick tunnel", func(m *model) tea.Cmd { return m.requestTunnel(metricsPort) }},
+		{"O named tunnel", func(m *model) tea.Cmd { return m.requestTunnelNamed(metricsPort) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newModel()
+			if cmd := c.run(&m); cmd == nil {
+				t.Error("a refusal should still return the error-toast cmd")
+			}
+			if m.flash != want || m.flashLevel != flashError {
+				t.Errorf("flash = %q (level %v), want %q (flashError)", m.flash, m.flashLevel, want)
+			}
+			if m.pending != 0 || m.mode != entryNone {
+				t.Errorf("refusal must not start an op or open a modal: pending=%d mode=%v", m.pending, m.mode)
+			}
+		})
+	}
+
+	// A normal port is unaffected: t begins a real toggle.
+	m := newModel()
+	if cmd := m.requestToggle(18823, true); cmd == nil {
+		t.Error("t on a normal port should still return a toggle cmd")
+	}
+	if m.pending != 18823 {
+		t.Errorf("t on a normal port: pending = %d, want 18823", m.pending)
+	}
+
+	// De-escalation is ungated, even on a metrics port that somehow carries an
+	// exposure.
+	m = newModel()
+	if cmd := m.requestToggle(metricsPort, false); cmd == nil || m.pending != metricsPort {
+		t.Errorf("serve-off on a metrics port must not be blocked: cmd=%v pending=%d", cmd, m.pending)
+	}
+	m = newModel()
+	m.funnel = map[int]int{metricsPort: 443}
+	if cmd := m.requestFunnel(metricsPort); cmd == nil || m.pending != metricsPort {
+		t.Errorf("funnel-off on a metrics port must not be blocked: cmd=%v pending=%d", cmd, m.pending)
+	}
+	m = newModel()
+	m.published = map[int]publishInfo{metricsPort: {hostname: "x.example.com"}}
+	if cmd := m.requestPublish(metricsPort); cmd == nil || m.pending != metricsPort {
+		t.Errorf("unpublish on a metrics port must not be blocked: cmd=%v pending=%d", cmd, m.pending)
+	}
+}
+
+// TestTunnelMetricsPortDocumented pins kata cn3a's user-facing doc claims: the
+// README's Cloudflare section says a running tunnel's cloudflared metrics port
+// is labelled in the list and can't be exposed, and the "?" overlay /
+// `tailport quickstart` source (keyLegendDescs) says the same.
+func TestTunnelMetricsPortDocumented(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	if !strings.Contains(string(readme), "cloudflared metrics for :<port>") {
+		t.Error("README.md should document the cloudflared metrics label (cloudflared metrics for :<port>)")
+	}
+	if !strings.Contains(string(readme), "cannot be exposed") {
+		t.Error("README.md should say a cloudflared metrics port cannot be exposed")
+	}
+	desc := keyLegendDescs(false)["o"]
+	if !strings.Contains(desc, "cloudflared metrics for :<port>") {
+		t.Errorf(`the o help text should mention the cloudflared metrics label; got %q`, desc)
+	}
+	if !strings.Contains(desc, "can't be exposed") {
+		t.Errorf(`the o help text should say the metrics port can't be exposed; got %q`, desc)
+	}
 }

@@ -2392,7 +2392,9 @@ func (m *model) favorite(port int) tea.Cmd {
 
 // requestToggle begins toggling a port on/off from either entry point (the
 // t handler or the "n" add-port submit). It enforces the lock guard
-// (turning a locked port on is refused) and interposes the :22 SSH confirm:
+// (turning a locked port on is refused), refuses to EXPOSE a cloudflared
+// metrics port (kata cn3a; turn-on only -- turning off is de-escalation), and
+// interposes the :22 SSH confirm:
 // for port 22 -- in either direction, since turning serve off is what kicks
 // you off SSH -- it opens an entryConfirm22 prompt and returns a nil cmd,
 // deferring the actual toggle to the y/n handler. Every other port toggles
@@ -2400,6 +2402,13 @@ func (m *model) favorite(port int) tea.Cmd {
 func (m *model) requestToggle(port int, turnOn bool) tea.Cmd {
 	if turnOn && m.cfg.Ports[port].Locked {
 		return m.setErr(fmt.Sprintf("port :%d is locked -- press x to unlock", port))
+	}
+	// A cloudflared metrics port is never exposable (kata cn3a) -- but only
+	// on turn-ON: turning serve OFF is de-escalation and must always work.
+	if turnOn {
+		if msg, ok := m.metricsRefusal(port); ok {
+			return m.setErr(msg)
+		}
 	}
 	if port == 22 {
 		m.confirmPort = port
@@ -2440,6 +2449,11 @@ func (m *model) requestFunnel(port int) tea.Cmd {
 	// funnel no longer refuses an already-published or already-tunnelled port.
 	// The funnel escalation still gets its own y/n public-internet confirm below
 	// (entryConfirmFunnel), and :22 stays hard-blocked from every public path.
+	// A cloudflared metrics port is never exposable either (kata cn3a) -- only
+	// reached on this turn-ON path; the de-escalation branch above returned.
+	if msg, ok := m.metricsRefusal(port); ok {
+		return m.setErr(msg)
+	}
 	if port == 22 {
 		return m.setErr("refusing to funnel :22 (SSH) to the public internet")
 	}
@@ -2549,6 +2563,13 @@ func (m *model) requestPublish(port int) tea.Cmd {
 	if info, ok := m.published[port]; ok {
 		m.pending = port
 		return unpublishCmd(m.caddyClient(), info.hostname, shortLabel(m.fqdn), port)
+	}
+	// 5b. a cloudflared metrics port is never exposable (kata cn3a). Placed
+	// AFTER the unpublish branch above on purpose: de-escalation must always
+	// work, so the refusal applies only to the turn-ON paths below (fresh
+	// setup or a remembered re-publish).
+	if msg, ok := m.metricsRefusal(port); ok {
+		return m.setErr(msg)
 	}
 	// 6. locked port: publish must not bypass the `x` lock any more than serve
 	// or funnel do. Resolved BEFORE any domain handling (kata w131, ycv1 r1-#10)
@@ -2671,7 +2692,8 @@ func (m *model) republishFromMemory(port int, info publishInfo) tea.Cmd {
 // re-publish.
 //
 // Guards mirror requestPublish's non-de-escalation refuse-guards exactly
-// (busy, :22, empty fqdn, funnel mutual-exclusion, locked): edit is a publish
+// (busy, :22, cloudflared metrics port, empty fqdn, funnel mutual-exclusion,
+// locked): edit is a publish
 // variant, so it must not be able to create the dual funnel+publish exposure
 // AGENTS.md forbids just because it has no unpublish branch to fall into.
 func (m *model) requestEditPublish(port int) tea.Cmd {
@@ -2682,6 +2704,12 @@ func (m *model) requestEditPublish(port int) tea.Cmd {
 	// 2. :22 (SSH) is hard-blocked from the public internet, same as funnel.
 	if port == 22 {
 		return m.setErr("refusing to publish :22 (SSH) to the public internet")
+	}
+	// 2b. a cloudflared metrics port is never exposable (kata cn3a). `e` has no
+	// de-escalation branch (it always edits forward), so unlike `d` this guard
+	// can sit right beside the :22 one.
+	if msg, ok := m.metricsRefusal(port); ok {
+		return m.setErr(msg)
 	}
 	// 3. empty fqdn: we derive the backend dial label from this machine's
 	// MagicDNS name, so without it we can't build a route. Refuse.
@@ -6728,7 +6756,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		// moved to "d" (was "p" under vzj4).
 		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
 		"d":      "Publish the selected port to a custom public hostname (" + published + ") through\nyour own Caddy edge over the tailnet (kata v1z5). d is a TOGGLE (kata\nprp1): on an already-published port it unpublishes immediately, no\nconfirm. On a port published earlier THIS session it re-publishes\nwith that remembered hostname + auth, skipping the setup prompts —\ndirectly, no confirm, if caddy.silent_republish is set, else one more\ny/n naming the exact https://<hostname>. On a port never published\nthis session it runs the full setup: hostname + optional basic auth,\nthen the same y/n confirm; :22 refused; auto-enables serve first;\nfirst publish also prompts for caddy.hostname/domain if unset (see\ndocs/caddy-edge.md). A SECOND public path, independent of funnel and\ncloudflare — since kata th05 a port MAY carry several public routes\nat once (each shown as its own sub-row); each still confirms\nseparately. Press e to change hostname/auth without unpublishing.",
-		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nQUICK Tunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j; split\nfrom the named tunnel under kata p7c5). Only offered when cloudflared\nis installed. No Cloudflare account needed: gets a random\nhttps://<name>.trycloudflare.com URL, unauthenticated, that appears\nonce it starts. o is a TOGGLE: on a quick-tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first (:22\nrefused) -- no mode prompt any more, o ALWAYS runs quick. The tunnel\nsurvives tailport exiting. Press O to run this port's NAMED tunnel\ninstead (config.yaml-bound, its own key, shown only here and in\n`tailport quickstart` -- not the bottom bar); o never touches a named\ntunnel already running on this port, and O never touches a quick one.\nA THIRD public path, independent of funnel and publish — since kata\nth05 a port may carry all three at once (each is its own route\nsub-row and confirms separately).",
+		"o":      "Tunnel the selected port to the PUBLIC INTERNET via a Cloudflare\nQUICK Tunnel (" + tunnelled + "), run by the cloudflared binary (kata nc1j; split\nfrom the named tunnel under kata p7c5). Only offered when cloudflared\nis installed. No Cloudflare account needed: gets a random\nhttps://<name>.trycloudflare.com URL, unauthenticated, that appears\nonce it starts. o is a TOGGLE: on a quick-tunnelled port it tears the\ntunnel down immediately, no confirm; otherwise it confirms first (:22\nrefused) -- no mode prompt any more, o ALWAYS runs quick. The tunnel\nsurvives tailport exiting. Press O to run this port's NAMED tunnel\ninstead (config.yaml-bound, its own key, shown only here and in\n`tailport quickstart` -- not the bottom bar); o never touches a named\ntunnel already running on this port, and O never touches a quick one.\nA THIRD public path, independent of funnel and publish — since kata\nth05 a port may carry all three at once (each is its own route\nsub-row and confirms separately). While a tunnel runs, its cloudflared\nmetrics port is labelled in the list (cloudflared metrics for :<port>)\nand can't be exposed by t/p/d/e/o/O.",
 		"O":      "Run the NAMED Cloudflare Tunnel bound to the selected port in\nconfig.yaml (" + tunnelled + ", kata p7c5): ports.<port>.cloudflare {tunnel,\nhostname}. No prompts -- an unbound port, a missing\n`cloudflared tunnel login`, or an invalid tunnel/hostname all refuse\nwith a toast naming the fix, rather than asking for one interactively.\nNeeds a tunnel you already created (`cloudflared tunnel create`) and\nrouted a hostname to (`cloudflared tunnel route dns`) -- tailport\nnever provisions either. O is a TOGGLE: on this port's named tunnel\nit tears it down immediately, no confirm; otherwise it confirms\nfirst, naming the exact https://<hostname> and the tunnel it will\nrun (:22 refused), and pins that tunnel's ingress to exactly this\nhostname. A named tunnel serves only ONE port at a time -- a second\nport bound to the same name is refused while the first is running.\nO never touches a QUICK tunnel already running on this port; press o\nto stop that one instead. Help-only: NOT shown in the bottom bar\n(like Redo) -- only here and in `tailport quickstart`.",
 		"e":      "Edit the selected port's publish config through the Caddy edge\n(kata prp1): runs the full setup flow (prefilled with its\ncurrent/remembered hostname when known) ending in the same y/n\nconfirm d uses. On a port that's already published it changes the\nAUTH in place; changing it to a NEW hostname while still published is\nrefused (unpublish first with d, then publish at the new name) so the\nold public route is never left dangling. Same refuse-guards as d\n(busy, :22, locked); e never de-escalates.",
 		"c":      "Copy the selected port's URL to the clipboard, via OSC 52 so it\nworks even over SSH (needs a terminal that supports it; tmux: set -g\nset-clipboard on). It copies the URL for the port's current exposure: a\nPUBLISHED port's public https://<hostname>, a LAN bind's\nhttp://<lan-ip>:<port>, a localhost-only or offline port's\nhttp://localhost:<port>, otherwise the tailnet http://<host>:<port>\n(served, tailnet, funnel). The copy is confirmed inline with a ✓, or by\na toast that names the exact URL copied.",

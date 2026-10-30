@@ -687,6 +687,10 @@ Like the other public paths, Tunnel is independent and may coexist with Funnel
 and Publish on the same port, every path still requires its own per-service
 confirm, and `:22` stays hard-blocked. A tunnelled service shows its own
 `cloudflare` route row (marker `◈` / ☁️) with the exact public URL once known.
+While a tunnel is running, cloudflared's own local metrics port
+(`--metrics 127.0.0.1:<metrics-port>`) is listed as
+`cloudflared metrics for :<port>` in the All-ports view and search, and it
+cannot be exposed: `t`, `p`, `d`, `e`, `o` and `O` all refuse it.
 
 ### Two separate toggles: `o` (quick) and `O` (named)
 

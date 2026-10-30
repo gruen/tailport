@@ -347,6 +347,12 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 	if m.tunnelForeign[port] {
 		return m.setErr(fmt.Sprintf("port :%d already has a cloudflared tunnel tailport doesn't own — resolve it outside tailport first", port))
 	}
+	// 3.6. a cloudflared metrics port is never exposable (kata cn3a). Only
+	// reached on the turn-ON path: the de-escalation/cross-key branch above
+	// already returned for a port with a tunnel of ours.
+	if msg, ok := m.metricsRefusal(port); ok {
+		return m.setErr(msg)
+	}
 	// 4. :22 (SSH) is hard-blocked from the public internet, same as funnel/publish.
 	if port == 22 {
 		return m.setErr("refusing to tunnel :22 (SSH) to the public internet")
@@ -395,6 +401,11 @@ func (m *model) requestTunnelNamed(port int) tea.Cmd {
 	// 3.5. a FOREIGN cloudflared already covers this port -- same guard as `o`.
 	if m.tunnelForeign[port] {
 		return m.setErr(fmt.Sprintf("port :%d already has a cloudflared tunnel tailport doesn't own — resolve it outside tailport first", port))
+	}
+	// 3.6. a cloudflared metrics port is never exposable (kata cn3a) -- same
+	// turn-ON-only placement as `o`.
+	if msg, ok := m.metricsRefusal(port); ok {
+		return m.setErr(msg)
 	}
 	// 4. :22 (SSH) is hard-blocked from the public internet, same as `o`.
 	if port == 22 {
@@ -467,6 +478,37 @@ func (m *model) tunnelNameInUse(name string, exceptPort int) int {
 		}
 	}
 	return 0
+}
+
+// metricsPortOwner reports which tailport-owned tunnel's cloudflared metrics
+// listener is local port -- (0, false) when port isn't any of them. tailport
+// starts every tunnel with `--metrics 127.0.0.1:<random>` (kata nc1j), and
+// that loopback listener otherwise shows up in tailport's own port list like
+// any app, even though it serves /config, /debug/pprof/ and /diag/* (audit
+// finding 8). It is never something to expose, but it must stay visible --
+// the default Favorites view already hides it; this is what labels it in All
+// ports/search and lets the expose paths refuse it (kata cn3a). Read from the
+// LIVE poll state (m.tunnels), so both the label and the refusal disappear on
+// the poll that drops a stopped tunnel. metricsPort 0 (unknown, e.g. a tunnel
+// recovered without a parseable --metrics) never matches.
+func (m model) metricsPortOwner(port int) (tunnelPort int, ok bool) {
+	for tp, info := range m.tunnels {
+		if info.metricsPort != 0 && info.metricsPort == port {
+			return tp, true
+		}
+	}
+	return 0, false
+}
+
+// metricsRefusal is metricsPortOwner as a ready-to-show toast: the exact
+// wording every expose path refuses a cloudflared metrics port with (kata
+// cn3a), kept in one place so t/p/d/e/o/O can't drift.
+func (m model) metricsRefusal(port int) (string, bool) {
+	tp, ok := m.metricsPortOwner(port)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf(":%d is cloudflared's local metrics endpoint for the :%d tunnel — not exposable", port, tp), true
 }
 
 // tunnelNameRefusedMsg is the shared refusal toast for tunnelNameInUse's two
