@@ -858,7 +858,15 @@ func TestGatherTunnelsIndependentOfTailscale(t *testing.T) {
 	tunnels := func(config.Config) []Tunnel {
 		return []Tunnel{{Port: 3000, Hostname: "fake-3000.trycloudflare.com"}}
 	}
-	rows, err := gatherFrom(config.Config{}, status, tunnels)
+	// Every source is a fake (roborev 5419): the real port scanner needs ss
+	// or lsof, and tsserve.FQDN needs tailscaled -- neither is guaranteed on a
+	// clean CI runner.
+	rows, err := gatherFrom(config.Config{}, gatherSources{
+		listPorts:       func() ([]portscan.Port, error) { return []portscan.Port{{Number: 3000, Process: "node"}}, nil },
+		fqdn:            func() (string, error) { return "", errors.New("no tailscaled") },
+		tailscaleStatus: status,
+		discoverTunnels: tunnels,
+	})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("gatherFrom error = %v, want it to wrap %v", err, wantErr)
 	}

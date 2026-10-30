@@ -170,14 +170,31 @@ const tunnelHealthTimeout = 3 * time.Second
 // depends on cfg.Cloudflared.Binary; this is also why `tailport status` now
 // honors -c/--config (see cmd/tailport's newStatusFlagSet).
 func Gather(cfg config.Config) ([]Row, error) {
-	return gatherFrom(cfg, tsserve.Status, gatherTunnels)
+	return gatherFrom(cfg, gatherSources{
+		listPorts:       portscan.List,
+		fqdn:            tsserve.FQDN,
+		tailscaleStatus: tsserve.Status,
+		discoverTunnels: gatherTunnels,
+	})
 }
 
-// gatherFrom is Gather with its two live, environment-dependent reads
-// injectable -- tsserve.Status (tailscaled) and the owned-tunnel discovery
-// (cloudflared) -- so tests can exercise the tailscaled-down path
-// deterministically, without a live tailscaled or cloudflared. Production
-// calls it only through Gather with the real functions.
+// gatherSources is every live, environment-dependent read Gather makes, so
+// gatherFrom can be driven entirely by fakes in tests: the port scanner (ss /
+// lsof), the tailnet FQDN and serve status (tailscaled), and owned-tunnel
+// discovery (cloudflared). Keeping ALL of them injectable is what lets a
+// Gather test honour the clean-runner contract in .github/workflows/ci.yml --
+// no ss, lsof, tailscaled or cloudflared required (roborev 5419).
+type gatherSources struct {
+	listPorts       func() ([]portscan.Port, error)
+	fqdn            func() (string, error)
+	tailscaleStatus func() ([]int, map[int]int, error)
+	discoverTunnels func(config.Config) []Tunnel
+}
+
+// gatherFrom is Gather with every live, environment-dependent read injected
+// through src (see gatherSources), so tests can exercise the tailscaled-down
+// path deterministically, on any host. Production calls it only through
+// Gather with the real functions.
 //
 // Tunnel discovery runs INDEPENDENTLY of tailscale (roborev 5416): a
 // cloudflared tunnel tailport started is detached and stays public even when
@@ -185,18 +202,18 @@ func Gather(cfg config.Config) ([]Row, error) {
 // from reporting it. In that case gatherFrom still returns the tunnel rows
 // alongside the error; runStatus prints them to stdout and the error to
 // stderr, preserving the non-zero exit code.
-func gatherFrom(cfg config.Config, tailscaleStatus func() ([]int, map[int]int, error), discoverTunnels func(config.Config) []Tunnel) ([]Row, error) {
-	ports, err := portscan.List()
+func gatherFrom(cfg config.Config, src gatherSources) ([]Row, error) {
+	ports, err := src.listPorts()
 	if err != nil {
 		return nil, fmt.Errorf("listing local ports: %w", err)
 	}
 	// Best-effort, mirroring ui.New/fetchFQDN: an unresolved hostname or FQDN
 	// degrades the URL rather than failing the whole report.
 	host, _ := os.Hostname()
-	fqdn, _ := tsserve.FQDN()
-	tunnels := discoverTunnels(cfg)
+	fqdn, _ := src.fqdn()
+	tunnels := src.discoverTunnels(cfg)
 	published := gatherPublished(cfg, fqdn)
-	active, funnel, err := tailscaleStatus()
+	active, funnel, err := src.tailscaleStatus()
 	if err != nil {
 		// Tailscale state is unavailable, but the tunnels (and any published
 		// rows the edge still knows about) are real exposures right now.
