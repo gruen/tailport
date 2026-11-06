@@ -27,7 +27,7 @@ on:
 jobs:
   brew:
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci brew]') }}
-    runs-on: macos-14 # Apple Silicon -- the arch the tap primarily serves
+    runs-on: macos-15 # Apple Silicon -- the arch the tap primarily serves (macos-14 retired 2026-11, kata hzwa)
     steps:
       - uses: actions/checkout@v5
 

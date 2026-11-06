@@ -17,7 +17,7 @@ on:
 jobs:
   darwin:
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci darwin]') }}
-    runs-on: macos-14 # Apple Silicon / arm64 -- matches the darwin/arm64 fleet target
+    runs-on: macos-15 # Apple Silicon / arm64 -- matches the darwin/arm64 fleet target (macos-14 retired 2026-11, kata hzwa)
     steps:
       - uses: actions/checkout@v5
 
