@@ -191,3 +191,54 @@ func TestSplitZone(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyBindDeviceRestriction pins classifyBind's device rule (kata
+// np07, roborev 6053): a "%iface" suffix restricts the socket to that device,
+// so the DEVICE -- not the address -- decides reachability. In particular a
+// zoned wildcard is NOT a wildcard: "0.0.0.0%eth0" accepts nothing on
+// loopback or tailscale0, so it must never yield localhost/tailnet routes or
+// clear No127.
+func TestClassifyBindDeviceRestriction(t *testing.T) {
+	orig := ifaceAddr
+	ifaceAddr = func(name string) string {
+		if name == "eth0" {
+			return "192.168.1.50"
+		}
+		return ""
+	}
+	t.Cleanup(func() { ifaceAddr = orig })
+
+	tests := []struct {
+		in       string
+		bare     string
+		zoned    bool
+		scope    BindScope
+		bindHost string
+		ok127    bool
+	}{
+		// unzoned: unchanged behavior
+		{"0.0.0.0", "0.0.0.0", false, ScopeWildcard, "0.0.0.0", true},
+		{"127.0.0.1", "127.0.0.1", false, ScopeLoopback, "127.0.0.1", true},
+		// loopback device
+		{"127.0.0.53%lo", "127.0.0.53", true, ScopeLoopback, "127.0.0.53", false},
+		{"0.0.0.0%lo", "0.0.0.0", true, ScopeLoopback, "0.0.0.0", true},
+		{"127.0.0.1%lo0", "127.0.0.1", true, ScopeLoopback, "127.0.0.1", true},
+		// tailscale device
+		{"100.110.98.29%tailscale0", "100.110.98.29", true, ScopeTailnet, "100.110.98.29", false},
+		{"0.0.0.0%tailscale0", "0.0.0.0", true, ScopeTailnet, "", false},
+		// any other device: that LAN interface only
+		{"0.0.0.0%eth0", "0.0.0.0", true, ScopeLAN, "192.168.1.50", false},
+		{"*%eth0", "*", true, ScopeLAN, "192.168.1.50", false},
+		{"0.0.0.0%wlan9", "0.0.0.0", true, ScopeLAN, "", false}, // no address on it
+		{"192.168.1.5%eth0", "192.168.1.5", true, ScopeLAN, "192.168.1.5", false},
+		{"127.0.0.1%eth0", "127.0.0.1", true, ScopeLAN, "", false}, // loopback addr on a non-loopback device: unreachable
+		{"fe80::1%eth0", "fe80::1", true, ScopeLAN, "fe80::1%eth0", false},
+	}
+	for _, tt := range tests {
+		bare, zoned, scope, bindHost, ok127 := classifyBind(tt.in)
+		if bare != tt.bare || zoned != tt.zoned || scope != tt.scope || bindHost != tt.bindHost || ok127 != tt.ok127 {
+			t.Errorf("classifyBind(%q) = (%q, %v, %v, %q, %v), want (%q, %v, %v, %q, %v)",
+				tt.in, bare, zoned, scope, bindHost, ok127, tt.bare, tt.zoned, tt.scope, tt.bindHost, tt.ok127)
+		}
+	}
+}

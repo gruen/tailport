@@ -172,8 +172,10 @@ LISTEN 0      128            127.0.0.1:631           0.0.0.0:*    users:(("cupsd
 // "addr%iface:port". The zone must be split off BEFORE classification, so a
 // device-bound tailnet socket classifies ScopeTailnet with a bare BindHost
 // (no bogus LAN route), while an IPv6 link-local socket keeps its zone in
-// BindHost because the address is undialable without it. A ZONELESS tailnet
-// row is still tailscaled's own and must stay filtered.
+// BindHost because the address is undialable without it. Tailnet rows are
+// split by OWNERSHIP: zoneless, ownerless, or tailscaled-owned rows are
+// tailscaled's serve proxy and stay filtered (79xb); a zoned row owned by an
+// app is that app's own tailnet bind.
 func TestParseSSDeviceZone(t *testing.T) {
 	const fixture = `LISTEN 0      511 100.110.98.29%tailscale0:5173      0.0.0.0:*    users:(("node",pid=449406,fd=20))
 LISTEN 0      128              [fe80::1%eth0]:8080           [::]:*    users:(("app",pid=1234,fd=3))
@@ -181,6 +183,9 @@ LISTEN 0      128              [fe80::1]%eth0:9090           [::]:*    users:(("
 LISTEN 0      128          127.0.0.1:5174          0.0.0.0:*    users:(("mixed",pid=2000,fd=4))
 LISTEN 0      4096 100.110.98.29%tailscale0:5174      0.0.0.0:*    users:(("mixed",pid=2000,fd=5))
 LISTEN 0      4096       100.101.102.103:8808      0.0.0.0:*    users:(("tailscaled",pid=50,fd=9))
+LISTEN 0      511          127.0.0.1:5180          0.0.0.0:*    users:(("chorse-fe",pid=449406,fd=20))
+LISTEN 0      4096 100.110.98.29%tailscale0:5180      0.0.0.0:*
+LISTEN 0      4096 100.110.98.29%tailscale0:5181      0.0.0.0:*    users:(("tailscaled",pid=50,fd=11))
 `
 	ports, err := parseSS([]byte(fixture))
 	if err != nil {
@@ -191,9 +196,9 @@ LISTEN 0      4096       100.101.102.103:8808      0.0.0.0:*    users:(("tailsca
 		byPort[p.Number] = p
 	}
 
-	// The moth :5173 case: a dev server pinned to tailscale0 is a real app
-	// (zoned), so it is NOT filtered as tailscaled -- it classifies Tailnet
-	// with the bare address.
+	// An app that pinned itself to tailscale0 (zoned, owned by "node") is
+	// NOT filtered as tailscaled -- it classifies Tailnet with the bare
+	// address.
 	if p, ok := byPort[5173]; !ok {
 		t.Errorf("device-bound tailnet :5173 should be kept; got %+v", ports)
 	} else if p.BindScope != ScopeTailnet || p.BindHost != "100.110.98.29" || p.No127 != true {
@@ -228,6 +233,44 @@ LISTEN 0      4096       100.101.102.103:8808      0.0.0.0:*    users:(("tailsca
 	// A zoneless tailnet row is still tailscaled's own: filtered (79xb).
 	if _, ok := byPort[8808]; ok {
 		t.Errorf("zoneless tailnet-only :8808 should still be filtered; got %+v", ports)
+	}
+
+	// The likelier reading of the owner's moth report: a newer tailscaled
+	// binds its SERVE proxy to the tailscale0 device, and an unprivileged ss
+	// shows no owning process for it (tailscaled runs as root). That zoned
+	// row must be skipped like tailscaled's zoneless one, leaving just the
+	// app's loopback bind -- so a served port still reads as loopback-bound
+	// (t keeps offering to unserve it), never as the app's own tailnet bind.
+	if p, ok := byPort[5180]; !ok {
+		t.Errorf(":5180 (app on loopback) should be present; got %+v", ports)
+	} else if p.BindScope != ScopeLoopback || p.BindHost != "127.0.0.1" || p.Process != "chorse-fe" {
+		t.Errorf(":5180 = %+v, want BindScope=loopback BindHost=127.0.0.1 Process=chorse-fe (the ownerless zoned tailnet row skipped)", p)
+	}
+	// ...and the same zoned row attributed to tailscaled (ss run as root).
+	if _, ok := byPort[5181]; ok {
+		t.Errorf("zoned tailnet row owned by tailscaled (:5181) should be filtered; got %+v", ports)
+	}
+}
+
+// TestParseSSZonedWildcard pins roborev 6053 through the real parser: a
+// wildcard restricted to a LAN device ("0.0.0.0%eth0") aggregates to a LAN
+// bind on that interface's address -- never ScopeWildcard, never Loopback, and
+// No127 stays true -- so the ui can't advertise localhost/tailnet routes or
+// mark a serve route healthy for a socket that can't receive them.
+func TestParseSSZonedWildcard(t *testing.T) {
+	orig := ifaceAddr
+	ifaceAddr = func(string) string { return "192.168.1.50" }
+	t.Cleanup(func() { ifaceAddr = orig })
+
+	const fixture = `LISTEN 0      511       0.0.0.0%eth0:8080        0.0.0.0:*    users:(("app",pid=77,fd=3))
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil || len(ports) != 1 {
+		t.Fatalf("parseSS = %+v, %v; want one port", ports, err)
+	}
+	p := ports[0]
+	if p.BindScope != ScopeLAN || p.BindHost != "192.168.1.50" || p.Loopback || !p.No127 {
+		t.Errorf(":8080 = %+v, want BindScope=lan BindHost=192.168.1.50 Loopback=false No127=true", p)
 	}
 }
 

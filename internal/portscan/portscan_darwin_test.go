@@ -191,6 +191,7 @@ func TestParseLsofDeviceZone(t *testing.T) {
 	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 node        501   mg   23u  IPv4 0x2222222222222222      0t0  TCP 100.110.98.29%tailscale0:5173 (LISTEN)
 app        600   mg   24u  IPv6 0x3333333333333333      0t0  TCP [fe80::1%en0]:8080 (LISTEN)
+tailscaled   50 root   11u  IPv4 0x4444444444444444      0t0  TCP 100.110.98.29%tailscale0:5181 (LISTEN)
 `
 	ports, err := parseLsof([]byte(fixture))
 	if err != nil {
@@ -205,6 +206,11 @@ app        600   mg   24u  IPv6 0x3333333333333333      0t0  TCP [fe80::1%en0]:8
 		t.Errorf("device-bound tailnet :5173 should be kept; got %+v", ports)
 	} else if p.BindScope != ScopeTailnet || p.BindHost != "100.110.98.29" {
 		t.Errorf(":5173 = %+v, want BindScope=tailnet BindHost=100.110.98.29", p)
+	}
+	// tailscaled's own zoned serve-proxy listener is skipped, exactly like
+	// its zoneless one (79xb) -- same ownership rule as the Linux parser.
+	if _, ok := got[5181]; ok {
+		t.Errorf("tailscaled-owned zoned tailnet :5181 should be filtered; got %+v", ports)
 	}
 	if p, ok := got[8080]; !ok {
 		t.Errorf("link-local :8080 should be kept; got %+v", ports)

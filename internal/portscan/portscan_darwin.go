@@ -87,26 +87,23 @@ func parseLsof(out []byte) ([]Port, error) {
 		// whether macOS lsof ever emits a zone is unverified here, but if it
 		// does, leaving it in place would make net.ParseIP fail and resurrect
 		// the bogus LAN row this ticket removed. So split it identically, and
-		// a zoned tailnet bind is an app pinned to the device, not tailscaled.
+		// apply the same ownership rule: a zoned tailnet row owned by
+		// tailscaled is its serve proxy and is skipped; one owned by any other
+		// process is that app's own tailnet bind and is kept.
 		//
 		// Known limitation (79xb): an app that binds the node's tailnet IP
 		// *directly* -- WITHOUT a device zone -- is indistinguishable from
 		// tailscaled's own listener here and so is dropped/classified-away as
 		// tailscaled. Accepted for now; revisit only if it bites.
 		rawHost := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
-		host, zone := splitZone(rawHost)
-		bindHost := host
-		if zone != "" {
-			bindHost = host + "%" + zone
-		}
-		if isTailscaleAddr(host) && rawHost == host {
+		host, zoned, scope, bindHost, ok127 := classifyBind(rawHost)
+		if isTailscaleAddr(host) && (!zoned || proc == "" || proc == "tailscaled") {
 			continue
 		}
-		scope := classifyBindScope(host)
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !accepts127(host)}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !ok127}
 			order = append(order, port)
 			continue
 		}
@@ -117,7 +114,7 @@ func parseLsof(out []byte) ([]Port, error) {
 		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
 			p.Loopback = true
 		}
-		if accepts127(host) { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
+		if ok127 { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
 			p.No127 = false
 		}
 		if p.Process == "" { // keep the first non-empty process name, paired with its pid

@@ -68,16 +68,12 @@ func parseSS(out []byte) ([]Port, error) {
 		if !ok {
 			continue
 		}
-		// Strip the "%iface" zone before anything looks at the address: a
-		// zoned tailnet bind is an APP that pinned itself to the interface
-		// (SO_BINDTODEVICE), not tailscaled, so only a ZONELESS tailnet bind
-		// is filtered as tailscaled's own (kata np07). BindHost gets the zone
-		// back only where it is semantically required (IPv6 link-local).
-		bare, zone := splitZone(host)
-		bindHost := bare
-		if zone != "" {
-			bindHost = bare + "%" + zone
-		}
+		// Strip the "%iface" zone before anything looks at the address (kata
+		// np07): with it attached, the address doesn't parse, so a tailnet
+		// listener fell through to ScopeLAN and rendered a bogus LAN route
+		// like "http://100.110.98.29%tailscale0:5173". classifyBind applies the
+		// device restriction (see its doc comment).
+		bare, zoned, scope, bindHost, ok127 := classifyBind(host)
 		// Skip tailscaled's own serve-proxy sockets (bound to a tailnet
 		// address) BEFORE aggregation, so that a real app socket sharing the
 		// port (e.g. 127.0.0.1:8808 alongside 100.x:8808) still registers the
@@ -90,11 +86,16 @@ func parseSS(out []byte) ([]Port, error) {
 		// *directly* -- WITHOUT a device zone -- is indistinguishable from
 		// tailscaled's own listener here and so is dropped/classified-away as
 		// tailscaled. Accepted for now; revisit only if it bites.
-		if isTailscaleAddr(bare) && host == bare {
-			continue
-		}
-		scope := classifyBindScope(bare)
-
+		//
+		// A DEVICE-ZONED tailnet listener ("100.x%tailscale0") is ambiguous
+		// (kata np07): newer tailscaled binds its serve proxy to the
+		// tailscale0 device, but an app can also pin itself there with
+		// SO_BINDTODEVICE. Ownership tells them apart: tailscaled runs as
+		// root, so an unprivileged `ss` shows NO owning process for its
+		// sockets (or "tailscaled" when run as root), while an app run by the
+		// user shows its own. Zoned rows with no process or tailscaled are
+		// skipped exactly like the zoneless case; a zoned row owned by some
+		// other process is the app's own tailnet bind and is kept.
 		proc := ""
 		pid := 0
 		if len(fields) > 5 {
@@ -106,10 +107,13 @@ func parseSS(out []byte) ([]Port, error) {
 				}
 			}
 		}
+		if isTailscaleAddr(bare) && (!zoned || proc == "" || proc == "tailscaled") {
+			continue
+		}
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !accepts127(bare)}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !ok127}
 			order = append(order, port)
 			continue
 		}
@@ -120,7 +124,7 @@ func parseSS(out []byte) ([]Port, error) {
 		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
 			p.Loopback = true
 		}
-		if accepts127(bare) { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
+		if ok127 { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
 			p.No127 = false
 		}
 		if p.Process == "" { // keep the first non-empty process name, paired with its pid

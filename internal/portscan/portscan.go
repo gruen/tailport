@@ -122,6 +122,84 @@ func splitZone(host string) (bare, zone string) {
 	return bare, zone
 }
 
+// classifyBind classifies one listener's bind address exactly as a scanner
+// printed it, device zone included (kata np07). Both parsers use it, so the
+// rules below can't drift between Linux (ss) and macOS (lsof).
+//
+// A "%iface" suffix means the socket is restricted to that network device
+// (SO_BINDTODEVICE, or an IPv6 link-local scope), and the DEVICE then governs
+// reachability, not the address -- so a zoned wildcard is NOT a wildcard
+// (roborev 6053):
+//
+//   - "%lo"/"%lo0": loopback only.
+//   - "%tailscale0": tailnet only (no 127.0.0.1, no LAN).
+//   - any other device: that LAN interface only. A link-local IPv6 address
+//     keeps its zone in bindHost (undialable without it); a wildcard resolves
+//     to the interface's own address via ifaceAddr so its LAN URL is real; a
+//     loopback address pinned to a non-loopback device can receive nothing,
+//     so it gets no dialable host at all.
+//
+// bare is the address with any zone removed (what isTailscaleAddr and the
+// 79xb ownership rule look at); zoned reports whether a zone was present;
+// ok127 is whether a dial to 127.0.0.1:PORT lands on this socket (No127).
+func classifyBind(host string) (bare string, zoned bool, scope BindScope, bindHost string, ok127 bool) {
+	i := strings.LastIndexByte(host, '%')
+	if i < 0 || i == len(host)-1 {
+		bare = strings.TrimSuffix(host, "%")
+		return bare, false, classifyBindScope(bare), bare, accepts127(bare)
+	}
+	bare, zone := host[:i], host[i+1:]
+	ip := net.ParseIP(bare)
+	unspecified := bare == "*" || (ip != nil && ip.IsUnspecified())
+	switch {
+	case zone == "lo" || zone == "lo0":
+		return bare, true, ScopeLoopback, bare, accepts127(bare)
+	case ip != nil && ip.IsLoopback():
+		return bare, true, ScopeLAN, "", false
+	case zone == "tailscale0":
+		h := bare
+		if unspecified {
+			h = ""
+		}
+		return bare, true, ScopeTailnet, h, false
+	case ip != nil && ip.To4() == nil && ip.IsLinkLocalUnicast():
+		return bare, true, ScopeLAN, bare + "%" + zone, false
+	case unspecified:
+		return bare, true, ScopeLAN, ifaceAddr(zone), false
+	default:
+		return bare, true, ScopeLAN, bare, false
+	}
+}
+
+// ifaceAddr resolves a network device name to a dialable address on it (its
+// first IPv4, else its first global IPv6), or "" if it has none. It's a
+// package var so parser tests stay hermetic -- a fixture names devices this
+// machine may not have.
+var ifaceAddr = func(name string) string {
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		return ""
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return ""
+	}
+	v6 := ""
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if v4 := ipn.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+		if v6 == "" && ipn.IP.IsGlobalUnicast() {
+			v6 = ipn.IP.String()
+		}
+	}
+	return v6
+}
+
 // BindScope classifies how far a listening socket's bind address reaches. It
 // captures the correctness insight behind 79xb: reachability is a property of
 // the BIND, not of `tailscale serve`. A wildcard-bound socket is already
