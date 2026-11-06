@@ -165,17 +165,30 @@ func classifyBind(host string) (bare string, zoned bool, scope BindScope, bindHo
 	case ip != nil && ip.To4() == nil && ip.IsLinkLocalUnicast():
 		return bare, true, ScopeLAN, bare + "%" + zone, false
 	case unspecified:
-		return bare, true, ScopeLAN, ifaceAddr(zone), false
+		// Match the listener's address family (roborev 6054): "0.0.0.0" is
+		// IPv4-only, "::" (ss prints a V6ONLY wildcard as "[::]") is
+		// IPv6-only, and ss's "*" is dual-stack, so either family dials it.
+		fam := 0
+		switch {
+		case bare == "*":
+		case ip.To4() != nil:
+			fam = 4
+		default:
+			fam = 6
+		}
+		return bare, true, ScopeLAN, ifaceAddr(zone, fam), false
 	default:
 		return bare, true, ScopeLAN, bare, false
 	}
 }
 
-// ifaceAddr resolves a network device name to a dialable address on it (its
-// first IPv4, else its first global IPv6), or "" if it has none. It's a
-// package var so parser tests stay hermetic -- a fixture names devices this
-// machine may not have.
-var ifaceAddr = func(name string) string {
+// ifaceAddr resolves a network device name to a dialable address on it, in
+// the listener's address family: fam 4 = its first IPv4, 6 = its first global
+// IPv6, 0 (dual-stack) = IPv4 if it has one, else IPv6. "" when it has no
+// address of a usable family -- never an address the socket can't receive on.
+// It's a package var so parser tests stay hermetic -- a fixture names devices
+// this machine may not have.
+var ifaceAddr = func(name string, fam int) string {
 	ifi, err := net.InterfaceByName(name)
 	if err != nil {
 		return ""
@@ -184,18 +197,28 @@ var ifaceAddr = func(name string) string {
 	if err != nil {
 		return ""
 	}
-	v6 := ""
+	v4, v6 := "", ""
 	for _, a := range addrs {
 		ipn, ok := a.(*net.IPNet)
 		if !ok {
 			continue
 		}
-		if v4 := ipn.IP.To4(); v4 != nil {
-			return v4.String()
-		}
-		if v6 == "" && ipn.IP.IsGlobalUnicast() {
+		if ip4 := ipn.IP.To4(); ip4 != nil {
+			if v4 == "" {
+				v4 = ip4.String()
+			}
+		} else if v6 == "" && ipn.IP.IsGlobalUnicast() {
 			v6 = ipn.IP.String()
 		}
+	}
+	switch fam {
+	case 4:
+		return v4
+	case 6:
+		return v6
+	}
+	if v4 != "" {
+		return v4
 	}
 	return v6
 }

@@ -95,7 +95,12 @@ func parseSS(out []byte) ([]Port, error) {
 		// sockets (or "tailscaled" when run as root), while an app run by the
 		// user shows its own. Zoned rows with no process or tailscaled are
 		// skipped exactly like the zoneless case; a zoned row owned by some
-		// other process is the app's own tailnet bind and is kept.
+		// other process is the app's own tailnet bind and is kept. The same
+		// 79xb limitation therefore extends to an app run by ANOTHER user
+		// (e.g. root) pinned to tailscale0: ss can't attribute it either, so
+		// it is treated as tailscaled's. Telling those apart needs the serve
+		// state (an unattributed tailnet listener on a port that isn't served
+		// can't be tailscaled's) -- tracked as kata nvv6.
 		proc := ""
 		pid := 0
 		if len(fields) > 5 {

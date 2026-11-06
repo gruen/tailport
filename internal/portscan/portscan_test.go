@@ -200,11 +200,20 @@ func TestSplitZone(t *testing.T) {
 // clear No127.
 func TestClassifyBindDeviceRestriction(t *testing.T) {
 	orig := ifaceAddr
-	ifaceAddr = func(name string) string {
-		if name == "eth0" {
-			return "192.168.1.50"
+	// eth0 is dual-stack; v4only has no IPv6; v6only has no IPv4.
+	ifaceAddr = func(name string, fam int) string {
+		v4 := map[string]string{"eth0": "192.168.1.50", "v4only": "10.0.0.7"}[name]
+		v6 := map[string]string{"eth0": "2001:db8::50", "v6only": "2001:db8::9"}[name]
+		switch fam {
+		case 4:
+			return v4
+		case 6:
+			return v6
 		}
-		return ""
+		if v4 != "" {
+			return v4
+		}
+		return v6
 	}
 	t.Cleanup(func() { ifaceAddr = orig })
 
@@ -233,6 +242,11 @@ func TestClassifyBindDeviceRestriction(t *testing.T) {
 		{"192.168.1.5%eth0", "192.168.1.5", true, ScopeLAN, "192.168.1.5", false},
 		{"127.0.0.1%eth0", "127.0.0.1", true, ScopeLAN, "", false}, // loopback addr on a non-loopback device: unreachable
 		{"fe80::1%eth0", "fe80::1", true, ScopeLAN, "fe80::1%eth0", false},
+		// address family must match the listener (roborev 6054)
+		{"::%eth0", "::", true, ScopeLAN, "2001:db8::50", false}, // IPv6-only wildcard on a dual-stack iface
+		{"0.0.0.0%v6only", "0.0.0.0", true, ScopeLAN, "", false}, // IPv4 wildcard, iface has no IPv4
+		{"::%v4only", "::", true, ScopeLAN, "", false},           // IPv6 wildcard, iface has no IPv6
+		{"*%v6only", "*", true, ScopeLAN, "2001:db8::9", false},  // dual-stack wildcard falls back to IPv6
 	}
 	for _, tt := range tests {
 		bare, zoned, scope, bindHost, ok127 := classifyBind(tt.in)

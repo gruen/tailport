@@ -259,7 +259,7 @@ LISTEN 0      4096 100.110.98.29%tailscale0:5181      0.0.0.0:*    users:(("tail
 // mark a serve route healthy for a socket that can't receive them.
 func TestParseSSZonedWildcard(t *testing.T) {
 	orig := ifaceAddr
-	ifaceAddr = func(string) string { return "192.168.1.50" }
+	ifaceAddr = func(string, int) string { return "192.168.1.50" }
 	t.Cleanup(func() { ifaceAddr = orig })
 
 	const fixture = `LISTEN 0      511       0.0.0.0%eth0:8080        0.0.0.0:*    users:(("app",pid=77,fd=3))
