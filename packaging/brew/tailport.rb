@@ -1,8 +1,8 @@
 class Tailport < Formula
   desc "TUI to share local ports on your tailnet or publicly (Funnel, Caddy, Cloudflare)"
   homepage "https://github.com/gruen/tailport"
-  url "https://github.com/gruen/tailport/archive/refs/tags/v0.3.4.tar.gz"
-  sha256 "27c6995807970bb89aac83e1fbf72df48d527cd71d51ec43ecc660434314dd7f"
+  url "https://github.com/gruen/tailport/archive/refs/tags/v0.3.5.tar.gz"
+  sha256 "5208a3e4bd0aed022cdae119ba9c86953057105669eb29cadd998a9c34f0a464"
   license "MIT"
   head "https://github.com/gruen/tailport.git", branch: "main"
 
