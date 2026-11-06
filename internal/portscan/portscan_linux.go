@@ -68,6 +68,16 @@ func parseSS(out []byte) ([]Port, error) {
 		if !ok {
 			continue
 		}
+		// Strip the "%iface" zone before anything looks at the address: a
+		// zoned tailnet bind is an APP that pinned itself to the interface
+		// (SO_BINDTODEVICE), not tailscaled, so only a ZONELESS tailnet bind
+		// is filtered as tailscaled's own (kata np07). BindHost gets the zone
+		// back only where it is semantically required (IPv6 link-local).
+		bare, zone := splitZone(host)
+		bindHost := bare
+		if zone != "" {
+			bindHost = bare + "%" + zone
+		}
 		// Skip tailscaled's own serve-proxy sockets (bound to a tailnet
 		// address) BEFORE aggregation, so that a real app socket sharing the
 		// port (e.g. 127.0.0.1:8808 alongside 100.x:8808) still registers the
@@ -77,13 +87,13 @@ func parseSS(out []byte) ([]Port, error) {
 		// dangling-forward detection depends on this).
 		//
 		// Known limitation (79xb): an app that binds the node's tailnet IP
-		// *directly* is indistinguishable from tailscaled's own listener here
-		// and so is dropped/classified-away as tailscaled. Accepted for now;
-		// revisit only if it bites.
-		if isTailscaleAddr(host) {
+		// *directly* -- WITHOUT a device zone -- is indistinguishable from
+		// tailscaled's own listener here and so is dropped/classified-away as
+		// tailscaled. Accepted for now; revisit only if it bites.
+		if isTailscaleAddr(bare) && host == bare {
 			continue
 		}
-		scope := classifyBindScope(host)
+		scope := classifyBindScope(bare)
 
 		proc := ""
 		pid := 0
@@ -99,18 +109,18 @@ func parseSS(out []byte) ([]Port, error) {
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host, Loopback: scope == ScopeLoopback, No127: !accepts127(host)}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !accepts127(bare)}
 			order = append(order, port)
 			continue
 		}
 		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
 			p.BindScope = scope
-			p.BindHost = host
+			p.BindHost = bindHost
 		}
 		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
 			p.Loopback = true
 		}
-		if accepts127(host) { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
+		if accepts127(bare) { // 2z0v(b): ANY row accepting 127.0.0.1 clears No127, regardless of which row wins BindScope
 			p.No127 = false
 		}
 		if p.Process == "" { // keep the first non-empty process name, paired with its pid
@@ -129,9 +139,24 @@ func parseSS(out []byte) ([]Port, error) {
 }
 
 // splitHostPort splits an `ss` local-address field into its bare host (no
-// brackets) and port. Handles bracketed IPv6 (`[fd7a:...]:57619`) and plain
-// v4/wildcard (`0.0.0.0:22`, `100.100.100.100:61584`).
+// brackets) and port. Handles bracketed IPv6 (`[fd7a:...]:57619`), plain
+// v4/wildcard (`0.0.0.0:22`, `100.100.100.100:61584`), and an IPv6 zone --
+// which ss renders OUTSIDE the brackets, `[fe80::1]%eth0:8080` (observed live,
+// kata np07), as well as the inside-the-brackets fixture spelling
+// `[fe80::1%eth0]:8080`. The returned host always carries the zone as
+// "addr%iface" so splitZone sees one shape.
 func splitHostPort(addr string) (host string, port int, ok bool) {
+	// Normalise ss's "[addr]%iface:port" spelling to "[addr%iface]:port" --
+	// without this the zone lands outside the brackets, ends up attached to a
+	// still-bracketed host, and every downstream parse (splitZone, ParseIP)
+	// fails.
+	if strings.HasPrefix(addr, "[") {
+		if i := strings.Index(addr, "]%"); i >= 0 {
+			if j := strings.IndexByte(addr[i+2:], ':'); j >= 0 {
+				addr = "[" + addr[1:i] + "%" + addr[i+2:i+2+j] + "]" + addr[i+2+j:]
+			}
+		}
+	}
 	var hostStr, portStr string
 	switch {
 	case strings.Contains(addr, "]:"):

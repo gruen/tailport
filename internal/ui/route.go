@@ -231,7 +231,9 @@ func isPlausiblyHTTP(port int) bool {
 }
 
 // hostPort renders a bare "host:port" address (no scheme), bracketing an IPv6
-// literal host exactly like httpURL -- the th05 §2 non-HTTP fallback.
+// literal host exactly like httpURL -- the th05 §2 non-HTTP fallback. Unlike a
+// URL, this is the form `ssh`/`nc` accept, so an IPv6 zone id stays a literal
+// '%': "[fe80::1%eth0]:5432", never "%25" (kata np07).
 func hostPort(host string, port int) string {
 	if strings.Contains(host, ":") { // IPv6 literal needs brackets
 		return fmt.Sprintf("[%s]:%d", host, port)

@@ -15,6 +15,13 @@ func TestSplitHostPort(t *testing.T) {
 		{"100.100.100.100:61584", "100.100.100.100", 61584, true},
 		{"[::]:22", "::", 22, true},
 		{"[fd7a:115c:a1e0::1]:57619", "fd7a:115c:a1e0::1", 57619, true},
+		// Zone suffix survives splitHostPort (splitZone owns that policy).
+		{"100.110.98.29%tailscale0:5173", "100.110.98.29%tailscale0", 5173, true},
+		{"[fe80::1%eth0]:8080", "fe80::1%eth0", 8080, true},
+		// Real `ss` spelling (observed live, kata np07): the zone sits AFTER
+		// the closing bracket, not inside it. splitHostPort normalises it into
+		// the same "addr%iface" host form so splitZone sees one shape.
+		{"[fe80::2eec:b657:f571:8457]%eno2:18891", "fe80::2eec:b657:f571:8457%eno2", 18891, true},
 		{"garbage", "", 0, false},
 	}
 	for _, c := range cases {
@@ -149,8 +156,78 @@ LISTEN 0      128            127.0.0.1:631           0.0.0.0:*    users:(("cupsd
 	if p := byPort[53]; p.Process != "systemd-resolve" || p.Pid != 700 {
 		t.Errorf(":53 = %+v, want process systemd-resolve pid 700", p)
 	}
+	// The row is "127.0.0.53%lo:53": the "%lo" zone must be stripped before
+	// classification, so :53 is Loopback with a BARE BindHost, never a
+	// ScopeLAN fallback from an unparseable "127.0.0.53%lo" (kata np07).
+	if p := byPort[53]; p.BindScope != ScopeLoopback || p.BindHost != "127.0.0.53" {
+		t.Errorf(":53 = %+v, want BindScope=loopback BindHost=127.0.0.53", p)
+	}
 	if p := byPort[631]; p.Process != "cupsd" || p.Pid != 800 {
 		t.Errorf(":631 = %+v, want process cupsd pid 800", p)
+	}
+}
+
+// TestParseSSDeviceZone pins kata np07 end to end in the parser: `ss` prints a
+// socket bound to a device (SO_BINDTODEVICE, or an IPv6 link-local scope) as
+// "addr%iface:port". The zone must be split off BEFORE classification, so a
+// device-bound tailnet socket classifies ScopeTailnet with a bare BindHost
+// (no bogus LAN route), while an IPv6 link-local socket keeps its zone in
+// BindHost because the address is undialable without it. A ZONELESS tailnet
+// row is still tailscaled's own and must stay filtered.
+func TestParseSSDeviceZone(t *testing.T) {
+	const fixture = `LISTEN 0      511 100.110.98.29%tailscale0:5173      0.0.0.0:*    users:(("node",pid=449406,fd=20))
+LISTEN 0      128              [fe80::1%eth0]:8080           [::]:*    users:(("app",pid=1234,fd=3))
+LISTEN 0      128              [fe80::1]%eth0:9090           [::]:*    users:(("app",pid=1234,fd=6))
+LISTEN 0      128          127.0.0.1:5174          0.0.0.0:*    users:(("mixed",pid=2000,fd=4))
+LISTEN 0      4096 100.110.98.29%tailscale0:5174      0.0.0.0:*    users:(("mixed",pid=2000,fd=5))
+LISTEN 0      4096       100.101.102.103:8808      0.0.0.0:*    users:(("tailscaled",pid=50,fd=9))
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseSS error: %v", err)
+	}
+	byPort := map[int]Port{}
+	for _, p := range ports {
+		byPort[p.Number] = p
+	}
+
+	// The moth :5173 case: a dev server pinned to tailscale0 is a real app
+	// (zoned), so it is NOT filtered as tailscaled -- it classifies Tailnet
+	// with the bare address.
+	if p, ok := byPort[5173]; !ok {
+		t.Errorf("device-bound tailnet :5173 should be kept; got %+v", ports)
+	} else if p.BindScope != ScopeTailnet || p.BindHost != "100.110.98.29" || p.No127 != true {
+		t.Errorf(":5173 = %+v, want BindScope=tailnet BindHost=100.110.98.29 No127=true", p)
+	}
+
+	// IPv6 link-local keeps its zone (needed to dial), but classifies LAN on
+	// the bare address.
+	if p, ok := byPort[8080]; !ok {
+		t.Errorf("link-local :8080 should be kept; got %+v", ports)
+	} else if p.BindScope != ScopeLAN || p.BindHost != "fe80::1%eth0" {
+		t.Errorf(":8080 = %+v, want BindScope=lan BindHost=fe80::1%%eth0", p)
+	}
+
+	// The REAL ss spelling puts the zone outside the brackets
+	// ("[fe80::1]%eth0:9090"); it must parse to the same bind form.
+	if p, ok := byPort[9090]; !ok {
+		t.Errorf("outside-bracket-zone :9090 should be kept; got %+v", ports)
+	} else if p.BindScope != ScopeLAN || p.BindHost != "fe80::1%eth0" {
+		t.Errorf(":9090 = %+v, want BindScope=lan BindHost=fe80::1%%eth0", p)
+	}
+
+	// Loopback + device-bound tailnet on one port: scope aggregates to the
+	// wider Tailnet, but Loopback survives, No127 is cleared by the 127.0.0.1
+	// row, and BindHost is the bare tailnet address (no zone).
+	if p, ok := byPort[5174]; !ok {
+		t.Errorf(":5174 should be present; got %+v", ports)
+	} else if p.BindScope != ScopeTailnet || !p.Loopback || p.No127 || p.BindHost != "100.110.98.29" {
+		t.Errorf(":5174 = %+v, want BindScope=tailnet Loopback=true No127=false BindHost=100.110.98.29", p)
+	}
+
+	// A zoneless tailnet row is still tailscaled's own: filtered (79xb).
+	if _, ok := byPort[8808]; ok {
+		t.Errorf("zoneless tailnet-only :8808 should still be filtered; got %+v", ports)
 	}
 }
 

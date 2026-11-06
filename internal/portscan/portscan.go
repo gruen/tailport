@@ -1,7 +1,10 @@
 // Package portscan enumerates locally listening TCP ports.
 package portscan
 
-import "net"
+import (
+	"net"
+	"strings"
+)
 
 // Port is a locally listening TCP port, optionally attributed to a process.
 type Port struct {
@@ -23,6 +26,11 @@ type Port struct {
 	// (ScopeLAN) copies http://<BindHost>:<port>. For loopback/wildcard binds
 	// the UI substitutes "localhost"/the tailnet host instead, so BindHost
 	// matters chiefly for the LAN case. Empty if unset.
+	//
+	// A scanner-reported "%iface" zone is stripped by splitZone: for IPv4 and
+	// non-link-local IPv6 it never appears here, but an IPv6 link-local bind
+	// keeps it ("fe80::1%eth0") because the address is not dialable without it.
+	// Classification and accepts127 always see the BARE address (kata np07).
 	BindHost string
 	// Loopback records whether a loopback-scope bind row was seen for this port
 	// AT ALL, independent of BindScope/BindHost (t12m). BindScope only ever
@@ -71,12 +79,47 @@ type Port struct {
 // narrower, more literal question than classifyBindScope: not "how far does
 // this reach" but "does this specific dial land."
 func accepts127(host string) bool {
+	host, _ = splitZone(host) // zoned callers: judge the bare address (kata np07)
 	switch host {
 	case "*", "0.0.0.0", "127.0.0.1", "::ffff:127.0.0.1":
 		return true
 	default:
 		return false
 	}
+}
+
+// splitZone splits a scanner-reported "%iface" zone suffix off a bind address
+// and reports the part that must survive in BindHost.
+//
+// Linux `ss` prints a socket bound to a specific device -- SO_BINDTODEVICE, or
+// an IPv6 link-local scope -- as "addr%iface:port": "100.110.98.29%tailscale0"
+// for a dev server pinned to the tailscale0 interface, "127.0.0.53%lo" for
+// systemd-resolved. Before kata np07 the zone survived into BindHost, so
+// net.ParseIP failed, classifyBindScope fell back to its conservative ScopeLAN
+// default, and the UI offered a bogus LAN row (and copyable URL) for what is
+// actually a tailnet or loopback bind. Classification and accepts127 must
+// always see the BARE address.
+//
+// Which zone is KEPT is a semantic distinction, not parsing trivia: an IPv6
+// link-local address (fe80::/10) is not dialable without its zone, so that one
+// is returned in zone and belongs back in BindHost as "fe80::1%eth0". For IPv4
+// and every non-link-local IPv6 address the zone is dropped (empty return).
+//
+// Both scanners use this one helper so their zone policy can't drift.
+func splitZone(host string) (bare, zone string) {
+	i := strings.LastIndexByte(host, '%')
+	if i < 0 {
+		return host, ""
+	}
+	bare, zone = host[:i], host[i+1:]
+	if zone == "" {
+		return bare, ""
+	}
+	ip := net.ParseIP(bare)
+	if ip == nil || ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+		return bare, "" // IPv4 / non-link-local / unparseable: drop the zone
+	}
+	return bare, zone
 }
 
 // BindScope classifies how far a listening socket's bind address reaches. It
@@ -134,6 +177,7 @@ func (s BindScope) String() string {
 //     Tailnet, because that would over-promise tailnet reachability for
 //     something we could not positively confirm reaches the tailnet.
 func classifyBindScope(host string) BindScope {
+	host, _ = splitZone(host) // zoned callers: classify the bare address (kata np07)
 	// lsof emits a literal "*" for a wildcard bind; net.ParseIP can't parse
 	// it, so recognise it explicitly before parsing.
 	if host == "*" {
@@ -193,6 +237,7 @@ var tailscaleNets = func() []*net.IPNet {
 // unparseable string) and out-of-range IPs return false, so loopback,
 // 0.0.0.0/::, and LAN addresses are all correctly kept.
 func isTailscaleAddr(host string) bool {
+	host, _ = splitZone(host) // zoned callers: test the bare address (kata np07)
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false

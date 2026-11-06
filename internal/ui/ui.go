@@ -2156,10 +2156,13 @@ const (
 )
 
 // httpURL builds an http:// URL for host:port, bracketing an IPv6 literal host
-// (a bare "fe80::1" would otherwise make the trailing :port ambiguous).
+// (a bare "fe80::1" would otherwise make the trailing :port ambiguous). A zone
+// id inside the brackets is percent-encoded per RFC 6874 (kata np07): a
+// link-local bind keeps its zone in BindHost as "fe80::1%eth0", and
+// "[fe80::1%eth0]" is not a valid URL -- it must be "[fe80::1%25eth0]".
 func httpURL(host string, port int) string {
 	if strings.Contains(host, ":") { // IPv6 literal needs brackets
-		return fmt.Sprintf("http://[%s]:%d", host, port)
+		return fmt.Sprintf("http://[%s]:%d", strings.ReplaceAll(host, "%", "%25"), port)
 	}
 	return fmt.Sprintf("http://%s:%d", host, port)
 }

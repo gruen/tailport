@@ -83,25 +83,36 @@ func parseLsof(out []byte) ([]Port, error) {
 		// its port reads as not-listening (internal/ui dangling-forward
 		// detection depends on this).
 		//
+		// The same "%iface" zone handling as the Linux parser (kata np07):
+		// whether macOS lsof ever emits a zone is unverified here, but if it
+		// does, leaving it in place would make net.ParseIP fail and resurrect
+		// the bogus LAN row this ticket removed. So split it identically, and
+		// a zoned tailnet bind is an app pinned to the device, not tailscaled.
+		//
 		// Known limitation (79xb): an app that binds the node's tailnet IP
-		// *directly* is indistinguishable from tailscaled's own listener here
-		// and so is dropped/classified-away as tailscaled. Accepted for now;
-		// revisit only if it bites.
-		host := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
-		if isTailscaleAddr(host) {
+		// *directly* -- WITHOUT a device zone -- is indistinguishable from
+		// tailscaled's own listener here and so is dropped/classified-away as
+		// tailscaled. Accepted for now; revisit only if it bites.
+		rawHost := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
+		host, zone := splitZone(rawHost)
+		bindHost := host
+		if zone != "" {
+			bindHost = host + "%" + zone
+		}
+		if isTailscaleAddr(host) && rawHost == host {
 			continue
 		}
 		scope := classifyBindScope(host)
 
 		p, ok := agg[port]
 		if !ok {
-			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: host, Loopback: scope == ScopeLoopback, No127: !accepts127(host)}
+			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !accepts127(host)}
 			order = append(order, port)
 			continue
 		}
 		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
 			p.BindScope = scope
-			p.BindHost = host
+			p.BindHost = bindHost
 		}
 		if scope == ScopeLoopback { // t12m: remember a loopback bind even when a wider one wins BindScope
 			p.Loopback = true

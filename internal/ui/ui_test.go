@@ -2676,6 +2676,17 @@ func TestRouteURLFormatting(t *testing.T) {
 	if got := lanRouteURL("fe80::1"); got != "http://[fe80::1]:3000" {
 		t.Errorf("LAN IPv6 route url = %q, want the bracketed http://[fe80::1]:3000", got)
 	}
+	// kata np07: an IPv6 link-local bind keeps its zone, and a URL must encode
+	// the zone's '%' as '%25' inside the brackets (RFC 6874) -- a literal
+	// "[fe80::1%eth0]" is not a valid URL.
+	if got := lanRouteURL("fe80::1%eth0"); got != "http://[fe80::1%25eth0]:3000" {
+		t.Errorf("LAN IPv6 zone route url = %q, want http://[fe80::1%%25eth0]:3000", got)
+	}
+	// The non-HTTP fallback is a bare address, not a URL: ssh/nc want the
+	// literal zone, so it stays '%' inside the brackets (no %25).
+	if got := addressFor("fe80::1%eth0", 5432); got != "[fe80::1%eth0]:5432" {
+		t.Errorf("non-HTTP IPv6 zone address = %q, want [fe80::1%%eth0]:5432", got)
+	}
 	// A published route carries its exact public https URL.
 	pub := portItem{port: portscan.Port{Number: 8080}, publishHostname: "app.example.com"}
 	pr := pub.routes()

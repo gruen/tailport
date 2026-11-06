@@ -142,6 +142,25 @@ func TestRoutesFor(t *testing.T) {
 			},
 		},
 		{
+			// kata np07: a device-bound tailnet socket ("100.110.98.29%tailscale0")
+			// classifies Tailnet with the bare address after the zone split, so it
+			// gets localhost+tailnet and NEVER the bogus LAN route (whose URL was
+			// an invalid "http://100.110.98.29%tailscale0:5173").
+			name: "device-bound tailnet bind -> localhost + tailnet, no LAN",
+			in: serviceState{
+				port:         5173,
+				bindScope:    portscan.ScopeTailnet,
+				bindHost:     "100.110.98.29",
+				bindLoopback: true,
+				listening:    true,
+				host:         "moth",
+			},
+			want: []route{
+				{kind: routeLocalhost, url: "http://localhost:5173"},
+				{kind: routeTailnet, url: "http://moth:5173"},
+			},
+		},
+		{
 			name: "LAN-only bind -> just LAN, no localhost",
 			in: serviceState{
 				port:      5432,

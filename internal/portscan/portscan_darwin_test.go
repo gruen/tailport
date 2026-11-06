@@ -177,3 +177,38 @@ func TestListDarwin(t *testing.T) {
 	}
 	t.Logf("lsof reported %d listening port(s): %+v", len(ports), ports)
 }
+
+// TestParseLsofDeviceZone pins the "%iface" zone handling in the lsof parser
+// (kata np07), mirroring Linux's TestParseSSDeviceZone. Whether macOS lsof
+// ever emits a zone suffix is UNVERIFIED here (no Mac available while writing
+// this), but the parser must not treat it as an opaque host: an unsplit zone
+// makes ParseIP fail and classifyBindScope fall back to ScopeLAN, resurrecting
+// the bogus LAN row np07 removed. This defensive fixture pins that.
+//
+// UNVERIFIED on macOS: exercised only by the opt-in `[ci darwin]` job, if its
+// lsof behaves as these hand-written rows say.
+func TestParseLsofDeviceZone(t *testing.T) {
+	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node        501   mg   23u  IPv4 0x2222222222222222      0t0  TCP 100.110.98.29%tailscale0:5173 (LISTEN)
+app        600   mg   24u  IPv6 0x3333333333333333      0t0  TCP [fe80::1%en0]:8080 (LISTEN)
+`
+	ports, err := parseLsof([]byte(fixture))
+	if err != nil {
+		t.Fatalf("parseLsof error: %v", err)
+	}
+	got := map[int]Port{}
+	for _, p := range ports {
+		got[p.Number] = p
+	}
+
+	if p, ok := got[5173]; !ok {
+		t.Errorf("device-bound tailnet :5173 should be kept; got %+v", ports)
+	} else if p.BindScope != ScopeTailnet || p.BindHost != "100.110.98.29" {
+		t.Errorf(":5173 = %+v, want BindScope=tailnet BindHost=100.110.98.29", p)
+	}
+	if p, ok := got[8080]; !ok {
+		t.Errorf("link-local :8080 should be kept; got %+v", ports)
+	} else if p.BindScope != ScopeLAN || p.BindHost != "fe80::1%en0" {
+		t.Errorf(":8080 = %+v, want BindScope=lan BindHost=fe80::1%%en0", p)
+	}
+}

@@ -152,3 +152,42 @@ func TestAccepts127(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitZone pins kata np07's zone policy, shared by the ss and lsof
+// parsers. A device zone must never reach classifyBindScope/accepts127 (they
+// only parse bare addresses): leaving it in place made ParseIP fail, which
+// fell back to ScopeLAN and produced an invalid "100.110.98.29%tailscale0"
+// LAN URL. The zone survives in the returned bind form ONLY for an IPv6
+// link-local address, where RFC 4007 scope is required to dial at all.
+func TestSplitZone(t *testing.T) {
+	cases := []struct {
+		host     string
+		wantBare string
+		wantZone string
+	}{
+		// No zone at all.
+		{"0.0.0.0", "0.0.0.0", ""},
+		{"fe80::1", "fe80::1", ""},
+
+		// Zone dropped: IPv4 (whatever the interface) and non-link-local IPv6.
+		{"100.110.98.29%tailscale0", "100.110.98.29", ""}, // the moth :5173 row
+		{"127.0.0.53%lo", "127.0.0.53", ""},               // systemd-resolved
+		{"192.168.1.5%eth0", "192.168.1.5", ""},
+		{"fd7a:115c:a1e0::1%tailscale0", "fd7a:115c:a1e0::1", ""},
+		{"::1%lo", "::1", ""},
+
+		// Zone kept: IPv6 link-local, not dialable without it.
+		{"fe80::1%eth0", "fe80::1", "eth0"},
+		{"fe80::2eec:b657:f571:8457%eno2", "fe80::2eec:b657:f571:8457", "eno2"},
+
+		// Unparseable / empty zone: the zone is dropped, never kept.
+		{"example%foo", "example", ""},
+		{"fe80::1%", "fe80::1", ""},
+	}
+	for _, c := range cases {
+		bare, zone := splitZone(c.host)
+		if bare != c.wantBare || zone != c.wantZone {
+			t.Errorf("splitZone(%q) = (%q, %q), want (%q, %q)", c.host, bare, zone, c.wantBare, c.wantZone)
+		}
+	}
+}
