@@ -6107,20 +6107,45 @@ type eggLayoutT struct {
 	sw            int // inner content width (viewport - 4)
 	eggCols       int // egg body width budget
 	eggRows       int // egg body height == number of body rows
-	blockH        int // total block height: fanfare+egg+fanfare+title+6 credits
+	blockH        int // total block height: fanfare+egg+fanfare+title+len(eggCredits)
 	topPad        int // rows above the block from vertical centring
 	topFanfareRow int // absolute row of the top rainbow fanfare
 	botFanfareRow int // absolute row of the bottom rainbow fanfare
 }
 
+// eggCredits are the egg's credit rows under the title, in order; the LAST is
+// the muted key hint. It is the single source of truth for both eggView's
+// rendering and eggLayout's height budget, so adding a credit can't desync the
+// block height from what's drawn (nfh0: the agent fleet grew a second line).
+// Every row must fit the minimum inner width, 48 columns (eggLayout's w >= 52
+// gate, minus the 4-column margin) -- TestEggCreditsFitMinWidth pins it.
+var eggCredits = []string{
+	"Michael E. Gruen",
+	"· The LLM Agent Fleet ·",
+	"Claude Opus 5.5 · 4.8 · Sonnet 5 · Haiku 4.5",
+	"DeepSeek 4.1 Flash · Codex (reviews)",
+	eggURL,
+	eggRepoURL,
+	"c: copy site · g: copy repo · esc / q: back",
+}
+
+// eggMinRows is the smallest egg body eggLayout will draw; below it (a short
+// terminal) eggView shows its bounded fallback instead.
+const eggMinRows = 7
+
+// eggMinH is the shortest viewport that fits the full art: the egg body at
+// eggMinRows, plus top and bottom fanfare, the title, every credit, and one
+// spare row for the transient copy toast.
+var eggMinH = eggMinRows + 4 + len(eggCredits)
+
 func eggLayout(w, h int) eggLayoutT {
 	var l eggLayoutT
-	if w < 52 || h < 17 { // must match eggView's fallback gate
+	if w < 52 || h < eggMinH { // must match eggView's fallback gate
 		return l
 	}
 	l.ok = true
 	l.sw = w - 4
-	l.eggRows = h - 10
+	l.eggRows = h - 4 - len(eggCredits)
 	if l.eggRows > 15 {
 		l.eggRows = 15
 	}
@@ -6128,8 +6153,8 @@ func eggLayout(w, h int) eggLayoutT {
 	if l.eggCols > 21 {
 		l.eggCols = 21
 	}
-	// 1 top fanfare + eggRows egg body + 1 bottom fanfare + 1 title + 6 credits.
-	l.blockH = l.eggRows + 9
+	// 1 top fanfare + eggRows egg body + 1 bottom fanfare + 1 title + the credits.
+	l.blockH = l.eggRows + 3 + len(eggCredits)
 	l.topPad = (h - l.blockH) / 2
 	if l.topPad < 0 {
 		l.topPad = 0
@@ -6814,7 +6839,7 @@ func (m model) eggView() string {
 	f := m.eggFrame
 
 	// The full art needs room for a ~7+ row egg plus ~9 rows of fanfare
-	// spacers/title/credits/hint (eggLayout's gate: w >= 52, h >= 17). Below
+	// spacers/title/credits/hint (eggLayout's gate: w >= 52, h >= eggMinH). Below
 	// it, a bounded fallback and no fireworks (nowhere safe to place them).
 	lay := eggLayout(w, h)
 	if !lay.ok {
@@ -6827,7 +6852,7 @@ func (m model) eggView() string {
 
 	// Compose the egg block as ROWS OF CELLS (never pre-styled strings) so the
 	// fireworks share the grid. Row order fixes the fanfare rows the burst band
-	// keys off (top fanfare, eggRows body, bottom fanfare, title, 6 credits).
+	// keys off (top fanfare, eggRows body, bottom fanfare, title, eggCredits).
 	// The fanfare rows are BLANK spacers (43xw): rainbow sparkles were removed,
 	// but each row still occupies exactly one grid row so topFanfareRow/
 	// botFanfareRow keep anchoring the fireworks burst band (mm5g) unchanged.
@@ -6844,14 +6869,7 @@ func (m model) eggView() string {
 	titleColor := lipgloss.Color(eggMutedColors[f%len(eggMutedColors)])
 	block = append(block, centerCells(plainCells("✦ "+eggZalgo("tailport", f)+" ✦", titleColor, true), sw))
 
-	credits := []string{
-		"Michael E. Gruen",
-		"· The LLM Agent Fleet ·",
-		"Claude Opus 4.8 · Sonnet 5 · Haiku 4.5",
-		eggURL,
-		eggRepoURL,
-		"c: copy site · g: copy repo · esc / q: back",
-	}
+	credits := eggCredits
 	for i, s := range credits {
 		color := lipgloss.Color(eggMutedColors[(f/2+i)%len(eggMutedColors)])
 		if i == len(credits)-1 {

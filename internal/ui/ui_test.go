@@ -3693,8 +3693,11 @@ func TestEggLayout(t *testing.T) {
 	if eggLayout(40, 40).ok {
 		t.Error("w<52 must be the not-ok fallback")
 	}
-	if eggLayout(80, 16).ok {
-		t.Error("h<17 must be the not-ok fallback")
+	if eggLayout(80, eggMinH-1).ok {
+		t.Errorf("h<%d (eggMinH) must be the not-ok fallback", eggMinH)
+	}
+	if min := eggLayout(80, eggMinH); !min.ok || min.eggRows != eggMinRows || min.topPad+min.blockH > eggMinH {
+		t.Errorf("h=%d (eggMinH) should fit exactly: %+v", eggMinH, min)
 	}
 	l := eggLayout(100, 40)
 	if !l.ok {
@@ -4471,7 +4474,8 @@ func TestEggViewGrid(t *testing.T) {
 		t.Error("an egg body row should be non-empty")
 	}
 	plain := stripANSI(view)
-	if !strings.Contains(plain, "Michael E. Gruen") || !strings.Contains(plain, "LLM Agent Fleet") {
+	if !strings.Contains(plain, "Michael E. Gruen") || !strings.Contains(plain, "LLM Agent Fleet") ||
+		!strings.Contains(plain, "Claude Opus 5.5") || !strings.Contains(plain, "DeepSeek 4.1 Flash") {
 		t.Error("egg credits should render inside the grid")
 	}
 	// 43xw: Fable was dropped from the fleet credit line.
@@ -4541,7 +4545,7 @@ func TestFireworkSchemes(t *testing.T) {
 // fireworks present: they must never panic or overflow.
 func TestEggViewTinyNoPanic(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	for _, d := range [][2]int{{0, 0}, {1, 1}, {10, 5}, {52, 17}, {200, 60}} {
+	for _, d := range [][2]int{{0, 0}, {1, 1}, {10, 5}, {52, 17}, {52, eggMinH}, {200, 60}} {
 		m := New(config.Config{})
 		m.active = map[int]bool{}
 		m.rebuildItems()
@@ -10658,5 +10662,18 @@ func TestHelpIntroNamesAllPublicPaths(t *testing.T) {
 	}
 	if strings.Contains(got, "mutually-exclusive") {
 		t.Error("helpContent still claims the public paths are mutually exclusive")
+	}
+}
+
+// TestEggCreditsFitMinWidth pins eggCredits' width contract (nfh0): every row
+// must fit the egg's minimum inner width -- 48 columns, i.e. eggLayout's
+// w >= 52 gate minus its 4-column margin -- so a longer credit (like the agent
+// fleet's) can never be clipped or overflow at the smallest supported size.
+func TestEggCreditsFitMinWidth(t *testing.T) {
+	sw := eggLayout(52, eggMinH).sw
+	for _, c := range eggCredits {
+		if w := lipgloss.Width(c); w > sw {
+			t.Errorf("egg credit %q is %d columns, wider than the minimum inner width %d", c, w, sw)
+		}
 	}
 }
