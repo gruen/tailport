@@ -329,6 +329,23 @@ contract. The short version:
   the clipboard carve-out, it is never required to build or run tailport:
   absence just disables both keys (no key, no discovery, no polling) and
   costs nothing.
+- Auto-clear of DANGLING serve forwards (kata 9p43) is an owner-approved
+  exception to "tailport mutates serve state only on a keypress": the TUI
+  turns a forward off with no keypress, and `tailport clean` does so from a
+  shell. It is a de-escalation (it only ever removes tailnet exposure) and its
+  scope is exactly: ON by default with a 30s grace, configurable via
+  `serve.auto_clear_stale` and per-port `ports.<n>.auto_clear_stale`
+  (duration, or `0`/`off`); a port must be dangling (served AND nothing
+  listening locally) CONTINUOUSLY for the whole grace, and the timer resets
+  when something listens or the serve goes away; never `:22`, never a locked
+  port, never a port also carrying funnel, Caddy publish or a Cloudflare
+  tunnel; never the No127 state (something IS listening, so there is no bind
+  collision). The one rule lives in `internal/stale`, shared by the TUI
+  (`trackDangling`, driven only by refreshes that pass the 4hcg generation
+  guard) and `tailport clean` (no grace; it ignores `auto_clear_stale`,
+  because running it is itself the instruction). Every auto-clear toasts. The
+  `C` key keeps its own unfiltered, confirmed semantics. Do not widen this
+  (other states, other mutations, shorter implicit defaults) without asking.
 
 ### Docs stay honest (a claim is a test)
 

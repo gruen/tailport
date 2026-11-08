@@ -306,6 +306,15 @@ useful for finding something new to serve, label, or favorite.
   machine-readable output. Cloudflare tunnel rows are still reported when
   tailscaled is down (a detached tunnel stays public); the tailscale error
   goes to stderr and the exit code is non-zero. Changes nothing.
+- **`tailport clean [--dry-run]`** — turn off every *dangling* serve forward
+  (served, nothing listening locally) and print one line per port, `cleared
+  :P`, or `nothing to clean`. `--dry-run` prints `would clear :P` and changes
+  nothing. No grace period: running it is the instruction, so it ignores
+  `auto_clear_stale` (global and per-port) and clears a dangling port even where
+  the TUI's auto-clear is set to `off`. It still never touches `:22`, a locked
+  port, or a port with funnel, a Caddy publish or a Cloudflare tunnel. Exits
+  non-zero if `tailscale serve status` can't be read or any unserve fails, so it
+  works as a `predev` step.
 - **`tailport update`** — self-update to the latest release (sha256-verified).
   `--check` reports whether an update is available without installing it;
   `-y`/`--yes` skips the confirmation prompt; `--force` overrides its refusal to
@@ -344,6 +353,29 @@ the state left behind by serving a port without labeling or favoriting it.
 tailport also records a `last_process` key per port automatically (the name it
 last saw listening, used for the `was <name>` display); you don't set that by
 hand.
+
+### Auto-clearing dangling forwards
+
+A `serve:` block holds one setting, `auto_clear_stale` (default `30s`): how
+long a dangling forward (see [Troubleshooting](#troubleshooting)) may
+stay dangling, continuously, before the TUI turns it off itself. It takes a Go
+duration (`30s`, `2m`) or `0` / `off` to disable. A per-port
+`ports.<n>.auto_clear_stale` overrides it for that port; leave it out to
+inherit.
+
+```yaml
+serve:
+    auto_clear_stale: 30s # a duration (30s, 2m), or 0 / off to disable
+ports:
+    3000:
+        auto_clear_stale: 5m  # this port gets longer
+    4000:
+        auto_clear_stale: off # never auto-clear this one
+```
+
+A value that is neither a duration, `0` nor `off` is treated as the default
+(30s globally, inherit per port) and the TUI shows a one-time warning toast
+naming it; it never stops tailport from starting.
 
 ### Status markers
 
@@ -786,8 +818,9 @@ the port. Two common cases:
 
 - **The app just isn't running** (it died, or hasn't started). Start it, or
   unbind the port — `t` on the row, or `C` to clear all stale forwards. The
-  mapping deliberately outlives the app so you can restart it freely, so
-  tailport won't tear it down for you.
+  mapping outlives the app for a while so you can restart it freely: the TUI
+  turns a forward off by itself only after it has been dangling for 30s straight
+  (see [Auto-clear and `tailport clean`](#auto-clear-and-tailport-clean)).
 - **The app can't start with "address already in use."** When you serve `:8025`,
   tailscaled binds your **tailnet IP** on `:8025`. If your app then tries to bind
   `0.0.0.0:8025` (all interfaces), that collides and the app fails to start — so
@@ -805,6 +838,28 @@ the port. Two common cases:
   `0.0.0.0:<port>`, unbind the port first (`t`, or `C`) — note that once
   it's on `0.0.0.0` it's already reachable on the tailnet on its own (state
   `on tailnet`), so there's nothing left to serve.
+
+#### Auto-clear and `tailport clean`
+
+A dangling forward is not just cosmetic. tailscaled keeps listening on your
+node's tailnet IPs at that port, so any app that binds the **wildcard** address
+(`0.0.0.0` / `::`, the default for Node, Go's `net.Listen(":P")` and Python's
+`http.server`) fails with "address already in use". An app bound to `127.0.0.1`
+is unaffected.
+
+So the TUI clears a dangling forward for you once it has been dangling for 30s
+without a break, and toasts it: `cleared stale forward :P (nothing listened for
+30s) — t to re-serve`. The wait rides out a dev server restarting under its
+forward. The timer starts over if anything listens on the port again or the
+forward goes away. Tune it with `serve.auto_clear_stale`, or
+`ports.<n>.auto_clear_stale` per port; `0` or `off` disables it (see
+[Auto-clearing dangling forwards](#auto-clearing-dangling-forwards)).
+
+The auto-clear never touches `:22`, a locked port, a port that also carries
+funnel, a Caddy publish or a Cloudflare tunnel, or the case below where
+something *is* listening. For a one-shot sweep from a shell, run
+`tailport clean` (`--dry-run` to preview); see the
+[command-line reference](#command-line-reference).
 
 ### Served row shows stale, but something IS listening
 

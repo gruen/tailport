@@ -29,6 +29,7 @@ import (
 	"github.com/gruen/tailport/internal/clip"
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/stale"
 	"github.com/gruen/tailport/internal/tsserve"
 )
 
@@ -778,7 +779,15 @@ type publishPollMsg struct {
 // cmd when publishing is unconfigured, so an unconfigured edge costs nothing.
 type publishTickMsg struct{}
 
-type cleanupDoneMsg struct{ err error }
+type cleanupDoneMsg struct {
+	err error
+	// cleaned / failed split the targets by outcome (kata 9p43), so the
+	// auto-clear path can toast exactly what went away and restart the grace
+	// of anything that would not. auto marks a grace-period teardown rather
+	// than the confirmed `C` batch.
+	cleaned, failed []int
+	auto            bool
+}
 
 // flashExpireMsg clears the transient toast if it's still the one that
 // scheduled this expiry (matched by id), so a newer toast isn't cut short.
@@ -1114,8 +1123,19 @@ type model struct {
 	sshInput      textinput.Model
 	sshUnlockPort int
 
-	pending       int   // port currently being toggled; 0 = none
-	cleaning      int   // number of dangling forwards being torn down; 0 = none
+	pending  int // port currently being toggled; 0 = none
+	cleaning int // number of dangling forwards being torn down; 0 = none
+	// danglingSince / now drive the grace-period auto-clear (kata 9p43):
+	// danglingSince records when each currently-clearable dangling port was
+	// FIRST seen so, by a refresh that actually applied (a dropped stale one
+	// never reaches it). An entry is deleted the moment the port listens,
+	// stops being served or becomes ineligible, so the grace only ever counts
+	// CONTINUOUS dangling. now is the clock (nil = time.Now); tests inject one.
+	danglingSince map[int]time.Time
+	now           func() time.Time
+	// staleWarned latches the one-shot toast for an unparseable
+	// auto_clear_stale value (config.Config.StaleWarnings).
+	staleWarned   bool
 	cleanTargets  []int // ports the entryConfirmClean prompt is asking about
 	confirmPort   int   // port the entryConfirm22 prompt is asking about (always 22)
 	confirmTurnOn bool  // direction of the pending entryConfirm22 toggle
@@ -1517,6 +1537,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 
 	return model{
 		list: l, delegate: del, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
+		danglingSince: map[int]time.Time{},
 		// lastPublish (kata prp1) is session-only memory, so it always starts
 		// empty here regardless of what cfg carries (cfg never carries it --
 		// see the field doc).
@@ -2255,21 +2276,116 @@ func (m *model) rememberProcesses() bool {
 	return changed
 }
 
+// serveOff is the unserve call the teardown uses, a var so tests can fake it
+// without a live tailscaled (the scanListeners/serveStatus pattern).
+var serveOff = tsserve.Off
+
 // cleanupDangling turns off every serve mapping in ports, one at a time.
 // It reports the ports it could not tear down (if any) as a single error.
-func cleanupDangling(ports []int) tea.Cmd {
+func cleanupDangling(ports []int) tea.Cmd { return cleanupPorts(ports, false) }
+
+// cleanupPorts is the one teardown path behind both the confirmed `C` batch
+// and the grace-period auto-clear (kata 9p43; auto only tags the result).
+func cleanupPorts(ports []int, auto bool) tea.Cmd {
 	return func() tea.Msg {
+		done := cleanupDoneMsg{auto: auto}
 		var failed []string
 		for _, p := range ports {
-			if err := tsserve.Off(p); err != nil {
+			if err := serveOff(p); err != nil {
 				failed = append(failed, strconv.Itoa(p))
+				done.failed = append(done.failed, p)
+				continue
 			}
+			done.cleaned = append(done.cleaned, p)
 		}
 		if len(failed) > 0 {
-			return cleanupDoneMsg{err: fmt.Errorf("could not clean :%s", strings.Join(failed, ", :"))}
+			done.err = fmt.Errorf("could not clean :%s", strings.Join(failed, ", :"))
 		}
-		return cleanupDoneMsg{}
+		return done
 	}
+}
+
+// clock returns the model's time source (time.Now unless a test injected one).
+func (m model) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// clearableStale is the dangling set the auto-clear and `tailport clean` act
+// on: danglingPorts minus :22, locked ports and ports with funnel, publish or
+// a tunnel (internal/stale holds the shared rule). `C` deliberately keeps the
+// unfiltered danglingPorts: its y/n confirm lets the user decide.
+func (m model) clearableStale() []int {
+	listening := make(map[int]bool, len(m.allPorts))
+	for _, p := range m.allPorts {
+		listening[p.Number] = true
+	}
+	public := make(map[int]bool, len(m.published)+len(m.tunnels))
+	for p := range m.published {
+		public[p] = true
+	}
+	for p := range m.tunnels {
+		public[p] = true
+	}
+	return stale.Clearable(m.cfg, m.active, listening, m.funnel, public)
+}
+
+// trackDangling advances the auto-clear grace timers after a refresh applied
+// and returns the ports whose grace has now fully elapsed (kata 9p43). Only
+// the refreshMsg handler calls it, after the generation guard, so a dropped
+// stale refresh never starts or advances a timer. A port leaving the clearable
+// set (listening again, no longer served, locked, newly funnelled...) loses
+// its entry, which is the "timer resets" rule.
+func (m *model) trackDangling() []int {
+	if m.danglingSince == nil {
+		m.danglingSince = map[int]time.Time{}
+	}
+	now := m.clock()
+	cur := m.clearableStale()
+	keep := make(map[int]bool, len(cur))
+	for _, p := range cur {
+		keep[p] = true
+		if _, ok := m.danglingSince[p]; !ok {
+			m.danglingSince[p] = now
+		}
+	}
+	for p := range m.danglingSince {
+		if !keep[p] {
+			delete(m.danglingSince, p)
+		}
+	}
+	var due []int
+	for _, p := range cur {
+		if g := m.cfg.AutoClearGrace(p); g > 0 && now.Sub(m.danglingSince[p]) >= g {
+			due = append(due, p)
+		}
+	}
+	return due
+}
+
+// formatGrace renders a grace period compactly: 30s, 2m, 1h, else the Go form.
+func formatGrace(d time.Duration) string {
+	switch {
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	}
+	return d.String()
+}
+
+// autoClearToast is the toast for ports the auto-clear just tore down.
+func (m model) autoClearToast(ports []int) string {
+	if len(ports) == 1 {
+		return fmt.Sprintf("cleared stale forward :%d (nothing listened for %s) — t to re-serve", ports[0], formatGrace(m.cfg.AutoClearGrace(ports[0])))
+	}
+	names := make([]string, len(ports))
+	for i, p := range ports {
+		names[i] = ":" + strconv.Itoa(p)
+	}
+	return fmt.Sprintf("cleared stale forwards %s (nothing listened past their grace) — t to re-serve", strings.Join(names, ", "))
 }
 
 // danglingPorts returns the sorted set of ports that are exposed via
@@ -3486,11 +3602,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// following successful refresh clears it again, same as
 		// publishReachable does for the edge-unreachable note.
 		m.tailnetUnavailable = msg.statusErr != nil
+		// Grace-period auto-clear (kata 9p43). Past the generation guard and the
+		// fatal-error return above, so only a refresh that really applied gets
+		// here. A statusErr refresh knows nothing about serve state, so it
+		// forgets every running timer (a gap in knowledge must not count as
+		// continuous dangling) and clears nothing.
+		var autoCmd tea.Cmd
+		if msg.statusErr != nil {
+			clear(m.danglingSince)
+		} else if due := m.trackDangling(); len(due) > 0 && m.pending == 0 && m.cleaning == 0 {
+			m.cleaning = len(due)
+			autoCmd = cleanupPorts(due, true)
+		}
+		if !m.staleWarned {
+			m.staleWarned = true
+			if w := m.cfg.StaleWarnings(); len(w) > 0 {
+				autoCmd = tea.Batch(autoCmd, m.setFlash("config: "+strings.Join(w, "; "), flashWarn))
+			}
+		}
 		// Remember the live process names of favorites BEFORE rebuilding, so a
 		// favorite that later goes down can show "was <name>". Persist only when
 		// something actually changed, so a steady state never re-writes config.
 		changed := m.rememberProcesses()
-		cmd := m.rebuildItems()
+		cmd := tea.Batch(m.rebuildItems(), autoCmd)
 		if changed {
 			return m, tea.Batch(cmd, m.saveConfig())
 		}
@@ -4263,10 +4397,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case cleanupDoneMsg:
 		m.cleaning = 0
-		if msg.err != nil {
-			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd())
+		now := m.clock()
+		for _, p := range msg.cleaned {
+			delete(m.danglingSince, p)
 		}
-		return m, m.refreshCmd()
+		// A teardown that failed starts its grace over, so a persistent failure
+		// retries once per grace instead of on every 3s refresh.
+		for _, p := range msg.failed {
+			if m.danglingSince != nil {
+				m.danglingSince[p] = now
+			}
+		}
+		if len(msg.cleaned) > 0 {
+			// The op recorded its outcome: a refresh issued before it would
+			// still show these forwards served (kata 4hcg).
+			m.supersedeRefreshes()
+		}
+		var toast tea.Cmd
+		if msg.auto && len(msg.cleaned) > 0 {
+			toast = m.setFlash(m.autoClearToast(msg.cleaned), flashInfo)
+		}
+		if msg.err != nil {
+			return m, tea.Batch(toast, m.setErr(msg.err.Error()), m.refreshCmd())
+		}
+		return m, tea.Batch(toast, m.refreshCmd())
 
 	case flashExpireMsg:
 		// Only clear if no newer toast has replaced this one (see flashID).
@@ -6977,7 +7131,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press t there to serve it once its service is up.",
 		"l":      "Set a text label for the selected port.",
 		"x":      "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
-		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "). Offered only when some exist.",
+		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "), behind a y/n confirm. Offered\nonly when some exist. A dangling forward holds its port on the\ntailnet IPs, so an app binding all interfaces there fails with\n\"address already in use\" — which is why tailport also clears one by\nitself after it has been dangling for 30s straight (serve.\nauto_clear_stale, ports.<n>.auto_clear_stale; 0/off disables). The\nauto-clear skips :22, locked ports and ports with funnel, publish or\na tunnel, and toasts each one it clears. From a shell: tailport clean.",
 		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
 		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
 		"s":      "Sort the list: toggle between port number (the default, ascending)\nand name (label, else process, else \"was <proc>\", else \"?\";\ncase-insensitive, port number breaks ties). Session-only -- it\nresets to port-number order on restart.",

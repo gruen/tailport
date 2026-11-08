@@ -223,6 +223,23 @@ func gatherFrom(cfg config.Config, src gatherSources) ([]Row, error) {
 	return Build(ports, active, funnel, published, tunnels, host, fqdn), nil
 }
 
+// PublicPorts returns the local ports that carry a Caddy-edge publish or a
+// tailport-owned Cloudflare tunnel (kata 9p43), for `tailport clean`'s "skip
+// deliberate public exposure" rule. Best-effort and read-only, exactly like
+// Gather's own reads: an unreachable edge or an absent cloudflared simply
+// contributes nothing.
+func PublicPorts(cfg config.Config) map[int]bool {
+	fqdn, _ := tsserve.FQDN()
+	ports := map[int]bool{}
+	for p := range gatherPublished(cfg, fqdn) {
+		ports[p] = true
+	}
+	for _, t := range gatherTunnels(cfg) {
+		ports[t.Port] = true
+	}
+	return ports
+}
+
 // gatherTunnels discovers this machine's tailport-OWNED Cloudflare tunnels, or
 // nil when the feature is unavailable -- cloudflared not installed (Detect
 // fails, exactly the gate internal/ui uses for its `o`/`O` keys) or a

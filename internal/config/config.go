@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,6 +38,11 @@ type PortMeta struct {
 	// `O` has: unlike the removed prompt flow, there is no session-only
 	// re-raise -- the config file itself is the source of truth every time.
 	Cloudflare *CloudflareBinding `yaml:"cloudflare,omitempty"`
+	// AutoClearStale overrides serve.auto_clear_stale for THIS port (kata
+	// 9p43): a Go duration ("30s", "2m"), or "0"/"off" to never auto-clear
+	// this port. Empty (the default) inherits the global value. A string, not
+	// a time.Duration, so "off" round-trips; see ParseAutoClear.
+	AutoClearStale string `yaml:"auto_clear_stale,omitempty"`
 }
 
 // CloudflareBinding pins a port to one pre-provisioned, named Cloudflare
@@ -140,9 +148,90 @@ func (c *CaddyConfig) applyDefaults() {
 	}
 }
 
+// DefaultAutoClearStale is the grace period applied when serve.auto_clear_stale
+// is unset or unparseable (kata 9p43).
+const DefaultAutoClearStale = 30 * time.Second
+
+// ServeConfig holds the settings for tailscale-serve housekeeping (kata 9p43).
+// Like CaddyConfig and CloudflaredConfig, the block is ALWAYS present in the
+// saved config (see Save and applyServeComments) so the knob is discoverable.
+type ServeConfig struct {
+	// AutoClearStale is how long a serve forward may stay DANGLING (served
+	// with nothing listening locally) before the TUI tears it down itself: a
+	// Go duration ("30s", "2m"), or "0"/"off" to disable. Default "30s".
+	// Overridden per port by PortMeta.AutoClearStale. Invalid text falls back
+	// to the default (see ParseAutoClear, Config.StaleWarnings).
+	AutoClearStale string `yaml:"auto_clear_stale"`
+}
+
+// applyDefaults fills the default grace when the key is absent or blank.
+func (s *ServeConfig) applyDefaults() {
+	if strings.TrimSpace(s.AutoClearStale) == "" {
+		s.AutoClearStale = DefaultAutoClearStale.String()
+	}
+}
+
+// ParseAutoClear parses an auto_clear_stale value. "" reports set=false (the
+// value is absent: inherit/default). "off" or "0" (case-insensitive) is a valid
+// disable, d == 0. Anything else must be a non-negative Go duration. ok is
+// false for text that is neither, which callers treat as the default and
+// surface (Config.StaleWarnings) rather than crash on.
+func ParseAutoClear(v string) (d time.Duration, set, ok bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false, true
+	}
+	if strings.EqualFold(v, "off") || v == "0" {
+		return 0, true, true
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, true, false
+	}
+	return d, true, true
+}
+
+// AutoClearGrace returns the effective auto-clear grace for port: the per-port
+// override if set and valid, else the global serve.auto_clear_stale if set and
+// valid, else DefaultAutoClearStale. 0 means auto-clear is disabled for port.
+func (c Config) AutoClearGrace(port int) time.Duration {
+	if d, set, ok := ParseAutoClear(c.Ports[port].AutoClearStale); set && ok {
+		return d
+	}
+	if d, set, ok := ParseAutoClear(c.Serve.AutoClearStale); set && ok {
+		return d
+	}
+	return DefaultAutoClearStale
+}
+
+// StaleWarnings lists every unparseable auto_clear_stale value (global, then
+// per-port in ascending port order) as a human-readable line. Each such value
+// is already being treated as inherit/default by AutoClearGrace.
+func (c Config) StaleWarnings() []string {
+	var w []string
+	if _, _, ok := ParseAutoClear(c.Serve.AutoClearStale); !ok {
+		w = append(w, fmt.Sprintf("serve.auto_clear_stale %q is not a duration, \"0\" or \"off\"; using %s", c.Serve.AutoClearStale, DefaultAutoClearStale))
+	}
+	ports := make([]int, 0, len(c.Ports))
+	for p := range c.Ports {
+		ports = append(ports, p)
+	}
+	sort.Ints(ports)
+	for _, p := range ports {
+		if _, _, ok := ParseAutoClear(c.Ports[p].AutoClearStale); !ok {
+			w = append(w, fmt.Sprintf("ports.%d.auto_clear_stale %q is not a duration, \"0\" or \"off\"; inheriting the global value", p, c.Ports[p].AutoClearStale))
+		}
+	}
+	return w
+}
+
 // Config is the persisted per-port registry, plus display preferences.
 type Config struct {
 	Ports map[int]PortMeta `yaml:"ports"`
+	// Serve holds the serve-housekeeping settings (kata 9p43). Always present
+	// in the saved file with its default + an explanatory comment -- see
+	// ServeConfig and applyServeComments.
+	Serve ServeConfig `yaml:"serve"`
 	// Caddy holds the publish-via-Caddy-edge settings (kata v1z5). Always
 	// present in the saved file with defaults + explanatory comments --
 	// see CaddyConfig and applyCaddyComments.
@@ -247,6 +336,7 @@ func (c Config) StickyHeaderEnabled() bool { return c.StickyHeader == nil || *c.
 func Default() Config {
 	cfg := Config{Ports: map[int]PortMeta{22: {Locked: true}}}
 	cfg.Caddy.applyDefaults()
+	cfg.Serve.applyDefaults()
 	t := true
 	cfg.StickyHeader = &t
 	return cfg
@@ -300,6 +390,9 @@ func Load(override string) (Config, error) {
 	// in-memory struct here, and the block appears -- with its comments --
 	// on the next Save.
 	cfg.Caddy.applyDefaults()
+	// Likewise a file from before 9p43 has no serve: block; it gets the 30s
+	// default in memory and the commented block on the next Save.
+	cfg.Serve.applyDefaults()
 	// A pre-existing config file from before k4cj has no sticky_header key at
 	// all, which unmarshals to a nil pointer here -- same as an explicit
 	// `sticky_header: null`. Normalize that to true (the default) rather than
@@ -363,6 +456,7 @@ func Load(override string) (Config, error) {
 // Default()/Load().
 func (c Config) Save() error {
 	c.Caddy.applyDefaults()
+	c.Serve.applyDefaults()
 	// Cloudflared.Domain is IGNORED (kata p7c5) -- see its doc comment. c is
 	// a value receiver, so clearing it here is local to THIS copy: an old
 	// config's on-disk `cloudflared.domain: <anything>` still loads fine
@@ -393,6 +487,7 @@ func (c Config) Save() error {
 	}
 	applyCaddyComments(&root)
 	applyCloudflaredComments(&root)
+	applyServeComments(&root)
 	applyStickyHeaderComment(&root)
 	data, err := yaml.Marshal(&root)
 	if err != nil {
@@ -854,6 +949,25 @@ func applyCloudflaredComments(root *yaml.Node) {
 	}
 	setKeyHeadComment(cf, "binary",
 		"Optional path to the cloudflared executable. Blank means tailport\nlooks up `cloudflared` on $PATH.")
+}
+
+// applyServeComments sets the explanatory head comments on the serve: key and
+// its auto_clear_stale knob (kata 9p43), re-applied on every Save like the
+// other blocks' comments.
+func applyServeComments(root *yaml.Node) {
+	setKeyHeadComment(root, "serve",
+		"\nServe housekeeping. A forward with nothing listening behind it still\n"+
+			"holds the port on the tailnet IPs, so a wildcard bind there fails\n"+
+			"with EADDRINUSE.")
+	serve := mappingValueNode(root, "serve")
+	if serve == nil {
+		return
+	}
+	setKeyHeadComment(serve, "auto_clear_stale",
+		"Turn off a dangling forward (served, nothing listening) once it has been\n"+
+			"dangling this long without a break. A Go duration (30s, 2m), or 0 / off\n"+
+			"to disable. Per-port override: ports.<n>.auto_clear_stale. Never touches\n"+
+			":22, locked ports, or ports with funnel, publish or a tunnel. Default 30s.")
 }
 
 // applyStickyHeaderComment sets the explanatory head comment on the

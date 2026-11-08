@@ -158,7 +158,7 @@ func parseFlags(args []string, stdout, stderr io.Writer) (cf *cliFlags, code int
 }
 
 // printUsage writes tailport's help text: a one-line description, the usage
-// synopsis, the flag list, the subcommands (quickstart/status/update -- most
+// synopsis, the flag list, the subcommands (quickstart/status/clean/update -- most
 // still extension points, see runSubcommand), and the resolved config path
 // (reusing config.Path's own resolution, honoring configOverride if one is
 // already known). It deliberately excludes the in-TUI keybinding legend --
@@ -182,6 +182,7 @@ func printUsage(w io.Writer, configOverride string) {
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  quickstart   non-interactive onboarding and keybinding legend")
 	fmt.Fprintln(w, "  status       headless, read-only report of current port exposure")
+	fmt.Fprintln(w, "  clean        turn off dangling serve forwards (--dry-run to preview)")
 	fmt.Fprintln(w, "  update       self-update tailport to the latest release")
 	fmt.Fprintln(w)
 	path, err := config.Path(configOverride)
@@ -265,6 +266,9 @@ func runSubcommand(args []string, stdout, stderr io.Writer) int {
 		return runQuickstart(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "clean":
+		// Grace-free sibling of the TUI's stale-forward auto-clear (kata 9p43).
+		return runClean(args[1:], stdout, stderr)
 	case "update":
 		// Built-in self-updater (kata prh1). runUpdate lives in update.go and
 		// parses its own flags (--check/-y/--yes/-f/--force); args[1:] is
