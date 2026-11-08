@@ -1062,8 +1062,8 @@ func TestRefreshDecouplesDiscoveryFromStatus(t *testing.T) {
 	scanListeners = func() ([]portscan.Port, error) {
 		return []portscan.Port{{Number: 3000, Process: "web"}}, nil
 	}
-	serveStatus = func() ([]int, map[int]int, error) {
-		return nil, nil, fmt.Errorf("tailscale: executable file not found in $PATH")
+	serveStatus = func() (tsserve.Detail, error) {
+		return tsserve.Detail{}, fmt.Errorf("tailscale: executable file not found in $PATH")
 	}
 
 	msg, ok := refresh().(refreshMsg)

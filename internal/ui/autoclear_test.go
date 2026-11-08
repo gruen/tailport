@@ -23,10 +23,16 @@ type acClock struct{ t time.Time }
 func (c *acClock) now() time.Time          { return c.t }
 func (c *acClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
+// acRemap lists served ports acRefresh reports as NOT plain 1:1 serves.
+var acRemap = map[int]bool{}
+
 func acModel(cfg config.Config) (model, *acClock) {
 	clk := &acClock{t: time.Unix(1_700_000_000, 0)}
 	m := New(cfg)
 	m.now = clk.now
+	// Hermetic: no cloudflared poll is required (its presence on the dev box
+	// must not gate these tests); public-state gating has its own tests.
+	m.cfAvailable = false
 	return m, clk
 }
 
@@ -45,7 +51,13 @@ func acRefresh(t *testing.T, m model, active, listen []int, funnel map[int]int) 
 		funnel = map[int]int{}
 	}
 	m.refreshGen++
-	res, cmd := m.Update(refreshMsg{ports: ports, active: am, funnel: funnel, gen: m.refreshGen})
+	one := map[int]bool{}
+	for p := range am {
+		if !acRemap[p] {
+			one[p] = true
+		}
+	}
+	res, cmd := m.Update(refreshMsg{ports: ports, active: am, funnel: funnel, oneToOne: one, gen: m.refreshGen})
 	return res.(model), cmd
 }
 
@@ -318,7 +330,7 @@ func TestAutoClearDocsMatchBehavior(t *testing.T) {
 		t.Fatalf("docs promise a 30s default, code has %v", config.DefaultAutoClearStale)
 	}
 	help := keyLegendDescs(false)["C"]
-	for _, want := range []string{"30s", "auto_clear_stale", "tailport clean", ":22", "locked"} {
+	for _, want := range []string{"30s", "auto_clear_stale", "tailport clean", ":22", "locked", "remap"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("C help should mention %q: %q", want, help)
 		}
@@ -335,9 +347,209 @@ func TestAutoClearDocsMatchBehavior(t *testing.T) {
 		"cleared stale forward :P (nothing listened for\n30s) — t to re-serve",
 		"address already in use",
 		"`0` / `off`",
+		"a remap such as tailnet `15173` → local `5173`",
+		"waits until\nthe publish and tunnel state",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README is missing %q", want)
 		}
+	}
+}
+
+// Finding 8: a remapped serve is never auto-cleared, with either port up or not.
+func TestAutoClearNeverClearsRemappedServe(t *testing.T) {
+	acRemap = map[int]bool{15173: true}
+	t.Cleanup(func() { acRemap = map[int]bool{} })
+	for _, listen := range [][]int{nil, {5173}} {
+		m, clk := acModel(config.Config{})
+		m, _ = acRefresh(t, m, []int{15173}, listen, nil)
+		clk.advance(time.Hour)
+		m, _ = acRefresh(t, m, []int{15173}, listen, nil)
+		if m.cleaning != 0 || len(m.danglingSince) != 0 {
+			t.Fatalf("listen=%v: remap must never be tracked or cleared (cleaning=%d)", listen, m.cleaning)
+		}
+	}
+	// The same port as a plain 1:1 serve IS eligible.
+	acRemap = map[int]bool{}
+	m, clk := acModel(config.Config{})
+	m, _ = acRefresh(t, m, []int{15173}, nil, nil)
+	clk.advance(30 * time.Second)
+	m, _ = acRefresh(t, m, []int{15173}, nil, nil)
+	if m.cleaning != 1 {
+		t.Fatal("a plain dangling 1:1 serve must be cleared")
+	}
+}
+
+// Finding 1: unknown public state is not "no public routes".
+func TestAutoClearWaitsForRequiredPublicState(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Caddy.Domain = "example.com"
+	m, clk := acModel(cfg)
+	m.cfAvailable = true
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(time.Hour)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 0 {
+		t.Fatal("nothing may clear before the edge and tunnel polls have succeeded")
+	}
+	m.publishOK = true
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 0 {
+		t.Fatal("still waiting on the tunnel poll")
+	}
+	m.tunnelsOK = true
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 {
+		t.Fatal("with every required source known it clears (grace long elapsed)")
+	}
+	// Pauses again while a source errors.
+	m.cleaning = 0
+	m.publishOK = false
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 0 {
+		t.Fatal("must pause while the edge poll is failing")
+	}
+	// Not required: no caddy.domain, no cloudflared.
+	m2, clk2 := acModel(config.Config{})
+	m2, _ = acRefresh(t, m2, []int{8080}, nil, nil)
+	clk2.advance(time.Hour)
+	m2, _ = acRefresh(t, m2, []int{8080}, nil, nil)
+	if m2.cleaning != 1 {
+		t.Fatal("unconfigured sources must not block auto-clear")
+	}
+}
+
+func TestPollMessagesMaintainPublicStateFlags(t *testing.T) {
+	m, _ := acModel(config.Config{})
+	res, _ := m.Update(publishPollMsg{published: map[int]publishInfo{}, gen: 1})
+	m = res.(model)
+	if !m.publishOK {
+		t.Fatal("successful edge poll should mark publishOK")
+	}
+	res, _ = m.Update(publishPollMsg{err: errors.New("down"), gen: 2})
+	m = res.(model)
+	if m.publishOK {
+		t.Fatal("failed edge poll should clear publishOK")
+	}
+	res, _ = m.Update(tunnelPollMsg{tunnels: map[int]tunnelInfo{}, gen: 1})
+	m = res.(model)
+	if !m.tunnelsOK {
+		t.Fatal("successful tunnel poll should mark tunnelsOK")
+	}
+	res, _ = m.Update(tunnelPollMsg{err: errors.New("down"), gen: 2})
+	if res.(model).tunnelsOK {
+		t.Fatal("failed tunnel poll should clear tunnelsOK")
+	}
+}
+
+// Finding 2: no auto-clear while any modal flow or in-flight op owns the state.
+func TestAutoClearBlockedByOpenFlowsAndInFlightOps(t *testing.T) {
+	for name, set := range map[string]func(*model){
+		"publish confirm": func(m *model) { m.mode = entryConfirmPublish },
+		"publish host":    func(m *model) { m.mode = entryPublishHost },
+		"funnel confirm":  func(m *model) { m.mode = entryConfirmFunnel },
+		"tunnel confirm":  func(m *model) { m.mode = entryConfirmTunnelQuick },
+		"C confirm":       func(m *model) { m.mode = entryConfirmClean },
+		":22 confirm":     func(m *model) { m.mode = entryConfirm22 },
+		"pending op":      func(m *model) { m.pending = 1234 },
+		"tunnel stopping": func(m *model) { m.tunnelStopping = map[int]bool{1: true} },
+		"tunnel starting": func(m *model) { m.tunnelSpinnerPort = 1 },
+	} {
+		m, clk := acModel(config.Config{})
+		m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+		set(&m)
+		clk.advance(time.Hour)
+		m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+		if m.cleaning != 0 {
+			t.Errorf("%s: auto-clear must wait", name)
+		}
+	}
+}
+
+// Finding 2: confirmPublish re-checks the CURRENT serve state, not the flag
+// saved when the dialog opened, and refuses while a teardown is in flight.
+func TestConfirmPublishRechecksServeState(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Caddy.Domain = "example.com"
+	m, _ := acModel(cfg)
+	m.fqdn = "box.tail.ts.net"
+	m.active = map[int]bool{8080: true}
+	m.publishPort, m.publishHostname = 8080, "app.example.com"
+	m.publishEnableServe = false // dialog opened while served
+	delete(m.active, 8080)       // ...then the serve went away before "y"
+	cmd := m.confirmPublish()
+	if cmd == nil || m.pending != 8080 {
+		t.Fatalf("publish should proceed (pending=%d)", m.pending)
+	}
+	// With a teardown in flight it refuses instead of racing it.
+	m2, _ := acModel(cfg)
+	m2.fqdn = "box.tail.ts.net"
+	m2.active = map[int]bool{8080: true}
+	m2.publishPort, m2.publishHostname = 8080, "app.example.com"
+	m2.cleaning = 1
+	m2.confirmPublish()
+	if m2.pending != 0 || !strings.Contains(m2.flash, "clearing stale forwards") {
+		t.Fatalf("must refuse during a teardown: pending=%d flash=%q", m2.pending, m2.flash)
+	}
+}
+
+// Finding 4: forgetting a favorite keeps a port's auto_clear_stale override.
+func TestForgetKeepsAutoClearOverride(t *testing.T) {
+	cfg := rooted(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true, AutoClearStale: "off"}}})
+	m, clk := acModel(cfg)
+	m.list.SetSize(80, 20)
+	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
+	m.list.Select(0)
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	m = res.(model)
+	meta, ok := m.cfg.Ports[8080]
+	if !ok || meta.Favorite || meta.AutoClearStale != "off" {
+		t.Fatalf("override must survive forget: %+v ok=%v", meta, ok)
+	}
+	// And auto-clear stays off for the port.
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(time.Hour)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 0 {
+		t.Fatal("auto-clear must stay off after forget")
+	}
+}
+
+// Finding 5: a listener-scan failure resets the grace.
+func TestAutoClearScanErrorResetsTimers(t *testing.T) {
+	m, clk := acModel(config.Config{})
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(29 * time.Second)
+	m.refreshGen++
+	res, _ := m.Update(refreshMsg{err: errors.New("ss failed"), auto: true, gen: m.refreshGen})
+	m = res.(model)
+	if len(m.danglingSince) != 0 {
+		t.Fatal("scan error must drop the timers")
+	}
+	clk.advance(2 * time.Second) // past the ORIGINAL deadline
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 0 {
+		t.Fatal("must not clear at the original deadline after a scan error")
+	}
+	clk.advance(30 * time.Second)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 {
+		t.Fatal("a fresh 30s of continuous dangling clears")
+	}
+}
+
+// Finding 7: a partial batch yields ONE error-severity notification naming both.
+func TestPartialBatchSingleCombinedNotification(t *testing.T) {
+	m, _ := acModel(config.Config{})
+	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}, failed: []int{9000}, err: errors.New("could not clean :9000")})
+	m = res.(model)
+	want := "cleared stale forward :8080 (nothing listened for 30s) — t to re-serve; could not clean :9000"
+	if m.flash != want || m.flashLevel != flashError {
+		t.Fatalf("flash=%q level=%v", m.flash, m.flashLevel)
+	}
+	res, _ = m.Update(cleanupDoneMsg{cleaned: []int{1}, failed: []int{2}, err: errors.New("could not clean :2")})
+	m = res.(model)
+	if m.flash != "cleared :1; could not clean :2" || m.flashLevel != flashError {
+		t.Fatalf("manual partial: flash=%q level=%v", m.flash, m.flashLevel)
 	}
 }

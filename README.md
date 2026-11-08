@@ -312,9 +312,14 @@ useful for finding something new to serve, label, or favorite.
   nothing. No grace period: running it is the instruction, so it ignores
   `auto_clear_stale` (global and per-port) and clears a dangling port even where
   the TUI's auto-clear is set to `off`. It still never touches `:22`, a locked
-  port, or a port with funnel, a Caddy publish or a Cloudflare tunnel. Exits
-  non-zero if `tailscale serve status` can't be read or any unserve fails, so it
-  works as a `predev` step.
+  port, or a port with funnel, a Caddy publish or a Cloudflare tunnel, and only
+  ever clears a plain 1:1 serve (a remap such as tailnet `15173` → local `5173`
+  is left alone). It re-checks each port against a fresh listener scan just
+  before unserving it (printing `skipped :P (no longer dangling)` if an app has
+  started since). It takes no port arguments: `tailport clean 8080` exits 2.
+  Exits non-zero if `tailscale serve status` can't be read, if publish or
+  tunnel state is configured but unreadable (then nothing is cleared), or if
+  any unserve fails, so it works as a `predev` step.
 - **`tailport update`** — self-update to the latest release (sha256-verified).
   `--check` reports whether an update is available without installing it;
   `-y`/`--yes` skips the confirmation prompt; `--force` overrides its refusal to
@@ -855,9 +860,13 @@ forward goes away. Tune it with `serve.auto_clear_stale`, or
 `ports.<n>.auto_clear_stale` per port; `0` or `off` disables it (see
 [Auto-clearing dangling forwards](#auto-clearing-dangling-forwards)).
 
-The auto-clear never touches `:22`, a locked port, a port that also carries
-funnel, a Caddy publish or a Cloudflare tunnel, or the case below where
-something *is* listening. For a one-shot sweep from a shell, run
+The auto-clear only ever acts on a plain 1:1 serve (`http://127.0.0.1:P` →
+`P`); a remapped or hand-built serve is left alone. It never touches `:22`, a
+locked port, a port that also carries funnel, a Caddy publish or a Cloudflare
+tunnel, or the case below where something *is* listening. It also waits until
+the publish and tunnel state it depends on (only if `caddy.domain` is set or
+`cloudflared` is installed) has been read successfully, and does nothing while a
+dialog is open or a toggle is in flight. For a one-shot sweep from a shell, run
 `tailport clean` (`--dry-run` to preview); see the
 [command-line reference](#command-line-reference).
 

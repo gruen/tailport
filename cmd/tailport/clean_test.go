@@ -10,6 +10,7 @@ import (
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/tsserve"
 )
 
 // Kata 9p43: `tailport clean`. Every source and the unserve are faked.
@@ -19,9 +20,17 @@ type cleanFakes struct {
 	served    []int
 	funnel    map[int]int
 	public    map[int]bool
+	publicErr error
 	statusErr error
 	failOn    map[int]bool
 	unserved  []int
+	remap     map[int]bool // served ports that are NOT plain 1:1 serves
+	scans     int
+	// listenLate: ports whose app starts after the first scan.
+	listenLate map[int]bool
+	// scanErrOn: the Nth scan (1-based) fails; 0 = never.
+	scanErrOn int
+	order     []string
 }
 
 func (f *cleanFakes) install(t *testing.T) {
@@ -29,19 +38,38 @@ func (f *cleanFakes) install(t *testing.T) {
 	oL, oS, oP, oU := cleanListPorts, cleanServeStatus, cleanPublicPorts, cleanUnserve
 	t.Cleanup(func() { cleanListPorts, cleanServeStatus, cleanPublicPorts, cleanUnserve = oL, oS, oP, oU })
 	cleanListPorts = func() ([]portscan.Port, error) {
+		f.scans++
+		f.order = append(f.order, "scan")
+		if f.scanErrOn == f.scans {
+			return nil, errors.New("ss exploded")
+		}
 		var ps []portscan.Port
 		for _, p := range f.listening {
 			ps = append(ps, portscan.Port{Number: p})
 		}
+		if f.scans > 1 {
+			for p := range f.listenLate {
+				ps = append(ps, portscan.Port{Number: p})
+			}
+		}
 		return ps, nil
 	}
-	cleanServeStatus = func() ([]int, map[int]int, error) {
+	cleanServeStatus = func() (tsserve.Detail, error) {
 		if f.statusErr != nil {
-			return nil, nil, f.statusErr
+			return tsserve.Detail{}, f.statusErr
 		}
-		return f.served, f.funnel, nil
+		one := map[int]bool{}
+		for _, p := range f.served {
+			if !f.remap[p] {
+				one[p] = true
+			}
+		}
+		return tsserve.Detail{Active: f.served, Funnel: f.funnel, OneToOne: one}, nil
 	}
-	cleanPublicPorts = func(config.Config) map[int]bool { return f.public }
+	cleanPublicPorts = func(config.Config) (map[int]bool, error) {
+		f.order = append(f.order, "public")
+		return f.public, f.publicErr
+	}
 	cleanUnserve = func(p int) error {
 		if f.failOn[p] {
 			return errors.New("boom")
@@ -147,9 +175,72 @@ func TestCleanReadmeClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"`tailport clean [--dry-run]`", "`would clear :P`", "ignores\n  `auto_clear_stale`", "Exits\n  non-zero"} {
+	for _, want := range []string{"`tailport clean [--dry-run]`", "`would clear :P`", "ignores\n  `auto_clear_stale`", "`tailport clean 8080` exits 2", "(then nothing is cleared)", "skipped :P (no longer dangling)"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("README should contain %q", want)
+		}
+	}
+}
+
+// Finding 8: a remapped serve (tailnet 15173 -> local 5173) is never touched,
+// whether or not either port is listening.
+func TestCleanNeverTouchesRemappedServe(t *testing.T) {
+	f := &cleanFakes{served: []int{15173}, remap: map[int]bool{15173: true}}
+	if code, out, _ := runCleanWith(t, f); code != 0 || out != "nothing to clean\n" || len(f.unserved) != 0 {
+		t.Fatalf("remap, nothing listening: code=%d out=%q unserved=%v", code, out, f.unserved)
+	}
+	f = &cleanFakes{served: []int{15173}, remap: map[int]bool{15173: true}, listening: []int{5173}}
+	if code, out, _ := runCleanWith(t, f); code != 0 || out != "nothing to clean\n" || len(f.unserved) != 0 {
+		t.Fatalf("remap, target up: code=%d out=%q unserved=%v", code, out, f.unserved)
+	}
+}
+
+// Finding 1: unreadable public state clears nothing and exits non-zero.
+func TestCleanUnknownPublicStateClearsNothing(t *testing.T) {
+	f := &cleanFakes{served: []int{8080}, publicErr: errors.New("cannot read publish state from the Caddy edge: refused")}
+	code, out, errOut := runCleanWith(t, f)
+	if code != 1 || out != "" || len(f.unserved) != 0 || !strings.Contains(errOut, "Caddy edge") || !strings.Contains(errOut, "nothing was cleared") {
+		t.Fatalf("code=%d out=%q err=%q unserved=%v", code, out, errOut, f.unserved)
+	}
+	f = &cleanFakes{served: []int{8080}, publicErr: errors.New("x")}
+	if code, _, _ := runCleanWith(t, f, "--dry-run"); code != 1 {
+		t.Fatalf("dry-run must fail too, code=%d", code)
+	}
+}
+
+// Finding 3: public state is read before the listener scan, and each port is
+// re-checked against a fresh scan right before it is unserved.
+func TestCleanRechecksEachPortBeforeUnserving(t *testing.T) {
+	f := &cleanFakes{served: []int{8080, 9000}, listenLate: map[int]bool{8080: true}}
+	code, out, _ := runCleanWith(t, f)
+	if code != 0 || out != "skipped :8080 (no longer dangling)\ncleared :9000\n" || !reflect.DeepEqual(f.unserved, []int{9000}) {
+		t.Fatalf("code=%d out=%q unserved=%v", code, out, f.unserved)
+	}
+	if len(f.order) < 2 || f.order[0] != "public" || f.order[1] != "scan" {
+		t.Fatalf("public state must be gathered before the first scan: %v", f.order)
+	}
+}
+
+func TestCleanAbortsOnRescanError(t *testing.T) {
+	f := &cleanFakes{served: []int{8080, 9000}, scanErrOn: 2}
+	code, out, errOut := runCleanWith(t, f)
+	if code != 1 || out != "" || len(f.unserved) != 0 || !strings.Contains(errOut, "aborting") {
+		t.Fatalf("code=%d out=%q err=%q unserved=%v", code, out, errOut, f.unserved)
+	}
+	f = &cleanFakes{served: []int{8080}, scanErrOn: 1}
+	if code, _, _ := runCleanWith(t, f); code != 1 || len(f.unserved) != 0 {
+		t.Fatalf("first-scan failure: code=%d unserved=%v", code, f.unserved)
+	}
+}
+
+// Finding 6: a stray positional is rejected before anything is gathered or
+// mutated.
+func TestCleanRejectsPositionalArgs(t *testing.T) {
+	for _, args := range [][]string{{"8080", "--dry-run"}, {"--dry-run", "8080"}, {"all"}} {
+		f := &cleanFakes{served: []int{8080}}
+		code, out, errOut := runCleanWith(t, f, args...)
+		if code != 2 || out != "" || !strings.Contains(errOut, "unexpected argument") || len(f.unserved) != 0 || f.scans != 0 || len(f.order) != 0 {
+			t.Errorf("%v: code=%d out=%q err=%q unserved=%v scans=%d", args, code, out, errOut, f.unserved, f.scans)
 		}
 	}
 }

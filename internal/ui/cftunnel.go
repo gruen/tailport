@@ -323,7 +323,7 @@ func tunnelStopCmd(client *cftunnel.Client, pid, port int) tea.Cmd {
 // tearing down the wrong mode or layering a second tunnel on the port.
 func (m *model) requestTunnel(port int) tea.Cmd {
 	// 1. busy: an exposure op is already in flight.
-	if m.pending != 0 {
+	if m.pending != 0 || m.cleaning != 0 {
 		return nil
 	}
 	// 2. feature gate: cloudflared must actually be installed.
@@ -382,7 +382,7 @@ func (m *model) requestTunnel(port int) tea.Cmd {
 // cross-key case, refused with a hint pointing at `o`.
 func (m *model) requestTunnelNamed(port int) tea.Cmd {
 	// 1. busy: an exposure op is already in flight.
-	if m.pending != 0 {
+	if m.pending != 0 || m.cleaning != 0 {
 		return nil
 	}
 	// 2. feature gate: cloudflared must actually be installed.

@@ -225,19 +225,39 @@ func gatherFrom(cfg config.Config, src gatherSources) ([]Row, error) {
 
 // PublicPorts returns the local ports that carry a Caddy-edge publish or a
 // tailport-owned Cloudflare tunnel (kata 9p43), for `tailport clean`'s "skip
-// deliberate public exposure" rule. Best-effort and read-only, exactly like
-// Gather's own reads: an unreachable edge or an absent cloudflared simply
-// contributes nothing.
-func PublicPorts(cfg config.Config) map[int]bool {
-	fqdn, _ := tsserve.FQDN()
+// deliberate public exposure" rule. Read-only. Unlike Gather's best-effort
+// reads it is TRI-STATE: a source that is configured/available but cannot be
+// read is an ERROR, never an empty set -- "unknown" must not read as "nothing
+// is public". A source that is not in play (no caddy.domain; cloudflared not
+// installed) contributes nothing and is not an error.
+func PublicPorts(cfg config.Config) (map[int]bool, error) {
 	ports := map[int]bool{}
-	for p := range gatherPublished(cfg, fqdn) {
-		ports[p] = true
+	if cfg.Caddy.Domain != "" {
+		fqdn, err := tsserve.FQDN()
+		if err != nil || shortLabel(fqdn) == "" {
+			return nil, fmt.Errorf("cannot read publish state: this machine's tailnet name is unknown (%v)", err)
+		}
+		published, err := fetchPublished(cfg, fqdn)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read publish state from the Caddy edge: %w", err)
+		}
+		for p := range published {
+			ports[p] = true
+		}
 	}
-	for _, t := range gatherTunnels(cfg) {
-		ports[t.Port] = true
+	client := &cftunnel.Client{Binary: cfg.Cloudflared.Binary}
+	if _, err := client.Detect(); err == nil {
+		running, err := client.Discover()
+		if err != nil {
+			return nil, fmt.Errorf("cannot read cloudflared tunnel state: %w", err)
+		}
+		for _, r := range running {
+			if r.Owned {
+				ports[r.Port] = true
+			}
+		}
 	}
-	return ports
+	return ports, nil
 }
 
 // gatherTunnels discovers this machine's tailport-OWNED Cloudflare tunnels, or
@@ -295,13 +315,21 @@ func gatherTunnels(cfg config.Config) []Tunnel {
 // failing Gather: a status report must still show serve/funnel rows when the
 // edge can't be reached.
 func gatherPublished(cfg config.Config, fqdn string) map[int]Published {
-	if cfg.Caddy.Domain == "" {
+	if cfg.Caddy.Domain == "" || shortLabel(fqdn) == "" {
 		return nil
 	}
+	published, err := fetchPublished(cfg, fqdn)
+	if err != nil {
+		return nil
+	}
+	return published
+}
+
+// fetchPublished is gatherPublished's strict core: the same filtered read, but
+// a List failure is returned rather than swallowed. Callers guarantee
+// cfg.Caddy.Domain != "" and a non-empty short label.
+func fetchPublished(cfg config.Config, fqdn string) (map[int]Published, error) {
 	label := shortLabel(fqdn)
-	if label == "" {
-		return nil
-	}
 
 	client := &caddyedge.Client{
 		AdminURL:   fmt.Sprintf("http://%s:%d", cfg.Caddy.Hostname, cfg.Caddy.AdminPort),
@@ -311,7 +339,7 @@ func gatherPublished(cfg config.Config, fqdn string) map[int]Published {
 	defer cancel()
 	routes, err := client.List(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	// Filter to routes whose backend is THIS machine (Label matches the
@@ -329,7 +357,7 @@ func gatherPublished(cfg config.Config, fqdn string) map[int]Published {
 		}
 		published[r.Port] = Published{Hostname: r.Hostname, Auth: r.Auth}
 	}
-	return published
+	return published, nil
 }
 
 // shortLabel derives the short MagicDNS label from a full FQDN (its first

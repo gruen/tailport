@@ -333,13 +333,18 @@ contract. The short version:
   exception to "tailport mutates serve state only on a keypress": the TUI
   turns a forward off with no keypress, and `tailport clean` does so from a
   shell. It is a de-escalation (it only ever removes tailnet exposure) and its
-  scope is exactly: ON by default with a 30s grace, configurable via
+  scope is exactly: only a plain 1:1 serve (a single "/" proxy to
+  `127.0.0.1:P`/`localhost:P`, P == the served port; never a remap, file/text
+  handler, extra paths or TCP forwarding); ON by default with a 30s grace, configurable via
   `serve.auto_clear_stale` and per-port `ports.<n>.auto_clear_stale`
   (duration, or `0`/`off`); a port must be dangling (served AND nothing
   listening locally) CONTINUOUSLY for the whole grace, and the timer resets
   when something listens or the serve goes away; never `:22`, never a locked
   port, never a port also carrying funnel, Caddy publish or a Cloudflare
-  tunnel; never the No127 state (something IS listening, so there is no bind
+  tunnel; no auto-clear until every REQUIRED public-state source (Caddy if
+  `caddy.domain` is set, cloudflared if installed) has been read successfully
+  (`clean` clears nothing and exits non-zero if one is unreadable), nor while
+  any modal flow, pending op or teardown is active; never the No127 state (something IS listening, so there is no bind
   collision). The one rule lives in `internal/stale`, shared by the TUI
   (`trackDangling`, driven only by refreshes that pass the 4hcg generation
   guard) and `tailport clean` (no grace; it ignores `auto_clear_stale`,

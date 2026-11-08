@@ -260,3 +260,47 @@ func TestIsOperatorNotSet(t *testing.T) {
 		t.Error("isOperatorNotSet(nil) = true, want false")
 	}
 }
+
+// Kata 9p43: Detail.OneToOne marks only plain tailport-shaped serves.
+func TestParseOneToOne(t *testing.T) {
+	const plain = `{"TCP":{"18911":{"HTTP":true}},"Web":{"h.ts.net:18911":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18911"}}}}}`
+	for name, tc := range map[string]struct {
+		json string
+		want []int
+	}{
+		"plain 1:1":        {plain, []int{18911}},
+		"localhost target": {`{"TCP":{"3000":{"HTTP":true}},"Web":{"h:3000":{"Handlers":{"/":{"Proxy":"http://localhost:3000"}}}}}`, []int{3000}},
+		"remap":            {`{"TCP":{"15173":{"HTTP":true}},"Web":{"h:15173":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5173"}}}}}`, nil},
+		"multi handler":    {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"},"/api":{"Proxy":"http://127.0.0.1:4001"}}}}}`, nil},
+		"non-root path":    {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/x":{"Proxy":"http://127.0.0.1:4000"}}}}}`, nil},
+		"text handler":     {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Text":"hi"}}}}}`, nil},
+		"file handler":     {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Path":"/srv"}}}}}`, nil},
+		"remote host":      {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"http://10.0.0.5:4000"}}}}}`, nil},
+		"https target":     {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"https://127.0.0.1:4000"}}}}}`, nil},
+		"tcp forward":      {`{"TCP":{"2222":{"TCPForward":"127.0.0.1:22"}}}`, nil},
+		"tls terminated":   {`{"TCP":{"4000":{"HTTPS":true}},"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"}}}}}`, nil},
+		"no tcp entry":     {`{"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"}}}}}`, nil},
+		"garbage proxy":    {`{"TCP":{"4000":{"HTTP":true}},"Web":{"h:4000":{"Handlers":{"/":{"Proxy":"%%%"}}}}}`, nil},
+	} {
+		got, err := parseOneToOne([]byte(tc.json))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		var ports []int
+		for p := range got {
+			ports = append(ports, p)
+		}
+		if len(ports) != len(tc.want) || (len(ports) == 1 && ports[0] != tc.want[0]) {
+			t.Errorf("%s: got %v want %v", name, ports, tc.want)
+		}
+	}
+	if _, err := parseOneToOne([]byte("not json")); err == nil {
+		t.Error("unparseable status must be an error, not an empty set")
+	}
+	// Two host keys for one port: both must be plain.
+	d, err := detailFrom([]byte(`{"TCP":{"5":{"HTTP":true}},"Web":{"a:5":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5"}}},"b:5":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:6"}}}}}`))
+	if err != nil || d.OneToOne[5] {
+		t.Errorf("a port with one non-plain host key must not be 1:1: %v %v", d.OneToOne, err)
+	}
+}

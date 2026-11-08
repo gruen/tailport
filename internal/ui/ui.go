@@ -551,6 +551,9 @@ type refreshMsg struct {
 	// m.allPorts and surfaces this as a quiet, persistent status-line note
 	// (m.tailnetUnavailable / statusText's suffix), never a blanking toast.
 	statusErr error
+	// oneToOne is the set of served ports whose mapping is a plain 1:1 proxy
+	// (tsserve.Detail.OneToOne, kata 9p43). Only those can be auto-cleared.
+	oneToOne map[int]bool
 	// gen is the issue-time stamp from refreshCmd/refreshAt; see
 	// model.refreshFloor.
 	gen int
@@ -1135,10 +1138,17 @@ type model struct {
 	now           func() time.Time
 	// staleWarned latches the one-shot toast for an unparseable
 	// auto_clear_stale value (config.Config.StaleWarnings).
-	staleWarned   bool
-	cleanTargets  []int // ports the entryConfirmClean prompt is asking about
-	confirmPort   int   // port the entryConfirm22 prompt is asking about (always 22)
-	confirmTurnOn bool  // direction of the pending entryConfirm22 toggle
+	staleWarned bool
+	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
+	oneToOne map[int]bool
+	// publishOK / tunnelsOK: the LAST edge poll / tunnel poll succeeded (false
+	// until the first success, and again after a failure). Auto-clear needs
+	// every REQUIRED public-state source known-good, because "unknown" must not
+	// read as "no public routes" (see publicStateKnown).
+	publishOK, tunnelsOK bool
+	cleanTargets         []int // ports the entryConfirmClean prompt is asking about
+	confirmPort          int   // port the entryConfirm22 prompt is asking about (always 22)
+	confirmTurnOn        bool  // direction of the pending entryConfirm22 toggle
 	// entryConfirmFunnel state: the local port being funnelled, the public
 	// ingress port it will use, and the toggle direction.
 	funnelPort   int
@@ -1721,7 +1731,7 @@ func fwLagNext(ewma, obs float64) float64 {
 // would still pass if refresh() itself regressed to discarding the scan).
 var (
 	scanListeners = portscan.List
-	serveStatus   = tsserve.Status
+	serveStatus   = tsserve.StatusDetail
 )
 
 func refresh() tea.Msg {
@@ -1732,7 +1742,8 @@ func refresh() tea.Msg {
 		return refreshMsg{err: err}
 	}
 	// One serve-status fetch reconciles both serve and funnel (e40f dedupe).
-	activeList, funnel, statusErr := serveStatus()
+	detail, statusErr := serveStatus()
+	activeList, funnel := detail.Active, detail.Funnel
 	if statusErr != nil {
 		// tailnet exposure is unknown (commonly: `tailscale` isn't on PATH),
 		// but discovery still succeeded -- decouple the two (yn46) rather than
@@ -1748,7 +1759,7 @@ func refresh() tea.Msg {
 	for _, p := range activeList {
 		active[p] = true
 	}
-	return refreshMsg{ports: ports, active: active, funnel: funnel}
+	return refreshMsg{ports: ports, active: active, funnel: funnel, oneToOne: detail.OneToOne}
 }
 
 // refreshCmd issues a status refresh stamped with a fresh generation, so a
@@ -2329,7 +2340,31 @@ func (m model) clearableStale() []int {
 	for p := range m.tunnels {
 		public[p] = true
 	}
-	return stale.Clearable(m.cfg, m.active, listening, m.funnel, public)
+	return stale.Clearable(m.cfg, m.active, listening, m.funnel, public, m.oneToOne)
+}
+
+// publicStateKnown reports whether every REQUIRED public-exposure source has
+// answered successfully (most recently): the Caddy edge poll when
+// caddy.domain is configured, the cloudflared process poll when cloudflared is
+// available. Unknown is not empty -- until this holds, nothing is auto-cleared,
+// because a published or tunnelled port's serve must not be torn down on the
+// strength of a poll that has not landed yet (or is failing).
+func (m model) publicStateKnown() bool {
+	if m.cfg.Caddy.Domain != "" && !m.publishOK {
+		return false
+	}
+	if m.cfAvailable && !m.tunnelsOK {
+		return false
+	}
+	return true
+}
+
+// autoClearBlocked reports whether something else owns the serve state right
+// now, so an auto-clear must wait: any open modal/entry flow (publish, funnel,
+// tunnel, C, :22, purge, label...), an in-flight toggle/publish/tunnel op, a
+// teardown already running, or a tunnel being stopped.
+func (m model) autoClearBlocked() bool {
+	return m.mode != entryNone || m.pending != 0 || m.cleaning != 0 || len(m.tunnelStopping) > 0 || m.tunnelSpinnerPort != 0
 }
 
 // trackDangling advances the auto-clear grace timers after a refresh applied
@@ -2376,16 +2411,21 @@ func formatGrace(d time.Duration) string {
 	return d.String()
 }
 
+// portList renders ports as ":A, :B".
+func portList(ports []int) string {
+	names := make([]string, len(ports))
+	for i, p := range ports {
+		names[i] = ":" + strconv.Itoa(p)
+	}
+	return strings.Join(names, ", ")
+}
+
 // autoClearToast is the toast for ports the auto-clear just tore down.
 func (m model) autoClearToast(ports []int) string {
 	if len(ports) == 1 {
 		return fmt.Sprintf("cleared stale forward :%d (nothing listened for %s) — t to re-serve", ports[0], formatGrace(m.cfg.AutoClearGrace(ports[0])))
 	}
-	names := make([]string, len(ports))
-	for i, p := range ports {
-		names[i] = ":" + strconv.Itoa(p)
-	}
-	return fmt.Sprintf("cleared stale forwards %s (nothing listened past their grace) — t to re-serve", strings.Join(names, ", "))
+	return fmt.Sprintf("cleared stale forwards %s (nothing listened past their grace) — t to re-serve", portList(ports))
 }
 
 // danglingPorts returns the sorted set of ports that are exposed via
@@ -2748,7 +2788,7 @@ func looksHTTP(port int, process string) bool {
 // publishSetupOrHostDialog).
 func (m *model) requestPublish(port int) tea.Cmd {
 	// 1. busy: a toggle/funnel/publish is already in flight.
-	if m.pending != 0 {
+	if m.pending != 0 || m.cleaning != 0 {
 		return nil
 	}
 	// 2. :22 (SSH) is hard-blocked from the public internet, same as funnel.
@@ -2903,7 +2943,7 @@ func (m *model) republishFromMemory(port int, info publishInfo) tea.Cmd {
 // AGENTS.md forbids just because it has no unpublish branch to fall into.
 func (m *model) requestEditPublish(port int) tea.Cmd {
 	// 1. busy: a toggle/funnel/publish is already in flight.
-	if m.pending != 0 {
+	if m.pending != 0 || m.cleaning != 0 {
 		return nil
 	}
 	// 2. :22 (SSH) is hard-blocked from the public internet, same as funnel.
@@ -3284,7 +3324,18 @@ func (m *model) confirmPublish() tea.Cmd {
 	// directly (never through here), so it is inherently exempt from this trigger.
 	m.clearLastPurge()
 	hostname := m.publishHostname
-	enableServe := m.publishEnableServe
+	// Re-check the CURRENT serve state rather than trusting the flag saved when
+	// the dialog opened (kata 9p43): the grace-period auto-clear can turn a
+	// dangling serve off while the confirm sits open, which would otherwise
+	// publish a route to a port that is no longer served. m.publishEnableServe
+	// stays what the confirm SCREEN says; this is what the op actually does.
+	enableServe := !m.active[port]
+	if m.cleaning != 0 {
+		// A teardown is in flight and its outcome is not applied yet, so
+		// m.active is not trustworthy for this port: ask the user to retry.
+		m.clearPublishFlow()
+		return m.setErr("tailport is clearing stale forwards — try again in a moment")
+	}
 
 	// Guard 3 re-check FIRST: never build a route dialling ":port" with no
 	// label -- and never persist a credential for a publish we'd then abort.
@@ -3576,6 +3627,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // issued before a mutation that has since succeeded
 		}
 		if msg.err != nil {
+			// A failed listener scan says nothing about what is listening, so
+			// it must not let a running grace carry across the gap (kata 9p43).
+			clear(m.danglingSince)
 			if msg.auto {
 				return m, nil // periodic poll: fail silently, don't nag
 			}
@@ -3607,10 +3661,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// here. A statusErr refresh knows nothing about serve state, so it
 		// forgets every running timer (a gap in knowledge must not count as
 		// continuous dangling) and clears nothing.
+		m.oneToOne = msg.oneToOne
 		var autoCmd tea.Cmd
 		if msg.statusErr != nil {
 			clear(m.danglingSince)
-		} else if due := m.trackDangling(); len(due) > 0 && m.pending == 0 && m.cleaning == 0 {
+		} else if due := m.trackDangling(); len(due) > 0 && m.publicStateKnown() && !m.autoClearBlocked() {
 			m.cleaning = len(due)
 			autoCmd = cleanupPorts(due, true)
 		}
@@ -4152,10 +4207,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// map, just mark the edge unreachable. No toast -- a persistent
 			// " · edge unreachable" status-line fragment carries it instead.
 			m.publishReachable = false
+			m.publishOK = false
 			return m, nil
 		}
 		m.published = msg.published
 		m.publishReachable = true
+		m.publishOK = true
 		// kata prp1: every port the live poll reports as published right now
 		// is, by definition, toggle-able -- remember its hostname/auth
 		// alongside whatever a publishDoneMsg has already recorded, so a
@@ -4292,8 +4349,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			// Quiet degrade: keep the last-known tunnels map. A Discover error is
 			// a transient /proc-scan hiccup, not a reason to blank exposure.
+			m.tunnelsOK = false
 			return m, nil
 		}
+		m.tunnelsOK = true
 		m.tunnels = msg.tunnels
 		m.tunnelForeign = msg.foreign
 		// Audit item 4 (kata nc1j W3b): a tunnel that exits on its own (a
@@ -4413,14 +4472,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// still show these forwards served (kata 4hcg).
 			m.supersedeRefreshes()
 		}
-		var toast tea.Cmd
-		if msg.auto && len(msg.cleaned) > 0 {
-			toast = m.setFlash(m.autoClearToast(msg.cleaned), flashInfo)
+		// ONE notification, never two that overwrite each other: a partial batch
+		// names both what was cleared and what was not, at error severity.
+		switch {
+		case msg.err != nil && msg.auto && len(msg.cleaned) > 0:
+			return m, tea.Batch(m.setErr(m.autoClearToast(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd())
+		case msg.err != nil && len(msg.cleaned) > 0:
+			return m, tea.Batch(m.setErr("cleared "+portList(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd())
+		case msg.err != nil:
+			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd())
+		case msg.auto && len(msg.cleaned) > 0:
+			return m, tea.Batch(m.setFlash(m.autoClearToast(msg.cleaned), flashInfo), m.refreshCmd())
 		}
-		if msg.err != nil {
-			return m, tea.Batch(toast, m.setErr(msg.err.Error()), m.refreshCmd())
-		}
-		return m, tea.Batch(toast, m.refreshCmd())
+		return m, m.refreshCmd()
 
 	case flashExpireMsg:
 		// Only clear if no newer toast has replaced this one (see flashID).
@@ -4546,7 +4610,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					turnOn := m.confirmTurnOn
 					m.mode = entryNone
 					m.confirmPort = 0
-					if m.pending != 0 {
+					if m.pending != 0 || m.cleaning != 0 {
 						return m, nil
 					}
 					return m, m.beginToggle(port, turnOn)
@@ -4567,7 +4631,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = entryNone
 					m.funnelPort = 0
 					m.funnelPublic = 0
-					if m.pending != 0 {
+					if m.pending != 0 || m.cleaning != 0 {
 						return m, nil
 					}
 					return m, m.beginFunnel(port, pub, true)
@@ -4586,7 +4650,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// confirm that can't, by cloudflared's design.
 			if m.mode == entryConfirmTunnelQuick {
 				if msg.String() == "y" || msg.String() == "Y" {
-					if m.pending != 0 {
+					if m.pending != 0 || m.cleaning != 0 {
 						m.clearTunnelFlow()
 						return m, nil
 					}
@@ -4597,7 +4661,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == entryConfirmTunnelNamed {
 				if msg.String() == "y" || msg.String() == "Y" {
-					if m.pending != 0 {
+					if m.pending != 0 || m.cleaning != 0 {
 						m.clearTunnelFlow()
 						return m, nil
 					}
@@ -5019,7 +5083,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if meta, ok := m.cfg.Ports[sel.port.Number]; ok {
 				before := m.portState(sel.port.Number)
 				meta.Favorite = false
-				if meta.Label == "" && !meta.Locked {
+				if meta.Label == "" && !meta.Locked && meta.AutoClearStale == "" {
 					delete(m.cfg.Ports, sel.port.Number)
 				} else {
 					m.cfg.Ports[sel.port.Number] = meta
@@ -5065,7 +5129,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pushUndo(sel.port.Number, before, fmt.Sprintf("%s :%d", verb, sel.port.Number))
 			return m, tea.Batch(m.saveConfig(), m.rebuildItems())
 		case "t": // tailnet serve toggle (remapped from space, kata 7nss BREAKING)
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -5105,7 +5169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// y/n confirm before any serve call.
 			return m, m.requestToggle(sel.port.Number, !sel.active)
 		case "p": // funnel key (swapped back from "P", kata 58ws)
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle/funnel is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -5116,7 +5180,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// taken, and defers a turn-on to the strong public-internet confirm.
 			return m, m.requestFunnel(sel.port.Number)
 		case "d": // publish key (moved from "p", kata 58ws)
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle/funnel/publish is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -5129,7 +5193,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// (kata prp1): unpublish / same-session re-publish / first-setup.
 			return m, m.requestPublish(sel.port.Number)
 		case "e": // edit publish config, without unpublishing first (kata prp1)
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle/funnel/publish is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -5143,7 +5207,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.requestEditPublish(sel.port.Number)
 		case "o": // cloudflared QUICK tunnel (kata nc1j; remapped from t, kata
 			// 7nss BREAKING; split from the named tunnel under kata p7c5)
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle/funnel/publish/tunnel is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -5157,7 +5221,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.requestTunnel(sel.port.Number)
 		case "O": // cloudflared NAMED tunnel, from the port's config.yaml
 			// binding (kata p7c5) -- help-only, see barGroups.
-			if m.pending != 0 {
+			if m.pending != 0 || m.cleaning != 0 {
 				return m, nil // a toggle/funnel/publish/tunnel is already in flight
 			}
 			sel, ok := m.list.SelectedItem().(portItem)
@@ -7131,7 +7195,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press t there to serve it once its service is up.",
 		"l":      "Set a text label for the selected port.",
 		"x":      "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
-		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "), behind a y/n confirm. Offered\nonly when some exist. A dangling forward holds its port on the\ntailnet IPs, so an app binding all interfaces there fails with\n\"address already in use\" — which is why tailport also clears one by\nitself after it has been dangling for 30s straight (serve.\nauto_clear_stale, ports.<n>.auto_clear_stale; 0/off disables). The\nauto-clear skips :22, locked ports and ports with funnel, publish or\na tunnel, and toasts each one it clears. From a shell: tailport clean.",
+		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "), behind a y/n confirm. Offered\nonly when some exist. A dangling forward holds its port on the\ntailnet IPs, so an app binding all interfaces there fails with\n\"address already in use\" — which is why tailport also clears one by\nitself after it has been dangling for 30s straight (serve.\nauto_clear_stale, ports.<n>.auto_clear_stale; 0/off disables). The\nauto-clear acts only on plain 1:1 serves (never a remap) and skips :22,\nlocked ports and ports with funnel, publish or a tunnel; it toasts each one it clears. From a shell: tailport clean.",
 		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
 		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
 		"s":      "Sort the list: toggle between port number (the default, ascending)\nand name (label, else process, else \"was <proc>\", else \"?\";\ncase-insensitive, port number breaks ties). Session-only -- it\nresets to port-number order on restart.",

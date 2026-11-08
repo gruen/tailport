@@ -19,7 +19,7 @@ import (
 // pattern as statusGather. Production code never reassigns them.
 var (
 	cleanListPorts   = portscan.List
-	cleanServeStatus = tsserve.Status
+	cleanServeStatus = tsserve.StatusDetail
 	cleanPublicPorts = statusreport.PublicPorts
 	cleanUnserve     = tsserve.Off
 )
@@ -30,8 +30,9 @@ func printCleanUsage(w io.Writer) {
 	fmt.Fprintln(w, "tailnet IPs, so an app binding the wildcard address there fails with")
 	fmt.Fprintln(w, "EADDRINUSE. No grace period (running it is deliberate); never touches :22,")
 	fmt.Fprintln(w, "locked ports, or ports with funnel, a Caddy publish or a Cloudflare tunnel.")
-	fmt.Fprintln(w, "Prints one line per port; exits non-zero if tailscale status can't be read")
-	fmt.Fprintln(w, "or any unserve fails.")
+	fmt.Fprintln(w, "Only a plain 1:1 serve (127.0.0.1:P -> P) qualifies; a remap is left alone.")
+	fmt.Fprintln(w, "Prints one line per port; exits non-zero (clearing nothing) if tailscale")
+	fmt.Fprintln(w, "status or publish/tunnel state can't be read, or if any unserve fails.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  tailport clean [flags]")
@@ -65,6 +66,13 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 		printCleanUsage(stderr)
 		return 2
 	}
+	if fs.NArg() > 0 {
+		// A stray positional (`clean 8080 --dry-run` stops flag parsing at
+		// 8080) must never silently turn into "clear everything".
+		fmt.Fprintf(stderr, "tailport clean: unexpected argument %q\n", fs.Arg(0))
+		printCleanUsage(stderr)
+		return 2
+	}
 	applyNoColor(*noColor)
 
 	cfg, err := config.Load(*configPath)
@@ -72,25 +80,20 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tailport clean: resolving config:", err)
 		return 1
 	}
-	ports, err := cleanListPorts()
+	// The slow public-state read goes FIRST, so the listener scan below is the
+	// freshest fact before any mutation. Unreadable public state clears nothing:
+	// unknown is not empty.
+	public, err := cleanPublicPorts(cfg)
 	if err != nil {
-		fmt.Fprintln(stderr, "tailport clean: listing local ports:", err)
+		fmt.Fprintln(stderr, "tailport clean:", err)
+		fmt.Fprintln(stderr, "tailport clean: nothing was cleared")
 		return 1
 	}
-	active, funnel, err := cleanServeStatus()
+	targets, err := cleanEligible(cfg, public)
 	if err != nil {
-		fmt.Fprintln(stderr, "tailport clean: reading tailscale serve status:", err)
+		fmt.Fprintln(stderr, "tailport clean:", err)
 		return 1
 	}
-	served := make(map[int]bool, len(active))
-	for _, p := range active {
-		served[p] = true
-	}
-	listening := make(map[int]bool, len(ports))
-	for _, p := range ports {
-		listening[p.Number] = true
-	}
-	targets := stale.Clearable(cfg, served, listening, funnel, cleanPublicPorts(cfg))
 	if len(targets) == 0 {
 		fmt.Fprintln(stdout, "nothing to clean")
 		return 0
@@ -101,6 +104,18 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "would clear :%d\n", p)
 			continue
 		}
+		// TOCTOU: re-check this port against a fresh listener scan and serve
+		// status immediately before unserving it, so an app that started
+		// since the first scan is never cut off. A scan failure aborts.
+		now, err := cleanEligible(cfg, public)
+		if err != nil {
+			fmt.Fprintln(stderr, "tailport clean: aborting:", err)
+			return 1
+		}
+		if !containsPort(now, p) {
+			fmt.Fprintf(stdout, "skipped :%d (no longer dangling)\n", p)
+			continue
+		}
 		if err := cleanUnserve(p); err != nil {
 			fmt.Fprintf(stderr, "tailport clean: could not clear :%d: %v\n", p, err)
 			code = 1
@@ -109,4 +124,35 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "cleared :%d\n", p)
 	}
 	return code
+}
+
+// cleanEligible scans listeners and reads serve status afresh and applies the
+// shared eligibility rule (internal/stale) with the given public-port set.
+func cleanEligible(cfg config.Config, public map[int]bool) ([]int, error) {
+	ports, err := cleanListPorts()
+	if err != nil {
+		return nil, fmt.Errorf("listing local ports: %w", err)
+	}
+	detail, err := cleanServeStatus()
+	if err != nil {
+		return nil, fmt.Errorf("reading tailscale serve status: %w", err)
+	}
+	served := make(map[int]bool, len(detail.Active))
+	for _, p := range detail.Active {
+		served[p] = true
+	}
+	listening := make(map[int]bool, len(ports))
+	for _, p := range ports {
+		listening[p.Number] = true
+	}
+	return stale.Clearable(cfg, served, listening, detail.Funnel, public, detail.OneToOne), nil
+}
+
+func containsPort(ports []int, p int) bool {
+	for _, q := range ports {
+		if q == p {
+			return true
+		}
+	}
+	return false
 }

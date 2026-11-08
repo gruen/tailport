@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -86,6 +87,113 @@ func Status() (active []int, funnel map[int]int, err error) {
 		return nil, nil, err
 	}
 	return active, funnel, nil
+}
+
+// Detail is Status plus the SHAPE of each serve mapping (kata 9p43).
+type Detail struct {
+	Active []int
+	Funnel map[int]int
+	// OneToOne is the set of served ports whose mapping is exactly the shape
+	// tailport itself creates: plain HTTP on that port, one handler at "/",
+	// a pure proxy to http://127.0.0.1:P or http://localhost:P with P equal to
+	// the served port. A remap (served 15173 -> local 5173), a file/text/
+	// redirect handler, several paths, TCP forwarding, TLS termination or
+	// anything unparseable is NOT in it, so nothing may treat the served port's
+	// own number as "the local port to check" for those.
+	OneToOne map[int]bool
+}
+
+// StatusDetail is Status with the per-port mapping shape; one fetch.
+func StatusDetail() (Detail, error) {
+	out, err := statusJSON()
+	if err != nil {
+		return Detail{}, err
+	}
+	return detailFrom(out)
+}
+
+func detailFrom(out []byte) (Detail, error) {
+	active, err := activePortsFrom(out)
+	if err != nil {
+		return Detail{}, err
+	}
+	funnel, err := parseFunnel(out)
+	if err != nil {
+		return Detail{}, err
+	}
+	one, err := parseOneToOne(out)
+	if err != nil {
+		return Detail{}, err
+	}
+	return Detail{Active: active, Funnel: funnel, OneToOne: one}, nil
+}
+
+// parseOneToOne computes Detail.OneToOne from a ServeConfig JSON blob.
+func parseOneToOne(out []byte) (map[int]bool, error) {
+	var cfg struct {
+		TCP map[string]struct {
+			HTTP       bool   `json:"HTTP"`
+			HTTPS      bool   `json:"HTTPS"`
+			TCPForward string `json:"TCPForward"`
+		} `json:"TCP"`
+		Web map[string]struct {
+			Handlers map[string]struct {
+				Proxy    string `json:"Proxy"`
+				Path     string `json:"Path"`
+				Text     string `json:"Text"`
+				Redirect string `json:"Redirect"`
+			} `json:"Handlers"`
+		} `json:"Web"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing serve shape: %w", err)
+	}
+	ok := map[int]bool{}
+	bad := map[int]bool{}
+	for hp, w := range cfg.Web {
+		port := portSuffix(hp)
+		if port == 0 {
+			continue
+		}
+		if !plainProxyTo(w.Handlers, port) {
+			bad[port] = true
+			continue
+		}
+		ok[port] = true
+	}
+	for port := range ok {
+		t, has := cfg.TCP[strconv.Itoa(port)]
+		if bad[port] || !has || !t.HTTP || t.HTTPS || t.TCPForward != "" {
+			delete(ok, port)
+		}
+	}
+	return ok, nil
+}
+
+// plainProxyTo reports whether handlers is exactly one "/" pure-proxy handler
+// to loopback port `port`.
+func plainProxyTo(handlers map[string]struct {
+	Proxy    string `json:"Proxy"`
+	Path     string `json:"Path"`
+	Text     string `json:"Text"`
+	Redirect string `json:"Redirect"`
+}, port int) bool {
+	if len(handlers) != 1 {
+		return false
+	}
+	h, has := handlers["/"]
+	if !has || h.Path != "" || h.Text != "" || h.Redirect != "" {
+		return false
+	}
+	u, err := url.Parse(h.Proxy)
+	if err != nil || u.Scheme != "http" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" {
+		return false
+	}
+	if host := u.Hostname(); host != "127.0.0.1" && host != "localhost" {
+		return false
+	}
+	p, err := strconv.Atoi(u.Port())
+	return err == nil && p == port
 }
 
 // statusJSON fetches the current ServeConfig as JSON. Serve status carries
