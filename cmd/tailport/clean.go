@@ -31,8 +31,10 @@ func printCleanUsage(w io.Writer) {
 	fmt.Fprintln(w, "EADDRINUSE. No grace period (running it is deliberate); never touches :22,")
 	fmt.Fprintln(w, "locked ports, or ports with funnel, a Caddy publish or a Cloudflare tunnel.")
 	fmt.Fprintln(w, "Only a plain 1:1 serve (127.0.0.1:P -> P) qualifies; a remap is left alone.")
-	fmt.Fprintln(w, "Prints one line per port; exits non-zero (clearing nothing) if tailscale")
-	fmt.Fprintln(w, "status or publish/tunnel state can't be read, or if any unserve fails.")
+	fmt.Fprintln(w, "Prints one line per port. Exits non-zero, clearing nothing, if tailscale")
+	fmt.Fprintln(w, "status or publish/tunnel state can't be read up front. A failure DURING")
+	fmt.Fprintln(w, "cleanup (an unserve or a re-scan) also exits non-zero, but forwards already")
+	fmt.Fprintln(w, "cleared by then stay cleared; the printed lines say which.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  tailport clean [flags]")
@@ -126,16 +128,19 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
-// cleanEligible scans listeners and reads serve status afresh and applies the
-// shared eligibility rule (internal/stale) with the given public-port set.
+// cleanEligible reads serve status and scans listeners afresh and applies the
+// shared eligibility rule (internal/stale) with the given public-port set. The
+// listener scan runs LAST (roborev 6192): it is the signal that must be
+// freshest at the moment a forward is removed, so an app that starts while the
+// slower serve-status request is in flight is still seen and kept.
 func cleanEligible(cfg config.Config, public map[int]bool) ([]int, error) {
-	ports, err := cleanListPorts()
-	if err != nil {
-		return nil, fmt.Errorf("listing local ports: %w", err)
-	}
 	detail, err := cleanServeStatus()
 	if err != nil {
 		return nil, fmt.Errorf("reading tailscale serve status: %w", err)
+	}
+	ports, err := cleanListPorts()
+	if err != nil {
+		return nil, fmt.Errorf("listing local ports: %w", err)
 	}
 	served := make(map[int]bool, len(detail.Active))
 	for _, p := range detail.Active {

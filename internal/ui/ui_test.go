@@ -10677,3 +10677,23 @@ func TestEggCreditsFitMinWidth(t *testing.T) {
 		}
 	}
 }
+
+// roborev 6192: a completed cleanup must drop its cleared ports from m.active
+// immediately -- not wait for the confirming refresh -- so a republish in that
+// gap sees the forward is gone and re-enables serve (enableServe=true) instead
+// of creating a public route with no working forward.
+func TestCleanupDoneDropsClearedForwardsAtOnce(t *testing.T) {
+	m := New(config.Config{})
+	m.active = map[int]bool{3000: true, 4000: true}
+	m.cleaning = 2
+	m = mustUpdate(t, m, cleanupDoneMsg{cleaned: []int{3000}, failed: []int{4000}, err: errors.New("could not clear :4000")})
+	if m.active[3000] {
+		t.Error("a successfully cleared forward must leave m.active at once, before any refresh")
+	}
+	if !m.active[4000] {
+		t.Error("a forward whose teardown failed must stay in m.active")
+	}
+	if m.cleaning != 0 {
+		t.Errorf("cleaning = %d, want 0", m.cleaning)
+	}
+}

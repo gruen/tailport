@@ -4459,6 +4459,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		now := m.clock()
 		for _, p := range msg.cleaned {
 			delete(m.danglingSince, p)
+			// The teardown succeeded, so the forward is gone NOW (roborev 6192):
+			// releasing the cleanup guard while m.active still claimed it let a
+			// republish in the gap before the confirming refresh compute
+			// enableServe=false and create a public route with no forward.
+			delete(m.active, p)
 		}
 		// A teardown that failed starts its grace over, so a persistent failure
 		// retries once per grace instead of on every 3s refresh.
@@ -4467,24 +4472,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.danglingSince[p] = now
 			}
 		}
+		var rebuild tea.Cmd
 		if len(msg.cleaned) > 0 {
 			// The op recorded its outcome: a refresh issued before it would
 			// still show these forwards served (kata 4hcg).
 			m.supersedeRefreshes()
+			rebuild = m.rebuildItems() // the row reflects the cleared forward at once
 		}
 		// ONE notification, never two that overwrite each other: a partial batch
 		// names both what was cleared and what was not, at error severity.
 		switch {
 		case msg.err != nil && msg.auto && len(msg.cleaned) > 0:
-			return m, tea.Batch(m.setErr(m.autoClearToast(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd())
+			return m, tea.Batch(m.setErr(m.autoClearToast(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd(), rebuild)
 		case msg.err != nil && len(msg.cleaned) > 0:
-			return m, tea.Batch(m.setErr("cleared "+portList(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd())
+			return m, tea.Batch(m.setErr("cleared "+portList(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd(), rebuild)
 		case msg.err != nil:
-			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd())
+			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd(), rebuild)
 		case msg.auto && len(msg.cleaned) > 0:
-			return m, tea.Batch(m.setFlash(m.autoClearToast(msg.cleaned), flashInfo), m.refreshCmd())
+			return m, tea.Batch(m.setFlash(m.autoClearToast(msg.cleaned), flashInfo), m.refreshCmd(), rebuild)
 		}
-		return m, m.refreshCmd()
+		return m, tea.Batch(m.refreshCmd(), rebuild)
 
 	case flashExpireMsg:
 		// Only clear if no newer toast has replaced this one (see flashID).

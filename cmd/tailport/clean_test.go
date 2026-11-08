@@ -31,6 +31,12 @@ type cleanFakes struct {
 	// scanErrOn: the Nth scan (1-based) fails; 0 = never.
 	scanErrOn int
 	order     []string
+	statuses  int
+	// listenAfterStatus: ports whose app starts WHILE the Nth serve-status
+	// request (startOnStatus, 1-based) is in flight -- visible to every scan
+	// after that request began.
+	listenAfterStatus map[int]bool
+	startOnStatus     int
 }
 
 func (f *cleanFakes) install(t *testing.T) {
@@ -55,6 +61,13 @@ func (f *cleanFakes) install(t *testing.T) {
 		return ps, nil
 	}
 	cleanServeStatus = func() (tsserve.Detail, error) {
+		f.statuses++
+		f.order = append(f.order, "status")
+		if f.startOnStatus != 0 && f.statuses == f.startOnStatus {
+			for p := range f.listenAfterStatus {
+				f.listening = append(f.listening, p)
+			}
+		}
 		if f.statusErr != nil {
 			return tsserve.Detail{}, f.statusErr
 		}
@@ -216,8 +229,20 @@ func TestCleanRechecksEachPortBeforeUnserving(t *testing.T) {
 	if code != 0 || out != "skipped :8080 (no longer dangling)\ncleared :9000\n" || !reflect.DeepEqual(f.unserved, []int{9000}) {
 		t.Fatalf("code=%d out=%q unserved=%v", code, out, f.unserved)
 	}
-	if len(f.order) < 2 || f.order[0] != "public" || f.order[1] != "scan" {
-		t.Fatalf("public state must be gathered before the first scan: %v", f.order)
+	if len(f.order) < 3 || f.order[0] != "public" || f.order[1] != "status" || f.order[2] != "scan" {
+		t.Fatalf("public state, then serve status, then the listener scan: %v", f.order)
+	}
+}
+
+// roborev 6192: the per-port recheck must scan listeners AFTER reading serve
+// status, so an app that starts while that (slower) status request is in
+// flight is still seen and its forward kept. With the old scan-then-status
+// order the recheck's scan ran first, missed the app, and the forward was cut.
+func TestCleanRecheckScansAfterServeStatus(t *testing.T) {
+	f := &cleanFakes{served: []int{8080}, listenAfterStatus: map[int]bool{8080: true}, startOnStatus: 2}
+	code, out, _ := runCleanWith(t, f)
+	if code != 0 || out != "skipped :8080 (no longer dangling)\n" || len(f.unserved) != 0 {
+		t.Fatalf("an app starting during the recheck's status request must be kept: code=%d out=%q unserved=%v", code, out, f.unserved)
 	}
 }
 
