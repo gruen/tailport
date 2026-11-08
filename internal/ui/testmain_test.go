@@ -41,6 +41,11 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("XDG_CONFIG_HOME", dir); err != nil {
 		panic("tailport ui test isolation: " + err.Error())
 	}
+	// The paused-serves file (kata p2r5) and tunnel files live in the state
+	// dir; isolate it too so no test can touch the developer's real one.
+	if err := os.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state")); err != nil {
+		panic("tailport ui test isolation: " + err.Error())
+	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

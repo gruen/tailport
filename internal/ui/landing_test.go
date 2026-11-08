@@ -12,7 +12,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/config"
+	"github.com/gruen/tailport/internal/pausedserve"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/procid"
 	"github.com/gruen/tailport/internal/tsserve"
 )
 
@@ -243,6 +245,7 @@ func TestRandomizedUpdateViewInvariants(t *testing.T) {
 
 func runRandomized(t *testing.T, seed int64, steps int) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir()) // paused-serves file (kata p2r5)
 	rng := rand.New(rand.NewSource(seed))
 	pool := []int{22, 1000, 2000, 3000, 3001, 5000, 8080, 9090}
 
@@ -317,6 +320,7 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 		case r < 78:
 			var ports []portscan.Port
 			active, funnel := map[int]bool{}, map[int]int{}
+			one, idents := map[int]bool{}, map[int]procid.Identity{}
 			for _, n := range pool {
 				if rng.Intn(3) == 0 {
 					continue
@@ -326,14 +330,31 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 					scope = portscan.ScopeWildcard
 				}
 				ports = append(ports, portscan.Port{Number: n, Process: fmt.Sprintf("p%d", rng.Intn(5)), BindScope: scope})
+				// Identity: one of two programs, or unreadable (kata p2r5).
+				switch rng.Intn(3) {
+				case 0:
+					idents[n] = procid.Identity{Exe: "/usr/bin/node", Cwd: "/srv/a"}
+				case 1:
+					idents[n] = procid.Identity{Exe: "/usr/bin/node", Cwd: "/srv/b"}
+				}
 				if rng.Intn(3) == 0 {
 					active[n] = true
+				}
+				if rng.Intn(4) != 0 {
+					one[n] = true
 				}
 				if rng.Intn(5) == 0 {
 					funnel[n] = 443
 				}
 			}
-			msg := refreshMsg{ports: ports, active: active, funnel: funnel, auto: rng.Intn(2) == 0, gen: m.refreshGen - rng.Intn(2)}
+			// Served-but-not-listening ports too, so pausing is reachable.
+			for _, n := range pool {
+				if !active[n] && rng.Intn(6) == 0 {
+					active[n] = true
+					one[n] = true
+				}
+			}
+			msg := refreshMsg{ports: ports, active: active, funnel: funnel, oneToOne: one, idents: idents, auto: rng.Intn(2) == 0, gen: m.refreshGen - rng.Intn(2)}
 			if msg.gen < 0 {
 				msg.gen = 0
 			}
@@ -370,7 +391,15 @@ func runRandomized(t *testing.T, seed int64, steps int) {
 			if rng.Intn(4) == 0 {
 				err = errors.New("boom")
 			}
-			switch rng.Intn(5) {
+			switch rng.Intn(7) {
+			case 5:
+				// An auto-pause teardown finishing: paused memory appears.
+				m.pausing[port] = pausedserve.Entry{Port: port, Exe: "/usr/bin/node", Cwd: "/srv/a", PausedAt: time.Now()}
+				step(fmt.Sprintf("auto-pause done :%d", port), cleanupDoneMsg{auto: true, cleaned: []int{port}})
+			case 6:
+				// A resume re-serve finishing (success or failure).
+				m.resuming[port] = true
+				step(fmt.Sprintf("resume done :%d err=%v", port, err), toggleDoneMsg{port: port, kind: routeTailnet, turnOn: true, err: err})
 			case 0:
 				step(fmt.Sprintf("serve done :%d err=%v", port, err), toggleDoneMsg{port: port, kind: routeTailnet, turnOn: rng.Intn(4) != 0, err: err})
 			case 1:

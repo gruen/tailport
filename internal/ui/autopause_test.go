@@ -11,10 +11,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/gruen/tailport/internal/config"
+	"github.com/gruen/tailport/internal/pausedserve"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/procid"
 )
 
-// Kata 9p43: grace-period auto-clear of dangling serve forwards. Every test
+// Kata p2r5 (reworking 9p43): grace-period auto-PAUSE of dangling serve forwards. Every test
 // drives the model through Update with an injected clock; none touches a real
 // tailscaled (serveOff is faked wherever a cmd is executed).
 
@@ -26,13 +28,39 @@ func (c *acClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 // acRemap lists served ports acRefresh reports as NOT plain 1:1 serves.
 var acRemap = map[int]bool{}
 
+// acIdent is the default program behind a test port; acSeeded are the ports
+// acModel pre-seeds with it (as if tailport had seen the app listening), so a
+// test can start from "served, app just died". Ports outside it have no
+// known identity.
+var acIdent = procid.Identity{Exe: "/usr/bin/python3", Cwd: "/srv/a"}
+var acSeeded = []int{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8080, 9090, 15173}
+
+// acBind / acListener override a test listener's bind and identity.
+type acBindSpec struct {
+	scope portscan.BindScope
+	no127 bool
+}
+
+var (
+	acBind     = map[int]acBindSpec{}
+	acListener = map[int]procid.Identity{}
+)
+
+func acReset(t *testing.T) {
+	acBind, acListener, acRemap = map[int]acBindSpec{}, map[int]procid.Identity{}, map[int]bool{}
+	t.Cleanup(func() { acBind, acListener, acRemap = map[int]acBindSpec{}, map[int]procid.Identity{}, map[int]bool{} })
+}
+
 func acModel(cfg config.Config) (model, *acClock) {
-	clk := &acClock{t: time.Unix(1_700_000_000, 0)}
+	clk := &acClock{t: time.Now()}
 	m := New(cfg)
 	m.now = clk.now
 	// Hermetic: no cloudflared poll is required (its presence on the dev box
 	// must not gate these tests); public-state gating has its own tests.
 	m.cfAvailable = false
+	for _, p := range acSeeded {
+		m.lastIdent[p] = acIdent
+	}
 	return m, clk
 }
 
@@ -44,8 +72,18 @@ func acRefresh(t *testing.T, m model, active, listen []int, funnel map[int]int) 
 		am[p] = true
 	}
 	var ports []portscan.Port
+	idents := map[int]procid.Identity{}
 	for _, p := range listen {
-		ports = append(ports, portscan.Port{Number: p})
+		pt := portscan.Port{Number: p, BindScope: portscan.ScopeLoopback, Loopback: true}
+		if b, ok := acBind[p]; ok {
+			pt.BindScope, pt.No127 = b.scope, b.no127
+		}
+		ports = append(ports, pt)
+		if id, ok := acListener[p]; ok {
+			idents[p] = id
+		} else {
+			idents[p] = acIdent
+		}
 	}
 	if funnel == nil {
 		funnel = map[int]int{}
@@ -57,72 +95,72 @@ func acRefresh(t *testing.T, m model, active, listen []int, funnel map[int]int) 
 			one[p] = true
 		}
 	}
-	res, cmd := m.Update(refreshMsg{ports: ports, active: am, funnel: funnel, oneToOne: one, gen: m.refreshGen})
+	res, cmd := m.Update(refreshMsg{ports: ports, active: am, funnel: funnel, oneToOne: one, idents: idents, gen: m.refreshGen})
 	return res.(model), cmd
 }
 
-func TestAutoClearGraceTiming(t *testing.T) {
+func TestAutoPauseGraceTiming(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 0 {
 		t.Fatal("must not clear on first sight")
 	}
-	clk.advance(config.DefaultAutoClearStale - time.Second)
+	clk.advance(config.DefaultAutoPause - time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 0 {
-		t.Fatal("must not clear before the 30s grace")
+		t.Fatal("must not pause before the 5s grace")
 	}
-	clk.advance(time.Second) // exactly 30s of continuous dangling
+	clk.advance(time.Second) // exactly 5s of continuous dangling
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 1 {
-		t.Fatalf("must clear at 30s; cleaning=%d", m.cleaning)
+		t.Fatalf("must pause at 5s; cleaning=%d", m.cleaning)
 	}
 }
 
-func TestAutoClearTimerResetsWhenListeningReturns(t *testing.T) {
+func TestAutoPauseTimerResetsWhenListeningReturns(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(25 * time.Second)
+	clk.advance(3 * time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil) // app came back
 	if _, ok := m.danglingSince[8080]; ok {
 		t.Fatal("listening again must drop the timer")
 	}
-	clk.advance(5 * time.Second)
+	clk.advance(1 * time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil) // dangling again: fresh timer
-	clk.advance(25 * time.Second)                 // 55s since the first sight, 25s since the restart
+	clk.advance(3 * time.Second)                  // 7s since the first sight, 3s since the restart
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 0 {
 		t.Fatal("grace must count only CONTINUOUS dangling")
 	}
-	clk.advance(5 * time.Second)
+	clk.advance(2 * time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 1 {
-		t.Fatal("30s after the restart it must clear")
+		t.Fatal("5s after the restart it must pause")
 	}
 }
 
-func TestAutoClearTimerDropsWhenServeGoesAway(t *testing.T) {
+func TestAutoPauseTimerDropsWhenServeGoesAway(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(20 * time.Second)
+	clk.advance(3 * time.Second)
 	m, _ = acRefresh(t, m, nil, nil, nil)
 	if len(m.danglingSince) != 0 {
 		t.Fatalf("timer should go when the serve does: %v", m.danglingSince)
 	}
 }
 
-func TestAutoClearPerPortOverrides(t *testing.T) {
+func TestAutoPausePerPortOverrides(t *testing.T) {
 	cfg := config.Config{Ports: map[int]config.PortMeta{
-		1000: {AutoClearStale: "5s"},  // shorter than the global
-		2000: {AutoClearStale: "off"}, // never, while the global is on
-		3000: {},                      // inherits 30s
+		1000: {AutoPause: "2s"},  // shorter than the global
+		2000: {AutoPause: "off"}, // never, while the global is on
+		3000: {},                 // inherits 5s
 	}}
 	m, clk := acModel(cfg)
 	m, _ = acRefresh(t, m, []int{1000, 2000, 3000}, nil, nil)
-	clk.advance(5 * time.Second)
+	clk.advance(2 * time.Second)
 	m, _ = acRefresh(t, m, []int{1000, 2000, 3000}, nil, nil)
 	if m.cleaning != 1 {
-		t.Fatalf("only :1000 is due at 5s; cleaning=%d", m.cleaning)
+		t.Fatalf("only :1000 is due at 2s; cleaning=%d", m.cleaning)
 	}
 	// Applying the result frees the in-flight guard; 2000 stays forever.
 	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{1000}})
@@ -134,10 +172,10 @@ func TestAutoClearPerPortOverrides(t *testing.T) {
 	}
 }
 
-func TestAutoClearGlobalOffPerPortOn(t *testing.T) {
+func TestAutoPauseGlobalOffPerPortOn(t *testing.T) {
 	cfg := config.Config{
-		Serve: config.ServeConfig{AutoClearStale: "off"},
-		Ports: map[int]config.PortMeta{1000: {AutoClearStale: "10s"}},
+		Serve: config.ServeConfig{AutoPause: "off"},
+		Ports: map[int]config.PortMeta{1000: {AutoPause: "10s"}},
 	}
 	m, clk := acModel(cfg)
 	m, _ = acRefresh(t, m, []int{1000, 2000}, nil, nil)
@@ -148,7 +186,7 @@ func TestAutoClearGlobalOffPerPortOn(t *testing.T) {
 	}
 }
 
-func TestAutoClearExclusions(t *testing.T) {
+func TestAutoPauseExclusions(t *testing.T) {
 	cfg := config.Config{Ports: map[int]config.PortMeta{22: {}, 3000: {Locked: true}}}
 	m, clk := acModel(cfg)
 	m.published = map[int]publishInfo{4000: {hostname: "x.example.com"}}
@@ -169,7 +207,7 @@ func TestAutoClearExclusions(t *testing.T) {
 	}
 }
 
-func TestAutoClearNo127StaleIsNeverCleared(t *testing.T) {
+func TestAutoPauseNo127StaleIsNeverCleared(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	// Served and something IS listening (e.g. bound ::1 only): not dangling.
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
@@ -180,7 +218,7 @@ func TestAutoClearNo127StaleIsNeverCleared(t *testing.T) {
 	}
 }
 
-func TestAutoClearStaleGenerationRefreshDoesNotAdvanceTimers(t *testing.T) {
+func TestAutoPauseGenerationRefreshDoesNotAdvanceTimers(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	m.supersedeRefreshes()
@@ -202,10 +240,10 @@ func TestAutoClearStaleGenerationRefreshDoesNotAdvanceTimers(t *testing.T) {
 	}
 }
 
-func TestAutoClearStatusErrorResetsTimers(t *testing.T) {
+func TestAutoPauseStatusErrorResetsTimers(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(29 * time.Second)
+	clk.advance(4 * time.Second)
 	m.refreshGen++
 	res, _ := m.Update(refreshMsg{statusErr: errors.New("tailscale down"), gen: m.refreshGen})
 	m = res.(model)
@@ -214,31 +252,33 @@ func TestAutoClearStatusErrorResetsTimers(t *testing.T) {
 	}
 }
 
-func TestAutoClearToastText(t *testing.T) {
-	cfg := config.Config{Ports: map[int]config.PortMeta{8080: {AutoClearStale: "2m"}}}
-	m, _ := acModel(cfg)
+func TestAutoPauseToastText(t *testing.T) {
+	e := pausedserve.Entry{Port: 8080, Exe: "/usr/bin/python3.12", Cwd: "/srv/a"}
+	want := "paused :8080 (app stopped) — resumes when python3.12 in /srv/a returns · t to forget"
+	if got := pauseToast([]pausedserve.Entry{e}); got != want {
+		t.Errorf("toast = %q, want %q", got, want)
+	}
+	if got, w := pauseToast([]pausedserve.Entry{e, {Port: 9000}}), "paused :8080, :9000 (apps stopped) — resume when the same apps return · t to forget"; got != w {
+		t.Errorf("plural toast = %q, want %q", got, w)
+	}
+	m, _ := acModel(config.Config{})
+	m.pausing[8080] = e
+	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
+	if got := res.(model).flash; got != want {
+		t.Errorf("flash after auto-pause = %q", got)
+	}
+	// A manual C batch neither toasts a pause nor records paused memory.
 	m2, _ := acModel(config.Config{})
-	if got, want := m2.autoClearToast([]int{8080}), "cleared stale forward :8080 (nothing listened for 30s) — t to re-serve"; got != want {
-		t.Errorf("toast = %q, want %q", got, want)
-	}
-	if got, want := m.autoClearToast([]int{8080}), "cleared stale forward :8080 (nothing listened for 2m) — t to re-serve"; got != want {
-		t.Errorf("toast = %q, want %q", got, want)
-	}
-	res, _ := m2.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
-	if got := res.(model).flash; got != "cleared stale forward :8080 (nothing listened for 30s) — t to re-serve" {
-		t.Errorf("flash after auto-clear = %q", got)
-	}
-	// A manual C batch does not use the auto toast.
 	res, _ = m2.Update(cleanupDoneMsg{cleaned: []int{8080}})
-	if got := res.(model).flash; got != "" {
-		t.Errorf("manual clean should not raise the auto toast, got %q", got)
+	if got := res.(model); got.flash != "" || len(got.paused) != 0 {
+		t.Errorf("manual clean must not pause: flash=%q paused=%v", got.flash, got.paused)
 	}
 }
 
-func TestAutoClearFailureRestartsGraceAndToastsError(t *testing.T) {
+func TestAutoPauseFailureRestartsGraceAndToastsError(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(30 * time.Second)
+	clk.advance(5 * time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	res, _ := m.Update(cleanupDoneMsg{auto: true, failed: []int{8080}, err: errors.New("could not clean :8080")})
 	m = res.(model)
@@ -252,7 +292,7 @@ func TestAutoClearFailureRestartsGraceAndToastsError(t *testing.T) {
 	}
 }
 
-func TestAutoClearRespectsInFlightGuards(t *testing.T) {
+func TestAutoPauseRespectsInFlightGuards(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	clk.advance(time.Minute)
@@ -265,7 +305,7 @@ func TestAutoClearRespectsInFlightGuards(t *testing.T) {
 
 // The cmd the refresh returns really tears the port down through the shared
 // cleanupPorts machinery (serveOff), tagged auto.
-func TestAutoClearCmdUnservesViaSharedTeardown(t *testing.T) {
+func TestAutoPauseCmdUnservesViaSharedTeardown(t *testing.T) {
 	var got []int
 	old := serveOff
 	serveOff = func(p int) error { got = append(got, p); return nil }
@@ -273,7 +313,7 @@ func TestAutoClearCmdUnservesViaSharedTeardown(t *testing.T) {
 
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(30 * time.Second)
+	clk.advance(5 * time.Second)
 	_, cmd := acRefresh(t, m, []int{8080}, nil, nil)
 
 	msgs := make(chan tea.Msg, 8)
@@ -310,10 +350,10 @@ func TestAutoClearCmdUnservesViaSharedTeardown(t *testing.T) {
 	}
 }
 
-func TestInvalidAutoClearValueWarnsOnce(t *testing.T) {
-	m, _ := acModel(config.Config{Serve: config.ServeConfig{AutoClearStale: "soon"}})
+func TestInvalidAutoPauseValueWarnsOnce(t *testing.T) {
+	m, _ := acModel(config.Config{Serve: config.ServeConfig{AutoPause: "soon"}})
 	m, _ = acRefresh(t, m, nil, nil, nil)
-	if !strings.Contains(m.flash, `serve.auto_clear_stale "soon"`) || m.flashLevel != flashWarn {
+	if !strings.Contains(m.flash, `serve.auto_pause "soon"`) || m.flashLevel != flashWarn {
 		t.Fatalf("expected a warn toast naming the bad value, got %q (%v)", m.flash, m.flashLevel)
 	}
 	m.flash = ""
@@ -324,16 +364,22 @@ func TestInvalidAutoClearValueWarnsOnce(t *testing.T) {
 }
 
 // Docs pins (AGENTS.md "Docs stay honest"): each claim below is made in the
-// README / the C help text and fails here if the behavior or the prose drifts.
-func TestAutoClearDocsMatchBehavior(t *testing.T) {
-	if config.DefaultAutoClearStale != 30*time.Second {
-		t.Fatalf("docs promise a 30s default, code has %v", config.DefaultAutoClearStale)
+// README / the C and t help text and fails here if the behavior or prose drifts.
+func TestAutoPauseDocsMatchBehavior(t *testing.T) {
+	if config.DefaultAutoPause != 5*time.Second {
+		t.Fatalf("docs promise a 5s default, code has %v", config.DefaultAutoPause)
+	}
+	if pausedserve.MaxAge != 7*24*time.Hour {
+		t.Fatalf("docs promise a 7 day expiry, code has %v", pausedserve.MaxAge)
 	}
 	help := keyLegendDescs(false)["C"]
-	for _, want := range []string{"30s", "auto_clear_stale", "tailport clean", ":22", "locked", "remap"} {
+	for _, want := range []string{"PERMANENTLY", "5s", "auto_pause", "tailport clean", ":22", "locked", "remap", "resumes", "different program"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("C help should mention %q: %q", want, help)
 		}
+	}
+	if th := keyLegendDescs(false)["t"]; !strings.Contains(th, "PAUSED row") || !strings.Contains(th, "forgets") {
+		t.Errorf("t help should explain paused rows: %q", th)
 	}
 	b, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
 	if err != nil {
@@ -341,14 +387,20 @@ func TestAutoClearDocsMatchBehavior(t *testing.T) {
 	}
 	readme := string(b)
 	for _, want := range []string{
-		"serve.auto_clear_stale",
-		"ports.<n>.auto_clear_stale",
+		"serve.auto_pause",
+		"ports.<n>.auto_pause",
 		"`tailport clean [--dry-run]`",
-		"cleared stale forward :P (nothing listened for\n30s) — t to re-serve",
+		"paused :P\n(app stopped) — resumes when <program> in <directory> returns · t to forget",
+		"`resumed :P (same app is\n  back)`",
 		"address already in use",
 		"`0` / `off`",
-		"a remap such as tailnet `15173` → local `5173`",
-		"waits until\nthe publish and tunnel state",
+		"a remap such as tailnet `15173` →\n  local `5173`",
+		"`go run`\nbuilds to a fresh temporary executable",
+		"paused-serves.json",
+		"expires 7 days after pausing",
+		"◌ paused",
+		"💤 paused",
+		"does not\n  touch the TUI's remembered paused serves",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README is missing %q", want)
@@ -357,7 +409,7 @@ func TestAutoClearDocsMatchBehavior(t *testing.T) {
 }
 
 // Finding 8: a remapped serve is never auto-cleared, with either port up or not.
-func TestAutoClearNeverClearsRemappedServe(t *testing.T) {
+func TestAutoPauseNeverClearsRemappedServe(t *testing.T) {
 	acRemap = map[int]bool{15173: true}
 	t.Cleanup(func() { acRemap = map[int]bool{} })
 	for _, listen := range [][]int{nil, {5173}} {
@@ -373,7 +425,7 @@ func TestAutoClearNeverClearsRemappedServe(t *testing.T) {
 	acRemap = map[int]bool{}
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{15173}, nil, nil)
-	clk.advance(30 * time.Second)
+	clk.advance(5 * time.Second)
 	m, _ = acRefresh(t, m, []int{15173}, nil, nil)
 	if m.cleaning != 1 {
 		t.Fatal("a plain dangling 1:1 serve must be cleared")
@@ -381,7 +433,7 @@ func TestAutoClearNeverClearsRemappedServe(t *testing.T) {
 }
 
 // Finding 1: unknown public state is not "no public routes".
-func TestAutoClearWaitsForRequiredPublicState(t *testing.T) {
+func TestAutoPauseWaitsForRequiredPublicState(t *testing.T) {
 	cfg := config.Config{}
 	cfg.Caddy.Domain = "example.com"
 	m, clk := acModel(cfg)
@@ -443,7 +495,7 @@ func TestPollMessagesMaintainPublicStateFlags(t *testing.T) {
 }
 
 // Finding 2: no auto-clear while any modal flow or in-flight op owns the state.
-func TestAutoClearBlockedByOpenFlowsAndInFlightOps(t *testing.T) {
+func TestAutoPauseBlockedByOpenFlowsAndInFlightOps(t *testing.T) {
 	for name, set := range map[string]func(*model){
 		"publish confirm": func(m *model) { m.mode = entryConfirmPublish },
 		"publish host":    func(m *model) { m.mode = entryPublishHost },
@@ -488,14 +540,14 @@ func TestConfirmPublishRechecksServeState(t *testing.T) {
 	m2.publishPort, m2.publishHostname = 8080, "app.example.com"
 	m2.cleaning = 1
 	m2.confirmPublish()
-	if m2.pending != 0 || !strings.Contains(m2.flash, "clearing stale forwards") {
+	if m2.pending != 0 || !strings.Contains(m2.flash, "pausing a stale forward") {
 		t.Fatalf("must refuse during a teardown: pending=%d flash=%q", m2.pending, m2.flash)
 	}
 }
 
-// Finding 4: forgetting a favorite keeps a port's auto_clear_stale override.
-func TestForgetKeepsAutoClearOverride(t *testing.T) {
-	cfg := rooted(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true, AutoClearStale: "off"}}})
+// Finding 4: forgetting a favorite keeps a port's auto_pause override.
+func TestForgetKeepsAutoPauseOverride(t *testing.T) {
+	cfg := rooted(t, config.Config{Ports: map[int]config.PortMeta{8080: {Favorite: true, AutoPause: "off"}}})
 	m, clk := acModel(cfg)
 	m.list.SetSize(80, 20)
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
@@ -503,7 +555,7 @@ func TestForgetKeepsAutoClearOverride(t *testing.T) {
 	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
 	m = res.(model)
 	meta, ok := m.cfg.Ports[8080]
-	if !ok || meta.Favorite || meta.AutoClearStale != "off" {
+	if !ok || meta.Favorite || meta.AutoPause != "off" {
 		t.Fatalf("override must survive forget: %+v ok=%v", meta, ok)
 	}
 	// And auto-clear stays off for the port.
@@ -516,10 +568,10 @@ func TestForgetKeepsAutoClearOverride(t *testing.T) {
 }
 
 // Finding 5: a listener-scan failure resets the grace.
-func TestAutoClearScanErrorResetsTimers(t *testing.T) {
+func TestAutoPauseScanErrorResetsTimers(t *testing.T) {
 	m, clk := acModel(config.Config{})
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(29 * time.Second)
+	clk.advance(4 * time.Second)
 	m.refreshGen++
 	res, _ := m.Update(refreshMsg{err: errors.New("ss failed"), auto: true, gen: m.refreshGen})
 	m = res.(model)
@@ -531,19 +583,20 @@ func TestAutoClearScanErrorResetsTimers(t *testing.T) {
 	if m.cleaning != 0 {
 		t.Fatal("must not clear at the original deadline after a scan error")
 	}
-	clk.advance(30 * time.Second)
+	clk.advance(5 * time.Second)
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
 	if m.cleaning != 1 {
-		t.Fatal("a fresh 30s of continuous dangling clears")
+		t.Fatal("a fresh 5s of continuous dangling pauses")
 	}
 }
 
 // Finding 7: a partial batch yields ONE error-severity notification naming both.
 func TestPartialBatchSingleCombinedNotification(t *testing.T) {
 	m, _ := acModel(config.Config{})
+	m.pausing[8080] = pausedserve.Entry{Port: 8080, Exe: "/usr/bin/python3", Cwd: "/srv/a"}
 	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}, failed: []int{9000}, err: errors.New("could not clean :9000")})
 	m = res.(model)
-	want := "cleared stale forward :8080 (nothing listened for 30s) — t to re-serve; could not clean :9000"
+	want := "paused :8080 (app stopped) — resumes when python3 in /srv/a returns · t to forget; could not clean :9000"
 	if m.flash != want || m.flashLevel != flashError {
 		t.Fatalf("flash=%q level=%v", m.flash, m.flashLevel)
 	}

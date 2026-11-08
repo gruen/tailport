@@ -28,7 +28,9 @@ import (
 	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/clip"
 	"github.com/gruen/tailport/internal/config"
+	"github.com/gruen/tailport/internal/pausedserve"
 	"github.com/gruen/tailport/internal/portscan"
+	"github.com/gruen/tailport/internal/procid"
 	"github.com/gruen/tailport/internal/stale"
 	"github.com/gruen/tailport/internal/tsserve"
 )
@@ -422,6 +424,13 @@ type portItem struct {
 	// stand out among the wider search results. See portDelegate.Render.
 	dimmed bool
 	meta   config.PortMeta
+	// paused marks a serve tailport PAUSED (kata p2r5): the forward was removed
+	// because its app stopped, and is remembered with the app's identity
+	// (pausedExe, pausedCwd). pausedOther: something is listening now but it is
+	// not that program (or its identity is unreadable), so it was NOT resumed.
+	paused               bool
+	pausedExe, pausedCwd string
+	pausedOther          bool
 	// emoji selects the moon-phase reach-ramp marker set
 	// (🌕/🌔/🌒/🌑/🌫️/✕) over the ASCII fallback (○/◔/◉/●/▲/✕) -- on tailnet
 	// and served share 🌒/◉ (qptn). Resolved once for the model and copied
@@ -554,6 +563,10 @@ type refreshMsg struct {
 	// oneToOne is the set of served ports whose mapping is a plain 1:1 proxy
 	// (tsserve.Detail.OneToOne, kata 9p43). Only those can be auto-cleared.
 	oneToOne map[int]bool
+	// idents is the (executable, cwd) identity of the listener behind each
+	// served 1:1 port and each paused port that is listening (kata p2r5). Read
+	// in refresh()'s cmd, never in Update.
+	idents map[int]procid.Identity
 	// gen is the issue-time stamp from refreshCmd/refreshAt; see
 	// model.refreshFloor.
 	gen int
@@ -1137,8 +1150,22 @@ type model struct {
 	danglingSince map[int]time.Time
 	now           func() time.Time
 	// staleWarned latches the one-shot toast for an unparseable
-	// auto_clear_stale value (config.Config.StaleWarnings).
+	// auto_clear_stale value (config.Config.PauseWarnings).
 	staleWarned bool
+	// Auto-pause / auto-resume state (kata p2r5; see pause.go). lastIdent is
+	// the last-known identity of the listener behind each served 1:1 port;
+	// paused is the persisted memory of paused serves (pausedPath = its file,
+	// "" = unavailable); pausing holds the entries being written by an
+	// in-flight auto-pause teardown; resuming marks ports whose re-serve is in
+	// flight; pausedOther marks paused ports with a DIFFERENT program
+	// listening. pausedLoadErr is toasted once (a corrupt file).
+	lastIdent     map[int]procid.Identity
+	paused        map[int]pausedserve.Entry
+	pausedPath    string
+	pausedLoadErr error
+	pausing       map[int]pausedserve.Entry
+	resuming      map[int]bool
+	pausedOther   map[int]bool
 	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
 	oneToOne map[int]bool
 	// publishOK / tunnelsOK: the LAST edge poll / tunnel poll succeeded (false
@@ -1545,9 +1572,28 @@ func New(cfg config.Config, markersOverride ...string) model {
 		markersMode = markersOverride[0]
 	}
 
+	// Paused serves persist in tailport's state dir (kata p2r5): load them so a
+	// relaunched tailport still resumes. A corrupt file starts empty and is
+	// toasted once; an unresolvable state dir just disables persistence.
+	paused := map[int]pausedserve.Entry{}
+	var pausedLoadErr error
+	pausedPath, perr := pausedserve.Path()
+	if perr != nil {
+		pausedPath = ""
+	} else {
+		paused, pausedLoadErr = pausedserve.Load(pausedPath, time.Now())
+	}
+
 	return model{
 		list: l, delegate: del, help: h, keys: newKeyMap(), cfg: cfg, host: host, active: map[int]bool{},
 		danglingSince: map[int]time.Time{},
+		lastIdent:     map[int]procid.Identity{},
+		pausing:       map[int]pausedserve.Entry{},
+		resuming:      map[int]bool{},
+		pausedOther:   map[int]bool{},
+		paused:        paused,
+		pausedPath:    pausedPath,
+		pausedLoadErr: pausedLoadErr,
 		// lastPublish (kata prp1) is session-only memory, so it always starts
 		// empty here regardless of what cfg carries (cfg never carries it --
 		// see the field doc).
@@ -1619,7 +1665,7 @@ func (m model) Init() tea.Cmd {
 	// local process-table scan, unlike the remote edge poll): tunnelStartupCmd
 	// is nil entirely -- not even the ticker -- when cloudflared is unavailable,
 	// so an uninstalled host pays nothing at all (kata aprt).
-	return tea.Batch(refreshAt(m.refreshGen, false), fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.tunnelStartupCmd(), tea.SetWindowTitle(title))
+	return tea.Batch(refreshAt(m.refreshGen, false, m.pausedPorts()...), fetchFQDN, detectOperator, refreshTick(), m.pollPublishedCmd(), publishTick(), m.tunnelStartupCmd(), tea.SetWindowTitle(title))
 }
 
 // refreshTick schedules the next auto-refresh.
@@ -1734,7 +1780,7 @@ var (
 	serveStatus   = tsserve.StatusDetail
 )
 
-func refresh() tea.Msg {
+func refresh(want ...int) tea.Msg {
 	ports, err := scanListeners()
 	if err != nil {
 		// Discovery itself failed -- there's nothing to show, so this alone
@@ -1759,7 +1805,20 @@ func refresh() tea.Msg {
 	for _, p := range activeList {
 		active[p] = true
 	}
-	return refreshMsg{ports: ports, active: active, funnel: funnel, oneToOne: detail.OneToOne}
+	// Identity of each served 1:1 listener (the pause side) and of any
+	// currently-paused port that is listening (the resume side) -- nothing else,
+	// so the macOS ps/lsof reads stay few (kata p2r5).
+	wantSet := make(map[int]bool, len(want))
+	for _, p := range want {
+		wantSet[p] = true
+	}
+	idents := map[int]procid.Identity{}
+	for _, p := range ports {
+		if p.Pid > 0 && ((active[p.Number] && detail.OneToOne[p.Number]) || wantSet[p.Number]) {
+			idents[p.Number] = identify(p.Pid)
+		}
+	}
+	return refreshMsg{ports: ports, active: active, funnel: funnel, oneToOne: detail.OneToOne, idents: idents}
 }
 
 // refreshCmd issues a status refresh stamped with a fresh generation, so a
@@ -1773,14 +1832,14 @@ func (m *model) autoRefreshCmd() tea.Cmd { return m.stampedRefresh(true) }
 
 func (m *model) stampedRefresh(auto bool) tea.Cmd {
 	m.refreshGen++
-	return refreshAt(m.refreshGen, auto)
+	return refreshAt(m.refreshGen, auto, m.pausedPorts()...)
 }
 
 // refreshAt is a status refresh carrying the given generation stamp. Init (a
 // value receiver, so it can't bump refreshGen) uses it with the current value.
-func refreshAt(gen int, auto bool) tea.Cmd {
+func refreshAt(gen int, auto bool, want ...int) tea.Cmd {
 	return func() tea.Msg {
-		msg, _ := refresh().(refreshMsg)
+		msg, _ := refresh(want...).(refreshMsg)
 		msg.gen, msg.auto = gen, auto
 		return msg
 	}
@@ -2359,11 +2418,11 @@ func (m model) publicStateKnown() bool {
 	return true
 }
 
-// autoClearBlocked reports whether something else owns the serve state right
+// autoPauseBlocked reports whether something else owns the serve state right
 // now, so an auto-clear must wait: any open modal/entry flow (publish, funnel,
 // tunnel, C, :22, purge, label...), an in-flight toggle/publish/tunnel op, a
 // teardown already running, or a tunnel being stopped.
-func (m model) autoClearBlocked() bool {
+func (m model) autoPauseBlocked() bool {
 	return m.mode != entryNone || m.pending != 0 || m.cleaning != 0 || len(m.tunnelStopping) > 0 || m.tunnelSpinnerPort != 0
 }
 
@@ -2378,7 +2437,7 @@ func (m *model) trackDangling() []int {
 		m.danglingSince = map[int]time.Time{}
 	}
 	now := m.clock()
-	cur := m.clearableStale()
+	cur := m.pausableStale()
 	keep := make(map[int]bool, len(cur))
 	for _, p := range cur {
 		keep[p] = true
@@ -2393,22 +2452,11 @@ func (m *model) trackDangling() []int {
 	}
 	var due []int
 	for _, p := range cur {
-		if g := m.cfg.AutoClearGrace(p); g > 0 && now.Sub(m.danglingSince[p]) >= g {
+		if g := m.cfg.PauseGrace(p); g > 0 && now.Sub(m.danglingSince[p]) >= g {
 			due = append(due, p)
 		}
 	}
 	return due
-}
-
-// formatGrace renders a grace period compactly: 30s, 2m, 1h, else the Go form.
-func formatGrace(d time.Duration) string {
-	switch {
-	case d >= time.Hour && d%time.Hour == 0:
-		return fmt.Sprintf("%dh", d/time.Hour)
-	case d >= time.Minute && d%time.Minute == 0:
-		return fmt.Sprintf("%dm", d/time.Minute)
-	}
-	return d.String()
 }
 
 // portList renders ports as ":A, :B".
@@ -2418,14 +2466,6 @@ func portList(ports []int) string {
 		names[i] = ":" + strconv.Itoa(p)
 	}
 	return strings.Join(names, ", ")
-}
-
-// autoClearToast is the toast for ports the auto-clear just tore down.
-func (m model) autoClearToast(ports []int) string {
-	if len(ports) == 1 {
-		return fmt.Sprintf("cleared stale forward :%d (nothing listened for %s) — t to re-serve", ports[0], formatGrace(m.cfg.AutoClearGrace(ports[0])))
-	}
-	return fmt.Sprintf("cleared stale forwards %s (nothing listened past their grace) — t to re-serve", portList(ports))
 }
 
 // danglingPorts returns the sorted set of ports that are exposed via
@@ -3334,7 +3374,7 @@ func (m *model) confirmPublish() tea.Cmd {
 		// A teardown is in flight and its outcome is not applied yet, so
 		// m.active is not trustworthy for this port: ask the user to retry.
 		m.clearPublishFlow()
-		return m.setErr("tailport is clearing stale forwards — try again in a moment")
+		return m.setErr("tailport is pausing a stale forward — try again in a moment")
 	}
 
 	// Guard 3 re-check FIRST: never build a route dialling ":port" with no
@@ -3663,17 +3703,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// continuous dangling) and clears nothing.
 		m.oneToOne = msg.oneToOne
 		var autoCmd tea.Cmd
+		var notice string
 		if msg.statusErr != nil {
 			clear(m.danglingSince)
-		} else if due := m.trackDangling(); len(due) > 0 && m.publicStateKnown() && !m.autoClearBlocked() {
-			m.cleaning = len(due)
-			autoCmd = cleanupPorts(due, true)
+		} else {
+			// Auto-pause (kata p2r5): record who is behind each served 1:1 port,
+			// advance the grace timers, and pause what is due. Then the resume
+			// side: a paused port with its same program back is re-served.
+			m.noteIdentities(msg)
+			if due := m.trackDangling(); len(due) > 0 && m.publicStateKnown() && !m.autoPauseBlocked() {
+				now := m.clock()
+				for _, p := range due {
+					id := m.lastIdent[p]
+					m.pausing[p] = pausedserve.Entry{Port: p, Exe: id.Exe, Cwd: id.Cwd, PausedAt: now}
+				}
+				m.cleaning = len(due)
+				autoCmd = cleanupPorts(due, true)
+			}
+			var rcmds []tea.Cmd
+			rcmds, notice = m.resumeReturned(msg)
+			autoCmd = tea.Batch(append(rcmds, autoCmd)...)
 		}
+		// One-shot warnings (config values that did not parse; a corrupt paused
+		// file) outrank an informational notice; all of them share one toast.
+		var warns []string
 		if !m.staleWarned {
 			m.staleWarned = true
-			if w := m.cfg.StaleWarnings(); len(w) > 0 {
-				autoCmd = tea.Batch(autoCmd, m.setFlash("config: "+strings.Join(w, "; "), flashWarn))
+			for _, w := range m.cfg.PauseWarnings() {
+				warns = append(warns, "config: "+w)
 			}
+			if m.pausedLoadErr != nil {
+				warns = append(warns, m.pausedLoadErr.Error())
+			}
+		}
+		switch {
+		case len(warns) > 0:
+			autoCmd = tea.Batch(autoCmd, m.setFlash(strings.Join(warns, "; "), flashWarn))
+		case notice != "":
+			autoCmd = tea.Batch(autoCmd, m.setFlash(notice, flashInfo))
 		}
 		// Remember the live process names of favorites BEFORE rebuilding, so a
 		// favorite that later goes down can show "was <name>". Persist only when
@@ -3788,6 +3855,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toggleDoneMsg:
 		m.pending = 0
+		// An auto-RESUME re-serve (kata p2r5) finishing: the paused memory is
+		// spent either way (a failure shows its normal error toast, and the
+		// user can press t); only a success toasts the resume.
+		var resumeToast tea.Cmd
+		if m.resuming[msg.port] && msg.kind == routeTailnet && msg.turnOn {
+			delete(m.resuming, msg.port)
+			forgetErr := m.forgetPaused(msg.port)
+			if msg.err == nil {
+				resumeToast = m.setFlash(fmt.Sprintf("resumed :%d (same app is back)", msg.port), flashInfo)
+				if forgetErr != nil {
+					resumeToast = forgetErr
+				}
+			}
+		}
 		if msg.err != nil {
 			if errors.Is(msg.err, tsserve.ErrOperatorNotSet) {
 				// Deliberate exception to the auto-dismiss toast (q89g): this is
@@ -3833,7 +3914,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			rebuild := m.rebuildItems()
 			m.landOn(msg.port, msg.kind)
-			return m, tea.Batch(rebuild, m.refreshCmd())
+			return m, tea.Batch(rebuild, m.refreshCmd(), resumeToast)
 		}
 		return m, m.refreshCmd()
 
@@ -4457,8 +4538,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case cleanupDoneMsg:
 		m.cleaning = 0
 		now := m.clock()
+		var pausedNow []pausedserve.Entry
 		for _, p := range msg.cleaned {
 			delete(m.danglingSince, p)
+			if e, ok := m.pausing[p]; ok && msg.auto {
+				// The forward is gone: remember it (with who was behind it) so
+				// the same app returning resumes it (kata p2r5).
+				m.paused[p] = e
+				pausedNow = append(pausedNow, e)
+				delete(m.lastIdent, p)
+			}
 			// The teardown succeeded, so the forward is gone NOW (roborev 6192):
 			// releasing the cleanup guard while m.active still claimed it let a
 			// republish in the gap before the confirming refresh compute
@@ -4472,6 +4561,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.danglingSince[p] = now
 			}
 		}
+		clear(m.pausing)
+		var saveErr error
+		if len(pausedNow) > 0 {
+			saveErr = m.savePaused()
+		}
 		var rebuild tea.Cmd
 		if len(msg.cleaned) > 0 {
 			// The op recorded its outcome: a refresh issued before it would
@@ -4482,14 +4576,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ONE notification, never two that overwrite each other: a partial batch
 		// names both what was cleared and what was not, at error severity.
 		switch {
-		case msg.err != nil && msg.auto && len(msg.cleaned) > 0:
-			return m, tea.Batch(m.setErr(m.autoClearToast(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd(), rebuild)
+		case msg.auto && len(pausedNow) > 0 && (msg.err != nil || saveErr != nil):
+			text := pauseToast(pausedNow)
+			if msg.err != nil {
+				text += "; " + msg.err.Error()
+			}
+			if saveErr != nil {
+				text += "; " + saveErr.Error()
+			}
+			return m, tea.Batch(m.setErr(text), m.refreshCmd(), rebuild)
 		case msg.err != nil && len(msg.cleaned) > 0:
 			return m, tea.Batch(m.setErr("cleared "+portList(msg.cleaned)+"; "+msg.err.Error()), m.refreshCmd(), rebuild)
 		case msg.err != nil:
 			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd(), rebuild)
-		case msg.auto && len(msg.cleaned) > 0:
-			return m, tea.Batch(m.setFlash(m.autoClearToast(msg.cleaned), flashInfo), m.refreshCmd(), rebuild)
+		case msg.auto && len(pausedNow) > 0:
+			return m, tea.Batch(m.setFlash(pauseToast(pausedNow), flashInfo), m.refreshCmd(), rebuild)
 		}
 		return m, tea.Batch(m.refreshCmd(), rebuild)
 
@@ -5090,7 +5191,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if meta, ok := m.cfg.Ports[sel.port.Number]; ok {
 				before := m.portState(sel.port.Number)
 				meta.Favorite = false
-				if meta.Label == "" && !meta.Locked && meta.AutoClearStale == "" {
+				if meta.Label == "" && !meta.Locked && meta.AutoPause == "" {
 					delete(m.cfg.Ports, sel.port.Number)
 				} else {
 					m.cfg.Ports[sel.port.Number] = meta
@@ -5143,6 +5244,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				return m, nil
 			}
+			// A PAUSED serve (kata p2r5): with nothing listening, t means "no
+			// longer wanted shared" -- forget the memory. With a DIFFERENT
+			// program listening (the row says so), t falls through to serve
+			// that program normally and the paused memory is dropped below.
+			if _, paused := m.paused[sel.port.Number]; paused && !sel.listening {
+				ferr := m.forgetPaused(sel.port.Number)
+				rebuild := m.rebuildItems()
+				if ferr != nil {
+					return m, tea.Batch(ferr, rebuild)
+				}
+				return m, tea.Batch(m.setFlash(fmt.Sprintf("forgot paused :%d — it will no longer be re-shared", sel.port.Number), flashInfo), rebuild)
+			}
 			// 79xb pt3 footgun guard: `tailscale serve` always proxies
 			// tailnet -> 127.0.0.1:PORT, so turning it ON is only ever
 			// meaningful for a loopback-bound app (state A). A B port
@@ -5174,6 +5287,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// requestToggle applies the lock guard and, for :22 only, the SSH
 			// y/n confirm before any serve call.
+			if _, paused := m.paused[sel.port.Number]; paused && !sel.active {
+				// Serving the program that is listening now supersedes the
+				// paused memory (kata p2r5). A refused toggle (locked, ...)
+				// leaves the memory too: only drop it once serving really starts.
+				cmd := m.requestToggle(sel.port.Number, true)
+				if m.pending == sel.port.Number {
+					return m, tea.Batch(cmd, m.forgetPaused(sel.port.Number))
+				}
+				return m, cmd
+			}
 			return m, m.requestToggle(sel.port.Number, !sel.active)
 		case "p": // funnel key (swapped back from "P", kata 58ws)
 			if m.pending != 0 || m.cleaning != 0 {
@@ -5389,6 +5512,14 @@ func (m *model) rebuildItems() tea.Cmd {
 				seen[n] = true
 			}
 		}
+		// A PAUSED serve (kata p2r5) stays visible with nothing listening, like a
+		// down favorite: it is waiting for its app to return.
+		for n := range m.paused {
+			if !seen[n] {
+				numbers = append(numbers, n)
+				seen[n] = true
+			}
+		}
 		// A FOREIGN cloudflared tunnel must surface as drift even when nothing
 		// listens locally on its port AND it isn't favorited -- otherwise the
 		// exact unowned public exposure the All-ports view exists to reveal is
@@ -5415,15 +5546,22 @@ func (m *model) rebuildItems() tea.Cmd {
 			tun := m.tunnels[n]
 			items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], dimmed: dimNonFav && !meta.Favorite, meta: meta, emoji: m.markerEmoji})
 		}
+		m.decorateItems(items)
 		sortItems(items, m.sortMode)
 		return m.setItems(items)
 	}
 
-	// Favorites view: exactly the ports flagged meta.Favorite. Unfavoriting
-	// a port (which clears the flag) makes it drop out here immediately.
+	// Favorites view: exactly the ports flagged meta.Favorite, plus any paused
+	// serve (kata p2r5) so it stays visible. Unfavoriting a port (which clears
+	// the flag) makes it drop out here immediately -- unless it is paused.
 	numbers := make([]int, 0, len(m.cfg.Ports))
 	for n, meta := range m.cfg.Ports {
-		if meta.Favorite {
+		if meta.Favorite || m.paused[n].Port != 0 {
+			numbers = append(numbers, n)
+		}
+	}
+	for n := range m.paused {
+		if !isIn(numbers, n) {
 			numbers = append(numbers, n)
 		}
 	}
@@ -5441,8 +5579,27 @@ func (m *model) rebuildItems() tea.Cmd {
 		tun := m.tunnels[n]
 		items = append(items, portItem{port: p, active: m.active[n], listening: ok, host: routeHost, fqdn: m.fqdn, funnelPublic: m.funnel[n], publishHostname: pub.hostname, publishAuth: pub.auth, tunnelActive: tun.pid != 0, tunnelHostname: tun.hostname, tunnelMode: tun.mode, tunnelReady: tun.ready, tunnelForeign: m.tunnelForeign[n], meta: m.cfg.Ports[n], emoji: m.markerEmoji})
 	}
+	m.decorateItems(items)
 	sortItems(items, m.sortMode)
 	return m.setItems(items)
+}
+
+// decorateItems stamps paused-serve memory onto the built items (kata p2r5).
+func (m model) decorateItems(items []list.Item) {
+	for i, it := range items {
+		if pi, ok := it.(portItem); ok {
+			items[i] = m.decoratePaused(pi)
+		}
+	}
+}
+
+func isIn(s []int, v int) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // setItems replaces the list's items and clamps the selection if it's now
@@ -7184,7 +7341,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		tunnelled = "☁️"
 	}
 	return map[string]string{
-		"t": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so t is a no-op there.",
+		"t": "Toggle tailscale serve for the selected port on/off. Once a port\nis served (" + served + ") its tailnet URL is shown beneath it. Only offered\nfor a loopback-bound port -- one already reachable on the tailnet\nneeds no serving, so t is a no-op there. On a PAUSED row (nothing\nlistening) t forgets the paused serve; if a different program is\nlistening there, t serves that one instead.",
 		// p/P swapped back (58ws): funnel now lives under "p" again, publish
 		// moved to "d" (was "p" under vzj4).
 		"p":      "Funnel the selected port to the PUBLIC INTERNET via tailscale\nfunnel (" + funneled + "), behind a strong y/n confirm. Funnel is HTTPS-only and\ncan use just three public ingress ports — 443, 8443, 10000\n(auto-assigned, max three at once) — so the public port won't match\nthe local one. :22 (SSH) is refused. Press p again to drop the port\nback to tailnet-served.",
@@ -7202,7 +7359,7 @@ func keyLegendDescs(emoji bool) map[string]string {
 		"n":      "Add a port by number to Favorites (★), even one not currently\nlistening. It doesn't serve — it just registers and sticks in the\nFavorites view; press t there to serve it once its service is up.",
 		"l":      "Set a text label for the selected port.",
 		"x":      "Lock / unlock the selected port (🔒). A locked port can't be\ntoggled on until you unlock it — a guard against exposing something\nby accident. Port :22 is locked by default; unlocking it requires\ntyping \"ssh\" to confirm (it guards your SSH access).",
-		"C":      "Tear down stale forwards — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "), behind a y/n confirm. Offered\nonly when some exist. A dangling forward holds its port on the\ntailnet IPs, so an app binding all interfaces there fails with\n\"address already in use\" — which is why tailport also clears one by\nitself after it has been dangling for 30s straight (serve.\nauto_clear_stale, ports.<n>.auto_clear_stale; 0/off disables). The\nauto-clear acts only on plain 1:1 serves (never a remap) and skips :22,\nlocked ports and ports with funnel, publish or a tunnel; it toasts each one it clears. From a shell: tailport clean.",
+		"C":      "Tear down stale forwards PERMANENTLY — ports still served by tailscale with\nnothing listening locally (shown " + dangling + "), behind a y/n confirm. Offered\nonly when some exist. A dangling forward holds its port on the\ntailnet IPs, so an app binding all interfaces there fails with\n\"address already in use\" — which is why tailport also PAUSES one by\nitself after 5s of dangling (serve.auto_pause, ports.<n>.auto_pause;\n0/off disables) and resumes it when the same app (binary + working\ndir) listens again on loopback. A different program is never shared\nautomatically (the row says so; t serves it, or forgets a paused row\nwith nothing listening). Pause/resume act only on plain 1:1 serves\n(never a remap) and skip :22, locked ports and ports with funnel,\npublish or a tunnel. From a shell: tailport clean (permanent).",
 		"/":      "Filter by port number, process, or label (fuzzy). Searches ALL\nlistening ports regardless of view, so it works even from an empty\nFavorites screen; non-favorite matches show dimmed in the Favorites\nview. esc clears the filter.",
 		"a":      "Switch between the two list views: Favorites (only ★ ports) and\nAll ports (every port listening locally, plus your favorites even\nwhen their process is down).",
 		"s":      "Sort the list: toggle between port number (the default, ascending)\nand name (label, else process, else \"was <proc>\", else \"?\";\ncase-insensitive, port number breaks ties). Session-only -- it\nresets to port-number order on restart.",
@@ -7323,13 +7480,13 @@ func (m model) markerLegend() string {
 	if m.markerEmoji {
 		return "🌕 localhost   🌔 local network   🌒 tailnet (served)   🌓 tailnet (bound wide)\n" +
 			"🌑 internet (funnel)   🌐 internet (published)   ☁️ internet (cloudflare tunnel)\n" +
-			"🌫️ stale   ✕ offline   🔒 locked   ★ favorite   " + authGlyphEmoji + " basic auth (published)"
+			"🌫️ stale  💤 paused  ✕ offline  🔒 locked  ★ favorite  " + authGlyphEmoji + " basic auth (published)"
 	}
 	// The tunnel glyph goes last on its line: its style's trailing reset would
 	// otherwise drop helpTextStyle's color for whatever followed it.
 	return "○ localhost   ◔ local network   ◉ tailnet (served)   ◑ tailnet (bound wide)\n" +
 		"● internet (funnel)   ◆ internet (published)   " + tunnelMarkerStyle.Render("◈") + " internet (cloudflare tunnel)\n" +
-		"▲ stale   ✕ offline   🔒 locked   ★ favorite   " + authGlyphMono + " basic auth (published)"
+		"▲ stale  ◌ paused  ✕ offline  🔒 locked  ★ favorite  " + authGlyphMono + " basic auth (published)"
 }
 
 // OperatorSetupText is the prerequisites prose shared by the "?" overlay's

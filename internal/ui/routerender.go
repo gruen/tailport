@@ -220,7 +220,7 @@ func renderRouteLine(b blockInput, r route, i int) string {
 	marker := r.marker(b.emoji)
 
 	label := padCells(r.label(), 10)
-	muted := r.kind == routeLocalhost || r.kind == routeOffline || b.dimmed
+	muted := r.kind == routeLocalhost || r.kind == routeOffline || r.kind == routePaused || b.dimmed
 	if muted {
 		// "Quiet" routes (design §6): localhost/offline read muted even when
 		// this is the current/selected service -- the label is exempt from
@@ -234,7 +234,7 @@ func renderRouteLine(b blockInput, r route, i int) string {
 
 	urlText := r.url
 	switch {
-	case r.kind == routeOffline || r.foreign:
+	case r.kind == routeOffline || r.kind == routePaused || r.foreign:
 		// Offline (no address at all) and a foreign tunnel (an address we
 		// deliberately never probe) both stand in for a URL with the design's
 		// em-dash placeholder.
@@ -292,6 +292,19 @@ func routeAdornments(b blockInput, r route, i int) string {
 	}
 	if r.foreign {
 		out.WriteString("  " + warnStyle.Render("· foreign"))
+	}
+	if r.kind == routePaused {
+		text := r.pausedText()
+		if b.width > 0 {
+			// Keep the whole line within the terminal width (z6yf): the fixed
+			// prefix is 20 cells, plus the "—" placeholder and the 2-space gap.
+			text = truncateCells(text, maxInt(12, b.width-20-1-2-2))
+		}
+		style := routeMutedStyle
+		if r.pausedOther {
+			style = warnStyle
+		}
+		out.WriteString("  " + style.Render(text))
 	}
 	if i == b.copiedRoute {
 		out.WriteString(activeStyle.Render(copiedSuffix))

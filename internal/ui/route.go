@@ -33,6 +33,7 @@ const (
 	routeFunnel  // ts.net
 	routePublish // caddy
 	routeTunnel  // cloudflare
+	routePaused  // pseudo-route (kata p2r5): a tailnet serve tailport paused, awaiting its app's return
 	routeOffline // pseudo-route: a down favorite / nothing reachable
 )
 
@@ -44,6 +45,10 @@ type route struct {
 	served  bool   // tailnet route provenance: true = via `tailscale serve`, false = via a wide/tailnet-IP bind
 	stale   bool   // administratively present but not functionally live: tailnet served-but-nothing-listening (a dangling forward), OR a tunnel with zero ready edge connections (kata aprt)
 	foreign bool   // tunnel only (kata aprt): a cloudflared tailport does NOT own covers this port -- surfaced as drift, never signalled or touched
+	// routePaused only (kata p2r5): the remembered program behind the paused
+	// serve, and whether a DIFFERENT program is listening on the port now.
+	pausedExe, pausedCwd string
+	pausedOther          bool
 }
 
 // serviceState is the derivation input -- deliberately a plain struct (not the
@@ -75,8 +80,12 @@ type serviceState struct {
 	tunnelActive  bool         // a cloudflared tunnel covers this port
 	tunnelReady   bool         // the tunnel's polled edge-connection state; only meaningful if tunnelActive
 	tunnelForeign bool         // a cloudflared tailport does NOT own covers this port (AGENTS.md: surfaced as drift)
-	host          string       // this node's tailnet short host (m.host) for tailnet URLs; "" if tailscale down
-	fqdn          string       // this node's FQDN (m.fqdn) for the funnel PublicURL
+	paused        bool         // tailport paused a serve here (kata p2r5); see portItem.paused
+	pausedExe     string
+	pausedCwd     string
+	pausedOther   bool
+	host          string // this node's tailnet short host (m.host) for tailnet URLs; "" if tailscale down
+	fqdn          string // this node's FQDN (m.fqdn) for the funnel PublicURL
 }
 
 // routesFor derives the ordered route list for one service from its live
@@ -133,6 +142,15 @@ func routesFor(s serviceState) []route {
 		} else if (s.bindScope == portscan.ScopeWildcard || s.bindScope == portscan.ScopeTailnet) && s.listening {
 			routes = append(routes, route{kind: routeTailnet, served: false, stale: false, url: tailnetURL})
 		}
+	}
+
+	// 3b. paused (kata p2r5): tailport removed this port's serve because its app
+	// stopped, and is waiting for the same program to return. Shown as a
+	// tailnet-labelled sub-row so the port stays visible and the state is
+	// explicit; it has no URL (nothing is served). Needs the tailnet host like
+	// the tailnet route does, and is never shown beside a live serve.
+	if s.paused && !s.served && s.host != "" {
+		routes = append(routes, route{kind: routePaused, pausedExe: s.pausedExe, pausedCwd: s.pausedCwd, pausedOther: s.pausedOther})
 	}
 
 	// 4. funnel: public ingress via Tailscale Funnel.
@@ -266,7 +284,7 @@ func (r route) label() string {
 		return "localhost"
 	case routeLAN:
 		return "LAN"
-	case routeTailnet:
+	case routeTailnet, routePaused:
 		return "tailnet"
 	case routeFunnel:
 		return "ts.net"

@@ -57,6 +57,10 @@ func (i portItem) serviceState() serviceState {
 		tunnelActive:  i.tunnelActive,
 		tunnelReady:   i.tunnelReady,
 		tunnelForeign: i.tunnelForeign,
+		paused:        i.paused,
+		pausedExe:     i.pausedExe,
+		pausedCwd:     i.pausedCwd,
+		pausedOther:   i.pausedOther,
 		host:          i.host,
 		fqdn:          i.fqdn,
 	}

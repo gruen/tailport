@@ -166,7 +166,7 @@ session-only toggle that resets to port order on restart.
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move between route rows (a flat walk across every service's routes) |
 | `Shift+↑`/`Shift+↓`, `J`/`K` | Jump between services (land on the target's first route) |
-| `t` | Serve on your tailnet — toggle (loopback-bound ports only) |
+| `t` | Serve on your tailnet — toggle (loopback-bound ports only); on a paused row, forget it (or, if a different program is listening, serve that) |
 | `p` | Funnel to the public internet — toggle, behind a confirm |
 | `d` | Publish via your Caddy edge — toggle, behind a confirm |
 | `e` | Edit a published port's auth in place (can't move it to a new hostname) |
@@ -175,7 +175,7 @@ session-only toggle that resets to port order on restart.
 | `c` / `y` | Copy the selected **route's** URL to the clipboard (via OSC 52, so it works over SSH) |
 | `i` | Copy the selected **port's** bare PID (e.g. `12345`) — refuses if it can't be resolved |
 | `I` | Copy a ready-to-run `kill <pid>` command (SIGTERM) — same refusal as `i`, plus refuses on a locked port |
-| `C` | Tear down stale forwards (served with nothing listening) |
+| `C` | Tear down stale forwards (served with nothing listening) permanently |
 | `x` | Lock / unlock the selected port (`:22` ships locked; unlocking it needs a typed `ssh`) |
 | `n` | Add a port to Favorites by number (even one nothing's listening on yet) |
 | `l` | Label the selected port |
@@ -309,16 +309,18 @@ useful for finding something new to serve, label, or favorite.
 - **`tailport clean [--dry-run]`** — turn off every *dangling* serve forward
   (served, nothing listening locally) and print one line per port, `cleared
   :P`, or `nothing to clean`. `--dry-run` prints `would clear :P` and changes
-  nothing. No grace period: running it is the instruction, so it ignores
-  `auto_clear_stale` (global and per-port) and clears a dangling port even where
-  the TUI's auto-clear is set to `off`. It still never touches `:22`, a locked
-  port, or a port with funnel, a Caddy publish or a Cloudflare tunnel, and only
-  ever clears a plain 1:1 serve (a remap such as tailnet `15173` → local `5173`
-  is left alone). It re-checks each port against a fresh listener scan just
-  before unserving it (printing `skipped :P (no longer dangling)` if an app has
-  started since). It takes no port arguments: `tailport clean 8080` exits 2.
-  Exits non-zero if `tailscale serve status` can't be read, if publish or
-  tunnel state is configured but unreadable (then nothing is cleared), or if
+  nothing. This is a permanent clear and has no grace period: running it is the
+  instruction, so it ignores `auto_pause` (global and per-port) and clears a
+  dangling port even where the TUI's auto-pause is set to `off`. It does not
+  touch the TUI's remembered paused serves (those are not tailscale state: a
+  paused port has no forward left to clear). It still never touches `:22`, a
+  locked port, or a port with funnel, a Caddy publish or a Cloudflare tunnel,
+  and only ever clears a plain 1:1 serve (a remap such as tailnet `15173` →
+  local `5173` is left alone). It re-checks each port against a fresh listener
+  scan just before unserving it (printing `skipped :P (no longer dangling)` if
+  an app has started since). It takes no port arguments: `tailport clean 8080`
+  exits 2. Exits non-zero if `tailscale serve status` can't be read, if publish
+  or tunnel state is configured but unreadable (then nothing is cleared), or if
   any unserve fails, so it works as a `predev` step.
 - **`tailport update`** — self-update to the latest release (sha256-verified).
   `--check` reports whether an update is available without installing it;
@@ -359,27 +361,27 @@ tailport also records a `last_process` key per port automatically (the name it
 last saw listening, used for the `was <name>` display); you don't set that by
 hand.
 
-### Auto-clearing dangling forwards
+### Pausing dangling forwards
 
-A `serve:` block holds one setting, `auto_clear_stale` (default `30s`): how
-long a dangling forward (see [Troubleshooting](#troubleshooting)) may
-stay dangling, continuously, before the TUI turns it off itself. It takes a Go
-duration (`30s`, `2m`) or `0` / `off` to disable. A per-port
-`ports.<n>.auto_clear_stale` overrides it for that port; leave it out to
-inherit.
+A `serve:` block holds one setting, `auto_pause` (default `5s`): how long a
+dangling forward (see [Troubleshooting](#troubleshooting)) may stay dangling,
+continuously, before the TUI *pauses* it: removes the forward and remembers the
+app behind it, so it can be restored when that app returns. It takes a Go
+duration (`5s`, `2m`) or `0` / `off` to disable. A per-port
+`ports.<n>.auto_pause` overrides it for that port; leave it out to inherit.
 
 ```yaml
 serve:
-    auto_clear_stale: 30s # a duration (30s, 2m), or 0 / off to disable
+    auto_pause: 5s # a duration (5s, 2m), or 0 / off to disable
 ports:
     3000:
-        auto_clear_stale: 5m  # this port gets longer
+        auto_pause: 2m  # this port gets longer
     4000:
-        auto_clear_stale: off # never auto-clear this one
+        auto_pause: off # never auto-pause this one
 ```
 
 A value that is neither a duration, `0` nor `off` is treated as the default
-(30s globally, inherit per port) and the TUI shows a one-time warning toast
+(5s globally, inherit per port) and the TUI shows a one-time warning toast
 naming it; it never stops tailport from starting.
 
 ### Status markers
@@ -393,12 +395,13 @@ markers: "" # "" / mono (default) | auto | emoji | ascii
 
 - **unset (`""`, the default) — mono:** ○ localhost · ◔ local network ·
   ◑ on tailnet · ◉ served · ● public (funnel) · ◆ public (published) ·
-  ◈ public (cloudflare tunnel) · ▲ stale (dangling forward) · ✕ offline.
+  ◈ public (cloudflare tunnel) · ▲ stale (dangling forward) · ◌ paused ·
+  ✕ offline.
 - **`auto`** — detects a UTF-8-capable terminal (UTF-8 locale, and `TERM` isn't
   the bare Linux console or `dumb`) and switches to the moon-phase emoji ramp
   there, otherwise falls back to mono: 🌕 localhost · 🌔 local network ·
   🌓 on tailnet · 🌒 served · 🌑 public (funnel) · 🌐 public (published) ·
-  ☁️ public (cloudflare tunnel) · 🌫️ stale · ✕ offline.
+  ☁️ public (cloudflare tunnel) · 🌫️ stale · 💤 paused · ✕ offline.
 - **`emoji`** — always the moon-phase ramp, regardless of terminal.
 - **`ascii`** — always mono, regardless of terminal (same glyphs as unset).
 
@@ -822,10 +825,10 @@ t to unbind"* — means the `serve` mapping is up but no local process holds
 the port. Two common cases:
 
 - **The app just isn't running** (it died, or hasn't started). Start it, or
-  unbind the port — `t` on the row, or `C` to clear all stale forwards. The
-  mapping outlives the app for a while so you can restart it freely: the TUI
-  turns a forward off by itself only after it has been dangling for 30s straight
-  (see [Auto-clear and `tailport clean`](#auto-clear-and-tailport-clean)).
+  unbind the port — `t` on the row, or `C` to clear all stale forwards
+  permanently. The mapping outlives the app for a few seconds so you can restart
+  it freely: after 5s of dangling the TUI pauses it, and resumes it when the
+  same app returns (see [Pause, resume and `tailport clean`](#pause-resume-and-tailport-clean)).
 - **The app can't start with "address already in use."** When you serve `:8025`,
   tailscaled binds your **tailnet IP** on `:8025`. If your app then tries to bind
   `0.0.0.0:8025` (all interfaces), that collides and the app fails to start — so
@@ -844,7 +847,7 @@ the port. Two common cases:
   it's on `0.0.0.0` it's already reachable on the tailnet on its own (state
   `on tailnet`), so there's nothing left to serve.
 
-#### Auto-clear and `tailport clean`
+#### Pause, resume and `tailport clean`
 
 A dangling forward is not just cosmetic. tailscaled keeps listening on your
 node's tailnet IPs at that port, so any app that binds the **wildcard** address
@@ -852,23 +855,53 @@ node's tailnet IPs at that port, so any app that binds the **wildcard** address
 `http.server`) fails with "address already in use". An app bound to `127.0.0.1`
 is unaffected.
 
-So the TUI clears a dangling forward for you once it has been dangling for 30s
-without a break, and toasts it: `cleared stale forward :P (nothing listened for
-30s) — t to re-serve`. The wait rides out a dev server restarting under its
-forward. The timer starts over if anything listens on the port again or the
-forward goes away. Tune it with `serve.auto_clear_stale`, or
-`ports.<n>.auto_clear_stale` per port; `0` or `off` disables it (see
-[Auto-clearing dangling forwards](#auto-clearing-dangling-forwards)).
+So the TUI **pauses** a dangling forward once it has been dangling for 5s
+without a break: it removes the forward (freeing the port) and toasts `paused :P
+(app stopped) — resumes when <program> in <directory> returns · t to forget`.
+The row stays in the list with a paused tailnet sub-row (`◌` / `💤`). The timer
+starts over if anything listens on the port again or the forward goes away.
+Tune it with `serve.auto_pause`, or `ports.<n>.auto_pause` per port; `0` or
+`off` disables it (see [Pausing dangling forwards](#pausing-dangling-forwards)).
 
-The auto-clear only ever acts on a plain 1:1 serve (`http://127.0.0.1:P` →
-`P`); a remapped or hand-built serve is left alone. It never touches `:22`, a
+**Resume.** tailport remembers *who* was behind the port: the executable path
+and working directory of the listening process. When something listens on a
+paused port again, the next refresh decides:
+
+- **The same program, bound to loopback** → it is re-served automatically
+  (tailnet only, as `t` does) and tailport toasts `resumed :P (same app is
+  back)`.
+- **The same program, bound wide (`0.0.0.0`)** → nothing is served, since a
+  wide bind is already reachable on the tailnet and a forward would collide; the
+  memory is dropped and a toast says so.
+- **A different program, or one whose identity can't be read** → never shared
+  automatically. The row reads `paused — a different program is listening (was
+  <program> in <directory>)`; `t` on it serves the program that is listening and
+  drops the paused memory.
+
+Both halves must match: interpreters such as `node`, `python3` and `java` share
+one binary, so the working directory is part of the identity. An app run by
+another user (identity unreadable) is never paused, so it can never be wrongly
+resumed; neither is one tailport never saw listening. Known limitation: `go run`
+builds to a fresh temporary executable on every run, so it never matches its
+previous run. Pressing `t` on a paused row with nothing listening **forgets**
+it (a toast says so). Paused serves are kept in tailport's state dir
+(`$XDG_STATE_HOME/tailport/paused-serves.json`, mode 0600) so a relaunched
+tailport still resumes; an entry expires 7 days after pausing, and a corrupt
+file is reported once and ignored.
+
+Pause and resume only ever act on a plain 1:1 serve (`http://127.0.0.1:P` →
+`P`); a remapped or hand-built serve is left alone. Neither touches `:22`, a
 locked port, a port that also carries funnel, a Caddy publish or a Cloudflare
-tunnel, or the case below where something *is* listening. It also waits until
+tunnel, or the case below where something *is* listening. Pausing waits until
 the publish and tunnel state it depends on (only if `caddy.domain` is set or
-`cloudflared` is installed) has been read successfully, and does nothing while a
-dialog is open or a toggle is in flight. For a one-shot sweep from a shell, run
-`tailport clean` (`--dry-run` to preview); see the
-[command-line reference](#command-line-reference).
+`cloudflared` is installed) has been read successfully, and neither pausing nor
+resuming happens while a dialog is open or a toggle is in flight. Resuming only
+ever restores the *tailnet* serve you had before; it never turns on funnel,
+publish or a tunnel.
+
+For a permanent, one-shot sweep from a shell, run `tailport clean` (`--dry-run`
+to preview); `C` in the TUI is the same permanent clear behind a y/n confirm.
+See the [command-line reference](#command-line-reference).
 
 ### Served row shows stale, but something IS listening
 

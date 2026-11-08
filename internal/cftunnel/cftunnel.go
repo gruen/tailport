@@ -1074,3 +1074,11 @@ func parseMetricsPort(hostport string) int {
 	}
 	return p
 }
+
+// StateDir and EnsureStateDir expose tailport's state-dir resolution and its
+// 0700/ownership/symlink hygiene to other state files (kata p2r5: the paused-
+// serves file), so there is ONE audited implementation.
+func StateDir() (string, error) { return stateDir() }
+
+// EnsureStateDir is ensureStateDir for other packages; see StateDir.
+func EnsureStateDir(dir string) error { return ensureStateDir(dir) }

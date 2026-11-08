@@ -21,6 +21,9 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("XDG_CONFIG_HOME", dir); err != nil {
 		panic("tailport cmd test isolation: " + err.Error())
 	}
+	if err := os.Setenv("XDG_STATE_HOME", dir+"/state"); err != nil {
+		panic("tailport cmd test isolation: " + err.Error())
+	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

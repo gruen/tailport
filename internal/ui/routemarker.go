@@ -48,6 +48,14 @@ func (r route) marker(emoji bool) string {
 		} else {
 			m = warnStyle.Render("▲")
 		}
+	case r.kind == routePaused:
+		// Paused (kata p2r5): off the exposure ramp -- nothing is served right
+		// now. A muted hollow circle / sleeping face.
+		if emoji {
+			m = "💤"
+		} else {
+			m = routeMutedStyle.Render("◌")
+		}
 	case r.kind == routeLocalhost:
 		if emoji {
 			m = "🌕"

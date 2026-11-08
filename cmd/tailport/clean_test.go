@@ -128,13 +128,13 @@ func TestCleanExclusionsAndNothingToClean(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	cfgPath := dir + "/c.yaml"
-	if err := (config.Config{Ports: map[int]config.PortMeta{3000: {Locked: true}, 6000: {AutoClearStale: "off"}}}).WithPath(cfgPath).Save(); err != nil {
+	if err := (config.Config{Ports: map[int]config.PortMeta{3000: {Locked: true}, 6000: {AutoPause: "off"}}}).WithPath(cfgPath).Save(); err != nil {
 		t.Fatal(err)
 	}
 	f.install(t)
 	var so, se bytes.Buffer
 	code := runClean([]string{"-c", cfgPath}, &so, &se)
-	// Only :6000 qualifies; its per-port auto_clear_stale: off governs the TUI
+	// Only :6000 qualifies; its per-port auto_pause: off governs the TUI
 	// auto-clear only, an explicit clean still clears it.
 	if code != 0 || so.String() != "cleared :6000\n" || !reflect.DeepEqual(f.unserved, []int{6000}) {
 		t.Fatalf("code=%d out=%q unserved=%v", code, so.String(), f.unserved)
@@ -181,14 +181,14 @@ func TestCleanIsListedInUsageAndDispatch(t *testing.T) {
 }
 
 // The README's `tailport clean` claims, each pinned by a test above: one line
-// per port, --dry-run, ignores auto_clear_stale (TestCleanExclusionsAndNothingToClean),
+// per port, --dry-run, ignores auto_pause (TestCleanExclusionsAndNothingToClean),
 // non-zero on failure (TestCleanExitCodes).
 func TestCleanReadmeClaims(t *testing.T) {
 	b, err := os.ReadFile("../../README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"`tailport clean [--dry-run]`", "`would clear :P`", "ignores\n  `auto_clear_stale`", "`tailport clean 8080` exits 2", "(then nothing is cleared)", "skipped :P (no longer dangling)"} {
+	for _, want := range []string{"`tailport clean [--dry-run]`", "`would clear :P`", "it ignores `auto_pause`", "does not\n  touch the TUI's remembered paused serves", "`tailport clean 8080`\n  exits 2", "(then nothing is cleared)", "skipped :P (no longer dangling)"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("README should contain %q", want)
 		}

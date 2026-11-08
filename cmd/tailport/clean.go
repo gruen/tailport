@@ -31,6 +31,9 @@ func printCleanUsage(w io.Writer) {
 	fmt.Fprintln(w, "EADDRINUSE. No grace period (running it is deliberate); never touches :22,")
 	fmt.Fprintln(w, "locked ports, or ports with funnel, a Caddy publish or a Cloudflare tunnel.")
 	fmt.Fprintln(w, "Only a plain 1:1 serve (127.0.0.1:P -> P) qualifies; a remap is left alone.")
+	fmt.Fprintln(w, "This is a permanent clear: it ignores auto_pause (the TUI's pause/resume")
+	fmt.Fprintln(w, "setting) and does not touch the TUI's remembered paused serves, which are")
+	fmt.Fprintln(w, "not tailscale state (a paused port has no forward to clear).")
 	fmt.Fprintln(w, "Prints one line per port. Exits non-zero, clearing nothing, if tailscale")
 	fmt.Fprintln(w, "status or publish/tunnel state can't be read up front. A failure DURING")
 	fmt.Fprintln(w, "cleanup (an unserve or a re-scan) also exits non-zero, but forwards already")
@@ -47,7 +50,7 @@ func printCleanUsage(w io.Writer) {
 // runClean implements `tailport clean [--dry-run]` (kata 9p43): the one-shot,
 // TUI-free counterpart of the TUI's grace-period auto-clear, usable as e.g. a
 // `predev` step. It applies the SAME eligibility rule (internal/stale) but no
-// grace, and it deliberately ignores auto_clear_stale (global and per-port):
+// grace, and it deliberately ignores auto_pause (global and per-port):
 // that setting governs only what tailport does UNPROMPTED in the TUI, whereas
 // running this command is itself the instruction. Locks, :22 and public
 // exposure still protect a port.

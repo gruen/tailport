@@ -38,11 +38,11 @@ type PortMeta struct {
 	// `O` has: unlike the removed prompt flow, there is no session-only
 	// re-raise -- the config file itself is the source of truth every time.
 	Cloudflare *CloudflareBinding `yaml:"cloudflare,omitempty"`
-	// AutoClearStale overrides serve.auto_clear_stale for THIS port (kata
-	// 9p43): a Go duration ("30s", "2m"), or "0"/"off" to never auto-clear
+	// AutoPause overrides serve.auto_pause for THIS port (kata
+	// p2r5): a Go duration ("5s", "2m"), or "0"/"off" to never auto-pause
 	// this port. Empty (the default) inherits the global value. A string, not
-	// a time.Duration, so "off" round-trips; see ParseAutoClear.
-	AutoClearStale string `yaml:"auto_clear_stale,omitempty"`
+	// a time.Duration, so "off" round-trips; see ParseAutoPause.
+	AutoPause string `yaml:"auto_pause,omitempty"`
 }
 
 // CloudflareBinding pins a port to one pre-provisioned, named Cloudflare
@@ -148,35 +148,37 @@ func (c *CaddyConfig) applyDefaults() {
 	}
 }
 
-// DefaultAutoClearStale is the grace period applied when serve.auto_clear_stale
-// is unset or unparseable (kata 9p43).
-const DefaultAutoClearStale = 30 * time.Second
+// DefaultAutoPause is the grace period applied when serve.auto_pause
+// is unset or unparseable (kata p2r5, replacing 9p43's auto_clear_stale).
+const DefaultAutoPause = 5 * time.Second
 
-// ServeConfig holds the settings for tailscale-serve housekeeping (kata 9p43).
+// ServeConfig holds the settings for tailscale-serve housekeeping (kata 9p43/p2r5).
 // Like CaddyConfig and CloudflaredConfig, the block is ALWAYS present in the
 // saved config (see Save and applyServeComments) so the knob is discoverable.
 type ServeConfig struct {
-	// AutoClearStale is how long a serve forward may stay DANGLING (served
-	// with nothing listening locally) before the TUI tears it down itself: a
-	// Go duration ("30s", "2m"), or "0"/"off" to disable. Default "30s".
-	// Overridden per port by PortMeta.AutoClearStale. Invalid text falls back
-	// to the default (see ParseAutoClear, Config.StaleWarnings).
-	AutoClearStale string `yaml:"auto_clear_stale"`
+	// AutoPause is how long a serve forward may stay DANGLING (served
+	// with nothing listening locally) before the TUI PAUSES it -- removes the
+	// forward so it stops holding the port on the tailnet IPs, and remembers
+	// the app behind it so it can resume when that app returns: a Go duration
+	// ("5s", "2m"), or "0"/"off" to disable. Default "5s".
+	// Overridden per port by PortMeta.AutoPause. Invalid text falls back
+	// to the default (see ParseAutoPause, Config.PauseWarnings).
+	AutoPause string `yaml:"auto_pause"`
 }
 
 // applyDefaults fills the default grace when the key is absent or blank.
 func (s *ServeConfig) applyDefaults() {
-	if strings.TrimSpace(s.AutoClearStale) == "" {
-		s.AutoClearStale = DefaultAutoClearStale.String()
+	if strings.TrimSpace(s.AutoPause) == "" {
+		s.AutoPause = DefaultAutoPause.String()
 	}
 }
 
-// ParseAutoClear parses an auto_clear_stale value. "" reports set=false (the
+// ParseAutoPause parses an auto_pause value. "" reports set=false (the
 // value is absent: inherit/default). "off" or "0" (case-insensitive) is a valid
 // disable, d == 0. Anything else must be a non-negative Go duration. ok is
 // false for text that is neither, which callers treat as the default and
-// surface (Config.StaleWarnings) rather than crash on.
-func ParseAutoClear(v string) (d time.Duration, set, ok bool) {
+// surface (Config.PauseWarnings) rather than crash on.
+func ParseAutoPause(v string) (d time.Duration, set, ok bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0, false, true
@@ -191,26 +193,26 @@ func ParseAutoClear(v string) (d time.Duration, set, ok bool) {
 	return d, true, true
 }
 
-// AutoClearGrace returns the effective auto-clear grace for port: the per-port
-// override if set and valid, else the global serve.auto_clear_stale if set and
-// valid, else DefaultAutoClearStale. 0 means auto-clear is disabled for port.
-func (c Config) AutoClearGrace(port int) time.Duration {
-	if d, set, ok := ParseAutoClear(c.Ports[port].AutoClearStale); set && ok {
+// PauseGrace returns the effective auto-pause grace for port: the per-port
+// override if set and valid, else the global serve.auto_pause if set and
+// valid, else DefaultAutoPause. 0 means auto-pause is disabled for port.
+func (c Config) PauseGrace(port int) time.Duration {
+	if d, set, ok := ParseAutoPause(c.Ports[port].AutoPause); set && ok {
 		return d
 	}
-	if d, set, ok := ParseAutoClear(c.Serve.AutoClearStale); set && ok {
+	if d, set, ok := ParseAutoPause(c.Serve.AutoPause); set && ok {
 		return d
 	}
-	return DefaultAutoClearStale
+	return DefaultAutoPause
 }
 
-// StaleWarnings lists every unparseable auto_clear_stale value (global, then
+// PauseWarnings lists every unparseable auto_pause value (global, then
 // per-port in ascending port order) as a human-readable line. Each such value
-// is already being treated as inherit/default by AutoClearGrace.
-func (c Config) StaleWarnings() []string {
+// is already being treated as inherit/default by PauseGrace.
+func (c Config) PauseWarnings() []string {
 	var w []string
-	if _, _, ok := ParseAutoClear(c.Serve.AutoClearStale); !ok {
-		w = append(w, fmt.Sprintf("serve.auto_clear_stale %q is not a duration, \"0\" or \"off\"; using %s", c.Serve.AutoClearStale, DefaultAutoClearStale))
+	if _, _, ok := ParseAutoPause(c.Serve.AutoPause); !ok {
+		w = append(w, fmt.Sprintf("serve.auto_pause %q is not a duration, \"0\" or \"off\"; using %s", c.Serve.AutoPause, DefaultAutoPause))
 	}
 	ports := make([]int, 0, len(c.Ports))
 	for p := range c.Ports {
@@ -218,8 +220,8 @@ func (c Config) StaleWarnings() []string {
 	}
 	sort.Ints(ports)
 	for _, p := range ports {
-		if _, _, ok := ParseAutoClear(c.Ports[p].AutoClearStale); !ok {
-			w = append(w, fmt.Sprintf("ports.%d.auto_clear_stale %q is not a duration, \"0\" or \"off\"; inheriting the global value", p, c.Ports[p].AutoClearStale))
+		if _, _, ok := ParseAutoPause(c.Ports[p].AutoPause); !ok {
+			w = append(w, fmt.Sprintf("ports.%d.auto_pause %q is not a duration, \"0\" or \"off\"; inheriting the global value", p, c.Ports[p].AutoPause))
 		}
 	}
 	return w
@@ -390,7 +392,7 @@ func Load(override string) (Config, error) {
 	// in-memory struct here, and the block appears -- with its comments --
 	// on the next Save.
 	cfg.Caddy.applyDefaults()
-	// Likewise a file from before 9p43 has no serve: block; it gets the 30s
+	// Likewise a file from before p2r5 has no serve: block; it gets the 5s
 	// default in memory and the commented block on the next Save.
 	cfg.Serve.applyDefaults()
 	// A pre-existing config file from before k4cj has no sticky_header key at
@@ -952,7 +954,7 @@ func applyCloudflaredComments(root *yaml.Node) {
 }
 
 // applyServeComments sets the explanatory head comments on the serve: key and
-// its auto_clear_stale knob (kata 9p43), re-applied on every Save like the
+// its auto_pause knob (kata 9p43), re-applied on every Save like the
 // other blocks' comments.
 func applyServeComments(root *yaml.Node) {
 	setKeyHeadComment(root, "serve",
@@ -963,11 +965,13 @@ func applyServeComments(root *yaml.Node) {
 	if serve == nil {
 		return
 	}
-	setKeyHeadComment(serve, "auto_clear_stale",
-		"Turn off a dangling forward (served, nothing listening) once it has been\n"+
-			"dangling this long without a break. A Go duration (30s, 2m), or 0 / off\n"+
-			"to disable. Per-port override: ports.<n>.auto_clear_stale. Never touches\n"+
-			":22, locked ports, or ports with funnel, publish or a tunnel. Default 30s.")
+	setKeyHeadComment(serve, "auto_pause",
+		"Pause a dangling forward (served, nothing listening) once it has been\n"+
+			"dangling this long without a break: the forward is removed, and\n"+
+			"restored when the same app (binary + working dir) listens again. A Go\n"+
+			"duration (5s, 2m), or 0 / off to disable. Per-port override:\n"+
+			"ports.<n>.auto_pause. Never touches :22, locked ports, or ports with\n"+
+			"funnel, publish or a tunnel. Default 5s.")
 }
 
 // applyStickyHeaderComment sets the explanatory head comment on the

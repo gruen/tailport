@@ -329,28 +329,45 @@ contract. The short version:
   the clipboard carve-out, it is never required to build or run tailport:
   absence just disables both keys (no key, no discovery, no polling) and
   costs nothing.
-- Auto-clear of DANGLING serve forwards (kata 9p43) is an owner-approved
-  exception to "tailport mutates serve state only on a keypress": the TUI
-  turns a forward off with no keypress, and `tailport clean` does so from a
-  shell. It is a de-escalation (it only ever removes tailnet exposure) and its
-  scope is exactly: only a plain 1:1 serve (a single "/" proxy to
-  `127.0.0.1:P`/`localhost:P`, P == the served port; never a remap, file/text
-  handler, extra paths or TCP forwarding); ON by default with a 30s grace, configurable via
-  `serve.auto_clear_stale` and per-port `ports.<n>.auto_clear_stale`
-  (duration, or `0`/`off`); a port must be dangling (served AND nothing
-  listening locally) CONTINUOUSLY for the whole grace, and the timer resets
-  when something listens or the serve goes away; never `:22`, never a locked
-  port, never a port also carrying funnel, Caddy publish or a Cloudflare
-  tunnel; no auto-clear until every REQUIRED public-state source (Caddy if
-  `caddy.domain` is set, cloudflared if installed) has been read successfully
-  (`clean` clears nothing and exits non-zero if one is unreadable), nor while
-  any modal flow, pending op or teardown is active; never the No127 state (something IS listening, so there is no bind
-  collision). The one rule lives in `internal/stale`, shared by the TUI
-  (`trackDangling`, driven only by refreshes that pass the 4hcg generation
-  guard) and `tailport clean` (no grace; it ignores `auto_clear_stale`,
-  because running it is itself the instruction). Every auto-clear toasts. The
-  `C` key keeps its own unfiltered, confirmed semantics. Do not widen this
-  (other states, other mutations, shorter implicit defaults) without asking.
+- Auto-PAUSE and auto-RESUME of DANGLING serve forwards (kata 9p43, reworked
+  into pause/resume by kata p2r5) are an owner-approved exception to "tailport
+  mutates serve state only on a keypress": the TUI changes serve state with no
+  keypress in exactly two ways, and `tailport clean` clears from a shell.
+  - **Auto-pause is a de-escalation** (it only ever removes tailnet exposure).
+    Scope, exactly: only a plain 1:1 serve (a single "/" proxy to
+    `127.0.0.1:P`/`localhost:P`, P == the served port; never a remap, file/text
+    handler, extra paths or TCP forwarding); ON by default with a 5s grace,
+    configurable via `serve.auto_pause` and per-port `ports.<n>.auto_pause`
+    (duration, or `0`/`off`); the port must be dangling (served AND nothing
+    listening locally) CONTINUOUSLY for the whole grace, and the timer resets
+    when something listens or the serve goes away; it needs a KNOWN last-seen
+    identity (executable path + working directory) of the app that was
+    listening, and an unreadable identity means never paused; never `:22`,
+    never a locked port, never a port also carrying funnel, Caddy publish or a
+    Cloudflare tunnel; no pause until every REQUIRED public-state source
+    (Caddy if `caddy.domain` is set, cloudflared if installed) has been read
+    successfully, nor while any modal flow, pending op or teardown is active;
+    never the No127 state (something IS listening, so there is no bind
+    collision). Every pause toasts and is remembered in the state dir
+    (`paused-serves.json`, 0600, atomic, 7-day expiry), not in config.yaml.
+  - **Auto-resume is an automatic RE-SERVE**, so it is bounded tightly: it
+    restores only the user's own explicit prior intent (a serve they had), on
+    the tailnet only, never funnel, publish or a tunnel, and only when the
+    listener's identity (executable path AND working directory) matches the
+    paused entry AND it is loopback-bound (accepts 127.0.0.1). A match bound
+    wide is NOT served (already tailnet-reachable; a forward would collide) and
+    its memory is dropped; a different or unreadable program is never
+    auto-shared (the row says so; `t` serves it). Resume goes through the same
+    serve-on path as `t`, honors the lock and :22 guards, and waits while any
+    dialog or op is active. Every resume toasts.
+  - The one eligibility rule lives in `internal/stale`, shared by the TUI
+    (`trackDangling`, driven only by refreshes that pass the 4hcg generation
+    guard, so a dropped stale refresh neither pauses nor resumes) and
+    `tailport clean` (no grace and no identity requirement; it ignores
+    `auto_pause`, does not touch paused memory, because running it is itself
+    the instruction). The `C` key keeps its own unfiltered, confirmed
+    semantics. Do not widen this (other states, other mutations, shorter
+    implicit defaults, resuming onto a public path) without asking.
 
 ### Docs stay honest (a claim is a test)
 
