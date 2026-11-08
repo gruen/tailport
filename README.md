@@ -878,6 +878,19 @@ paused port again, the next refresh decides:
   <program> in <directory>)`; `t` on it serves the program that is listening and
   drops the paused memory.
 
+The identity is read from the process that owns the socket accepting
+`127.0.0.1` (the one `serve` would proxy to) — never from another listener on
+the same port. If that cannot be pinned to exactly one process (two programs
+both accepting `127.0.0.1`, or one whose owner `ss`/`lsof` cannot attribute),
+nothing is paused or resumed. A resume is checked again *immediately* before
+the serve is made, and again right after; if the program behind the port is not
+provably the remembered one it is abandoned and the paused memory kept. And the
+share follows the app, not the port: for a port tailport itself auto-resumed, if
+a different program later ends up behind it, the serve is removed again, the
+port goes back to paused under the original identity, and the toast says
+`stopped sharing :P — a different program took over the port`. (Ports you
+served by hand keep today's behaviour and are never withdrawn this way.)
+
 Both halves must match: interpreters such as `node`, `python3` and `java` share
 one binary, so the working directory is part of the identity. An app run by
 another user (identity unreadable) is never paused, so it can never be wrongly
@@ -889,13 +902,23 @@ it (a toast says so). Paused serves are kept in tailport's state dir
 tailport still resumes; an entry expires 7 days after pausing, and a corrupt
 file is reported once and ignored.
 
+The paused file is only trusted if its directory and the file are yours: the
+state directory must be a real directory (not a symlink) owned by you and not
+group/other-writable, and the file a regular file you own, not group/other-writable;
+otherwise it is ignored, with a warning, and nothing is resumed from it.
+Program and directory names shown in toasts and rows are stripped of terminal
+control and formatting characters.
+
 Pause and resume only ever act on a plain 1:1 serve (`http://127.0.0.1:P` →
 `P`); a remapped or hand-built serve is left alone. Neither touches `:22`, a
 locked port, a port that also carries funnel, a Caddy publish or a Cloudflare
 tunnel, or the case below where something *is* listening. Pausing waits until
 the publish and tunnel state it depends on (only if `caddy.domain` is set or
 `cloudflared` is installed) has been read successfully, and neither pausing nor
-resuming happens while a dialog is open or a toggle is in flight. Resuming only
+resuming happens while a dialog is open or a toggle is in flight. Resuming also
+needs that public state known, and a port that carries funnel, a Caddy publish
+or a Cloudflare tunnel (including one started after the pause) is never
+resumed — its paused memory is kept for later. Resuming only
 ever restores the *tailnet* serve you had before; it never turns on funnel,
 publish or a tunnel.
 

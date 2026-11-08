@@ -23,13 +23,27 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/gruen/tailport/internal/cftunnel"
 	"github.com/gruen/tailport/internal/pausedserve"
 	"github.com/gruen/tailport/internal/portscan"
 	"github.com/gruen/tailport/internal/procid"
+	"github.com/gruen/tailport/internal/tsserve"
 )
 
 // identify reads a listener's identity; a var so tests stay hermetic.
-var identify = procid.Of
+// serveOn is the serve-ON call the guarded resume makes (a var for tests).
+var (
+	identify = procid.Of
+	serveOn  = tsserve.On
+)
+
+// dispPath / dispExe are the DISPLAY copies of a remembered path: abbreviated
+// and passed through cftunnel.SanitizeDisplay so a directory name carrying
+// escapes, newlines or bidi/format characters can never inject content into a
+// toast or a route line (roborev 6305 #5). Matching always uses the raw
+// strings, never these.
+func dispPath(p string) string { return cftunnel.SanitizeDisplay(shortPath(p)) }
+func dispExe(p string) string  { return cftunnel.SanitizeDisplay(filepath.Base(p)) }
 
 // pausedIdentity is the remembered program of a paused serve.
 func pausedIdentity(e pausedserve.Entry) procid.Identity {
@@ -107,7 +121,7 @@ func shortPath(p string) string {
 func pauseToast(es []pausedserve.Entry) string {
 	if len(es) == 1 {
 		e := es[0]
-		return fmt.Sprintf("paused :%d (app stopped) — resumes when %s in %s returns · t to forget", e.Port, filepath.Base(e.Exe), shortPath(e.Cwd))
+		return fmt.Sprintf("paused :%d (app stopped) — resumes when %s in %s returns · t to forget", e.Port, dispExe(e.Exe), dispPath(e.Cwd))
 	}
 	ports := make([]int, len(es))
 	for i, e := range es {
@@ -183,16 +197,19 @@ func (m *model) resumeReturned(msg refreshMsg) (cmds []tea.Cmd, notice string) {
 		}
 		switch {
 		case p.BindScope == portscan.ScopeLoopback && !p.No127:
-			if m.autoPauseBlocked() {
-				continue // try again on the next refresh
+			// Resume is an automatic EXPOSURE, so it obeys every guard pause
+			// does (roborev 6305 #4): required public-state sources known, and
+			// no funnel/publish/tunnel on the port. While any blocks it the
+			// paused memory is KEPT.
+			if !m.publicStateKnown() || m.hasPublicExposure(port) || m.autoPauseBlocked() {
+				continue // try again on a later refresh
 			}
 			if m.resuming == nil {
 				m.resuming = map[int]bool{}
 			}
 			m.resuming[port] = true
-			cmd := m.beginToggle(port, true) // exactly what `t` does: tailnet only, no confirm
-			cmds = append(cmds, cmd)
-			if m.pending != port { // beginToggle refused (e.g. a cloudflared metrics port)
+			cmds = append(cmds, m.beginResume(port, e))
+			if m.pending != port { // refused (e.g. a cloudflared metrics port)
 				delete(m.resuming, port)
 				delete(m.paused, port)
 				changed = true
@@ -226,10 +243,160 @@ func (m model) decoratePaused(it portItem) portItem {
 
 // pausedText is the adornment on a paused route line.
 func (r route) pausedText() string {
-	exe := filepath.Base(r.pausedExe)
-	cwd := shortPath(r.pausedCwd)
+	exe := dispExe(r.pausedExe)
+	cwd := dispPath(r.pausedCwd)
 	if r.pausedOther {
 		return fmt.Sprintf("· paused — a different program is listening (was %s in %s)", exe, cwd)
 	}
 	return fmt.Sprintf("· paused — resumes when %s in %s returns", exe, cwd)
+}
+
+// hasPublicExposure reports funnel, a Caddy publish or a Cloudflare tunnel on
+// port (owned or foreign): the same exclusion pause applies.
+func (m model) hasPublicExposure(port int) bool {
+	if _, ok := m.funnel[port]; ok {
+		return true
+	}
+	if _, ok := m.published[port]; ok {
+		return true
+	}
+	if _, ok := m.tunnels[port]; ok {
+		return true
+	}
+	return m.tunnelForeign[port]
+}
+
+// beginResume starts the guarded re-serve of a paused port: the same
+// bookkeeping as beginToggle(port, true), but the serve itself runs through
+// guardedResume, which re-verifies the listener right before tsserve.On.
+func (m *model) beginResume(port int, e pausedserve.Entry) tea.Cmd {
+	if _, refused := m.metricsRefusal(port); refused {
+		return nil
+	}
+	save := m.remember(port)
+	m.pending = port
+	return tea.Batch(save, guardedResume(port, pausedIdentity(e)))
+}
+
+// resumeAbortedMsg: the guarded resume declined to serve (or undid its serve
+// at once) because the listener on the port was not provably the remembered
+// program. The paused memory is kept.
+type resumeAbortedMsg struct {
+	port    int
+	why     string
+	revoked bool // a serve was made and immediately removed again
+}
+
+// verifyListener freshly re-derives who is behind port's 127.0.0.1 listener
+// and checks it is want, bound to loopback. It returns the verified identity,
+// or a non-empty reason it is not provably the same program.
+func verifyListener(port int, want procid.Identity) (procid.Identity, string) {
+	ports, err := scanListeners()
+	if err != nil {
+		return procid.Identity{}, "the listener scan failed"
+	}
+	for _, p := range ports {
+		if p.Number != port {
+			continue
+		}
+		if p.Pid127 <= 0 {
+			return procid.Identity{}, "the 127.0.0.1 listener is ambiguous or unattributed"
+		}
+		if p.BindScope != portscan.ScopeLoopback || p.No127 {
+			return procid.Identity{}, "the listener is no longer loopback-bound"
+		}
+		id := identify(p.Pid127)
+		if !id.Matches(want) {
+			return procid.Identity{}, "the program on the port changed"
+		}
+		return id, ""
+	}
+	return procid.Identity{}, "nothing is listening any more"
+}
+
+// guardedResume is the off-Update-thread resume (roborev 6305 #2): the
+// refresh snapshot that decided to resume may be seconds old, and an app can
+// release its socket (staying alive) while another program binds the port. So
+// immediately before tsserve.On it re-scans, re-derives the 127.0.0.1 owner and
+// re-reads ITS identity, serving only if it still matches; and re-verifies
+// once more right after, undoing the serve if the answer flipped.
+func guardedResume(port int, want procid.Identity) tea.Cmd {
+	return func() tea.Msg {
+		id, why := verifyListener(port, want)
+		if why != "" {
+			return resumeAbortedMsg{port: port, why: why}
+		}
+		if err := serveOn(port); err != nil {
+			return toggleDoneMsg{port: port, err: err, kind: routeTailnet, turnOn: true}
+		}
+		if _, why := verifyListener(port, want); why != "" {
+			_ = serveOff(port)
+			return resumeAbortedMsg{port: port, why: why, revoked: true}
+		}
+		return toggleDoneMsg{port: port, kind: routeTailnet, turnOn: true, verified: id}
+	}
+}
+
+// revokeChanged is the other half of the guard: for a port tailport itself
+// AUTO-resumed (m.autoResumed holds the identity it verified), a later refresh
+// that finds a different program behind it -- or one that cannot be told apart
+// -- unserves it and pauses it again under the ORIGINAL identity. The share
+// follows the app, not the port. Manually served ports are never revoked; and
+// once the user adds funnel/publish/a tunnel (or turns the serve off) the
+// share is theirs and tracking stops.
+func (m *model) revokeChanged(msg refreshMsg) tea.Cmd {
+	if len(m.autoResumed) == 0 {
+		return nil
+	}
+	listening := make(map[int]bool, len(msg.ports))
+	for _, p := range msg.ports {
+		listening[p.Number] = true
+	}
+	ports := make([]int, 0, len(m.autoResumed))
+	for p := range m.autoResumed {
+		ports = append(ports, p)
+	}
+	sort.Ints(ports)
+	now := m.clock()
+	var due []int
+	for _, port := range ports {
+		want := m.autoResumed[port]
+		switch {
+		case !m.active[port], m.hasPublicExposure(port):
+			delete(m.autoResumed, port)
+			continue
+		case !listening[port]:
+			continue // gone: the ordinary pause path handles a dangling forward
+		case msg.idents[port].Matches(want):
+			continue
+		}
+		due = append(due, port)
+	}
+	if len(due) == 0 || m.autoPauseBlocked() {
+		return nil
+	}
+	if m.revoking == nil {
+		m.revoking = map[int]bool{}
+	}
+	for _, port := range due {
+		want := m.autoResumed[port]
+		m.pausing[port] = pausedserve.Entry{Port: port, Exe: want.Exe, Cwd: want.Cwd, PausedAt: now}
+		m.revoking[port] = true
+	}
+	m.cleaning = len(due)
+	return cleanupPorts(due, true)
+}
+
+// revokeToast is the toast for a share withdrawn because the program changed.
+func revokeToast(e pausedserve.Entry) string {
+	return fmt.Sprintf("stopped sharing :%d — a different program took over the port · paused again, resumes when %s in %s returns", e.Port, dispExe(e.Exe), dispPath(e.Cwd))
+}
+
+// pausedToast is the toast for serves just paused: a plain pause, or -- for a
+// share withdrawn by revokeChanged -- the revocation wording.
+func (m model) pausedToast(es []pausedserve.Entry) string {
+	if len(es) == 1 && m.revoking[es[0].Port] {
+		return revokeToast(es[0])
+	}
+	return pauseToast(es)
 }

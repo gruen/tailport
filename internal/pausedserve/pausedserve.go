@@ -57,16 +57,38 @@ func Path() (string, error) {
 // no identity). A missing file is an empty set with no error. A corrupt file is
 // an EMPTY set plus a non-nil error, so the caller can say so once and carry
 // on; the bad file is left in place until the next Save overwrites it.
+//
+// This file drives an AUTOMATIC serve, so nothing in it is trusted until the
+// place it came from is: the state dir must be a real directory this uid owns,
+// not group/other-writable (and not reached through a symlink), and the file
+// itself -- opened with O_NOFOLLOW and judged by fstat on the OPEN descriptor,
+// not the path -- a regular file this uid owns, not group/other-writable.
+// Any failure is an empty set plus an error: another user who can write the
+// directory can never plant an entry that matches a listener.
 func Load(path string, now time.Time) (map[int]Entry, error) {
 	out := map[int]Entry{}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err := cftunnel.ValidateStateDir(filepath.Dir(path)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return out, nil
+		}
+		return out, fmt.Errorf("paused serves ignored: %w", err)
+	}
+	// O_NONBLOCK so opening a planted FIFO cannot hang; fstat then rejects it.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return out, nil
 	}
 	if err != nil {
-		return out, fmt.Errorf("paused serves: %w", err)
+		return out, fmt.Errorf("paused serves ignored: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return out, fmt.Errorf("paused serves ignored: %w", err)
+	}
+	if err := cftunnel.ValidateOwnedFile(path, info); err != nil {
+		return out, fmt.Errorf("paused serves ignored: %w", err)
+	}
 	var ff fileFormat
 	if err := json.NewDecoder(f).Decode(&ff); err != nil {
 		return map[int]Entry{}, fmt.Errorf("paused serves file %s is corrupt (%v); starting with none", path, err)

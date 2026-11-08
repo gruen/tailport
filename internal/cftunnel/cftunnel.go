@@ -1082,3 +1082,56 @@ func StateDir() (string, error) { return stateDir() }
 
 // EnsureStateDir is ensureStateDir for other packages; see StateDir.
 func EnsureStateDir(dir string) error { return ensureStateDir(dir) }
+
+// ValidateStateDir is the READ-ONLY half of ensureStateDir's checks, for code
+// that must decide whether to TRUST what it finds in the state dir before
+// acting on it (kata p2r5: the paused-serves file drives an automatic serve).
+// It never creates or chmods anything. dir must be a real directory (not a
+// symlink), owned by this uid, and not group/other-writable; and its parent
+// -- the only other component inside tailport's own state path -- must be
+// owned by this uid or root and not group/other-writable (unless sticky, as
+// /tmp is), since a writable parent lets another user swap the directory.
+// A missing dir is os.ErrNotExist (nothing to trust yet).
+func ValidateStateDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("state dir %s is not a plain directory (is it a symlink?)", dir)
+	}
+	if err := checkOwnerAndMode(dir, info, false); err != nil {
+		return err
+	}
+	parent := filepath.Dir(dir)
+	pinfo, err := os.Stat(parent)
+	if err != nil {
+		return err
+	}
+	return checkOwnerAndMode(parent, pinfo, true)
+}
+
+// ValidateOwnedFile checks an OPEN file's fstat: a regular file owned by this
+// uid and not group/other-writable.
+func ValidateOwnedFile(name string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", name)
+	}
+	return checkOwnerAndMode(name, info, false)
+}
+
+// checkOwnerAndMode: owned by this uid (or, for a parent, root), and no
+// group/other write bit (a sticky directory excepted when allowSticky).
+func checkOwnerAndMode(name string, info os.FileInfo, parent bool) error {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine the owner of %s on this platform", name)
+	}
+	if st.Uid != uint32(os.Getuid()) && !(parent && st.Uid == 0) {
+		return fmt.Errorf("refusing %s: owned by uid %d, not this process's uid %d", name, st.Uid, os.Getuid())
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 && !(parent && info.Mode()&os.ModeSticky != 0) {
+		return fmt.Errorf("refusing %s: group/other-writable (mode %04o)", name, perm)
+	}
+	return nil
+}

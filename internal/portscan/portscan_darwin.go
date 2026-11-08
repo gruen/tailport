@@ -52,6 +52,7 @@ func parseLsof(out []byte) ([]Port, error) {
 	// the moment ANY row accepts a 127.0.0.1 dial (2z0v(b)), regardless of
 	// which row's scope ends up winning BindScope.
 	agg := map[int]*Port{}
+	acc127 := pidAcc{}
 	var order []int
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	first := true
@@ -100,6 +101,7 @@ func parseLsof(out []byte) ([]Port, error) {
 		if isTailscaleAddr(host) && (!zoned || proc == "" || proc == "tailscaled") {
 			continue
 		}
+		acc127.note(port, pid, ok127)
 
 		p, ok := agg[port]
 		if !ok {
@@ -127,6 +129,7 @@ func parseLsof(out []byte) ([]Port, error) {
 	}
 	ports := make([]Port, 0, len(order))
 	for _, port := range order {
+		acc127.apply(agg[port])
 		ports = append(ports, *agg[port])
 	}
 	return ports, nil

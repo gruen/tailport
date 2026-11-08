@@ -1,6 +1,9 @@
 package portscan
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 // TestIsTailscaleAddr guards the address-range filter that distinguishes
 // tailscaled's serve-proxy sockets from real local app sockets. This runs
@@ -256,3 +259,5 @@ func TestClassifyBindDeviceRestriction(t *testing.T) {
 		}
 	}
 }
+
+func itoa(n int) string { return strconv.Itoa(n) }

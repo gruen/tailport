@@ -57,6 +57,7 @@ func List() ([]Port, error) {
 // ends up winning BindScope.
 func parseSS(out []byte) ([]Port, error) {
 	agg := map[int]*Port{}
+	acc127 := pidAcc{}
 	var order []int
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
@@ -115,6 +116,7 @@ func parseSS(out []byte) ([]Port, error) {
 		if isTailscaleAddr(bare) && (!zoned || proc == "" || proc == "tailscaled") {
 			continue
 		}
+		acc127.note(port, pid, ok127)
 
 		p, ok := agg[port]
 		if !ok {
@@ -142,6 +144,7 @@ func parseSS(out []byte) ([]Port, error) {
 	}
 	ports := make([]Port, 0, len(order))
 	for _, port := range order {
+		acc127.apply(agg[port])
 		ports = append(ports, *agg[port])
 	}
 	return ports, nil

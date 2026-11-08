@@ -58,6 +58,54 @@ type Port struct {
 	// literal already written (tests and callers alike) -- none of them need
 	// updating to stay correct after this field was added.
 	No127 bool
+	// Pid127 is the owning pid of the bind row(s) that ACCEPT a dial to
+	// 127.0.0.1:PORT (kata p2r5) -- the process `tailscale serve` would
+	// actually be proxying to. Pid above is just the first attributed row's
+	// owner, which need not be that process (a remembered app on ::1 and a
+	// different program on 127.0.0.1 share one port). Pid127 is the single
+	// distinct pid of all such rows, or 0 when there are none, when they belong
+	// to more than one pid, or when any of them is unattributed. 0 therefore
+	// means "ambiguous or unknown": auto-pause and auto-resume read a
+	// program's identity from Pid127 ONLY and do nothing on 0.
+	Pid127 int
+}
+
+// pidAcc accumulates, per port, which pids own rows that accept a
+// 127.0.0.1 dial (see Port.Pid127). Shared by the ss and lsof parsers.
+type pidAcc map[int]*pidSet
+
+type pidSet struct {
+	pids         map[int]bool
+	unattributed bool
+}
+
+// note records one bind row: a no-op unless the row accepts 127.0.0.1.
+func (a pidAcc) note(port, pid int, ok127 bool) {
+	if !ok127 {
+		return
+	}
+	s := a[port]
+	if s == nil {
+		s = &pidSet{pids: map[int]bool{}}
+		a[port] = s
+	}
+	if pid <= 0 {
+		s.unattributed = true
+		return
+	}
+	s.pids[pid] = true
+}
+
+// apply sets p.Pid127 from the accumulated rows.
+func (a pidAcc) apply(p *Port) {
+	s := a[p.Number]
+	if s == nil || s.unattributed || len(s.pids) != 1 {
+		p.Pid127 = 0
+		return
+	}
+	for pid := range s.pids {
+		p.Pid127 = pid
+	}
 }
 
 // accepts127 reports whether a bare bind host (no brackets, no port -- exactly

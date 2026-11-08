@@ -413,3 +413,38 @@ LISTEN 0      128            0.0.0.0:5000          0.0.0.0:*
 		t.Errorf(":5000 (foreign/unattributed) = %+v, want Process=\"\" Pid=0", p)
 	}
 }
+
+// Kata p2r5: Pid127 is the owner of the row that ACCEPTS 127.0.0.1, not the
+// first attributed row's owner.
+func TestParseSSPid127(t *testing.T) {
+	row := func(addr, name string, pid int) string {
+		return "LISTEN 0 5 " + addr + " 0.0.0.0:* users:((\"" + name + "\",pid=" + itoa(pid) + ",fd=3))\n"
+	}
+	for name, tc := range map[string]struct {
+		out  string
+		want int
+	}{
+		// The remembered app is on ::1 (first row, becomes Port.Pid); a DIFFERENT
+		// program holds 127.0.0.1. Only the latter may be identified.
+		"two programs ::1 vs 127.0.0.1": {row("[::1]:18921", "oldapp", 111) + row("127.0.0.1:18921", "other", 222), 222},
+		"one program dual rows":         {row("127.0.0.1:18921", "app", 111) + row("[::]:18921", "app", 111), 111},
+		"two pids both accept 127":      {row("127.0.0.1:18921", "a", 111) + row("0.0.0.0:18921", "b", 222), 0},
+		"unattributed accepting row":    {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:*\n" + row("0.0.0.0:18921", "b", 222), 0},
+		"nobody accepts 127.0.0.1":      {row("[::1]:18921", "a", 111), 0},
+		"no process info at all":        {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:*\n", 0},
+	} {
+		ports, err := parseSS([]byte(tc.out))
+		if err != nil || len(ports) != 1 {
+			t.Fatalf("%s: %v %v", name, ports, err)
+		}
+		if ports[0].Pid127 != tc.want {
+			t.Errorf("%s: Pid127 = %d, want %d (Pid=%d)", name, ports[0].Pid127, tc.want, ports[0].Pid)
+		}
+	}
+	// The trap itself: Pid is the ::1 app's, No127 is false (the other
+	// program's row cleared it), and Pid127 refuses to conflate them.
+	ports, _ := parseSS([]byte(row("[::1]:18921", "oldapp", 111) + row("127.0.0.1:18921", "other", 222)))
+	if ports[0].Pid != 111 || ports[0].No127 || ports[0].Pid127 != 222 {
+		t.Errorf("trap case: %+v", ports[0])
+	}
+}

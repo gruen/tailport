@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/gruen/tailport/internal/config"
 	"github.com/gruen/tailport/internal/pausedserve"
@@ -411,13 +412,278 @@ func TestRefreshReadsIdentitiesOnlyWhereNeeded(t *testing.T) {
 	t.Cleanup(func() { identify, scanListeners, serveStatus = oldID, oldScan, oldStatus })
 	identify = func(pid int) procid.Identity { asked = append(asked, pid); return acIdent }
 	scanListeners = func() ([]portscan.Port, error) {
-		return []portscan.Port{{Number: 1, Pid: 101}, {Number: 2, Pid: 102}, {Number: 3, Pid: 103}, {Number: 4}}, nil
+		return []portscan.Port{{Number: 1, Pid: 9, Pid127: 101}, {Number: 2, Pid127: 102}, {Number: 3, Pid127: 103}, {Number: 4}, {Number: 5, Pid: 105}}, nil
 	}
 	serveStatus = func() (tsserve.Detail, error) {
 		return tsserve.Detail{Active: []int{1, 2}, OneToOne: map[int]bool{1: true}}, nil
 	}
-	msg := refresh(3, 4).(refreshMsg)
-	if len(asked) != 2 || msg.idents[1].Exe == "" || msg.idents[3].Exe == "" {
-		t.Fatalf("asked=%v idents=%v (want :1 served 1:1 and :3 paused; not remap :2, not pid-less :4)", asked, msg.idents)
+	msg := refresh(3, 4, 5).(refreshMsg)
+	// :1 is read via Pid127 (101), NOT the aggregated Pid (9); :5 has only an
+	// aggregated Pid (no 127.0.0.1 owner known), so it is never read.
+	if len(asked) != 2 || asked[0] != 101 || asked[1] != 103 || msg.idents[1].Exe == "" || msg.idents[3].Exe == "" {
+		t.Fatalf("asked=%v idents=%v (want :1 served 1:1 and :3 paused; not remap :2, not pid-less :4, not Pid127-less :5)", asked, msg.idents)
+	}
+}
+
+// ── roborev 6305 ────────────────────────────────────────────────────────────
+
+// guardEnv fakes the scanner, identity reader and serve calls for the guarded
+// resume; scans is consumed one entry per scan (the last repeats).
+type guardEnv struct {
+	scans   [][]portscan.Port
+	idOf    map[int]procid.Identity
+	onCalls []int
+	offs    []int
+	onErr   error
+	n       int
+}
+
+func (g *guardEnv) install(t *testing.T) {
+	t.Helper()
+	oS, oI, oOn, oOff := scanListeners, identify, serveOn, serveOff
+	t.Cleanup(func() { scanListeners, identify, serveOn, serveOff = oS, oI, oOn, oOff })
+	scanListeners = func() ([]portscan.Port, error) {
+		i := g.n
+		if i >= len(g.scans) {
+			i = len(g.scans) - 1
+		}
+		g.n++
+		return g.scans[i], nil
+	}
+	identify = func(pid int) procid.Identity { return g.idOf[pid] }
+	serveOn = func(p int) error { g.onCalls = append(g.onCalls, p); return g.onErr }
+	serveOff = func(p int) error { g.offs = append(g.offs, p); return nil }
+}
+
+func loopbackPort(pid127 int) []portscan.Port {
+	return []portscan.Port{{Number: 8080, BindScope: portscan.ScopeLoopback, Pid: pid127, Pid127: pid127}}
+}
+
+func TestGuardedResumeServesOnlyAfterFreshVerification(t *testing.T) {
+	g := &guardEnv{scans: [][]portscan.Port{loopbackPort(200)}, idOf: map[int]procid.Identity{200: acIdent}}
+	g.install(t)
+	msg := guardedResume(8080, acIdent)()
+	d, ok := msg.(toggleDoneMsg)
+	if !ok || d.err != nil || d.verified != acIdent || len(g.onCalls) != 1 {
+		t.Fatalf("verified listener should be served: %#v on=%v", msg, g.onCalls)
+	}
+}
+
+// The snapshot said "same app", but by the time of the call the port belongs to
+// someone else (the app released the socket yet stayed alive): abort.
+func TestGuardedResumeAbortsWhenIdentityChangedSinceSnapshot(t *testing.T) {
+	for name, scan := range map[string][]portscan.Port{
+		"different program now behind 127.0.0.1": loopbackPort(300),
+		"ambiguous (Pid127 == 0)":                {{Number: 8080, BindScope: portscan.ScopeLoopback, Pid: 200}},
+		"no longer loopback":                     {{Number: 8080, BindScope: portscan.ScopeWildcard, Pid127: 200}},
+		"not listening":                          {},
+		"no 127.0.0.1 accept":                    {{Number: 8080, BindScope: portscan.ScopeLoopback, Pid127: 200, No127: true}},
+	} {
+		g := &guardEnv{scans: [][]portscan.Port{scan}, idOf: map[int]procid.Identity{200: acIdent, 300: otherIdent}}
+		g.install(t)
+		msg := guardedResume(8080, acIdent)()
+		if _, ok := msg.(resumeAbortedMsg); !ok || len(g.onCalls) != 0 {
+			t.Errorf("%s: must abort without serving: %#v on=%v", name, msg, g.onCalls)
+		}
+	}
+}
+
+// A swap that lands between the pre-check and the post-check is undone at once.
+func TestGuardedResumeUndoesAServeWhoseListenerFlipped(t *testing.T) {
+	g := &guardEnv{
+		scans: [][]portscan.Port{loopbackPort(200), loopbackPort(300)},
+		idOf:  map[int]procid.Identity{200: acIdent, 300: otherIdent},
+	}
+	g.install(t)
+	msg := guardedResume(8080, acIdent)()
+	a, ok := msg.(resumeAbortedMsg)
+	if !ok || !a.revoked || len(g.onCalls) != 1 || len(g.offs) != 1 || g.offs[0] != 8080 {
+		t.Fatalf("flip after serve must be undone: %#v on=%v off=%v", msg, g.onCalls, g.offs)
+	}
+}
+
+func TestAbortedResumeKeepsMemoryAndFreesTheGuard(t *testing.T) {
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(resumeAbortedMsg{port: 8080, why: "the program on the port changed"})
+	m = res.(model)
+	if m.pending != 0 || m.resuming[8080] {
+		t.Fatal("guard must be freed")
+	}
+	if _, ok := m.paused[8080]; !ok {
+		t.Fatal("paused memory must be kept")
+	}
+	if !strings.Contains(m.flash, "did not resume :8080") {
+		t.Fatalf("toast = %q", m.flash)
+	}
+}
+
+// Revocation: a different program takes over an AUTO-resumed port.
+func TestRevokeWhenProgramBehindAutoResumedPortChanges(t *testing.T) {
+	m, clk := pmModel(t, config.Config{})
+	m.autoResumed[8080] = acIdent
+	acListener[8080] = otherIdent
+	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
+	if m.cleaning != 1 || !m.revoking[8080] {
+		t.Fatalf("must unserve the takeover: cleaning=%d revoking=%v", m.cleaning, m.revoking)
+	}
+	if e := m.pausing[8080]; e.Exe != acIdent.Exe || e.Cwd != acIdent.Cwd {
+		t.Fatalf("re-paused entry must carry the ORIGINAL identity, got %+v", e)
+	}
+	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
+	m = res.(model)
+	if e, ok := m.paused[8080]; !ok || e.Cwd != acIdent.Cwd {
+		t.Fatalf("not re-paused: %+v", m.paused)
+	}
+	if !strings.HasPrefix(m.flash, "stopped sharing :8080 — a different program took over the port") {
+		t.Fatalf("toast = %q", m.flash)
+	}
+	if _, ok := m.autoResumed[8080]; ok {
+		t.Fatal("tracking ends once revoked")
+	}
+	// The row is now marked: a different program is listening.
+	m, _ = acRefresh(t, m, nil, []int{8080}, nil)
+	if !m.pausedOther[8080] {
+		t.Fatal("row should read 'a different program is listening'")
+	}
+	_ = clk
+}
+
+func TestNoRevokeForManualShareOrSameProgramOrUserEscalation(t *testing.T) {
+	// A manually served port is never revoked, whoever listens.
+	m, _ := pmModel(t, config.Config{})
+	acListener[8080] = otherIdent
+	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
+	if m.cleaning != 0 {
+		t.Fatal("manual shares are not revoked")
+	}
+	// Same program: untouched.
+	m2, _ := pmModel(t, config.Config{})
+	m2.autoResumed[8080] = acIdent
+	m2, _ = acRefresh(t, m2, []int{8080}, []int{8080}, nil)
+	if m2.cleaning != 0 {
+		t.Fatal("same program must keep its share")
+	}
+	// The user escalated (funnel): the share is theirs now.
+	m3, _ := pmModel(t, config.Config{})
+	m3.autoResumed[8080] = acIdent
+	acListener[8080] = otherIdent
+	m3, _ = acRefresh(t, m3, []int{8080}, []int{8080}, map[int]int{8080: 443})
+	if m3.cleaning != 0 || len(m3.autoResumed) != 0 {
+		t.Fatalf("funnel makes the share the user's: cleaning=%d tracked=%v", m3.cleaning, m3.autoResumed)
+	}
+	// A manual toggle ends tracking.
+	m4, _ := pmModel(t, config.Config{})
+	m4.autoResumed[8080] = acIdent
+	m4.beginToggle(8080, false)
+	if len(m4.autoResumed) != 0 {
+		t.Fatal("a manual toggle must end revocation tracking")
+	}
+}
+
+// Resume obeys the pause guards (#4) and keeps the memory while blocked.
+func TestResumeBlockedByPublicExposureAndUnknownPublicState(t *testing.T) {
+	for name, set := range map[string]func(*model){
+		"tunnel started on the paused row": func(m *model) { m.tunnels = map[int]tunnelInfo{8080: {pid: 5}} },
+		"foreign tunnel":                   func(m *model) { m.tunnelForeign = map[int]bool{8080: true} },
+		"caddy publish":                    func(m *model) { m.published = map[int]publishInfo{8080: {hostname: "x.example.com"}} },
+	} {
+		m, clk := pmModel(t, config.Config{})
+		pmPause(&m, clk, 8080)
+		set(&m)
+		m, _ = acRefresh(t, m, nil, []int{8080}, nil)
+		if m.pending != 0 || len(m.resuming) != 0 {
+			t.Errorf("%s: must not auto-serve", name)
+		}
+		if _, ok := m.paused[8080]; !ok {
+			t.Errorf("%s: memory must be kept", name)
+		}
+	}
+	// Unknown public state at startup: no resume until it is known.
+	m, clk := pmModel(t, config.Config{})
+	m.cfAvailable = true
+	pmPause(&m, clk, 8080)
+	m, _ = acRefresh(t, m, nil, []int{8080}, nil)
+	if m.pending != 0 {
+		t.Fatal("no resume while the tunnel poll has not succeeded")
+	}
+	m.tunnelsOK = true
+	m, _ = acRefresh(t, m, nil, []int{8080}, nil)
+	if m.pending != 8080 {
+		t.Fatal("resumes once public state is known")
+	}
+	// Funnel too.
+	m2, clk2 := pmModel(t, config.Config{})
+	pmPause(&m2, clk2, 8080)
+	m2, _ = acRefresh(t, m2, nil, []int{8080}, map[int]int{8080: 443})
+	if m2.pending != 0 {
+		t.Fatal("funnel on the port blocks resume")
+	}
+}
+
+// Display copies are sanitized (#5); raw strings still drive matching.
+func TestPausedDisplayIsSanitized(t *testing.T) {
+	evil := pausedserve.Entry{Port: 8080, Exe: "/usr/bin/py\x1b]0;pwn\x07thon", Cwd: "/srv/\x1b[31mred\nINJECTED\u202eevil\u200b"}
+	check := func(what, s string) {
+		t.Helper()
+		for _, bad := range []string{"\x1b", "\n", "\u202e", "\u200b", "\x07"} {
+			if strings.Contains(s, bad) {
+				t.Errorf("%s leaks %q: %q", what, bad, s)
+			}
+		}
+	}
+	check("pauseToast", pauseToast([]pausedserve.Entry{evil}))
+	check("revokeToast", revokeToast(evil))
+	r := route{kind: routePaused, pausedExe: evil.Exe, pausedCwd: evil.Cwd}
+	check("pausedText", r.pausedText())
+	r.pausedOther = true
+	check("pausedText(other)", r.pausedText())
+	// Matching is untouched: the raw identity still equals itself.
+	id := procid.Identity{Exe: evil.Exe, Cwd: evil.Cwd}
+	if !id.Matches(pausedIdentity(evil)) {
+		t.Error("sanitizing must not alter matching")
+	}
+}
+
+// After a verified resume the identity is installed in lastIdent, so an app
+// that dies before the confirming refresh is re-paused (#6).
+func TestResumeKeepsVerifiedIdentitySoACrashIsRePaused(t *testing.T) {
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	m.lastIdent = map[int]procid.Identity{} // as after a restart: nothing known
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(toggleDoneMsg{port: 8080, kind: routeTailnet, turnOn: true, verified: acIdent})
+	m = res.(model)
+	if m.lastIdent[8080] != acIdent || m.autoResumed[8080] != acIdent {
+		t.Fatalf("verified identity not kept: last=%v auto=%v", m.lastIdent, m.autoResumed)
+	}
+	if _, ok := m.paused[8080]; ok {
+		t.Fatal("paused memory should be forgotten")
+	}
+	// The app crashes before any refresh saw it listening: dangling -> paused.
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(5 * time.Second)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 || m.pausing[8080].Cwd != acIdent.Cwd {
+		t.Fatalf("a crash right after resume must re-pause: cleaning=%d pausing=%v", m.cleaning, m.pausing)
+	}
+}
+
+// #7: every paused route line fits the terminal at narrow widths.
+func TestPausedRouteLineFitsNarrowWidths(t *testing.T) {
+	for _, other := range []bool{false, true} {
+		for _, w := range []int{21, 25, 28, 30, 31, 40, 60, 100} {
+			b := blockInput{
+				port: 8080, name: "python3",
+				routes:        []route{{kind: routePaused, pausedExe: "/usr/bin/python3.14", pausedCwd: "/home/me/some/deeply/nested/project/dir", pausedOther: other}},
+				selectedRoute: -1, copiedRoute: -1, width: w,
+			}
+			for _, ln := range renderServiceBlock(b) {
+				if got := lipgloss.Width(ln); got > w {
+					t.Errorf("width %d other=%v: line is %d cells: %q", w, other, got, stripANSI(ln))
+				}
+			}
+		}
 	}
 }

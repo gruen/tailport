@@ -3,6 +3,7 @@ package pausedserve
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -101,4 +102,82 @@ func TestSymlinkIsNotFollowed(t *testing.T) {
 	if fi, _ := os.Lstat(p); fi.Mode()&os.ModeSymlink != 0 {
 		t.Error("Save should replace the symlink with a regular file")
 	}
+}
+
+// Kata p2r5 (roborev 6305 #3): the file drives an automatic serve, so a state
+// dir/file another user could have written is never trusted.
+func TestLoadRefusesUntrustworthyDirOrFile(t *testing.T) {
+	good := map[int]Entry{1: {Port: 1, Exe: "/a", Cwd: "/c", PausedAt: t0}}
+	mk := func(t *testing.T) (dir, path string) {
+		dir = filepath.Join(t.TempDir(), "state")
+		path = filepath.Join(dir, FileName)
+		if err := Save(path, good); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := Load(path, t0); err != nil || len(out) != 1 {
+			t.Fatalf("baseline must load: %v %v", out, err)
+		}
+		return dir, path
+	}
+	refuse := func(t *testing.T, why, path string) {
+		t.Helper()
+		out, err := Load(path, t0)
+		if err == nil || len(out) != 0 {
+			t.Errorf("%s: want empty set + error, got %v %v", why, out, err)
+		}
+	}
+
+	t.Run("group-writable dir", func(t *testing.T) {
+		dir, path := mk(t)
+		_ = os.Chmod(dir, 0o770)
+		refuse(t, "group-writable dir", path)
+	})
+	t.Run("other-writable dir", func(t *testing.T) {
+		dir, path := mk(t)
+		_ = os.Chmod(dir, 0o707)
+		refuse(t, "other-writable dir", path)
+	})
+	t.Run("symlinked dir", func(t *testing.T) {
+		dir, _ := mk(t)
+		link := filepath.Join(filepath.Dir(dir), "link")
+		if err := os.Symlink(dir, link); err != nil {
+			t.Fatal(err)
+		}
+		refuse(t, "symlinked dir", filepath.Join(link, FileName))
+	})
+	t.Run("writable parent", func(t *testing.T) {
+		dir, path := mk(t)
+		_ = os.Chmod(filepath.Dir(dir), 0o777) // another user could swap the dir
+		refuse(t, "writable non-sticky parent", path)
+		_ = os.Chmod(filepath.Dir(dir), 0o700)
+	})
+	t.Run("foreign-owned dir", func(t *testing.T) {
+		// /etc is root-owned: not this uid (skip if we ARE root).
+		if os.Getuid() == 0 {
+			t.Skip("running as root")
+		}
+		refuse(t, "foreign-owned dir", "/etc/"+FileName)
+	})
+	t.Run("group-writable file", func(t *testing.T) {
+		_, path := mk(t)
+		_ = os.Chmod(path, 0o660)
+		refuse(t, "group-writable file", path)
+	})
+	t.Run("non-regular file", func(t *testing.T) {
+		dir, path := mk(t)
+		_ = os.Remove(path)
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Skip("mkfifo unavailable:", err)
+		}
+		_ = dir
+		refuse(t, "FIFO instead of a file", path) // must not hang either
+	})
+	t.Run("a directory in place of the file", func(t *testing.T) {
+		_, path := mk(t)
+		_ = os.Remove(path)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		refuse(t, "directory in place of the file", path)
+	})
 }

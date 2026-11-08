@@ -401,6 +401,13 @@ func TestAutoPauseDocsMatchBehavior(t *testing.T) {
 		"◌ paused",
 		"💤 paused",
 		"does not\n  touch the TUI's remembered paused serves",
+		"owns the socket accepting\n`127.0.0.1`",
+		"checked again *immediately* before",
+		"`stopped sharing :P — a different program took over the port`",
+		"never withdrawn this way",
+		"is only trusted if its directory and the file are yours",
+		"stripped of terminal\ncontrol and formatting characters",
+		"(including one started after the pause) is never\nresumed",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README is missing %q", want)

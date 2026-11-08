@@ -669,6 +669,9 @@ type toggleDoneMsg struct {
 	// publicPort is the funnel's public ingress port; a successful funnel
 	// turn-ON records it in m.funnel at once (see the toggleDoneMsg handler).
 	publicPort int
+	// verified is the identity a guarded auto-RESUME re-verified immediately
+	// before serving (kata p2r5); zero for every other toggle.
+	verified procid.Identity
 }
 
 // publishInfo is the live per-port publish state the edge poll returns: the
@@ -1166,6 +1169,11 @@ type model struct {
 	pausing       map[int]pausedserve.Entry
 	resuming      map[int]bool
 	pausedOther   map[int]bool
+	// autoResumed holds, per port tailport itself AUTO-resumed, the identity it
+	// verified; revokeChanged unserves the port if the program behind it later
+	// changes. revoking marks teardowns that are such a revocation.
+	autoResumed map[int]procid.Identity
+	revoking    map[int]bool
 	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
 	oneToOne map[int]bool
 	// publishOK / tunnelsOK: the LAST edge poll / tunnel poll succeeded (false
@@ -1591,6 +1599,8 @@ func New(cfg config.Config, markersOverride ...string) model {
 		pausing:       map[int]pausedserve.Entry{},
 		resuming:      map[int]bool{},
 		pausedOther:   map[int]bool{},
+		autoResumed:   map[int]procid.Identity{},
+		revoking:      map[int]bool{},
 		paused:        paused,
 		pausedPath:    pausedPath,
 		pausedLoadErr: pausedLoadErr,
@@ -1814,8 +1824,10 @@ func refresh(want ...int) tea.Msg {
 	}
 	idents := map[int]procid.Identity{}
 	for _, p := range ports {
-		if p.Pid > 0 && ((active[p.Number] && detail.OneToOne[p.Number]) || wantSet[p.Number]) {
-			idents[p.Number] = identify(p.Pid)
+		// Identity comes from the owner of the row that ACCEPTS 127.0.0.1
+		// (Pid127), never the aggregated Pid; 0 = ambiguous/unknown -> no read.
+		if p.Pid127 > 0 && ((active[p.Number] && detail.OneToOne[p.Number]) || wantSet[p.Number]) {
+			idents[p.Number] = identify(p.Pid127)
 		}
 	}
 	return refreshMsg{ports: ports, active: active, funnel: funnel, oneToOne: detail.OneToOne, idents: idents}
@@ -2694,6 +2706,7 @@ func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
 			return m.setErr(msg)
 		}
 	}
+	delete(m.autoResumed, port) // a manual toggle makes the share the user's own
 	var saveCmd tea.Cmd
 	if turnOn {
 		saveCmd = m.remember(port)
@@ -3722,6 +3735,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var rcmds []tea.Cmd
 			rcmds, notice = m.resumeReturned(msg)
+			rcmds = append(rcmds, m.revokeChanged(msg))
 			autoCmd = tea.Batch(append(rcmds, autoCmd)...)
 		}
 		// One-shot warnings (config values that did not parse; a corrupt paused
@@ -3861,6 +3875,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var resumeToast tea.Cmd
 		if m.resuming[msg.port] && msg.kind == routeTailnet && msg.turnOn {
 			delete(m.resuming, msg.port)
+			if msg.err == nil && msg.verified.Known() {
+				// Keep the identity the guard just verified BEFORE the paused
+				// memory goes (roborev 6305 #6): if the app dies before the
+				// confirming refresh sees it listening, the new forward must
+				// still be pausable rather than left dangling with no known
+				// identity. It is also what revokeChanged compares against.
+				m.lastIdent[msg.port] = msg.verified
+				m.autoResumed[msg.port] = msg.verified
+			}
 			forgetErr := m.forgetPaused(msg.port)
 			if msg.err == nil {
 				resumeToast = m.setFlash(fmt.Sprintf("resumed :%d (same app is back)", msg.port), flashInfo)
@@ -3917,6 +3940,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(rebuild, m.refreshCmd(), resumeToast)
 		}
 		return m, m.refreshCmd()
+
+	case resumeAbortedMsg:
+		// The guarded resume declined (or undid its serve): keep the paused
+		// memory, free the in-flight guard, say why.
+		m.pending = 0
+		delete(m.resuming, msg.port)
+		if msg.revoked {
+			m.supersedeRefreshes() // the serve existed for a moment and is gone
+			delete(m.active, msg.port)
+		}
+		return m, tea.Batch(m.setFlash(fmt.Sprintf("did not resume :%d — %s", msg.port, msg.why), flashWarn), m.refreshCmd())
 
 	case publishDoneMsg:
 		// Mirrors toggleDoneMsg (kata v1z5): clear pending, and rather than
@@ -4547,6 +4581,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.paused[p] = e
 				pausedNow = append(pausedNow, e)
 				delete(m.lastIdent, p)
+				delete(m.autoResumed, p)
 			}
 			// The teardown succeeded, so the forward is gone NOW (roborev 6192):
 			// releasing the cleanup guard while m.active still claimed it let a
@@ -4561,7 +4596,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.danglingSince[p] = now
 			}
 		}
+		pausedText := m.pausedToast(pausedNow) // before revoking is cleared
 		clear(m.pausing)
+		clear(m.revoking)
 		var saveErr error
 		if len(pausedNow) > 0 {
 			saveErr = m.savePaused()
@@ -4577,7 +4614,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// names both what was cleared and what was not, at error severity.
 		switch {
 		case msg.auto && len(pausedNow) > 0 && (msg.err != nil || saveErr != nil):
-			text := pauseToast(pausedNow)
+			text := pausedText
 			if msg.err != nil {
 				text += "; " + msg.err.Error()
 			}
@@ -4590,7 +4627,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.err != nil:
 			return m, tea.Batch(m.setErr(msg.err.Error()), m.refreshCmd(), rebuild)
 		case msg.auto && len(pausedNow) > 0:
-			return m, tea.Batch(m.setFlash(pauseToast(pausedNow), flashInfo), m.refreshCmd(), rebuild)
+			return m, tea.Batch(m.setFlash(pausedText, flashInfo), m.refreshCmd(), rebuild)
 		}
 		return m, tea.Batch(m.refreshCmd(), rebuild)
 

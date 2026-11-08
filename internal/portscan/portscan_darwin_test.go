@@ -218,3 +218,23 @@ tailscaled   50 root   11u  IPv4 0x4444444444444444      0t0  TCP 100.110.98.29%
 		t.Errorf(":8080 = %+v, want BindScope=lan BindHost=fe80::1%%en0", p)
 	}
 }
+
+// Kata p2r5: Pid127 mirrors the Linux parser on lsof output.
+func TestParseLsofPid127(t *testing.T) {
+	hdr := "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+	row := func(name string, pid int, addr string) string {
+		return name + " " + itoa(pid) + " u 3u IPv4 0x1 0t0 TCP " + addr + " (LISTEN)\n"
+	}
+	ports, err := parseLsof([]byte(hdr + row("oldapp", 111, "[::1]:18921") + row("other", 222, "127.0.0.1:18921")))
+	if err != nil || len(ports) != 1 || ports[0].Pid != 111 || ports[0].Pid127 != 222 {
+		t.Fatalf("two programs: %+v %v", ports, err)
+	}
+	ports, _ = parseLsof([]byte(hdr + row("a", 111, "127.0.0.1:18921") + row("b", 222, "*:18921")))
+	if ports[0].Pid127 != 0 {
+		t.Errorf("two pids both accepting 127.0.0.1 must be ambiguous, got %d", ports[0].Pid127)
+	}
+	ports, _ = parseLsof([]byte(hdr + row("a", 111, "[::1]:18921")))
+	if ports[0].Pid127 != 0 {
+		t.Errorf("no row accepts 127.0.0.1, got %d", ports[0].Pid127)
+	}
+}

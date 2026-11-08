@@ -354,7 +354,17 @@ contract. The short version:
     restores only the user's own explicit prior intent (a serve they had), on
     the tailnet only, never funnel, publish or a tunnel, and only when the
     listener's identity (executable path AND working directory) matches the
-    paused entry AND it is loopback-bound (accepts 127.0.0.1). A match bound
+    paused entry AND it is loopback-bound (accepts 127.0.0.1). The identity is
+    read ONLY from `portscan.Port.Pid127`, the single owning pid of the bind
+    rows that accept 127.0.0.1 (0 = ambiguous/unattributed = no capture, no
+    resume); the aggregated `Pid` is never used. The decision is re-verified in
+    a guarded cmd immediately before (and once after) `tsserve.On`, resume obeys
+    the same public-state/funnel/publish/tunnel guards pause does, and the
+    paused file is trusted only if its dir and file pass ownership/mode/symlink
+    validation (`cftunnel.ValidateStateDir`/`ValidateOwnedFile`). For a port
+    tailport AUTO-resumed, a later change of the program behind it unserves it
+    again (re-paused under the original identity); hand-served ports are never
+    revoked. A match bound
     wide is NOT served (already tailnet-reachable; a forward would collide) and
     its memory is dropped; a different or unreadable program is never
     auto-shared (the row says so; `t` serves it). Resume goes through the same

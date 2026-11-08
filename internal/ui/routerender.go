@@ -295,16 +295,26 @@ func routeAdornments(b blockInput, r route, i int) string {
 	}
 	if r.kind == routePaused {
 		text := r.pausedText()
+		show := true
 		if b.width > 0 {
-			// Keep the whole line within the terminal width (z6yf): the fixed
-			// prefix is 20 cells, plus the "—" placeholder and the 2-space gap.
-			text = truncateCells(text, maxInt(12, b.width-20-1-2-2))
+			// Keep the whole line within the terminal width (z6yf, roborev 6305
+			// #7): fixed prefix 20 cells + the one-cell "—" placeholder + the
+			// 2-space gap before the adornment. Truncate to what remains and,
+			// if almost nothing does, omit the adornment altogether.
+			room := b.width - 20 - 1 - 2
+			if room < 8 {
+				show = false
+			} else {
+				text = truncateCells(text, room)
+			}
 		}
-		style := routeMutedStyle
-		if r.pausedOther {
-			style = warnStyle
+		if show {
+			style := routeMutedStyle
+			if r.pausedOther {
+				style = warnStyle
+			}
+			out.WriteString("  " + style.Render(text))
 		}
-		out.WriteString("  " + style.Render(text))
 	}
 	if i == b.copiedRoute {
 		out.WriteString(activeStyle.Render(copiedSuffix))
