@@ -238,3 +238,20 @@ func TestParseLsofPid127(t *testing.T) {
 		t.Errorf("no row accepts 127.0.0.1, got %d", ports[0].Pid127)
 	}
 }
+
+// lsof lists a socket shared by two processes as two rows; both accept
+// 127.0.0.1, so the distinct pids make it ambiguous.
+func TestParseLsofSharedSocketIsAmbiguous(t *testing.T) {
+	hdr := "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+	row := func(name string, pid int) string {
+		return name + " " + itoa(pid) + " u 3u IPv4 0x1 0t0 TCP 127.0.0.1:18921 (LISTEN)\n"
+	}
+	ports, err := parseLsof([]byte(hdr + row("parent", 111) + row("child", 222)))
+	if err != nil || len(ports) != 1 || ports[0].Pid127 != 0 {
+		t.Fatalf("%+v %v", ports, err)
+	}
+	ports, _ = parseLsof([]byte(hdr + row("app", 111) + row("app", 111)))
+	if ports[0].Pid127 != 111 {
+		t.Fatalf("same pid twice stays unambiguous, got %d", ports[0].Pid127)
+	}
+}

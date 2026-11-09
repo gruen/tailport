@@ -79,8 +79,10 @@ type pidSet struct {
 	unattributed bool
 }
 
-// note records one bind row: a no-op unless the row accepts 127.0.0.1.
-func (a pidAcc) note(port, pid int, ok127 bool) {
+// note records one bind row: a no-op unless the row accepts 127.0.0.1. pids
+// is EVERY owner the scanner listed for the row (one `ss` row can list several
+// processes sharing an inherited listening descriptor); none = unattributed.
+func (a pidAcc) note(port int, pids []int, ok127 bool) {
 	if !ok127 {
 		return
 	}
@@ -89,11 +91,17 @@ func (a pidAcc) note(port, pid int, ok127 bool) {
 		s = &pidSet{pids: map[int]bool{}}
 		a[port] = s
 	}
-	if pid <= 0 {
+	if len(pids) == 0 {
 		s.unattributed = true
 		return
 	}
-	s.pids[pid] = true
+	for _, pid := range pids {
+		if pid <= 0 {
+			s.unattributed = true
+			continue
+		}
+		s.pids[pid] = true
+	}
 }
 
 // apply sets p.Pid127 from the accumulated rows.

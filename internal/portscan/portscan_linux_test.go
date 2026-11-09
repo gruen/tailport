@@ -432,6 +432,10 @@ func TestParseSSPid127(t *testing.T) {
 		"unattributed accepting row":    {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:*\n" + row("0.0.0.0:18921", "b", 222), 0},
 		"nobody accepts 127.0.0.1":      {row("[::1]:18921", "a", 111), 0},
 		"no process info at all":        {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:*\n", 0},
+		// One row, several owners (an inherited listening descriptor).
+		"two owners in one users field": {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:* users:((\"parent\",pid=111,fd=3),(\"child\",pid=222,fd=3))\n", 0},
+		"same pid listed twice":         {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:* users:((\"app\",pid=111,fd=3),(\"app\",pid=111,fd=4))\n", 111},
+		"owner repeated across rows":    {"LISTEN 0 5 127.0.0.1:18921 0.0.0.0:* users:((\"app\",pid=111,fd=3),(\"app\",pid=111,fd=4))\n" + row("[::]:18921", "app", 111), 111},
 	} {
 		ports, err := parseSS([]byte(tc.out))
 		if err != nil || len(ports) != 1 {
@@ -446,5 +450,13 @@ func TestParseSSPid127(t *testing.T) {
 	ports, _ := parseSS([]byte(row("[::1]:18921", "oldapp", 111) + row("127.0.0.1:18921", "other", 222)))
 	if ports[0].Pid != 111 || ports[0].No127 || ports[0].Pid127 != 222 {
 		t.Errorf("trap case: %+v", ports[0])
+	}
+}
+
+// Display behaviour is unchanged by multi-owner rows: Process/Pid stay the first.
+func TestParseSSMultiOwnerKeepsFirstForDisplay(t *testing.T) {
+	ports, err := parseSS([]byte("LISTEN 0 5 127.0.0.1:18921 0.0.0.0:* users:((\"parent\",pid=111,fd=3),(\"child\",pid=222,fd=3))\n"))
+	if err != nil || len(ports) != 1 || ports[0].Process != "parent" || ports[0].Pid != 111 || ports[0].Pid127 != 0 {
+		t.Fatalf("%+v %v", ports, err)
 	}
 }

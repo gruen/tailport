@@ -179,7 +179,12 @@ func (m *model) resumeReturned(msg refreshMsg) (cmds []tea.Cmd, notice string) {
 	var already []int
 	for _, port := range m.pausedPorts() {
 		e := m.paused[port]
+		if !m.active[port] {
+			delete(m.unresolved, port) // the exposure is gone; resumable again
+		}
 		switch {
+		case m.active[port] && m.unresolved[port]:
+			continue // an unresolved resume: keep the original entry for now
 		case e.Expired(now), m.active[port], port == 22, m.cfg.Ports[port].Locked:
 			// Expired, or overtaken: someone served it meanwhile, or the user
 			// locked it. Either way the memory is no longer wanted.
@@ -284,7 +289,8 @@ func (m *model) beginResume(port int, e pausedserve.Entry) tea.Cmd {
 type resumeAbortedMsg struct {
 	port    int
 	why     string
-	revoked bool // a serve was made and immediately removed again
+	undone  bool  // a serve was made and rolled back again
+	rollErr error // the rollback itself failed: the port may be shared with the wrong program
 }
 
 // verifyListener freshly re-derives who is behind port's 127.0.0.1 listener
@@ -330,73 +336,13 @@ func guardedResume(port int, want procid.Identity) tea.Cmd {
 			return toggleDoneMsg{port: port, err: err, kind: routeTailnet, turnOn: true}
 		}
 		if _, why := verifyListener(port, want); why != "" {
-			_ = serveOff(port)
-			return resumeAbortedMsg{port: port, why: why, revoked: true}
+			if err := serveOff(port); err != nil {
+				// The serve exists and the listener is not provably ours: do NOT
+				// report success. The handler surfaces the unresolved exposure.
+				return resumeAbortedMsg{port: port, why: why, rollErr: err}
+			}
+			return resumeAbortedMsg{port: port, why: why, undone: true}
 		}
 		return toggleDoneMsg{port: port, kind: routeTailnet, turnOn: true, verified: id}
 	}
-}
-
-// revokeChanged is the other half of the guard: for a port tailport itself
-// AUTO-resumed (m.autoResumed holds the identity it verified), a later refresh
-// that finds a different program behind it -- or one that cannot be told apart
-// -- unserves it and pauses it again under the ORIGINAL identity. The share
-// follows the app, not the port. Manually served ports are never revoked; and
-// once the user adds funnel/publish/a tunnel (or turns the serve off) the
-// share is theirs and tracking stops.
-func (m *model) revokeChanged(msg refreshMsg) tea.Cmd {
-	if len(m.autoResumed) == 0 {
-		return nil
-	}
-	listening := make(map[int]bool, len(msg.ports))
-	for _, p := range msg.ports {
-		listening[p.Number] = true
-	}
-	ports := make([]int, 0, len(m.autoResumed))
-	for p := range m.autoResumed {
-		ports = append(ports, p)
-	}
-	sort.Ints(ports)
-	now := m.clock()
-	var due []int
-	for _, port := range ports {
-		want := m.autoResumed[port]
-		switch {
-		case !m.active[port], m.hasPublicExposure(port):
-			delete(m.autoResumed, port)
-			continue
-		case !listening[port]:
-			continue // gone: the ordinary pause path handles a dangling forward
-		case msg.idents[port].Matches(want):
-			continue
-		}
-		due = append(due, port)
-	}
-	if len(due) == 0 || m.autoPauseBlocked() {
-		return nil
-	}
-	if m.revoking == nil {
-		m.revoking = map[int]bool{}
-	}
-	for _, port := range due {
-		want := m.autoResumed[port]
-		m.pausing[port] = pausedserve.Entry{Port: port, Exe: want.Exe, Cwd: want.Cwd, PausedAt: now}
-		m.revoking[port] = true
-	}
-	m.cleaning = len(due)
-	return cleanupPorts(due, true)
-}
-
-// revokeToast is the toast for a share withdrawn because the program changed.
-func revokeToast(e pausedserve.Entry) string {
-	return fmt.Sprintf("stopped sharing :%d — a different program took over the port · paused again, resumes when %s in %s returns", e.Port, dispExe(e.Exe), dispPath(e.Cwd))
-}
-
-// pausedToast is the toast for serves just paused: a plain pause, or -- for a
-// share withdrawn by revokeChanged -- the revocation wording.
-func (m model) pausedToast(es []pausedserve.Entry) string {
-	if len(es) == 1 && m.revoking[es[0].Port] {
-		return revokeToast(es[0])
-	}
-	return pauseToast(es)
 }

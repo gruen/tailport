@@ -18,7 +18,7 @@ import (
 // process name can't literally contain "pid=<digits>") but mis-paired on
 // paper if it ever did; one combined regex makes that impossible by
 // construction.
-var procRe = regexp.MustCompile(`\(\("([^"]+)",pid=(\d+)`)
+var procRe = regexp.MustCompile(`\("([^"]+)",pid=(\d+)`)
 
 // List enumerates locally listening TCP ports via `ss`. Process names are
 // best-effort: ss can only attribute a socket to a process when it's owned
@@ -104,19 +104,24 @@ func parseSS(out []byte) ([]Port, error) {
 		// can't be tailscaled's) -- tracked as kata nvv6.
 		proc := ""
 		pid := 0
+		var allPids []int // every owner in the users:(...) field (Pid127 needs them all)
 		if len(fields) > 5 {
 			joined := strings.Join(fields[5:], " ")
-			if m := procRe.FindStringSubmatch(joined); m != nil {
-				proc = m[1]
-				if v, err := strconv.Atoi(m[2]); err == nil {
-					pid = v
+			for i, m := range procRe.FindAllStringSubmatch(joined, -1) {
+				v, err := strconv.Atoi(m[2])
+				if err != nil {
+					continue
+				}
+				allPids = append(allPids, v)
+				if i == 0 { // Process/Pid display stays the first owner
+					proc, pid = m[1], v
 				}
 			}
 		}
 		if isTailscaleAddr(bare) && (!zoned || proc == "" || proc == "tailscaled") {
 			continue
 		}
-		acc127.note(port, pid, ok127)
+		acc127.note(port, allPids, ok127)
 
 		p, ok := agg[port]
 		if !ok {

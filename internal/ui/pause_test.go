@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -497,7 +498,7 @@ func TestGuardedResumeUndoesAServeWhoseListenerFlipped(t *testing.T) {
 	g.install(t)
 	msg := guardedResume(8080, acIdent)()
 	a, ok := msg.(resumeAbortedMsg)
-	if !ok || !a.revoked || len(g.onCalls) != 1 || len(g.offs) != 1 || g.offs[0] != 8080 {
+	if !ok || !a.undone || len(g.onCalls) != 1 || len(g.offs) != 1 || g.offs[0] != 8080 {
 		t.Fatalf("flip after serve must be undone: %#v on=%v off=%v", msg, g.onCalls, g.offs)
 	}
 }
@@ -519,66 +520,85 @@ func TestAbortedResumeKeepsMemoryAndFreesTheGuard(t *testing.T) {
 	}
 }
 
-// Revocation: a different program takes over an AUTO-resumed port.
-func TestRevokeWhenProgramBehindAutoResumedPortChanges(t *testing.T) {
+// A takeover AFTER a resume is an ordinary share (owner decision, kata p2r5):
+// exactly what `t` would have left. It is NOT withdrawn; it follows the port.
+func TestAutoResumedShareIsAnOrdinaryShare(t *testing.T) {
 	m, clk := pmModel(t, config.Config{})
-	m.autoResumed[8080] = acIdent
+	pmPause(&m, clk, 8080)
+	m.lastIdent = map[int]procid.Identity{}
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(toggleDoneMsg{port: 8080, kind: routeTailnet, turnOn: true, verified: acIdent})
+	m = res.(model)
+	// A different program now listens behind the port: nothing is unserved.
 	acListener[8080] = otherIdent
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
-	if m.cleaning != 1 || !m.revoking[8080] {
-		t.Fatalf("must unserve the takeover: cleaning=%d revoking=%v", m.cleaning, m.revoking)
+	clk.advance(time.Hour)
+	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
+	if m.cleaning != 0 || m.pending != 0 {
+		t.Fatalf("an auto-resumed share must not be withdrawn: cleaning=%d", m.cleaning)
 	}
-	if e := m.pausing[8080]; e.Exe != acIdent.Exe || e.Cwd != acIdent.Cwd {
-		t.Fatalf("re-paused entry must carry the ORIGINAL identity, got %+v", e)
+	// ...and when the port goes dangling it pauses again, with the identity
+	// it was last seen with (the takeover program, like any manual share).
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(5 * time.Second)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 || m.pausing[8080].Cwd != otherIdent.Cwd {
+		t.Fatalf("ordinary pause path: cleaning=%d pausing=%v", m.cleaning, m.pausing)
 	}
-	res, _ := m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
-	m = res.(model)
-	if e, ok := m.paused[8080]; !ok || e.Cwd != acIdent.Cwd {
-		t.Fatalf("not re-paused: %+v", m.paused)
-	}
-	if !strings.HasPrefix(m.flash, "stopped sharing :8080 — a different program took over the port") {
-		t.Fatalf("toast = %q", m.flash)
-	}
-	if _, ok := m.autoResumed[8080]; ok {
-		t.Fatal("tracking ends once revoked")
-	}
-	// The row is now marked: a different program is listening.
-	m, _ = acRefresh(t, m, nil, []int{8080}, nil)
-	if !m.pausedOther[8080] {
-		t.Fatal("row should read 'a different program is listening'")
-	}
-	_ = clk
 }
 
-func TestNoRevokeForManualShareOrSameProgramOrUserEscalation(t *testing.T) {
-	// A manually served port is never revoked, whoever listens.
-	m, _ := pmModel(t, config.Config{})
+// 6309 #1: the post-check fails AND the rollback fails: never report success.
+func TestGuardedResumeFailedRollbackIsNotSuccess(t *testing.T) {
+	g := &guardEnv{
+		scans: [][]portscan.Port{loopbackPort(200), loopbackPort(300)},
+		idOf:  map[int]procid.Identity{200: acIdent, 300: otherIdent},
+	}
+	g.install(t)
+	serveOff = func(p int) error { g.offs = append(g.offs, p); return errors.New("tailscale: boom") }
+	msg := guardedResume(8080, acIdent)()
+	a, ok := msg.(resumeAbortedMsg)
+	if !ok || a.rollErr == nil || a.undone || len(g.onCalls) != 1 || len(g.offs) != 1 {
+		t.Fatalf("failed rollback must surface as an abort carrying the error: %#v", msg)
+	}
+	if _, isDone := msg.(toggleDoneMsg); isDone {
+		t.Fatal("must not report success")
+	}
+
+	// The handler: error toast naming the exposure, ORIGINAL entry kept, port
+	// left to the ordinary pause path (no retry loop: nothing is started).
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(a)
+	m = res.(model)
+	want := ":8080 may be shared with a different program — rollback failed: tailscale: boom; press t to stop it"
+	if m.flash != want || m.flashLevel != flashError {
+		t.Fatalf("toast = %q (%v)", m.flash, m.flashLevel)
+	}
+	if e, kept := m.paused[8080]; !kept || e.Cwd != acIdent.Cwd {
+		t.Fatalf("original paused entry must be kept: %+v", m.paused)
+	}
+	if m.pending != 0 || m.resuming[8080] {
+		t.Fatal("guard must be freed; no retry in flight")
+	}
+	// The next refresh (port served, a different program listening) neither
+	// drops the original entry nor starts another resume.
 	acListener[8080] = otherIdent
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
-	if m.cleaning != 0 {
-		t.Fatal("manual shares are not revoked")
+	if _, kept := m.paused[8080]; !kept || m.pending != 0 {
+		t.Fatal("unresolved entry must survive the next refresh, with no new resume")
 	}
-	// Same program: untouched.
-	m2, _ := pmModel(t, config.Config{})
-	m2.autoResumed[8080] = acIdent
-	m2, _ = acRefresh(t, m2, []int{8080}, []int{8080}, nil)
-	if m2.cleaning != 0 {
-		t.Fatal("same program must keep its share")
+	// When that program dies the ordinary pause runs, and the ORIGINAL identity wins.
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(5 * time.Second)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 {
+		t.Fatal("the dangling forward must go through the normal pause path")
 	}
-	// The user escalated (funnel): the share is theirs now.
-	m3, _ := pmModel(t, config.Config{})
-	m3.autoResumed[8080] = acIdent
-	acListener[8080] = otherIdent
-	m3, _ = acRefresh(t, m3, []int{8080}, []int{8080}, map[int]int{8080: 443})
-	if m3.cleaning != 0 || len(m3.autoResumed) != 0 {
-		t.Fatalf("funnel makes the share the user's: cleaning=%d tracked=%v", m3.cleaning, m3.autoResumed)
-	}
-	// A manual toggle ends tracking.
-	m4, _ := pmModel(t, config.Config{})
-	m4.autoResumed[8080] = acIdent
-	m4.beginToggle(8080, false)
-	if len(m4.autoResumed) != 0 {
-		t.Fatal("a manual toggle must end revocation tracking")
+	res, _ = m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
+	m = res.(model)
+	if m.paused[8080].Cwd != acIdent.Cwd {
+		t.Fatalf("original identity must be kept, got %+v", m.paused[8080])
 	}
 }
 
@@ -634,7 +654,6 @@ func TestPausedDisplayIsSanitized(t *testing.T) {
 		}
 	}
 	check("pauseToast", pauseToast([]pausedserve.Entry{evil}))
-	check("revokeToast", revokeToast(evil))
 	r := route{kind: routePaused, pausedExe: evil.Exe, pausedCwd: evil.Cwd}
 	check("pausedText", r.pausedText())
 	r.pausedOther = true
@@ -655,8 +674,8 @@ func TestResumeKeepsVerifiedIdentitySoACrashIsRePaused(t *testing.T) {
 	m.pending, m.resuming[8080] = 8080, true
 	res, _ := m.Update(toggleDoneMsg{port: 8080, kind: routeTailnet, turnOn: true, verified: acIdent})
 	m = res.(model)
-	if m.lastIdent[8080] != acIdent || m.autoResumed[8080] != acIdent {
-		t.Fatalf("verified identity not kept: last=%v auto=%v", m.lastIdent, m.autoResumed)
+	if m.lastIdent[8080] != acIdent {
+		t.Fatalf("verified identity not kept: last=%v", m.lastIdent)
 	}
 	if _, ok := m.paused[8080]; ok {
 		t.Fatal("paused memory should be forgotten")

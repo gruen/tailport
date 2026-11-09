@@ -881,15 +881,18 @@ paused port again, the next refresh decides:
 The identity is read from the process that owns the socket accepting
 `127.0.0.1` (the one `serve` would proxy to) — never from another listener on
 the same port. If that cannot be pinned to exactly one process (two programs
-both accepting `127.0.0.1`, or one whose owner `ss`/`lsof` cannot attribute),
-nothing is paused or resumed. A resume is checked again *immediately* before
-the serve is made, and again right after; if the program behind the port is not
-provably the remembered one it is abandoned and the paused memory kept. And the
-share follows the app, not the port: for a port tailport itself auto-resumed, if
-a different program later ends up behind it, the serve is removed again, the
-port goes back to paused under the original identity, and the toast says
-`stopped sharing :P — a different program took over the port`. (Ports you
-served by hand keep today's behaviour and are never withdrawn this way.)
+both accepting `127.0.0.1`, one `ss` row listing several owning processes, or
+one whose owner `ss`/`lsof` cannot attribute), nothing is paused or resumed. A
+resume is checked again *immediately* before the serve is made, and again right
+after; if the program behind the port is not provably the remembered one it is
+rolled back and the paused memory kept. (If that rollback itself fails, tailport
+never reports success: it toasts `:P may be shared with a different program —
+rollback failed: <error>; press t to stop it`, keeps the original paused entry,
+and leaves the port to the ordinary pause path.) After a resume the share is an
+ordinary share, exactly what pressing `t` would have left: it follows the port
+like any manual serve, and if the port later goes dangling it pauses again,
+remembering the identity it resumed with. A different program that takes the
+port over *after* a resume is not withdrawn.
 
 Both halves must match: interpreters such as `node`, `python3` and `java` share
 one binary, so the working directory is part of the identity. An app run by

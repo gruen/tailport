@@ -101,7 +101,13 @@ func parseLsof(out []byte) ([]Port, error) {
 		if isTailscaleAddr(host) && (!zoned || proc == "" || proc == "tailscaled") {
 			continue
 		}
-		acc127.note(port, pid, ok127)
+		// lsof prints one line per (process, socket), so a socket shared by several
+		// processes arrives as several rows and accumulates several distinct pids.
+		var owners []int
+		if pid > 0 {
+			owners = []int{pid}
+		}
+		acc127.note(port, owners, ok127)
 
 		p, ok := agg[port]
 		if !ok {

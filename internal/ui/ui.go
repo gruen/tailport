@@ -1169,11 +1169,10 @@ type model struct {
 	pausing       map[int]pausedserve.Entry
 	resuming      map[int]bool
 	pausedOther   map[int]bool
-	// autoResumed holds, per port tailport itself AUTO-resumed, the identity it
-	// verified; revokeChanged unserves the port if the program behind it later
-	// changes. revoking marks teardowns that are such a revocation.
-	autoResumed map[int]procid.Identity
-	revoking    map[int]bool
+	// unresolved marks ports whose guarded resume could not roll back its own
+	// serve (the identity check failed AFTER tsserve.On and the unserve failed
+	// too): the original paused entry is kept for them.
+	unresolved map[int]bool
 	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
 	oneToOne map[int]bool
 	// publishOK / tunnelsOK: the LAST edge poll / tunnel poll succeeded (false
@@ -1599,8 +1598,7 @@ func New(cfg config.Config, markersOverride ...string) model {
 		pausing:       map[int]pausedserve.Entry{},
 		resuming:      map[int]bool{},
 		pausedOther:   map[int]bool{},
-		autoResumed:   map[int]procid.Identity{},
-		revoking:      map[int]bool{},
+		unresolved:    map[int]bool{},
 		paused:        paused,
 		pausedPath:    pausedPath,
 		pausedLoadErr: pausedLoadErr,
@@ -2706,7 +2704,6 @@ func (m *model) beginToggle(port int, turnOn bool) tea.Cmd {
 			return m.setErr(msg)
 		}
 	}
-	delete(m.autoResumed, port) // a manual toggle makes the share the user's own
 	var saveCmd tea.Cmd
 	if turnOn {
 		saveCmd = m.remember(port)
@@ -3735,7 +3732,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var rcmds []tea.Cmd
 			rcmds, notice = m.resumeReturned(msg)
-			rcmds = append(rcmds, m.revokeChanged(msg))
 			autoCmd = tea.Batch(append(rcmds, autoCmd)...)
 		}
 		// One-shot warnings (config values that did not parse; a corrupt paused
@@ -3880,9 +3876,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// memory goes (roborev 6305 #6): if the app dies before the
 				// confirming refresh sees it listening, the new forward must
 				// still be pausable rather than left dangling with no known
-				// identity. It is also what revokeChanged compares against.
+				// identity. After this the share is an ordinary one, exactly as if `t` had
+				// served it; it pauses again with this identity if the port dangles.
 				m.lastIdent[msg.port] = msg.verified
-				m.autoResumed[msg.port] = msg.verified
 			}
 			forgetErr := m.forgetPaused(msg.port)
 			if msg.err == nil {
@@ -3946,7 +3942,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// memory, free the in-flight guard, say why.
 		m.pending = 0
 		delete(m.resuming, msg.port)
-		if msg.revoked {
+		if msg.rollErr != nil {
+			// The serve was made, the identity check then failed, and the
+			// rollback failed too: the port may be shared with a different
+			// program. Never report success; keep the ORIGINAL paused entry;
+			// leave the port to the ordinary pause path (no retry loop).
+			m.unresolved[msg.port] = true
+			if m.active == nil {
+				m.active = map[int]bool{}
+			}
+			m.active[msg.port] = true
+			return m, tea.Batch(m.setErr(fmt.Sprintf(":%d may be shared with a different program — rollback failed: %v; press t to stop it", msg.port, msg.rollErr)), m.refreshCmd(), m.rebuildItems())
+		}
+		if msg.undone {
 			m.supersedeRefreshes() // the serve existed for a moment and is gone
 			delete(m.active, msg.port)
 		}
@@ -4578,10 +4586,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if e, ok := m.pausing[p]; ok && msg.auto {
 				// The forward is gone: remember it (with who was behind it) so
 				// the same app returning resumes it (kata p2r5).
+				if prior, had := m.paused[p]; had {
+					e = prior // keep the ORIGINAL identity of an unresolved resume
+				}
 				m.paused[p] = e
 				pausedNow = append(pausedNow, e)
 				delete(m.lastIdent, p)
-				delete(m.autoResumed, p)
+				delete(m.unresolved, p)
 			}
 			// The teardown succeeded, so the forward is gone NOW (roborev 6192):
 			// releasing the cleanup guard while m.active still claimed it let a
@@ -4596,9 +4607,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.danglingSince[p] = now
 			}
 		}
-		pausedText := m.pausedToast(pausedNow) // before revoking is cleared
+		pausedText := pauseToast(pausedNow)
 		clear(m.pausing)
-		clear(m.revoking)
 		var saveErr error
 		if len(pausedNow) > 0 {
 			saveErr = m.savePaused()

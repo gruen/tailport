@@ -403,13 +403,22 @@ func TestAutoPauseDocsMatchBehavior(t *testing.T) {
 		"does not\n  touch the TUI's remembered paused serves",
 		"owns the socket accepting\n`127.0.0.1`",
 		"checked again *immediately* before",
-		"`stopped sharing :P — a different program took over the port`",
-		"never withdrawn this way",
 		"is only trusted if its directory and the file are yours",
 		"stripped of terminal\ncontrol and formatting characters",
 		"(including one started after the pause) is never\nresumed",
 	} {
 		if !strings.Contains(readme, want) {
+			t.Errorf("README is missing %q", want)
+		}
+	}
+	flat := strings.Join(strings.Fields(readme), " ")
+	for _, want := range []string{
+		"After a resume the share is an ordinary share, exactly what pressing `t` would have left",
+		"If that rollback itself fails, tailport never reports success",
+		"`:P may be shared with a different program — rollback failed: <error>; press t to stop it`",
+		"A different program that takes the port over *after* a resume is not withdrawn",
+	} {
+		if !strings.Contains(flat, want) {
 			t.Errorf("README is missing %q", want)
 		}
 	}
