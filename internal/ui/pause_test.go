@@ -547,8 +547,10 @@ func TestAutoResumedShareIsAnOrdinaryShare(t *testing.T) {
 	}
 }
 
-// 6309 #1: the post-check fails AND the rollback fails: never report success.
-func TestGuardedResumeFailedRollbackIsNotSuccess(t *testing.T) {
+// 6309 #1 / 6313: the post-check fails AND the rollback fails. Never success;
+// the port is then an ORDINARY active share (no active-plus-paused state).
+func rollbackFailure(t *testing.T) resumeAbortedMsg {
+	t.Helper()
 	g := &guardEnv{
 		scans: [][]portscan.Port{loopbackPort(200), loopbackPort(300)},
 		idOf:  map[int]procid.Identity{200: acIdent, 300: otherIdent},
@@ -558,47 +560,101 @@ func TestGuardedResumeFailedRollbackIsNotSuccess(t *testing.T) {
 	msg := guardedResume(8080, acIdent)()
 	a, ok := msg.(resumeAbortedMsg)
 	if !ok || a.rollErr == nil || a.undone || len(g.onCalls) != 1 || len(g.offs) != 1 {
-		t.Fatalf("failed rollback must surface as an abort carrying the error: %#v", msg)
+		t.Fatalf("failed rollback must surface as an abort carrying the error, not success: %#v", msg)
 	}
-	if _, isDone := msg.(toggleDoneMsg); isDone {
-		t.Fatal("must not report success")
-	}
+	return a
+}
 
-	// The handler: error toast naming the exposure, ORIGINAL entry kept, port
-	// left to the ordinary pause path (no retry loop: nothing is started).
+const rollbackToast = ":8080 may be shared with a different program — rollback failed: tailscale: boom; press t to stop it"
+
+func TestFailedRollbackBecomesAnOrdinaryShareUnderOriginalIdentity(t *testing.T) {
+	a := rollbackFailure(t)
 	m, clk := pmModel(t, config.Config{})
 	pmPause(&m, clk, 8080)
+	m.lastIdent = map[int]procid.Identity{} // as after a restart
 	m.pending, m.resuming[8080] = 8080, true
 	res, _ := m.Update(a)
 	m = res.(model)
-	want := ":8080 may be shared with a different program — rollback failed: tailscale: boom; press t to stop it"
-	if m.flash != want || m.flashLevel != flashError {
+	if m.flash != rollbackToast || m.flashLevel != flashError {
 		t.Fatalf("toast = %q (%v)", m.flash, m.flashLevel)
 	}
-	if e, kept := m.paused[8080]; !kept || e.Cwd != acIdent.Cwd {
-		t.Fatalf("original paused entry must be kept: %+v", m.paused)
+	if _, dual := m.paused[8080]; dual || !m.active[8080] {
+		t.Fatalf("must be a plain active share: paused=%v active=%v", m.paused, m.active[8080])
+	}
+	if m.lastIdent[8080] != acIdent {
+		t.Fatalf("lastIdent must be the ORIGINAL identity, got %+v", m.lastIdent[8080])
 	}
 	if m.pending != 0 || m.resuming[8080] {
 		t.Fatal("guard must be freed; no retry in flight")
 	}
-	// The next refresh (port served, a different program listening) neither
-	// drops the original entry nor starts another resume.
+	if onDisk, _ := pausedserve.Load(m.pausedPath, clk.now()); len(onDisk) != 0 {
+		t.Fatalf("the paused memory must be forgotten on disk too: %+v", onDisk)
+	}
+	// #1 regression: an INACTIVE refresh (a different program was there, then
+	// the listener disappears) -> dangling -> pauses under the ORIGINAL identity.
 	acListener[8080] = otherIdent
 	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
-	if _, kept := m.paused[8080]; !kept || m.pending != 0 {
-		t.Fatal("unresolved entry must survive the next refresh, with no new resume")
-	}
-	// When that program dies the ordinary pause runs, and the ORIGINAL identity wins.
 	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	clk.advance(5 * time.Second)
-	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
-	if m.cleaning != 1 {
-		t.Fatal("the dangling forward must go through the normal pause path")
+	if m.lastIdent[8080] != otherIdent {
+		// a legitimately observed listener updates it, exactly as for a manual share
+		t.Fatalf("a later observed loopback listener is recorded like any manual share: %+v", m.lastIdent[8080])
 	}
-	res, _ = m.Update(cleanupDoneMsg{auto: true, cleaned: []int{8080}})
+	m2, clk2 := pmModel(t, config.Config{})
+	pmPause(&m2, clk2, 8080)
+	m2.lastIdent = map[int]procid.Identity{}
+	m2.pending, m2.resuming[8080] = 8080, true
+	res, _ = m2.Update(a)
+	m2 = res.(model)
+	m2, _ = acRefresh(t, m2, []int{8080}, nil, nil) // listener gone, nothing observed
+	clk2.advance(5 * time.Second)
+	m2, _ = acRefresh(t, m2, []int{8080}, nil, nil)
+	if m2.cleaning != 1 || m2.pausing[8080].Cwd != acIdent.Cwd || m2.pausing[8080].Exe != acIdent.Exe {
+		t.Fatalf("must pause under the ORIGINAL identity: cleaning=%d pausing=%+v", m2.cleaning, m2.pausing)
+	}
+}
+
+// #2: `t` after a failed rollback is a real teardown, and no paused memory remains.
+func TestTAfterFailedRollbackTearsDown(t *testing.T) {
+	a := rollbackFailure(t)
+	m, clk := pmModel(t, config.Config{})
+	m.cfg = rooted(t, m.cfg)
+	pmPause(&m, clk, 8080)
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(a)
 	m = res.(model)
-	if m.paused[8080].Cwd != acIdent.Cwd {
-		t.Fatalf("original identity must be kept, got %+v", m.paused[8080])
+	acListener[8080] = otherIdent
+	m, _ = acRefresh(t, m, []int{8080}, []int{8080}, nil)
+	m.showAllPorts = true
+	m.rebuildItems()
+	selectPort(t, &m, 8080)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = res.(model)
+	if m.pending != 8080 {
+		t.Fatalf("t must start a normal serve-OFF teardown: pending=%d flash=%q", m.pending, m.flash)
+	}
+	if _, ok := m.paused[8080]; ok {
+		t.Fatal("no paused memory may remain")
+	}
+}
+
+// #3: a pre-serve refresh delivered AFTER the rollback error is dropped and does
+// not wipe the identity or resurrect a paused entry.
+func TestStalePreServeRefreshAfterRollbackErrorIsDropped(t *testing.T) {
+	a := rollbackFailure(t)
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	m.lastIdent = map[int]procid.Identity{}
+	m.pending, m.resuming[8080] = 8080, true
+	issued := m.refreshGen // a refresh issued before the serve existed
+	res, _ := m.Update(a)
+	m = res.(model)
+	if m.refreshFloor <= issued {
+		t.Fatalf("pre-serve refreshes must be superseded: floor=%d issued=%d", m.refreshFloor, issued)
+	}
+	res, _ = m.Update(refreshMsg{ports: nil, active: map[int]bool{}, funnel: map[int]int{}, oneToOne: map[int]bool{}, gen: issued})
+	m = res.(model)
+	if !m.active[8080] || m.lastIdent[8080] != acIdent {
+		t.Fatalf("stale refresh must not erase the active share or its identity: active=%v last=%+v", m.active[8080], m.lastIdent[8080])
 	}
 }
 

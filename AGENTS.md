@@ -363,7 +363,9 @@ contract. The short version:
     paused file is trusted only if its dir and file pass ownership/mode/symlink
     validation (`cftunnel.ValidateStateDir`/`ValidateOwnedFile`). If the
     post-`On` check fails and the rollback also fails, resume reports an
-    unresolved-exposure error (never success) and keeps the original entry.
+    error (never success) and the port is treated as an ordinary active share:
+    `lastIdent` is set to the original paused identity and the paused entry is
+    forgotten, so there is never an active-plus-paused state.
     Once a resume succeeds the share is an ORDINARY share, exactly what `t`
     would have left (owner decision 2026-11-08): there is NO ongoing revocation;
     it follows the port like any manual serve and pauses again if the port goes

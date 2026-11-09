@@ -179,12 +179,7 @@ func (m *model) resumeReturned(msg refreshMsg) (cmds []tea.Cmd, notice string) {
 	var already []int
 	for _, port := range m.pausedPorts() {
 		e := m.paused[port]
-		if !m.active[port] {
-			delete(m.unresolved, port) // the exposure is gone; resumable again
-		}
 		switch {
-		case m.active[port] && m.unresolved[port]:
-			continue // an unresolved resume: keep the original entry for now
 		case e.Expired(now), m.active[port], port == 22, m.cfg.Ports[port].Locked:
 			// Expired, or overtaken: someone served it meanwhile, or the user
 			// locked it. Either way the memory is no longer wanted.
@@ -338,7 +333,7 @@ func guardedResume(port int, want procid.Identity) tea.Cmd {
 		if _, why := verifyListener(port, want); why != "" {
 			if err := serveOff(port); err != nil {
 				// The serve exists and the listener is not provably ours: do NOT
-				// report success. The handler surfaces the unresolved exposure.
+				// report success. The handler treats the port as an ordinary active share.
 				return resumeAbortedMsg{port: port, why: why, rollErr: err}
 			}
 			return resumeAbortedMsg{port: port, why: why, undone: true}

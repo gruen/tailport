@@ -1169,10 +1169,6 @@ type model struct {
 	pausing       map[int]pausedserve.Entry
 	resuming      map[int]bool
 	pausedOther   map[int]bool
-	// unresolved marks ports whose guarded resume could not roll back its own
-	// serve (the identity check failed AFTER tsserve.On and the unserve failed
-	// too): the original paused entry is kept for them.
-	unresolved map[int]bool
 	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
 	oneToOne map[int]bool
 	// publishOK / tunnelsOK: the LAST edge poll / tunnel poll succeeded (false
@@ -1598,7 +1594,6 @@ func New(cfg config.Config, markersOverride ...string) model {
 		pausing:       map[int]pausedserve.Entry{},
 		resuming:      map[int]bool{},
 		pausedOther:   map[int]bool{},
-		unresolved:    map[int]bool{},
 		paused:        paused,
 		pausedPath:    pausedPath,
 		pausedLoadErr: pausedLoadErr,
@@ -3945,13 +3940,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.rollErr != nil {
 			// The serve was made, the identity check then failed, and the
 			// rollback failed too: the port may be shared with a different
-			// program. Never report success; keep the ORIGINAL paused entry;
-			// leave the port to the ordinary pause path (no retry loop).
-			m.unresolved[msg.port] = true
+			// program. Never report success. The forward is ACTIVE, so by the
+			// normal-share rule it is simply an ordinary share now: remember
+			// the ORIGINAL identity (so a later dangling pauses under it),
+			// forget the paused entry (no active-plus-paused dual state),
+			// supersede refreshes that predate the serve, and let `t` stop it
+			// through the usual teardown. No retry loop.
+			if e, ok := m.paused[msg.port]; ok {
+				m.lastIdent[msg.port] = pausedIdentity(e)
+			}
+			forgetErr := m.forgetPaused(msg.port)
+			m.supersedeRefreshes()
 			if m.active == nil {
 				m.active = map[int]bool{}
 			}
 			m.active[msg.port] = true
+			// The rollback toast is the one that matters; it is raised last.
+			_ = forgetErr
 			return m, tea.Batch(m.setErr(fmt.Sprintf(":%d may be shared with a different program — rollback failed: %v; press t to stop it", msg.port, msg.rollErr)), m.refreshCmd(), m.rebuildItems())
 		}
 		if msg.undone {
@@ -4586,13 +4591,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if e, ok := m.pausing[p]; ok && msg.auto {
 				// The forward is gone: remember it (with who was behind it) so
 				// the same app returning resumes it (kata p2r5).
-				if prior, had := m.paused[p]; had {
-					e = prior // keep the ORIGINAL identity of an unresolved resume
-				}
 				m.paused[p] = e
 				pausedNow = append(pausedNow, e)
 				delete(m.lastIdent, p)
-				delete(m.unresolved, p)
 			}
 			// The teardown succeeded, so the forward is gone NOW (roborev 6192):
 			// releasing the cleanup guard while m.active still claimed it let a

@@ -887,8 +887,8 @@ resume is checked again *immediately* before the serve is made, and again right
 after; if the program behind the port is not provably the remembered one it is
 rolled back and the paused memory kept. (If that rollback itself fails, tailport
 never reports success: it toasts `:P may be shared with a different program —
-rollback failed: <error>; press t to stop it`, keeps the original paused entry,
-and leaves the port to the ordinary pause path.) After a resume the share is an
+rollback failed: <error>; press t to stop it`, and the port is then an ordinary
+share: `t` stops it, and if it dangles it pauses under the original identity.) After a resume the share is an
 ordinary share, exactly what pressing `t` would have left: it follows the port
 like any manual serve, and if the port later goes dangling it pauses again,
 remembering the identity it resumed with. A different program that takes the
