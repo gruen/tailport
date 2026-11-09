@@ -140,26 +140,55 @@ func (m *model) persistPaused() tea.Cmd {
 	return nil
 }
 
+// savePausedFile is the file write; a var so tests can inject a failure.
+var savePausedFile = pausedserve.Save
+
 // savePaused is persistPaused without the toast, for a caller that folds the
-// failure into a notification of its own.
+// failure into a notification of its own. EVERY paused-file write goes through
+// it (pause, forget, expiry, resume), and it owns m.pausedDirty: a failure sets
+// the flag, and each fresh refresh retries (retryPausedSave) until a save lands.
+// Without that, a stale entry left on disk could auto-share after a restart
+// even though the user already stopped or forgot the share.
 func (m *model) savePaused() error {
 	if m.pausedPath == "" {
 		return nil
 	}
-	if err := pausedserve.Save(m.pausedPath, m.paused); err != nil {
+	if err := savePausedFile(m.pausedPath, m.paused); err != nil {
+		m.pausedDirty = true
 		return fmt.Errorf("could not save paused serves: %w", err)
 	}
+	m.pausedDirty = false
 	return nil
 }
 
-// forgetPaused drops port's paused memory and persists the change.
-func (m *model) forgetPaused(port int) tea.Cmd {
+// retryPausedSave re-attempts a failed paused-file write; called from every
+// applied refresh. Silent on a repeat failure (the first failure was already
+// surfaced where it happened, and the flag keeps retrying).
+func (m *model) retryPausedSave() {
+	if m.pausedDirty {
+		_ = m.savePaused()
+	}
+}
+
+// dropPaused removes port's paused memory and persists; it returns the save
+// error (nil if nothing was there or the save worked) for callers that fold it
+// into their own notification.
+func (m *model) dropPaused(port int) error {
 	if _, ok := m.paused[port]; !ok {
 		return nil
 	}
 	delete(m.paused, port)
 	delete(m.pausedOther, port)
-	return m.persistPaused()
+	return m.savePaused()
+}
+
+// forgetPaused drops port's paused memory and persists the change, toasting a
+// save failure.
+func (m *model) forgetPaused(port int) tea.Cmd {
+	if err := m.dropPaused(port); err != nil {
+		return m.setErr(err.Error())
+	}
+	return nil
 }
 
 // resumeReturned runs after a refresh applied: it expires old entries, drops
@@ -282,10 +311,14 @@ func (m *model) beginResume(port int, e pausedserve.Entry) tea.Cmd {
 // at once) because the listener on the port was not provably the remembered
 // program. The paused memory is kept.
 type resumeAbortedMsg struct {
-	port    int
-	why     string
-	undone  bool  // a serve was made and rolled back again
-	rollErr error // the rollback itself failed: the port may be shared with the wrong program
+	port int
+	why  string
+	// original is the identity the resume started with, carried in the message
+	// so a rollback failure can install it without consulting the (mutable)
+	// paused map -- a refresh may have dropped the entry meanwhile.
+	original procid.Identity
+	undone   bool  // a serve was made and rolled back again
+	rollErr  error // the rollback itself failed: the port may be shared with the wrong program
 }
 
 // verifyListener freshly re-derives who is behind port's 127.0.0.1 listener
@@ -325,7 +358,7 @@ func guardedResume(port int, want procid.Identity) tea.Cmd {
 	return func() tea.Msg {
 		id, why := verifyListener(port, want)
 		if why != "" {
-			return resumeAbortedMsg{port: port, why: why}
+			return resumeAbortedMsg{port: port, why: why, original: want}
 		}
 		if err := serveOn(port); err != nil {
 			return toggleDoneMsg{port: port, err: err, kind: routeTailnet, turnOn: true}
@@ -334,9 +367,9 @@ func guardedResume(port int, want procid.Identity) tea.Cmd {
 			if err := serveOff(port); err != nil {
 				// The serve exists and the listener is not provably ours: do NOT
 				// report success. The handler treats the port as an ordinary active share.
-				return resumeAbortedMsg{port: port, why: why, rollErr: err}
+				return resumeAbortedMsg{port: port, why: why, rollErr: err, original: want}
 			}
-			return resumeAbortedMsg{port: port, why: why, undone: true}
+			return resumeAbortedMsg{port: port, why: why, undone: true, original: want}
 		}
 		return toggleDoneMsg{port: port, kind: routeTailnet, turnOn: true, verified: id}
 	}

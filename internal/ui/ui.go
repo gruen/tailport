@@ -1167,6 +1167,7 @@ type model struct {
 	pausedPath    string
 	pausedLoadErr error
 	pausing       map[int]pausedserve.Entry
+	pausedDirty   bool // the last paused-file write failed; retried on each refresh
 	resuming      map[int]bool
 	pausedOther   map[int]bool
 	// oneToOne mirrors refreshMsg.oneToOne from the last applied refresh.
@@ -3707,6 +3708,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// forgets every running timer (a gap in knowledge must not count as
 		// continuous dangling) and clears nothing.
 		m.oneToOne = msg.oneToOne
+		m.retryPausedSave() // a failed paused-file write is retried on every applied refresh
 		var autoCmd tea.Cmd
 		var notice string
 		if msg.statusErr != nil {
@@ -3946,18 +3948,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// forget the paused entry (no active-plus-paused dual state),
 			// supersede refreshes that predate the serve, and let `t` stop it
 			// through the usual teardown. No retry loop.
-			if e, ok := m.paused[msg.port]; ok {
-				m.lastIdent[msg.port] = pausedIdentity(e)
+			if msg.original.Known() {
+				m.lastIdent[msg.port] = msg.original // from the message, not the mutable paused map
 			}
-			forgetErr := m.forgetPaused(msg.port)
+			saveErr := m.dropPaused(msg.port)
 			m.supersedeRefreshes()
 			if m.active == nil {
 				m.active = map[int]bool{}
 			}
 			m.active[msg.port] = true
-			// The rollback toast is the one that matters; it is raised last.
-			_ = forgetErr
-			return m, tea.Batch(m.setErr(fmt.Sprintf(":%d may be shared with a different program — rollback failed: %v; press t to stop it", msg.port, msg.rollErr)), m.refreshCmd(), m.rebuildItems())
+			text := fmt.Sprintf(":%d may be shared with a different program — rollback failed: %v; press t to stop it", msg.port, msg.rollErr)
+			if saveErr != nil {
+				text += "; " + saveErr.Error() // ONE notification carrying both
+			}
+			return m, tea.Batch(m.setErr(text), m.refreshCmd(), m.rebuildItems())
 		}
 		if msg.undone {
 			m.supersedeRefreshes() // the serve existed for a moment and is gone

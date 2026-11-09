@@ -762,3 +762,95 @@ func TestPausedRouteLineFitsNarrowWidths(t *testing.T) {
 		}
 	}
 }
+
+// roborev 6316 #1: a refresh that applies while the guarded resume runs drops
+// the paused entry (the new forward looks active); the abort message still
+// carries the ORIGINAL identity, so the port remains pausable under it.
+func TestRollbackFailureUsesIdentityFromMessageNotPausedMap(t *testing.T) {
+	a := rollbackFailure(t)
+	if a.original != acIdent {
+		t.Fatalf("abort message must carry the original identity, got %+v", a.original)
+	}
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	m.lastIdent = map[int]procid.Identity{}
+	m.pending, m.resuming[8080] = 8080, true
+	// The manual refresh lands first: serve active, listener already gone.
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if _, still := m.paused[8080]; still {
+		t.Fatal("precondition: the refresh should have dropped the paused entry")
+	}
+	res, _ := m.Update(a)
+	m = res.(model)
+	if m.lastIdent[8080] != acIdent {
+		t.Fatalf("lastIdent must be the original from the message, got %+v", m.lastIdent[8080])
+	}
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	clk.advance(5 * time.Second)
+	m, _ = acRefresh(t, m, []int{8080}, nil, nil)
+	if m.cleaning != 1 || m.pausing[8080].Cwd != acIdent.Cwd {
+		t.Fatalf("must pause under the original identity: cleaning=%d pausing=%v", m.cleaning, m.pausing)
+	}
+}
+
+func failingSave(t *testing.T) {
+	t.Helper()
+	old := savePausedFile
+	savePausedFile = func(string, map[int]pausedserve.Entry) error { return errors.New("disk full") }
+	t.Cleanup(func() { savePausedFile = old })
+}
+
+// roborev 6316 #2: a failed paused-file write is visible, flagged dirty, and
+// retried on later refreshes until the stale entry is gone from disk.
+func TestPausedSaveFailureIsVisibleAndRetried(t *testing.T) {
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	if err := m.savePaused(); err != nil { // the entry exists on disk
+		t.Fatal(err)
+	}
+	m, _ = acRefresh(t, m, nil, nil, nil)
+	selectPort(t, &m, 8080)
+
+	real := savePausedFile
+	failingSave(t)
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}}) // forget
+	m = res.(model)
+	if !strings.Contains(m.flash, "could not save paused serves") || m.flashLevel != flashError || !m.pausedDirty {
+		t.Fatalf("failure must be visible and flagged: flash=%q dirty=%v", m.flash, m.pausedDirty)
+	}
+	if onDisk, _ := pausedserve.Load(m.pausedPath, clk.now()); len(onDisk) != 1 {
+		t.Fatal("precondition: the stale entry is still on disk")
+	}
+	// A refresh while the disk is still failing keeps the flag.
+	m, _ = acRefresh(t, m, nil, nil, nil)
+	if !m.pausedDirty {
+		t.Fatal("still failing: stay dirty")
+	}
+	// Disk recovers: the next refresh retries and the disk entry is gone.
+	savePausedFile = real
+	m, _ = acRefresh(t, m, nil, nil, nil)
+	if m.pausedDirty {
+		t.Fatal("a successful retry clears the flag")
+	}
+	if onDisk, _ := pausedserve.Load(m.pausedPath, clk.now()); len(onDisk) != 0 {
+		t.Fatalf("the retry must remove the stale entry: %+v", onDisk)
+	}
+}
+
+// On the rollback path the save error is COMBINED with the rollback toast.
+func TestRollbackToastCombinesSaveFailure(t *testing.T) {
+	a := rollbackFailure(t)
+	m, clk := pmModel(t, config.Config{})
+	pmPause(&m, clk, 8080)
+	_ = m.savePaused()
+	failingSave(t)
+	m.pending, m.resuming[8080] = 8080, true
+	res, _ := m.Update(a)
+	m = res.(model)
+	if !strings.Contains(m.flash, "rollback failed: tailscale: boom; press t to stop it; could not save paused serves") || m.flashLevel != flashError {
+		t.Fatalf("toast = %q", m.flash)
+	}
+	if !m.pausedDirty {
+		t.Fatal("must be retried later")
+	}
+}
