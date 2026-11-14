@@ -208,7 +208,7 @@ tailscaled   50 root   11u  IPv4 0x4444444444444444      0t0  TCP 100.110.98.29%
 		t.Errorf(":5173 = %+v, want BindScope=tailnet BindHost=100.110.98.29", p)
 	}
 	// tailscaled's own zoned serve-proxy listener is skipped, exactly like
-	// its zoneless one (79xb) -- same ownership rule as the Linux parser.
+	// its zoneless one (nvv6) -- same ownership rule as the Linux parser.
 	if _, ok := got[5181]; ok {
 		t.Errorf("tailscaled-owned zoned tailnet :5181 should be filtered; got %+v", ports)
 	}
@@ -253,5 +253,55 @@ func TestParseLsofSharedSocketIsAmbiguous(t *testing.T) {
 	ports, _ = parseLsof([]byte(hdr + row("app", 111) + row("app", 111)))
 	if ports[0].Pid127 != 111 {
 		t.Fatalf("same pid twice stays unambiguous, got %d", ports[0].Pid127)
+	}
+}
+
+// TestParseLsofTailnetOwnership pins kata nvv6 on the lsof parser, mirroring
+// Linux's TestParseSSTailnetOwnership: a tailnet-IP row (zoned or not, IPv4 or
+// fd7a:...) owned by Tailscale's own processes -- tailscaled (lsof's default
+// 9-char truncation prints it "tailscale"), the app's network extension
+// ("IPNExtens...") -- is the serve proxy and is dropped; any other visible
+// owner is the app's own tailnet bind and is kept. Fixture-only: the exact
+// COMMAND strings the Tailscale app's extension prints on a real Mac are
+// UNVERIFIED here, hence the prefix match (isTailscaleLsofCommand).
+func TestParseLsofTailnetOwnership(t *testing.T) {
+	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3     501   mg    3u  IPv4 0x1111111111111111      0t0  TCP 100.81.94.92:18951 (LISTEN)
+tailscale   310 root   12u  IPv4 0x2222222222222222      0t0  TCP 100.81.94.92:18952 (LISTEN)
+IPNExtens   320 root   13u  IPv4 0x3333333333333333      0t0  TCP 100.81.94.92:18953 (LISTEN)
+Tailscale   330   mg   14u  IPv4 0x4444444444444444      0t0  TCP 100.81.94.92:18954 (LISTEN)
+node        502   mg    5u  IPv6 0x5555555555555555      0t0  TCP [fd7a:115c:a1e0::1]:18955 (LISTEN)
+IPNExtens   320 root   15u  IPv6 0x6666666666666666      0t0  TCP [fd7a:115c:a1e0::1]:18956 (LISTEN)
+app         503   mg    6u  IPv4 0x7777777777777777      0t0  TCP 127.0.0.1:18957 (LISTEN)
+IPNExtens   320 root   16u  IPv4 0x8888888888888888      0t0  TCP 100.81.94.92:18957 (LISTEN)
+`
+	ports, err := parseLsof([]byte(fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int]Port{}
+	for _, p := range ports {
+		if _, dup := got[p.Number]; dup {
+			t.Errorf("port %d reported twice: %+v", p.Number, ports)
+		}
+		got[p.Number] = p
+	}
+	for _, n := range []int{18951, 18955} {
+		p, ok := got[n]
+		if !ok || p.BindScope != ScopeTailnet || p.UnattribTailnet || !p.No127 {
+			t.Errorf(":%d = %+v (present=%v), want an app tailnet bind", n, p, ok)
+		}
+	}
+	if p := got[18951]; p.Process != "python3" || p.BindHost != "100.81.94.92" {
+		t.Errorf(":18951 = %+v", p)
+	}
+	for _, n := range []int{18952, 18953, 18954, 18956} {
+		if p, ok := got[n]; ok {
+			t.Errorf(":%d is Tailscale's own serve proxy and must be dropped: %+v", n, p)
+		}
+	}
+	// A loopback app alongside the extension's proxy row: only the app's row.
+	if p := got[18957]; p.BindScope != ScopeLoopback || p.Process != "app" || p.UnattribTailnet {
+		t.Errorf(":18957 = %+v, want the app's loopback bind", p)
 	}
 }

@@ -304,3 +304,19 @@ func TestParseOneToOne(t *testing.T) {
 		t.Errorf("a port with one non-plain host key must not be 1:1: %v %v", d.OneToOne, err)
 	}
 }
+
+// Kata nvv6: tailscaled's PeerAPI listeners (random, unserved, ownerless on
+// the tailnet IP) are read from Self.PeerAPIURL so they are never mistaken for
+// an app's own tailnet bind.
+func TestParsePeerAPIPorts(t *testing.T) {
+	got, err := parsePeerAPIPorts([]byte(`{"Self":{"PeerAPIURL":["http://100.81.94.92:61584","http://[fd7a:115c:a1e0::1438:5e5e]:57619","bogus"]}}`))
+	if err != nil || len(got) != 2 || !got[61584] || !got[57619] {
+		t.Fatalf("got %v err=%v, want {61584, 57619}", got, err)
+	}
+	if got, err := parsePeerAPIPorts([]byte(`{"Self":{}}`)); err != nil || len(got) != 0 {
+		t.Errorf("no PeerAPIURL: %v %v", got, err)
+	}
+	if _, err := parsePeerAPIPorts([]byte(`not json`)); err == nil {
+		t.Error("bad JSON must be an error")
+	}
+}

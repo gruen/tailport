@@ -37,6 +37,12 @@ type cleanFakes struct {
 	// after that request began.
 	listenAfterStatus map[int]bool
 	startOnStatus     int
+	// tsRows: ports the scanner reports ONLY as unattributed rows on the node's
+	// tailnet IP (portscan.Port.UnattribTailnet, kata nvv6) -- tailscaled's own
+	// serve-proxy listener on a served port, or an app run by another user.
+	tsRows []int
+	// tsAppRows: tailnet-IP rows with a visible, non-Tailscale owner.
+	tsAppRows []int
 }
 
 func (f *cleanFakes) install(t *testing.T) {
@@ -52,6 +58,12 @@ func (f *cleanFakes) install(t *testing.T) {
 		var ps []portscan.Port
 		for _, p := range f.listening {
 			ps = append(ps, portscan.Port{Number: p})
+		}
+		for _, p := range f.tsRows {
+			ps = append(ps, portscan.Port{Number: p, UnattribTailnet: true, UnattribHost: "100.81.94.92"})
+		}
+		for _, p := range f.tsAppRows {
+			ps = append(ps, portscan.Port{Number: p, Process: "python3", BindScope: portscan.ScopeTailnet, BindHost: "100.81.94.92", No127: true})
 		}
 		if f.scans > 1 {
 			for p := range f.listenLate {
@@ -267,5 +279,31 @@ func TestCleanRejectsPositionalArgs(t *testing.T) {
 		if code != 2 || out != "" || !strings.Contains(errOut, "unexpected argument") || len(f.unserved) != 0 || f.scans != 0 || len(f.order) != 0 {
 			t.Errorf("%v: code=%d out=%q err=%q unserved=%v scans=%d", args, code, out, errOut, f.unserved, f.scans)
 		}
+	}
+}
+
+// Kata nvv6: tailscaled's serve proxy listens on the node's tailnet IP at every
+// served port, and an unprivileged scan can't name its owner. Those unattributed
+// rows must NOT make a dangling forward look like a listening app -- on a served
+// port they are resolved away (so clean still lists, rechecks and clears it) --
+// while an app that bound the tailnet IP itself (visible owner) is listening.
+func TestCleanDanglingIgnoresTailscaledsOwnTailnetRow(t *testing.T) {
+	f := &cleanFakes{served: []int{18952}, tsRows: []int{18952}}
+	code, out, _ := runCleanWith(t, f, "--dry-run")
+	if code != 0 || out != "would clear :18952\n" {
+		t.Fatalf("dry-run: code=%d out=%q", code, out)
+	}
+	f = &cleanFakes{served: []int{18952}, tsRows: []int{18952}}
+	code, out, _ = runCleanWith(t, f)
+	if code != 0 || out != "cleared :18952\n" || !reflect.DeepEqual(f.unserved, []int{18952}) {
+		t.Fatalf("clean (incl. the per-port recheck): code=%d out=%q unserved=%v", code, out, f.unserved)
+	}
+}
+
+func TestCleanKeepsServeWhenAppOwnsTheTailnetBind(t *testing.T) {
+	f := &cleanFakes{served: []int{18951}, tsAppRows: []int{18951}}
+	code, out, _ := runCleanWith(t, f, "--dry-run")
+	if code != 0 || out != "nothing to clean\n" {
+		t.Fatalf("an owner-visible tailnet bind is a listening app: code=%d out=%q", code, out)
 	}
 }

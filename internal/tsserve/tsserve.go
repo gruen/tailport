@@ -481,6 +481,43 @@ func FQDN() (string, error) {
 	return strings.TrimSuffix(s.Self.DNSName, "."), nil
 }
 
+// PeerAPIPorts returns the ports tailscaled itself listens on, on the node's
+// tailnet IPs, for its PeerAPI (Taildrop and friends: Self.PeerAPIURL, e.g.
+// "http://100.x.y.z:61584" and "http://[fd7a:...]:57619"). They are random,
+// unserved, and unattributed to an unprivileged ss -- exactly what an app run
+// by another user looks like -- so the scanner's tailnet-IP rows on them must
+// be treated as tailscaled's (kata nvv6). Best-effort: an error means "none
+// known".
+func PeerAPIPorts() (map[int]bool, error) {
+	out, err := exec.Command("tailscale", "status", "--json", "--peers=false").Output()
+	if err != nil {
+		return nil, fmt.Errorf("tailscale status: %w", err)
+	}
+	return parsePeerAPIPorts(out)
+}
+
+func parsePeerAPIPorts(out []byte) (map[int]bool, error) {
+	var s struct {
+		Self struct {
+			PeerAPIURL []string `json:"PeerAPIURL"`
+		} `json:"Self"`
+	}
+	if err := json.Unmarshal(out, &s); err != nil {
+		return nil, fmt.Errorf("parsing status: %w", err)
+	}
+	ports := map[int]bool{}
+	for _, raw := range s.Self.PeerAPIURL {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.Atoi(u.Port()); err == nil && n > 0 {
+			ports[n] = true
+		}
+	}
+	return ports, nil
+}
+
 // PublicURL builds the public HTTPS URL a funnel is reachable at. Port 443 is
 // implicit (https://host); 8443/10000 are shown explicitly (https://host:port).
 func PublicURL(fqdn string, publicPort int) string {

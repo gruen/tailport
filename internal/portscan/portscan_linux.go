@@ -55,9 +55,14 @@ func List() ([]Port, error) {
 // true (not accepted) on the port's first row and flips to false the moment
 // ANY row accepts a 127.0.0.1 dial (2z0v(b)), regardless of which row's scope
 // ends up winning BindScope.
+//
+// Tailnet-IP rows: see the ownership rule in the loop (kata nvv6). Unattributed
+// ones never enter the aggregation; they only flag the port.
 func parseSS(out []byte) ([]Port, error) {
 	agg := map[int]*Port{}
 	acc127 := pidAcc{}
+	unattr := unattrAcc{}
+	seen := map[int]bool{}
 	var order []int
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
@@ -74,37 +79,11 @@ func parseSS(out []byte) ([]Port, error) {
 		// listener fell through to ScopeLAN and rendered a bogus LAN route
 		// like "http://100.110.98.29%tailscale0:5173". classifyBind applies the
 		// device restriction (see its doc comment).
-		bare, zoned, scope, bindHost, ok127 := classifyBind(host)
-		// Skip tailscaled's own serve-proxy sockets (bound to a tailnet
-		// address) BEFORE aggregation, so that a real app socket sharing the
-		// port (e.g. 127.0.0.1:8808 alongside 100.x:8808) still registers the
-		// port as listening regardless of line order. A dangling serve --
-		// only tailnet-range sockets on a port -- aggregates to nothing, so
-		// its port is never added and reads as not-listening (internal/ui
-		// dangling-forward detection depends on this).
-		//
-		// Known limitation (79xb): an app that binds the node's tailnet IP
-		// *directly* -- WITHOUT a device zone -- is indistinguishable from
-		// tailscaled's own listener here and so is dropped/classified-away as
-		// tailscaled. Accepted for now; revisit only if it bites.
-		//
-		// A DEVICE-ZONED tailnet listener ("100.x%tailscale0") is ambiguous
-		// (kata np07): newer tailscaled binds its serve proxy to the
-		// tailscale0 device, but an app can also pin itself there with
-		// SO_BINDTODEVICE. Ownership tells them apart: tailscaled runs as
-		// root, so an unprivileged `ss` shows NO owning process for its
-		// sockets (or "tailscaled" when run as root), while an app run by the
-		// user shows its own. Zoned rows with no process or tailscaled are
-		// skipped exactly like the zoneless case; a zoned row owned by some
-		// other process is the app's own tailnet bind and is kept. The same
-		// 79xb limitation therefore extends to an app run by ANOTHER user
-		// (e.g. root) pinned to tailscale0: ss can't attribute it either, so
-		// it is treated as tailscaled's. Telling those apart needs the serve
-		// state (an unattributed tailnet listener on a port that isn't served
-		// can't be tailscaled's) -- tracked as kata nvv6.
+		bare, _, scope, bindHost, ok127 := classifyBind(host)
 		proc := ""
 		pid := 0
 		var allPids []int // every owner in the users:(...) field (Pid127 needs them all)
+		hasTailscaled := false
 		if len(fields) > 5 {
 			joined := strings.Join(fields[5:], " ")
 			for i, m := range procRe.FindAllStringSubmatch(joined, -1) {
@@ -113,20 +92,55 @@ func parseSS(out []byte) ([]Port, error) {
 					continue
 				}
 				allPids = append(allPids, v)
+				if isTailscaledProc(m[1]) {
+					hasTailscaled = true
+				}
 				if i == 0 { // Process/Pid display stays the first owner
 					proc, pid = m[1], v
 				}
 			}
 		}
-		if isTailscaleAddr(bare) && (!zoned || proc == "" || proc == "tailscaled") {
-			continue
+		// tailscaled's own serve-proxy sockets (bound to a tailnet address)
+		// are dropped BEFORE aggregation, so that a real app socket sharing
+		// the port (e.g. 127.0.0.1:8808 alongside 100.x:8808) still registers
+		// the port as listening regardless of line order. A dangling serve --
+		// only tailscaled's tailnet-range sockets on a port -- aggregates to
+		// nothing, so its port is never added and reads as not-listening
+		// (internal/ui dangling-forward detection depends on this).
+		//
+		// Whose row a tailnet-IP bind is, zoned ("100.x%tailscale0", kata
+		// np07) or not (kata nvv6), is decided by OWNERSHIP: tailscaled runs
+		// as root, so an unprivileged `ss` shows NO owner for its sockets
+		// (or "tailscaled" when run as root), while a process of the user's
+		// own shows itself.
+		//   - an owner that is tailscaled: its serve proxy; dropped.
+		//   - any other visible owner: the app's own tailnet bind; KEPT.
+		//   - no owner: can't tell here (an app run by root/another user looks
+		//     the same) -- it is tailscaled's iff the port is served, which
+		//     only the caller knows. FLAG it (Port.UnattribTailnet) and let
+		//     ResolveTailnetRows decide once serve status is read.
+		if isTailscaleAddr(bare) {
+			if hasTailscaled {
+				continue
+			}
+			if proc == "" {
+				unattr.note(port, bindHost)
+				if !seen[port] {
+					seen[port] = true
+					order = append(order, port)
+				}
+				continue
+			}
 		}
 		acc127.note(port, allPids, ok127)
 
 		p, ok := agg[port]
 		if !ok {
 			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !ok127}
-			order = append(order, port)
+			if !seen[port] {
+				seen[port] = true
+				order = append(order, port)
+			}
 			continue
 		}
 		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
@@ -149,8 +163,13 @@ func parseSS(out []byte) ([]Port, error) {
 	}
 	ports := make([]Port, 0, len(order))
 	for _, port := range order {
-		acc127.apply(agg[port])
-		ports = append(ports, *agg[port])
+		p := agg[port]
+		if p == nil { // only unattributed tailnet rows (kata nvv6)
+			p = &Port{Number: port}
+		}
+		acc127.apply(p)
+		unattr.apply(p)
+		ports = append(ports, *p)
 	}
 	return ports, nil
 }

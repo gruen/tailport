@@ -65,6 +65,14 @@ const (
 	// one port may carry all three, each with its own row. Always rendered
 	// distinctly from ModeServe -- see WriteTable.
 	ModeTunnel Mode = "tunnel"
+	// ModeTailnet is an app that bound the node's tailnet IP itself (kata
+	// nvv6): already reachable by tailnet peers with no `tailscale serve`, so
+	// it is reported at its own http://<host>:<port> URL. It is only emitted
+	// for a port with no serve/funnel/publish/tunnel row of its own. A
+	// documented ADDITIVE schema value, like ModePublish and ModeTunnel
+	// before it. (Wildcard-bound apps are not listed: that is every
+	// merely-listening port, which the TUI's full list is for.)
+	ModeTailnet Mode = "tailnet"
 )
 
 // Row is one exposed port in the report. Field names and types are the
@@ -81,9 +89,9 @@ type Row struct {
 	// peer hitting URL would get connection refused until something binds it
 	// locally again.
 	Process string `json:"process"`
-	// Mode is "serve", "funnel", "publish", or "tunnel" (see the Mode
-	// constants). Funnel, publish, and tunnel all mean PUBLIC INTERNET
-	// exposure; serve is tailnet-only.
+	// Mode is "serve", "funnel", "publish", "tunnel", or "tailnet" (see the
+	// Mode constants). Funnel, publish, and tunnel all mean PUBLIC INTERNET
+	// exposure; serve and tailnet are tailnet-only.
 	Mode Mode `json:"mode"`
 	// URL is the address a client would actually use to reach this port: the
 	// tailnet http://<host>:<port> URL for serve, the public
@@ -172,6 +180,7 @@ const tunnelHealthTimeout = 3 * time.Second
 func Gather(cfg config.Config) ([]Row, error) {
 	return gatherFrom(cfg, gatherSources{
 		listPorts:       portscan.List,
+		peerAPIPorts:    tsserve.PeerAPIPorts,
 		fqdn:            tsserve.FQDN,
 		tailscaleStatus: tsserve.Status,
 		discoverTunnels: gatherTunnels,
@@ -186,6 +195,7 @@ func Gather(cfg config.Config) ([]Row, error) {
 // no ss, lsof, tailscaled or cloudflared required (roborev 5419).
 type gatherSources struct {
 	listPorts       func() ([]portscan.Port, error)
+	peerAPIPorts    func() (map[int]bool, error) // tailscaled's own tailnet listeners; nil = none known
 	fqdn            func() (string, error)
 	tailscaleStatus func() ([]int, map[int]int, error)
 	discoverTunnels func(config.Config) []Tunnel
@@ -218,8 +228,27 @@ func gatherFrom(cfg config.Config, src gatherSources) ([]Row, error) {
 		// Tailscale state is unavailable, but the tunnels (and any published
 		// rows the edge still knows about) are real exposures right now.
 		// Report those rows and surface the tailscale failure alongside them.
-		return Build(ports, nil, nil, published, tunnels, host, fqdn), fmt.Errorf("reading tailscale serve status: %w", err)
+		return Build(portscan.ResolveTailnetRows(ports, nil, false), nil, nil, published, tunnels, host, fqdn), fmt.Errorf("reading tailscale serve status: %w", err)
 	}
+	served := make(map[int]bool, len(active))
+	for _, p := range active {
+		served[p] = true
+	}
+	// Same resolution as the TUI's refresh (kata nvv6), including tailscaled's
+	// own PeerAPI listeners (see tsserve.PeerAPIPorts).
+	tsOwned := served
+	if src.peerAPIPorts != nil && portscan.HasUnservedUnattributed(ports, served) {
+		if peer, perr := src.peerAPIPorts(); perr == nil {
+			tsOwned = make(map[int]bool, len(served)+len(peer))
+			for p := range served {
+				tsOwned[p] = true
+			}
+			for p := range peer {
+				tsOwned[p] = true
+			}
+		}
+	}
+	ports = portscan.ResolveTailnetRows(ports, tsOwned, true)
 	return Build(ports, active, funnel, published, tunnels, host, fqdn), nil
 }
 
@@ -382,7 +411,8 @@ func shortLabel(fqdn string) string {
 // issue's verification bar).
 //
 // Only ports that are actually exposed -- present in active, funnel,
-// published, or tunnels -- are included; a merely-listening, never-served
+// published, or tunnels, or bound by their app straight to the tailnet IP
+// (ModeTailnet, kata nvv6) -- are included; a merely-listening, never-served
 // port is out of scope for a status report (that's what the TUI's full port
 // list is for). The exposed set deliberately includes a public path on its
 // own (not gated behind also being in active): a published-but-not-served
@@ -404,8 +434,10 @@ func shortLabel(fqdn string) string {
 // expected, legitimate shape.
 func Build(ports []portscan.Port, active []int, funnel map[int]int, published map[int]Published, tunnels []Tunnel, host, fqdn string) []Row {
 	processByPort := make(map[int]string, len(ports))
+	boundByPort := make(map[int]bool, len(ports))
 	for _, p := range ports {
 		processByPort[p.Number] = p.Process
+		boundByPort[p.Number] = p.BindScope == portscan.ScopeTailnet
 	}
 
 	tunnelsByPort := make(map[int][]Tunnel, len(tunnels))
@@ -414,6 +446,17 @@ func Build(ports []portscan.Port, active []int, funnel map[int]int, published ma
 	}
 
 	exposed := make(map[int]bool, len(active)+len(funnel)+len(published)+len(tunnelsByPort))
+	activeSet := make(map[int]bool, len(active))
+	for _, p := range active {
+		activeSet[p] = true
+	}
+	// An app bound straight to the tailnet IP is exposed to the tailnet by its
+	// own bind (kata nvv6), served or not.
+	for _, p := range ports {
+		if p.BindScope == portscan.ScopeTailnet {
+			exposed[p.Number] = true
+		}
+	}
 	for _, p := range active {
 		exposed[p] = true
 	}
@@ -450,6 +493,10 @@ func Build(ports []portscan.Port, active []int, funnel map[int]int, published ma
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModeTunnel, URL: tunnelURL(tun)})
 		}
 		if !isFunnel && !isPublished && len(portTunnels) == 0 {
+			if !activeSet[n] && boundByPort[n] {
+				rows = append(rows, Row{Port: n, Process: process, Mode: ModeTailnet, URL: fmt.Sprintf("http://%s:%d", host, n)})
+				continue
+			}
 			rows = append(rows, Row{Port: n, Process: process, Mode: ModeServe, URL: fmt.Sprintf("http://%s:%d", host, n)})
 		}
 	}
@@ -510,6 +557,7 @@ const (
 	modeFunnelText  = "FUNNEL (public)"
 	modePublishText = "PUBLISH (edge, public)"
 	modeTunnelText  = "TUNNEL (cloudflare, public)"
+	modeTailnetText = "tailnet (app bound)"
 )
 
 // pendingHostnameNote is what WriteTable shows in a tunnel row's URL cell
@@ -546,6 +594,8 @@ func WriteTable(w io.Writer, rows []Row) {
 			mode = modePublishText
 		case ModeTunnel:
 			mode = modeTunnelText
+		case ModeTailnet:
+			mode = modeTailnetText
 		}
 		process := r.Process
 		if process == "" {

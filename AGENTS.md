@@ -385,6 +385,23 @@ contract. The short version:
     semantics. Do not widen this (other states, other mutations, shorter
     implicit defaults, resuming onto a public path) without asking.
 
+### Tailnet-IP listeners (kata nvv6)
+
+A listener on the node's own tailnet IP is either tailscaled's `serve` proxy or
+an app that bound that address itself. `internal/portscan` decides by OWNER:
+tailscaled (or the macOS Tailscale app's network-extension process) is the
+proxy and is dropped; any other visible owner is the app's own tailnet bind
+(`ScopeTailnet`); an UNATTRIBUTED row (tailscaled runs as root, so an
+unprivileged `ss` shows no owner) is only FLAGGED (`Port.UnattribTailnet`) and
+contributes nothing to the aggregate until `portscan.ResolveTailnetRows` is
+given the serve set: served means tailscaled's (dropped, so a dangling forward
+still reads as not listening), unserved means an app (kept) unless the port is one of tailscaled's own
+PeerAPI ports (`tsserve.PeerAPIPorts`, folded into the served set the callers pass), serve status
+unreadable means dropped. EVERY consumer of `portscan.List` that has serve
+state (the TUI `refresh()`, `statusreport.Gather`, `tailport clean`) must call
+the resolver right after reading it; a new one must too, or dangling-forward
+detection and the tailnet-bound listing drift.
+
 ### Docs stay honest (a claim is a test)
 
 A user-facing behavioral claim is only as trustworthy as the test that pins it.

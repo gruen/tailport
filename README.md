@@ -300,7 +300,9 @@ useful for finding something new to serve, label, or favorite.
   the TUI.
 - **`tailport status`** — a headless, read-only report of how each port is
   currently exposed: tailnet `serve`, public `FUNNEL`, a Caddy-edge `PUBLISH`,
-  and a Cloudflare `TUNNEL` (quick or named). The three public paths are
+  and a Cloudflare `TUNNEL` (quick or named). An app that bound your node's
+  tailnet IP itself is listed too, as `tailnet (app bound)` (JSON mode
+  `tailnet`) — it is already reachable without `serve`. The three public paths are
   independent, so a port carrying several of them gets one row per path, and
   two tunnels on one port get one row each. Add `--json` for
   machine-readable output. Cloudflare tunnel rows are still reported when
@@ -404,6 +406,10 @@ markers: "" # "" / mono (default) | auto | emoji | ascii
   ☁️ public (cloudflare tunnel) · 🌫️ stale · 💤 paused · ✕ offline.
 - **`emoji`** — always the moon-phase ramp, regardless of terminal.
 - **`ascii`** — always mono, regardless of terminal (same glyphs as unset).
+
+◑ / 🌓 also marks an app that bound your node's **tailnet IP** directly (for
+example `python3 -m http.server --bind 100.x.y.z`): it is already reachable on
+the tailnet, so tailport shows it with a tailnet route and `t` doesn't serve it.
 
 This setting governs the exposure markers only. Any other emoji/animation
 tailport might render (e.g. its hidden Easter-egg overlay) auto-detects terminal
@@ -801,7 +807,15 @@ scope.)
 ## How it works
 
 - **Port discovery:** `ss -H -t -l -n -p` on Linux, `lsof -iTCP -sTCP:LISTEN -n
-  -P` on macOS, run locally — tailport never scans the network.
+  -P` on macOS, run locally — tailport never scans the network. A listener on
+  your node's tailnet IP is either tailscaled's own `serve` proxy or an app
+  that bound that address itself. If the scanner can name its owner, that
+  decides it (tailscaled, or the macOS Tailscale app's network extension, is
+  the proxy; anything else is the app). If it can't (tailscaled runs as root, so
+  an unprivileged scan sees no owner), the serve state decides: on a served
+  port it is the proxy, on an unserved port it is an app — except tailscaled's own
+  PeerAPI ports, which `tailscale status` names and tailport never lists. If
+  serve status can't be read, such rows are treated as the proxy and not listed.
 - **Serve status:** `tailscale serve status --json`, parsed to find which ports
   currently have an active HTTP mapping.
 - **Toggling on:** `tailscale serve --bg --http=<port> <port>`.

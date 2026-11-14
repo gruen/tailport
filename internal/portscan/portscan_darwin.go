@@ -53,6 +53,8 @@ func parseLsof(out []byte) ([]Port, error) {
 	// which row's scope ends up winning BindScope.
 	agg := map[int]*Port{}
 	acc127 := pidAcc{}
+	unattr := unattrAcc{}
+	seen := map[int]bool{}
 	var order []int
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	first := true
@@ -76,30 +78,39 @@ func parseLsof(out []byte) ([]Port, error) {
 		if err != nil {
 			continue
 		}
-		// Skip tailscaled's own serve-proxy sockets (bound to a tailnet
-		// address) BEFORE aggregation, so a real app socket sharing the port
-		// still registers it as listening. The host is everything before the
-		// last colon, with any IPv6 brackets stripped. A dangling serve --
-		// only tailnet-range sockets on a port -- aggregates to nothing, so
-		// its port reads as not-listening (internal/ui dangling-forward
-		// detection depends on this).
+		// tailscaled's own serve-proxy sockets (bound to a tailnet address)
+		// are dropped BEFORE aggregation, so a real app socket sharing the
+		// port still registers it as listening. The host is everything before
+		// the last colon, with any IPv6 brackets stripped. A dangling serve --
+		// only tailscaled's tailnet-range sockets on a port -- aggregates to
+		// nothing, so its port reads as not-listening (internal/ui
+		// dangling-forward detection depends on this).
 		//
 		// The same "%iface" zone handling as the Linux parser (kata np07):
 		// whether macOS lsof ever emits a zone is unverified here, but if it
 		// does, leaving it in place would make net.ParseIP fail and resurrect
-		// the bogus LAN row this ticket removed. So split it identically, and
-		// apply the same ownership rule: a zoned tailnet row owned by
-		// tailscaled is its serve proxy and is skipped; one owned by any other
-		// process is that app's own tailnet bind and is kept.
+		// the bogus LAN row that ticket removed. So split it identically.
 		//
-		// Known limitation (79xb): an app that binds the node's tailnet IP
-		// *directly* -- WITHOUT a device zone -- is indistinguishable from
-		// tailscaled's own listener here and so is dropped/classified-away as
-		// tailscaled. Accepted for now; revisit only if it bites.
+		// Ownership decides whose a tailnet-IP row is (kata nvv6), zoned or
+		// not: Tailscale's own processes (tailscaled, the app's network
+		// extension -- see isTailscaleLsofCommand) own its serve proxy and are
+		// dropped; any other visible owner is the app's own tailnet bind and
+		// is kept. A row with no owner (lsof normally always names one) is
+		// FLAGGED for ResolveTailnetRows, exactly as on Linux.
 		rawHost := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
-		host, zoned, scope, bindHost, ok127 := classifyBind(rawHost)
-		if isTailscaleAddr(host) && (!zoned || proc == "" || proc == "tailscaled") {
-			continue
+		host, _, scope, bindHost, ok127 := classifyBind(rawHost)
+		if isTailscaleAddr(host) {
+			if isTailscaleLsofCommand(proc) {
+				continue
+			}
+			if proc == "" {
+				unattr.note(port, bindHost)
+				if !seen[port] {
+					seen[port] = true
+					order = append(order, port)
+				}
+				continue
+			}
 		}
 		// lsof prints one line per (process, socket), so a socket shared by several
 		// processes arrives as several rows and accumulates several distinct pids.
@@ -112,7 +123,10 @@ func parseLsof(out []byte) ([]Port, error) {
 		p, ok := agg[port]
 		if !ok {
 			agg[port] = &Port{Number: port, Process: proc, Pid: pid, BindScope: scope, BindHost: bindHost, Loopback: scope == ScopeLoopback, No127: !ok127}
-			order = append(order, port)
+			if !seen[port] {
+				seen[port] = true
+				order = append(order, port)
+			}
 			continue
 		}
 		if scope > p.BindScope { // strictly wider bind: adopt its scope AND host
@@ -135,8 +149,13 @@ func parseLsof(out []byte) ([]Port, error) {
 	}
 	ports := make([]Port, 0, len(order))
 	for _, port := range order {
-		acc127.apply(agg[port])
-		ports = append(ports, *agg[port])
+		p := agg[port]
+		if p == nil { // only unattributed tailnet rows (kata nvv6)
+			p = &Port{Number: port}
+		}
+		acc127.apply(p)
+		unattr.apply(p)
+		ports = append(ports, *p)
 	}
 	return ports, nil
 }

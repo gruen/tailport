@@ -2,7 +2,10 @@
 
 package portscan
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestSplitHostPort(t *testing.T) {
 	cases := []struct {
@@ -173,9 +176,9 @@ LISTEN 0      128            127.0.0.1:631           0.0.0.0:*    users:(("cupsd
 // device-bound tailnet socket classifies ScopeTailnet with a bare BindHost
 // (no bogus LAN route), while an IPv6 link-local socket keeps its zone in
 // BindHost because the address is undialable without it. Tailnet rows are
-// split by OWNERSHIP: zoneless, ownerless, or tailscaled-owned rows are
-// tailscaled's serve proxy and stay filtered (79xb); a zoned row owned by an
-// app is that app's own tailnet bind.
+// split by OWNERSHIP: tailscaled-owned rows are tailscaled's serve proxy and stay
+// filtered; an OWNERLESS one is flagged for ResolveTailnetRows (kata nvv6); any
+// row owned by an app, zoned or not, is that app's own tailnet bind.
 func TestParseSSDeviceZone(t *testing.T) {
 	const fixture = `LISTEN 0      511 100.110.98.29%tailscale0:5173      0.0.0.0:*    users:(("node",pid=449406,fd=20))
 LISTEN 0      128              [fe80::1%eth0]:8080           [::]:*    users:(("app",pid=1234,fd=3))
@@ -230,21 +233,22 @@ LISTEN 0      4096 100.110.98.29%tailscale0:5181      0.0.0.0:*    users:(("tail
 		t.Errorf(":5174 = %+v, want BindScope=tailnet Loopback=true No127=false BindHost=100.110.98.29", p)
 	}
 
-	// A zoneless tailnet row is still tailscaled's own: filtered (79xb).
+	// A zoneless tailnet row owned by tailscaled is its serve proxy: filtered.
 	if _, ok := byPort[8808]; ok {
-		t.Errorf("zoneless tailnet-only :8808 should still be filtered; got %+v", ports)
+		t.Errorf("tailscaled-owned zoneless tailnet-only :8808 should be filtered; got %+v", ports)
 	}
 
 	// The likelier reading of the owner's moth report: a newer tailscaled
 	// binds its SERVE proxy to the tailscale0 device, and an unprivileged ss
-	// shows no owning process for it (tailscaled runs as root). That zoned
-	// row must be skipped like tailscaled's zoneless one, leaving just the
-	// app's loopback bind -- so a served port still reads as loopback-bound
-	// (t keeps offering to unserve it), never as the app's own tailnet bind.
+	// shows no owning process for it (tailscaled runs as root). That row
+	// contributes nothing to the aggregation (the app's loopback bind stays
+	// the port's scope) but is FLAGGED (kata nvv6): ResolveTailnetRows drops
+	// it on a served port -- so a served port still reads as loopback-bound
+	// (t keeps offering to unserve it) -- and keeps it on an unserved one.
 	if p, ok := byPort[5180]; !ok {
 		t.Errorf(":5180 (app on loopback) should be present; got %+v", ports)
-	} else if p.BindScope != ScopeLoopback || p.BindHost != "127.0.0.1" || p.Process != "chorse-fe" {
-		t.Errorf(":5180 = %+v, want BindScope=loopback BindHost=127.0.0.1 Process=chorse-fe (the ownerless zoned tailnet row skipped)", p)
+	} else if p.BindScope != ScopeLoopback || p.BindHost != "127.0.0.1" || p.Process != "chorse-fe" || !p.UnattribTailnet || p.UnattribHost != "100.110.98.29" {
+		t.Errorf(":5180 = %+v, want BindScope=loopback BindHost=127.0.0.1 Process=chorse-fe flagged UnattribTailnet (host 100.110.98.29)", p)
 	}
 	// ...and the same zoned row attributed to tailscaled (ss run as root).
 	if _, ok := byPort[5181]; ok {
@@ -458,5 +462,112 @@ func TestParseSSMultiOwnerKeepsFirstForDisplay(t *testing.T) {
 	ports, err := parseSS([]byte("LISTEN 0 5 127.0.0.1:18921 0.0.0.0:* users:((\"parent\",pid=111,fd=3),(\"child\",pid=222,fd=3))\n"))
 	if err != nil || len(ports) != 1 || ports[0].Process != "parent" || ports[0].Pid != 111 || ports[0].Pid127 != 0 {
 		t.Fatalf("%+v %v", ports, err)
+	}
+}
+
+// TestParseSSTailnetOwnership pins kata nvv6 on the Linux parser: a tailnet-IP
+// row (zoned OR zoneless, IPv4 or the fd7a:... IPv6) is split by its owner --
+// tailscaled's is dropped, any other visible owner's is the app's own tailnet
+// bind (kept, ScopeTailnet), an ownerless one is FLAGGED and decided by
+// ResolveTailnetRows from the serve state.
+func TestParseSSTailnetOwnership(t *testing.T) {
+	const fixture = `LISTEN 0      5      100.81.94.92:18951      0.0.0.0:*    users:(("python3",pid=3319382,fd=3))
+LISTEN 0      4096   100.81.94.92:18952      0.0.0.0:*    users:(("tailscaled",pid=50,fd=9))
+LISTEN 0      4096   100.81.94.92:18953      0.0.0.0:*
+LISTEN 0      5   [fd7a:115c:a1e0::1]:18954      [::]:*    users:(("python3",pid=3319383,fd=3))
+LISTEN 0      4096 [fd7a:115c:a1e0::1]:18955     [::]:*    users:(("tailscaled",pid=50,fd=10))
+LISTEN 0      4096 [fd7a:115c:a1e0::1]:18956     [::]:*
+LISTEN 0      5          127.0.0.1:18957      0.0.0.0:*    users:(("app",pid=77,fd=3))
+LISTEN 0      4096   100.81.94.92:18957      0.0.0.0:*
+LISTEN 0      4096   100.81.94.92:18958      0.0.0.0:*
+LISTEN 0      5          127.0.0.1:18958      0.0.0.0:*    users:(("app",pid=78,fd=3))
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[int]Port{}
+	var order []int
+	for _, p := range ports {
+		if _, dup := by[p.Number]; dup {
+			t.Errorf("port %d reported twice: %+v", p.Number, ports)
+		}
+		by[p.Number] = p
+		order = append(order, p.Number)
+	}
+	// First-seen order, flag-only ports included; 18952/18955 (tailscaled's) absent.
+	if want := []int{18951, 18953, 18954, 18956, 18957, 18958}; !reflect.DeepEqual(order, want) {
+		t.Errorf("order = %v, want %v", order, want)
+	}
+	for _, n := range []int{18951, 18954} { // visible non-tailscale owner: kept
+		p := by[n]
+		if p.BindScope != ScopeTailnet || p.Process != "python3" || p.UnattribTailnet || !p.No127 || p.Loopback {
+			t.Errorf(":%d = %+v, want an app tailnet bind (ScopeTailnet, python3, not flagged, No127)", n, p)
+		}
+	}
+	if p := by[18951]; p.BindHost != "100.81.94.92" || p.Pid != 3319382 {
+		t.Errorf(":18951 = %+v, want BindHost 100.81.94.92 Pid 3319382", p)
+	}
+	if p := by[18954]; p.BindHost != "fd7a:115c:a1e0::1" {
+		t.Errorf(":18954 = %+v, want the IPv6 tailnet BindHost", p)
+	}
+	for _, n := range []int{18953, 18956} { // unattributed only: flagged, no other effect
+		p := by[n]
+		if !p.UnattribTailnet || p.BindScope != ScopeUnknown || p.Loopback || p.No127 || p.Pid127 != 0 || p.Process != "" {
+			t.Errorf(":%d = %+v, want flag-only (BindScope/Loopback/No127/Pid127 untouched)", n, p)
+		}
+	}
+	// Mixed with a 127.0.0.1 row, in either line order: aggregation is the
+	// loopback row's, the flag rides along.
+	for _, n := range []int{18957, 18958} {
+		p := by[n]
+		if !p.UnattribTailnet || p.BindScope != ScopeLoopback || !p.Loopback || p.No127 || p.Pid127 == 0 {
+			t.Errorf(":%d = %+v, want loopback aggregation untouched plus the flag", n, p)
+		}
+	}
+
+	// Resolution: served drops tailscaled's rows; unserved keeps them; unknown drops.
+	served := ResolveTailnetRows(ports, map[int]bool{18953: true, 18956: true, 18957: true}, true)
+	got := map[int]Port{}
+	for _, p := range served {
+		got[p.Number] = p
+	}
+	if _, ok := got[18953]; ok {
+		t.Errorf("served, ownerless-only :18953 must be dropped (dangling stays not-listening): %+v", served)
+	}
+	if _, ok := got[18956]; ok {
+		t.Errorf("served, ownerless-only IPv6 :18956 must be dropped: %+v", served)
+	}
+	if p := got[18957]; p.BindScope != ScopeLoopback {
+		t.Errorf("served :18957 must stay loopback-only: %+v", p)
+	}
+	if p := got[18958]; p.BindScope != ScopeTailnet || p.BindHost != "100.81.94.92" || !p.Loopback {
+		t.Errorf("unserved :18958 must widen to tailnet and keep Loopback: %+v", p)
+	}
+	unserved := ResolveTailnetRows(ports, map[int]bool{}, true)
+	for _, p := range unserved {
+		if p.Number == 18953 && (p.BindScope != ScopeTailnet || p.BindHost != "100.81.94.92" || !p.No127) {
+			t.Errorf("unserved ownerless :18953 = %+v, want an app tailnet bind", p)
+		}
+		if p.Number == 18956 && (p.BindScope != ScopeTailnet || p.BindHost != "fd7a:115c:a1e0::1") {
+			t.Errorf("unserved ownerless IPv6 :18956 = %+v, want an app tailnet bind", p)
+		}
+	}
+	for _, p := range ResolveTailnetRows(ports, map[int]bool{}, false) {
+		if p.Number == 18953 || p.Number == 18956 {
+			t.Errorf("known=false must drop ownerless tailnet rows (as before nvv6): %+v", p)
+		}
+	}
+}
+
+// Without -p there are no owners at all: every tailnet-IP row is flagged and
+// the serve state decides.
+func TestParseSSNoOwnersFlagsTailnetRows(t *testing.T) {
+	ports, err := parseSS([]byte("LISTEN 0 5 100.81.94.92:18951 0.0.0.0:*\nLISTEN 0 5 100.81.94.92%tailscale0:18952 0.0.0.0:*\n"))
+	if err != nil || len(ports) != 2 || !ports[0].UnattribTailnet || !ports[1].UnattribTailnet {
+		t.Fatalf("%+v %v", ports, err)
+	}
+	if got := ResolveTailnetRows(ports, map[int]bool{18951: true}, true); len(got) != 1 || got[0].Number != 18952 {
+		t.Errorf("only the unserved port survives: %+v", got)
 	}
 }

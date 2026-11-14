@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -810,6 +811,31 @@ func TestReadmeDocumentsStatusTunnels(t *testing.T) {
 	}
 }
 
+// TestReadmeDocumentsTailnetBoundApps pins the README's nvv6 claims: status
+// lists a tailnet-bound app (TestBuildTailnetBoundApp pins the behavior), and
+// "How it works" states the owner-then-serve-state rule the scanners and
+// portscan.ResolveTailnetRows implement (TestParseSSTailnetOwnership,
+// TestResolveTailnetRows).
+func TestReadmeDocumentsTailnetBoundApps(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Skipf("README.md not readable from %q: %v", mustCwd(t), err)
+	}
+	body := strings.Join(strings.Fields(string(readme)), " ")
+	for _, want := range []string{
+		"An app that bound your node's tailnet IP itself is listed too, as `tailnet (app bound)` (JSON mode `tailnet`)",
+		"also marks an app that bound your node's **tailnet IP** directly",
+		"If the scanner can name its owner, that decides it",
+		"the serve state decides: on a served port it is the proxy, on an unserved port it is an app",
+		"except tailscaled's own PeerAPI ports, which `tailscale status` names and tailport never lists",
+		"If serve status can't be read, such rows are treated as the proxy and not listed",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("README should contain %q", want)
+		}
+	}
+}
+
 // mustCwd mirrors internal/ui's docs_consistency_test helper: the working
 // directory, for a useful skip message.
 func mustCwd(t *testing.T) string {
@@ -879,4 +905,65 @@ func TestGatherTunnelsIndependentOfTailscale(t *testing.T) {
 		}
 	}
 	t.Errorf("gatherFrom rows = %+v, want the tunnel row even though tailscale failed", rows)
+}
+
+// Kata nvv6: an app that bound the node's tailnet IP itself is exposed to the
+// tailnet by its own bind -- no `tailscale serve` -- and `tailport status`
+// lists it (mode "tailnet") at its own URL. A merely-listening wildcard/
+// loopback port is still out of scope, and a served port keeps its serve row.
+func TestBuildTailnetBoundApp(t *testing.T) {
+	ports := []portscan.Port{
+		{Number: 18951, Process: "python3", BindScope: portscan.ScopeTailnet, BindHost: "100.81.94.92", No127: true},
+		{Number: 3000, Process: "node", BindScope: portscan.ScopeWildcard},
+		{Number: 5173, Process: "vite", BindScope: portscan.ScopeLoopback},
+		{Number: 8080, Process: "web", BindScope: portscan.ScopeTailnet}, // also served
+	}
+	rows := Build(ports, []int{8080}, nil, nil, nil, "lysander", "lysander.tailnet.ts.net")
+	want := []Row{
+		{Port: 8080, Process: "web", Mode: ModeServe, URL: "http://lysander:8080"},
+		{Port: 18951, Process: "python3", Mode: ModeTailnet, URL: "http://lysander:18951"},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("rows = %+v, want %+v", rows, want)
+	}
+	var buf bytes.Buffer
+	WriteTable(&buf, rows[1:])
+	if !strings.Contains(buf.String(), "tailnet (app bound)") || !strings.Contains(buf.String(), "http://lysander:18951") {
+		t.Errorf("table = %q", buf.String())
+	}
+	buf.Reset()
+	if err := WriteJSON(&buf, rows[1:]); err != nil || !strings.Contains(buf.String(), `"mode": "tailnet"`) {
+		t.Errorf("json = %q err=%v", buf.String(), err)
+	}
+}
+
+// Gather resolves the scanner's unattributed tailnet-IP rows with the serve
+// set: an app run by another user on an UNSERVED port is listed; the same row
+// on a SERVED port is tailscaled's proxy (a dangling forward: empty process);
+// with serve status unreadable it is dropped (as before nvv6).
+func TestGatherResolvesUnattributedTailnetRows(t *testing.T) {
+	ports := func() ([]portscan.Port, error) {
+		return []portscan.Port{
+			{Number: 18951, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
+			{Number: 18952, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
+			{Number: 18954, UnattribTailnet: true, UnattribHost: "100.81.94.92"}, // tailscaled's PeerAPI
+		}, nil
+	}
+	src := func(status func() ([]int, map[int]int, error)) gatherSources {
+		return gatherSources{
+			listPorts:       ports,
+			peerAPIPorts:    func() (map[int]bool, error) { return map[int]bool{18954: true}, nil },
+			fqdn:            func() (string, error) { return "", errors.New("no tailscaled") },
+			tailscaleStatus: status,
+			discoverTunnels: func(config.Config) []Tunnel { return nil },
+		}
+	}
+	rows, err := gatherFrom(config.Config{}, src(func() ([]int, map[int]int, error) { return []int{18952}, nil, nil }))
+	if err != nil || len(rows) != 2 || rows[0].Port != 18951 || rows[0].Mode != ModeTailnet || rows[1].Port != 18952 || rows[1].Mode != ModeServe || rows[1].Process != "" {
+		t.Fatalf("rows = %+v err=%v, want :18951 tailnet-bound and :18952 a dangling serve", rows, err)
+	}
+	rows, _ = gatherFrom(config.Config{}, src(func() ([]int, map[int]int, error) { return nil, nil, errors.New("down") }))
+	if len(rows) != 0 {
+		t.Errorf("serve state unknown must drop unattributed rows: %+v", rows)
+	}
 }

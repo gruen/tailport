@@ -1782,6 +1782,7 @@ func fwLagNext(ewma, obs float64) float64 {
 var (
 	scanListeners = portscan.List
 	serveStatus   = tsserve.StatusDetail
+	peerAPIPorts  = tsserve.PeerAPIPorts
 )
 
 func refresh(want ...int) tea.Msg {
@@ -1803,12 +1804,35 @@ func refresh(want ...int) tea.Msg {
 		// tailnet route; funnel routes need m.fqdn, also empty without
 		// tailscale. So ports fall back to their localhost/LAN routes instead
 		// of vanishing, and nothing advertises a tailnet URL that isn't live.
-		return refreshMsg{ports: ports, statusErr: statusErr}
+		// Serve state unknown: unattributed tailnet-IP rows stay tailscaled's
+		// (dropped), exactly as before nvv6 -- never invent an app bind.
+		return refreshMsg{ports: portscan.ResolveTailnetRows(ports, nil, false), statusErr: statusErr}
 	}
 	active := make(map[int]bool, len(activeList))
 	for _, p := range activeList {
 		active[p] = true
 	}
+	// Settle the scanner's unattributed tailnet-IP rows now that the serve set
+	// is known (kata nvv6): on a served port they are tailscaled's serve proxy
+	// (dropped, so a dangling forward still reads as not listening); on an
+	// unserved port they are an app's own tailnet bind (kept).
+	//
+	// tailscaled's own PeerAPI listeners sit on the tailnet IP at random
+	// unserved ports with no visible owner too; they are tailscaled's, never an
+	// app. Looked up only when an unserved unattributed row exists.
+	tsOwned := active
+	if portscan.HasUnservedUnattributed(ports, active) {
+		if peer, err := peerAPIPorts(); err == nil {
+			tsOwned = make(map[int]bool, len(active)+len(peer))
+			for p := range active {
+				tsOwned[p] = true
+			}
+			for p := range peer {
+				tsOwned[p] = true
+			}
+		}
+	}
+	ports = portscan.ResolveTailnetRows(ports, tsOwned, true)
 	// Identity of each served 1:1 listener (the pause side) and of any
 	// currently-paused port that is listening (the resume side) -- nothing else,
 	// so the macOS ps/lsof reads stay few (kata p2r5).
@@ -5328,6 +5352,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// lock them out -- so a dedicated, non-actionable line.
 						return m, m.setFlash("on tailnet as SSH — this is how you're connected; nothing for tailport to serve", flashInfo)
 					}
+					if sel.port.BindScope == portscan.ScopeTailnet {
+						// The app bound the node's tailnet IP itself (kata nvv6).
+						return m, m.setFlash("on tailnet — app bound to the tailnet IP; rebind to localhost (or 127.0.0.1) to make toggleable", flashInfo)
+					}
 					// Wildcard bind owned by the APP (0.0.0.0), not a tailport
 					// serve, so there's no mapping to toggle. Honest about WHY,
 					// and actionable: rebinding to loopback -> reach()==reachLocalhost,
@@ -7530,13 +7558,13 @@ func configSaveLines(path string) []string {
 // route.marker can emit must appear here (TestMarkerLegendCoversEveryRouteMarker).
 func (m model) markerLegend() string {
 	if m.markerEmoji {
-		return "🌕 localhost   🌔 local network   🌒 tailnet (served)   🌓 tailnet (bound wide)\n" +
+		return "🌕 localhost   🌔 local network   🌒 tailnet (served)   🌓 tailnet (app bound)\n" +
 			"🌑 internet (funnel)   🌐 internet (published)   ☁️ internet (cloudflare tunnel)\n" +
 			"🌫️ stale  💤 paused  ✕ offline  🔒 locked  ★ favorite  " + authGlyphEmoji + " basic auth (published)"
 	}
 	// The tunnel glyph goes last on its line: its style's trailing reset would
 	// otherwise drop helpTextStyle's color for whatever followed it.
-	return "○ localhost   ◔ local network   ◉ tailnet (served)   ◑ tailnet (bound wide)\n" +
+	return "○ localhost   ◔ local network   ◉ tailnet (served)   ◑ tailnet (app bound)\n" +
 		"● internet (funnel)   ◆ internet (published)   " + tunnelMarkerStyle.Render("◈") + " internet (cloudflare tunnel)\n" +
 		"▲ stale  ◌ paused  ✕ offline  🔒 locked  ★ favorite  " + authGlyphMono + " basic auth (published)"
 }

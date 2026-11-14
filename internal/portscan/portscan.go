@@ -68,6 +68,118 @@ type Port struct {
 	// means "ambiguous or unknown": auto-pause and auto-resume read a
 	// program's identity from Pid127 ONLY and do nothing on 0.
 	Pid127 int
+	// UnattribTailnet marks a port that has at least one listener row bound to
+	// the node's tailnet IP with NO visible owner (kata nvv6). Such a row is
+	// EITHER tailscaled's serve proxy (tailscaled runs as root, so an
+	// unprivileged ss/lsof can't attribute it) OR an app run by root/another
+	// user -- and only the serve state can tell which: it is tailscaled's iff
+	// the port is served. portscan doesn't know serve state, so the scanners
+	// FLAG the row instead of deciding, and contribute NOTHING to BindScope,
+	// Loopback, No127, Pid127, Process or Pid until ResolveTailnetRows decides.
+	// A port whose only rows are such rows has BindScope==ScopeUnknown (no
+	// real bind row ever classifies as Unknown). Every consumer that has the
+	// serve state MUST call ResolveTailnetRows right after reading it.
+	UnattribTailnet bool
+	// UnattribHost is the bare tailnet address of the first unattributed row,
+	// the BindHost ResolveTailnetRows adopts if it keeps the row as an app bind.
+	UnattribHost string
+}
+
+// unattrAcc records, per port, the unattributed tailnet-IP rows the scanner
+// saw (kata nvv6): the first row's bare host. Shared by the ss and lsof parsers.
+type unattrAcc map[int]string
+
+func (a unattrAcc) note(port int, host string) {
+	if _, ok := a[port]; !ok {
+		a[port] = host
+	}
+}
+
+// apply stamps p with the flag if its port had any such row.
+func (a unattrAcc) apply(p *Port) {
+	if host, ok := a[p.Number]; ok {
+		p.UnattribTailnet = true
+		p.UnattribHost = host
+	}
+}
+
+// ResolveTailnetRows settles the unattributed tailnet-IP rows the scanners
+// flag (kata nvv6), given tailscale serve's active port set. It is pure and
+// returns a new slice (ports is not modified):
+//
+//   - known=false (serve status unavailable): behave exactly as before nvv6 --
+//     treat the rows as tailscaled's and drop them. Conservative: never invent
+//     an app bind from rows we can't classify.
+//   - the port is served: the rows are tailscaled's serve proxy. Drop them,
+//     and the port entirely if they were its only rows, reproducing the old
+//     aggregation exactly. This is what keeps dangling-forward detection
+//     intact (served + only tailscaled's rows = not listening).
+//   - the port is NOT served: tailscaled has no listener there, so the rows
+//     are an app's own tailnet bind (root or another user). Fold them in:
+//     BindScope widens to at least Tailnet, adopting UnattribHost as BindHost
+//     when it wins. Loopback/No127/Pid127 are left as the other rows set them
+//     (a tailnet bind never accepts a 127.0.0.1 dial, so a port with only this
+//     row has No127=true).
+//
+// The flag is cleared on every returned port.
+func ResolveTailnetRows(ports []Port, served map[int]bool, known bool) []Port {
+	out := make([]Port, 0, len(ports))
+	for _, p := range ports {
+		if !p.UnattribTailnet {
+			out = append(out, p)
+			continue
+		}
+		host := p.UnattribHost
+		p.UnattribTailnet, p.UnattribHost = false, ""
+		if !known || served[p.Number] {
+			if p.BindScope == ScopeUnknown { // only unattributed tailnet rows: tailscaled's alone
+				continue
+			}
+			out = append(out, p)
+			continue
+		}
+		if p.BindScope == ScopeUnknown {
+			p.No127 = true // a tailnet bind never accepts a 127.0.0.1 dial
+		}
+		if p.BindScope < ScopeTailnet {
+			p.BindScope = ScopeTailnet
+			p.BindHost = host
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// HasUnservedUnattributed reports whether ResolveTailnetRows would have to
+// decide anything for ports given served: some port carries unattributed
+// tailnet rows and is not served. Callers use it to run an extra, costlier
+// lookup (tsserve.PeerAPIPorts) only when it can matter.
+func HasUnservedUnattributed(ports []Port, served map[int]bool) bool {
+	for _, p := range ports {
+		if p.UnattribTailnet && !served[p.Number] {
+			return true
+		}
+	}
+	return false
+}
+
+// isTailscaledProc reports whether an ss-reported process name is tailscaled
+// itself (Linux comm names are not truncated at this length).
+func isTailscaledProc(name string) bool { return name == "tailscaled" }
+
+// isTailscaleLsofCommand reports whether an lsof COMMAND column is Tailscale's
+// own: tailscaled, or the macOS app's network-extension process (kata nvv6).
+// lsof truncates COMMAND to 9 characters by default (tailscaled prints as
+// "tailscale"; the extension as "IPNExtens..." or "io.tailsc..."), so match a
+// case-insensitive PREFIX rather than the full name.
+func isTailscaleLsofCommand(cmd string) bool {
+	c := strings.ToLower(cmd)
+	for _, pre := range []string{"tailscale", "ipnextens", "io.tailsc"} {
+		if strings.HasPrefix(c, pre) {
+			return true
+		}
+	}
+	return false
 }
 
 // pidAcc accumulates, per port, which pids own rows that accept a
@@ -196,7 +308,7 @@ func splitZone(host string) (bare, zone string) {
 //     so it gets no dialable host at all.
 //
 // bare is the address with any zone removed (what isTailscaleAddr and the
-// 79xb ownership rule look at); zoned reports whether a zone was present;
+// nvv6 ownership rule look at); zoned reports whether a zone was present;
 // ok127 is whether a dial to 127.0.0.1:PORT lands on this socket (No127).
 func classifyBind(host string) (bare string, zoned bool, scope BindScope, bindHost string, ok127 bool) {
 	i := strings.LastIndexByte(host, '%')
@@ -362,9 +474,7 @@ func classifyBindScope(host string) BindScope {
 // one honest reachability: a port bound on BOTH 127.0.0.1 and 0.0.0.0 IS
 // tailnet-reachable, so it must aggregate to Wildcard, not Loopback.
 // Reachability order, widest first: Wildcard > Tailnet > LAN > Loopback >
-// Unknown -- encoded directly by the constant ordering above. (Tailnet-scope
-// binds are filtered out upstream as tailscaled's own, so in practice only
-// Wildcard/LAN/Loopback ever reach this helper.)
+// Unknown -- encoded directly by the constant ordering above.
 func widerScope(a, b BindScope) BindScope {
 	if a >= b {
 		return a
@@ -372,10 +482,12 @@ func widerScope(a, b BindScope) BindScope {
 	return b
 }
 
-// Tailscale's own address ranges. A socket bound to one of these is always
-// tailscaled itself (e.g. the serve-proxy listener it opens for every active
-// `tailscale serve` mapping), never a local application. Filtering these out
-// is what lets an exposed-but-not-listening port register as genuinely
+// Tailscale's own address ranges. A socket bound to one of these may be
+// tailscaled's own serve-proxy listener (opened for every active
+// `tailscale serve` mapping) or an app that bound the tailnet IP itself; the
+// scanners tell them apart by owner, and by serve state when the owner is
+// invisible (kata nvv6, ResolveTailnetRows). Dropping tailscaled's is what
+// lets an exposed-but-not-listening port register as genuinely
 // not-listening -- see internal/ui dangling-forward detection.
 //   - 100.64.0.0/10 is the CGNAT range Tailscale carves tailnet IPv4s from.
 //   - fd7a:115c:a1e0::/48 is Tailscale's ULA prefix for tailnet IPv6s.

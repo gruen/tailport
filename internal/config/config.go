@@ -244,7 +244,7 @@ type Config struct {
 	Cloudflared CloudflaredConfig `yaml:"cloudflared"`
 	// Markers selects the EXPOSURE-marker glyph style (qwcw): the port-state
 	// moon-phase ramp 🌕 localhost/🌔 local network/🌒 on tailnet (served or
-	// bound wide)/🌑 funnelled to the internet (plus the off-ramp 🌫️ stale/
+	// app bound)/🌑 funnelled to the internet (plus the off-ramp 🌫️ stale/
 	// ✕ offline), or its mono fallback ○/◔/◉/●/▲/✕. Empty (the default, ""
 	// -- not set) means MONO/ASCII; "auto" opts into detecting a
 	// UTF-8-capable terminal and picking emoji there; "emoji"/"ascii" force

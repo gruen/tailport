@@ -149,6 +149,9 @@ func cleanEligible(cfg config.Config, public map[int]bool) ([]int, error) {
 	for _, p := range detail.Active {
 		served[p] = true
 	}
+	// Unattributed tailnet-IP rows on a served port are tailscaled's own proxy,
+	// not an app (kata nvv6): resolve them so a dangling forward stays one.
+	ports = portscan.ResolveTailnetRows(ports, served, true)
 	listening := make(map[int]bool, len(ports))
 	for _, p := range ports {
 		listening[p.Number] = true
