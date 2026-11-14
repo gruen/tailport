@@ -1817,16 +1817,20 @@ func refresh(want ...int) tea.Msg {
 	// (dropped, so a dangling forward still reads as not listening); on an
 	// unserved port they are an app's own tailnet bind (kept).
 	//
-	// tailscaled's own PeerAPI listeners sit on the tailnet IP at random
-	// unserved ports with no visible owner too; they are tailscaled's, never an
-	// app. Looked up only when an unserved unattributed row exists.
-	tsOwned := active
-	if portscan.HasUnservedUnattributed(ports, active) {
+	// tailscaled's own listeners are not apps either: every serve/funnel
+	// listen port (funnel ingress 443/8443/10000, HTTPS and TCP serves, not
+	// just the 1:1 local services in active) and its PeerAPI ports (random,
+	// unserved, ownerless). The PeerAPI lookup runs only when an unserved
+	// unattributed row exists.
+	tsOwned := make(map[int]bool, len(active)+len(detail.ListenPorts))
+	for p := range active {
+		tsOwned[p] = true
+	}
+	for p := range detail.ListenPorts {
+		tsOwned[p] = true
+	}
+	if portscan.HasUnservedUnattributed(ports, tsOwned) {
 		if peer, err := peerAPIPorts(); err == nil {
-			tsOwned = make(map[int]bool, len(active)+len(peer))
-			for p := range active {
-				tsOwned[p] = true
-			}
 			for p := range peer {
 				tsOwned[p] = true
 			}

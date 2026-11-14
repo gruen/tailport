@@ -101,6 +101,13 @@ type Detail struct {
 	// anything unparseable is NOT in it, so nothing may treat the served port's
 	// own number as "the local port to check" for those.
 	OneToOne map[int]bool
+	// ListenPorts is EVERY port tailscaled itself listens on for serve or
+	// funnel (kata nvv6): all TCP keys of the serve config (HTTP, HTTPS and TCP
+	// forwards, funnel ingress 443/8443/10000 included) plus the funnel public
+	// ports. A superset of Active, which is only the local services served; the
+	// scanner's ownerless tailnet-IP rows on these ports are tailscaled's, never
+	// an app. Not a set of local services -- never merge it into Active.
+	ListenPorts map[int]bool
 }
 
 // StatusDetail is Status with the per-port mapping shape; one fetch.
@@ -125,7 +132,31 @@ func detailFrom(out []byte) (Detail, error) {
 	if err != nil {
 		return Detail{}, err
 	}
-	return Detail{Active: active, Funnel: funnel, OneToOne: one}, nil
+	listen, err := parseListenPorts(out, funnel)
+	if err != nil {
+		return Detail{}, err
+	}
+	return Detail{Active: active, Funnel: funnel, OneToOne: one, ListenPorts: listen}, nil
+}
+
+// parseListenPorts computes Detail.ListenPorts from a ServeConfig JSON blob.
+func parseListenPorts(out []byte, funnel map[int]int) (map[int]bool, error) {
+	var cfg struct {
+		TCP map[string]json.RawMessage `json:"TCP"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing serve listeners: %w", err)
+	}
+	ports := map[int]bool{}
+	for k := range cfg.TCP {
+		if n, err := strconv.Atoi(k); err == nil {
+			ports[n] = true
+		}
+	}
+	for _, pub := range funnel {
+		ports[pub] = true
+	}
+	return ports, nil
 }
 
 // parseOneToOne computes Detail.OneToOne from a ServeConfig JSON blob.

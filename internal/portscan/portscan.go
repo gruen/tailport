@@ -83,24 +83,48 @@ type Port struct {
 	// UnattribHost is the bare tailnet address of the first unattributed row,
 	// the BindHost ResolveTailnetRows adopts if it keeps the row as an app bind.
 	UnattribHost string
+	// UnattribScope is the classified scope of that row (what classifyBind
+	// said), preserved through resolution rather than assumed.
+	UnattribScope BindScope
 }
 
-// unattrAcc records, per port, the unattributed tailnet-IP rows the scanner
-// saw (kata nvv6): the first row's bare host. Shared by the ss and lsof parsers.
-type unattrAcc map[int]string
+// unattrAcc records, per port, the unattributed deferrable tailnet-IP rows the
+// scanner saw (kata nvv6): the first row's classification. Shared by the ss and
+// lsof parsers.
+type unattrAcc map[int]unattrRow
 
-func (a unattrAcc) note(port int, host string) {
+type unattrRow struct {
+	host  string
+	scope BindScope
+}
+
+func (a unattrAcc) note(port int, host string, scope BindScope) {
 	if _, ok := a[port]; !ok {
-		a[port] = host
+		a[port] = unattrRow{host, scope}
 	}
 }
 
 // apply stamps p with the flag if its port had any such row.
 func (a unattrAcc) apply(p *Port) {
-	if host, ok := a[p.Number]; ok {
+	if r, ok := a[p.Number]; ok {
 		p.UnattribTailnet = true
-		p.UnattribHost = host
+		p.UnattribHost = r.host
+		p.UnattribScope = r.scope
 	}
+}
+
+// canBeTailscaledProxy reports whether a bind host as the scanner printed it
+// (zone included) is a tailnet address that tailscaled's own serve proxy could
+// be listening on: zoneless, or restricted to tailscale0. A tailnet address
+// restricted to any OTHER device (%lo, %eth0, ...) cannot be tailscaled's, so
+// it is classified normally by classifyBind and never deferred.
+func canBeTailscaledProxy(host string) bool {
+	bare, _ := splitZone(host)
+	if !isTailscaleAddr(bare) {
+		return false
+	}
+	i := strings.LastIndexByte(host, '%')
+	return i < 0 || i == len(host)-1 || host[i+1:] == "tailscale0"
 }
 
 // ResolveTailnetRows settles the unattributed tailnet-IP rows the scanners
@@ -129,8 +153,11 @@ func ResolveTailnetRows(ports []Port, served map[int]bool, known bool) []Port {
 			out = append(out, p)
 			continue
 		}
-		host := p.UnattribHost
-		p.UnattribTailnet, p.UnattribHost = false, ""
+		host, scope := p.UnattribHost, p.UnattribScope
+		if scope == ScopeUnknown {
+			scope = ScopeTailnet
+		}
+		p.UnattribTailnet, p.UnattribHost, p.UnattribScope = false, "", ScopeUnknown
 		if !known || served[p.Number] {
 			if p.BindScope == ScopeUnknown { // only unattributed tailnet rows: tailscaled's alone
 				continue
@@ -141,8 +168,8 @@ func ResolveTailnetRows(ports []Port, served map[int]bool, known bool) []Port {
 		if p.BindScope == ScopeUnknown {
 			p.No127 = true // a tailnet bind never accepts a 127.0.0.1 dial
 		}
-		if p.BindScope < ScopeTailnet {
-			p.BindScope = ScopeTailnet
+		if p.BindScope < scope {
+			p.BindScope = scope
 			p.BindHost = host
 		}
 		out = append(out, p)

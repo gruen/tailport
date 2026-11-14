@@ -571,3 +571,34 @@ func TestParseSSNoOwnersFlagsTailnetRows(t *testing.T) {
 		t.Errorf("only the unserved port survives: %+v", got)
 	}
 }
+
+// Kata nvv6 (roborev 7329 #2): only a tailnet-address row that could be
+// tailscaled's proxy (zoneless or %tailscale0) is deferred; one restricted to
+// another device is classified by its device and never becomes a tailnet bind.
+func TestParseSSDeviceRestrictedTailnetRows(t *testing.T) {
+	const fixture = `LISTEN 0 5 100.81.94.92%lo:18951 0.0.0.0:*
+LISTEN 0 5 100.81.94.92%eth0:18952 0.0.0.0:*
+LISTEN 0 5 100.81.94.92%tailscale0:18953 0.0.0.0:*
+`
+	ports, err := parseSS([]byte(fixture))
+	if err != nil || len(ports) != 3 {
+		t.Fatalf("%+v %v", ports, err)
+	}
+	if p := ports[0]; p.UnattribTailnet || p.BindScope != ScopeLoopback || !p.Loopback {
+		t.Errorf("%%lo row = %+v, want loopback, not deferred", p)
+	}
+	if p := ports[1]; p.UnattribTailnet || p.BindScope != ScopeLAN {
+		t.Errorf("%%eth0 row = %+v, want LAN, not deferred", p)
+	}
+	if p := ports[2]; !p.UnattribTailnet || p.BindScope != ScopeUnknown || p.UnattribScope != ScopeTailnet {
+		t.Errorf("%%tailscale0 row = %+v, want deferred as before", p)
+	}
+	for _, p := range ResolveTailnetRows(ports, map[int]bool{}, true) {
+		if p.Number == 18951 && p.BindScope != ScopeLoopback {
+			t.Errorf("resolution must not widen a loopback-restricted row: %+v", p)
+		}
+		if p.Number == 18952 && p.BindScope != ScopeLAN {
+			t.Errorf("resolution must not widen an eth0-restricted row: %+v", p)
+		}
+	}
+}

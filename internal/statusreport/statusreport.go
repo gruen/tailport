@@ -179,8 +179,12 @@ const tunnelHealthTimeout = 3 * time.Second
 // honors -c/--config (see cmd/tailport's newStatusFlagSet).
 func Gather(cfg config.Config) ([]Row, error) {
 	return gatherFrom(cfg, gatherSources{
-		listPorts:       portscan.List,
-		peerAPIPorts:    tsserve.PeerAPIPorts,
+		listPorts:    portscan.List,
+		peerAPIPorts: tsserve.PeerAPIPorts,
+		listenPorts: func() (map[int]bool, error) {
+			d, err := tsserve.StatusDetail()
+			return d.ListenPorts, err
+		},
 		fqdn:            tsserve.FQDN,
 		tailscaleStatus: tsserve.Status,
 		discoverTunnels: gatherTunnels,
@@ -196,6 +200,7 @@ func Gather(cfg config.Config) ([]Row, error) {
 type gatherSources struct {
 	listPorts       func() ([]portscan.Port, error)
 	peerAPIPorts    func() (map[int]bool, error) // tailscaled's own tailnet listeners; nil = none known
+	listenPorts     func() (map[int]bool, error) // every serve/funnel listen port (tsserve.Detail.ListenPorts); nil = none known
 	fqdn            func() (string, error)
 	tailscaleStatus func() ([]int, map[int]int, error)
 	discoverTunnels func(config.Config) []Tunnel
@@ -236,15 +241,21 @@ func gatherFrom(cfg config.Config, src gatherSources) ([]Row, error) {
 	}
 	// Same resolution as the TUI's refresh (kata nvv6), including tailscaled's
 	// own PeerAPI listeners (see tsserve.PeerAPIPorts).
-	tsOwned := served
-	if src.peerAPIPorts != nil && portscan.HasUnservedUnattributed(ports, served) {
-		if peer, perr := src.peerAPIPorts(); perr == nil {
-			tsOwned = make(map[int]bool, len(served)+len(peer))
-			for p := range served {
-				tsOwned[p] = true
+	tsOwned := make(map[int]bool, len(served))
+	for p := range served {
+		tsOwned[p] = true
+	}
+	if portscan.HasUnservedUnattributed(ports, tsOwned) {
+		// Funnel ingress (443/8443/10000), HTTPS and TCP serves are tailscaled
+		// listeners too, as are its PeerAPI ports (tsserve.PeerAPIPorts).
+		for _, f := range []func() (map[int]bool, error){src.listenPorts, src.peerAPIPorts} {
+			if f == nil {
+				continue
 			}
-			for p := range peer {
-				tsOwned[p] = true
+			if extra, perr := f(); perr == nil {
+				for p := range extra {
+					tsOwned[p] = true
+				}
 			}
 		}
 	}

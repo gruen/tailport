@@ -98,13 +98,13 @@ func parseLsof(out []byte) ([]Port, error) {
 		// is kept. A row with no owner (lsof normally always names one) is
 		// FLAGGED for ResolveTailnetRows, exactly as on Linux.
 		rawHost := strings.TrimSuffix(strings.TrimPrefix(name[:idx], "["), "]")
-		host, _, scope, bindHost, ok127 := classifyBind(rawHost)
-		if isTailscaleAddr(host) {
+		_, _, scope, bindHost, ok127 := classifyBind(rawHost)
+		if canBeTailscaledProxy(rawHost) {
 			if isTailscaleLsofCommand(proc) {
 				continue
 			}
 			if proc == "" {
-				unattr.note(port, bindHost)
+				unattr.note(port, bindHost, scope)
 				if !seen[port] {
 					seen[port] = true
 					order = append(order, port)

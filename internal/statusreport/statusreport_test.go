@@ -947,12 +947,14 @@ func TestGatherResolvesUnattributedTailnetRows(t *testing.T) {
 			{Number: 18951, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
 			{Number: 18952, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
 			{Number: 18954, UnattribTailnet: true, UnattribHost: "100.81.94.92"}, // tailscaled's PeerAPI
+			{Number: 443, UnattribTailnet: true, UnattribHost: "100.81.94.92"},   // funnel ingress
 		}, nil
 	}
 	src := func(status func() ([]int, map[int]int, error)) gatherSources {
 		return gatherSources{
 			listPorts:       ports,
 			peerAPIPorts:    func() (map[int]bool, error) { return map[int]bool{18954: true}, nil },
+			listenPorts:     func() (map[int]bool, error) { return map[int]bool{443: true}, nil },
 			fqdn:            func() (string, error) { return "", errors.New("no tailscaled") },
 			tailscaleStatus: status,
 			discoverTunnels: func(config.Config) []Tunnel { return nil },

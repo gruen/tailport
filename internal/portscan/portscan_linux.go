@@ -79,7 +79,7 @@ func parseSS(out []byte) ([]Port, error) {
 		// listener fell through to ScopeLAN and rendered a bogus LAN route
 		// like "http://100.110.98.29%tailscale0:5173". classifyBind applies the
 		// device restriction (see its doc comment).
-		bare, _, scope, bindHost, ok127 := classifyBind(host)
+		_, _, scope, bindHost, ok127 := classifyBind(host)
 		proc := ""
 		pid := 0
 		var allPids []int // every owner in the users:(...) field (Pid127 needs them all)
@@ -119,12 +119,12 @@ func parseSS(out []byte) ([]Port, error) {
 		//     the same) -- it is tailscaled's iff the port is served, which
 		//     only the caller knows. FLAG it (Port.UnattribTailnet) and let
 		//     ResolveTailnetRows decide once serve status is read.
-		if isTailscaleAddr(bare) {
+		if canBeTailscaledProxy(host) {
 			if hasTailscaled {
 				continue
 			}
 			if proc == "" {
-				unattr.note(port, bindHost)
+				unattr.note(port, bindHost, scope)
 				if !seen[port] {
 					seen[port] = true
 					order = append(order, port)

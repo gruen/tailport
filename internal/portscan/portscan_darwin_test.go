@@ -305,3 +305,19 @@ IPNExtens   320 root   16u  IPv4 0x8888888888888888      0t0  TCP 100.81.94.92:1
 		t.Errorf(":18957 = %+v, want the app's loopback bind", p)
 	}
 }
+
+// Kata nvv6 (roborev 7329 #2): a tailnet address restricted to a non-tailscale
+// device keeps its device classification (fixture-only on macOS).
+func TestParseLsofDeviceRestrictedTailnetRows(t *testing.T) {
+	const fixture = `COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3     501   mg    3u  IPv4 0x1111111111111111      0t0  TCP 100.81.94.92%lo0:18951 (LISTEN)
+python3     502   mg    3u  IPv4 0x2222222222222222      0t0  TCP 100.81.94.92%en0:18952 (LISTEN)
+`
+	ports, err := parseLsof([]byte(fixture))
+	if err != nil || len(ports) != 2 {
+		t.Fatalf("%+v %v", ports, err)
+	}
+	if ports[0].BindScope != ScopeLoopback || ports[1].BindScope != ScopeLAN {
+		t.Errorf("got %+v, want loopback then LAN", ports)
+	}
+}

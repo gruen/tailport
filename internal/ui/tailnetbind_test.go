@@ -36,10 +36,13 @@ func TestRefreshTailnetBoundApps(t *testing.T) {
 			{Number: 18953, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
 			// unattributed, unserved, but tailscaled's own PeerAPI port
 			{Number: 18954, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
+			// funnel ingress / an HTTPS serve key that is no 1:1 local service
+			{Number: 443, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
+			{Number: 8443, UnattribTailnet: true, UnattribHost: "100.81.94.92"},
 		}, nil
 	}
 	serveStatus = func() (tsserve.Detail, error) {
-		return tsserve.Detail{Active: []int{18953}, OneToOne: map[int]bool{18953: true}}, nil
+		return tsserve.Detail{Active: []int{18953}, OneToOne: map[int]bool{18953: true}, ListenPorts: map[int]bool{18953: true, 443: true, 8443: true}}, nil
 	}
 
 	msg := refresh().(refreshMsg)
@@ -52,6 +55,12 @@ func TestRefreshTailnetBoundApps(t *testing.T) {
 	}
 	if p, ok := have[18952]; !ok || p.BindScope != portscan.ScopeTailnet || p.UnattribTailnet {
 		t.Errorf("unserved unattributed :18952 must be an app tailnet bind: %+v", msg.ports)
+	}
+	if _, ok := have[443]; ok {
+		t.Errorf("funnel ingress :443 is tailscaled's, not an app: %+v", msg.ports)
+	}
+	if _, ok := have[8443]; ok {
+		t.Errorf("HTTPS serve key :8443 is tailscaled's, not an app: %+v", msg.ports)
 	}
 	if _, ok := have[18954]; ok {
 		t.Errorf("tailscaled's PeerAPI port :18954 is not an app: %+v", msg.ports)

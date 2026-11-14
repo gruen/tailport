@@ -11,11 +11,11 @@ import (
 // app's own tailnet bind (folded in); serve state unknown -> dropped, exactly
 // as before nvv6.
 func TestResolveTailnetRows(t *testing.T) {
-	only := Port{Number: 18951, UnattribTailnet: true, UnattribHost: "100.81.94.92"}
+	only := Port{Number: 18951, UnattribTailnet: true, UnattribHost: "100.81.94.92", UnattribScope: ScopeTailnet}
 	withLoop := Port{Number: 18951, Process: "app", Pid: 7, Pid127: 7, BindScope: ScopeLoopback, BindHost: "127.0.0.1", Loopback: true,
-		UnattribTailnet: true, UnattribHost: "100.81.94.92"}
+		UnattribTailnet: true, UnattribHost: "100.81.94.92", UnattribScope: ScopeTailnet}
 	withWild := Port{Number: 18951, BindScope: ScopeWildcard, BindHost: "0.0.0.0",
-		UnattribTailnet: true, UnattribHost: "100.81.94.92"}
+		UnattribTailnet: true, UnattribHost: "100.81.94.92", UnattribScope: ScopeTailnet}
 	plain := Port{Number: 22, Process: "sshd", BindScope: ScopeWildcard}
 
 	tests := []struct {
@@ -59,6 +59,25 @@ func TestResolveTailnetRows(t *testing.T) {
 				t.Errorf("input was modified: %+v", in)
 			}
 		})
+	}
+}
+
+func TestResolveKeepsClassifiedScope(t *testing.T) {
+	in := []Port{{Number: 1, UnattribTailnet: true, UnattribHost: "10.0.0.5", UnattribScope: ScopeLAN}}
+	got := ResolveTailnetRows(in, map[int]bool{}, true)
+	if len(got) != 1 || got[0].BindScope != ScopeLAN || got[0].BindHost != "10.0.0.5" {
+		t.Errorf("got %+v, want the deferred row's own scope kept", got)
+	}
+}
+
+func TestCanBeTailscaledProxy(t *testing.T) {
+	for h, want := range map[string]bool{
+		"100.81.94.92": true, "100.81.94.92%tailscale0": true, "fd7a:115c:a1e0::1": true,
+		"100.81.94.92%lo": false, "100.81.94.92%eth0": false, "192.168.1.5": false, "*": false,
+	} {
+		if got := canBeTailscaledProxy(h); got != want {
+			t.Errorf("canBeTailscaledProxy(%q) = %v, want %v", h, got, want)
+		}
 	}
 }
 

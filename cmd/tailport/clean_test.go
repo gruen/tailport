@@ -43,6 +43,9 @@ type cleanFakes struct {
 	tsRows []int
 	// tsAppRows: tailnet-IP rows with a visible, non-Tailscale owner.
 	tsAppRows []int
+	// listen: tailscaled listen ports that are not local services
+	// (tsserve.Detail.ListenPorts: funnel ingress, HTTPS/TCP serves).
+	listen []int
 }
 
 func (f *cleanFakes) install(t *testing.T) {
@@ -89,7 +92,11 @@ func (f *cleanFakes) install(t *testing.T) {
 				one[p] = true
 			}
 		}
-		return tsserve.Detail{Active: f.served, Funnel: f.funnel, OneToOne: one}, nil
+		lp := map[int]bool{}
+		for _, p := range f.listen {
+			lp[p] = true
+		}
+		return tsserve.Detail{Active: f.served, Funnel: f.funnel, OneToOne: one, ListenPorts: lp}, nil
 	}
 	cleanPublicPorts = func(config.Config) (map[int]bool, error) {
 		f.order = append(f.order, "public")
@@ -305,5 +312,16 @@ func TestCleanKeepsServeWhenAppOwnsTheTailnetBind(t *testing.T) {
 	code, out, _ := runCleanWith(t, f, "--dry-run")
 	if code != 0 || out != "nothing to clean\n" {
 		t.Fatalf("an owner-visible tailnet bind is a listening app: code=%d out=%q", code, out)
+	}
+}
+
+// Kata nvv6 (roborev 7329 #1): tailscaled's funnel-ingress/HTTPS listener has
+// no visible owner either; it must not read as an app, or a dangling serve
+// whose number matches would be kept.
+func TestCleanIgnoresTailscaledListenPorts(t *testing.T) {
+	f := &cleanFakes{served: []int{18952}, listen: []int{18952, 443}, tsRows: []int{18952, 443}}
+	code, out, _ := runCleanWith(t, f, "--dry-run")
+	if code != 0 || out != "would clear :18952\n" {
+		t.Fatalf("code=%d out=%q", code, out)
 	}
 }

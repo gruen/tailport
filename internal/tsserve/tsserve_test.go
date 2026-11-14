@@ -320,3 +320,29 @@ func TestParsePeerAPIPorts(t *testing.T) {
 		t.Error("bad JSON must be an error")
 	}
 }
+
+// Kata nvv6: ListenPorts is every port tailscaled itself listens on for serve
+// or funnel -- all TCP keys (an HTTPS serve, a TCP forward, funnel ingress 443)
+// and the funnel public ports -- while Active stays the local services only.
+func TestDetailListenPorts(t *testing.T) {
+	const blob = `{"TCP":{"443":{"HTTPS":true},"8080":{"HTTP":true},"2222":{"TCPForward":"127.0.0.1:22"}},
+	 "Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}},
+	 "AllowFunnel":{"host.ts.net:443":true}}`
+	d, err := detailFrom([]byte(blob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []int{443, 8080, 2222} {
+		if !d.ListenPorts[p] {
+			t.Errorf("ListenPorts missing :%d: %v", p, d.ListenPorts)
+		}
+	}
+	if d.ListenPorts[3000] {
+		t.Errorf("a local proxy target is not a tailscaled listener: %v", d.ListenPorts)
+	}
+	for _, p := range d.Active {
+		if p == 443 {
+			t.Errorf("funnel ingress must stay out of Active: %v", d.Active)
+		}
+	}
+}
